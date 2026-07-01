@@ -1,0 +1,12 @@
+[package]
+name    = "pinn-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde   = { workspace = true }
+ndarray = { workspace = true }
+anyhow  = { workspace = true }
+
+[dev-dependencies]
+approx = "0.5"

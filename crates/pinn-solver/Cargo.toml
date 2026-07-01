@@ -1,0 +1,12 @@
+[package]
+name    = "pinn-solver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pinn-core         = { path = "../pinn-core" }
+burn              = { workspace = true }
+nalgebra          = { workspace = true }
+ndarray           = { workspace = true }
+anyhow            = { workspace = true }
+crossbeam-channel = { workspace = true }

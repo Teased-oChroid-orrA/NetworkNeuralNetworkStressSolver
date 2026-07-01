@@ -1,0 +1,164 @@
+use std::{collections::HashMap, env, fs, path::Path};
+
+use pinn_core::{
+    messages::SolverConfig,
+    units::{IN_TO_M, KSI_TO_PA, MSI_TO_PA},
+    HoleType,
+};
+
+/// Read a KEY=VALUE env file; strip comments and blank lines.
+fn load_pinn_env(path: &Path) -> HashMap<String, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return HashMap::new(),
+    };
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        // Strip inline comments before parsing
+        let line = if let Some(pos) = line.find('#') { &line[..pos] } else { line };
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim().to_string();
+            let val = v.trim().to_string();
+            if !key.is_empty() {
+                map.insert(key, val);
+            }
+        }
+    }
+    map
+}
+
+/// Apply parsed env map to config in-place. Unknown keys are silently ignored.
+fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>) {
+    macro_rules! parse_usize {
+        ($key:expr, $field:expr) => {
+            if let Some(v) = env.get($key) {
+                if let Ok(n) = v.parse::<usize>() { $field = n; }
+            }
+        };
+    }
+    macro_rules! parse_f32 {
+        ($key:expr, $field:expr) => {
+            if let Some(v) = env.get($key) {
+                if let Ok(n) = v.parse::<f32>() { $field = n; }
+            }
+        };
+    }
+    macro_rules! parse_f64 {
+        ($key:expr, $field:expr) => {
+            if let Some(v) = env.get($key) {
+                if let Ok(n) = v.parse::<f64>() { $field = n; }
+            }
+        };
+    }
+    macro_rules! parse_bool {
+        ($key:expr, $field:expr) => {
+            if let Some(v) = env.get($key) {
+                match v.to_lowercase().as_str() {
+                    "true" | "1" | "yes" => $field = true,
+                    "false" | "0" | "no" => $field = false,
+                    _ => {}
+                }
+            }
+        };
+    }
+
+    // Sampling & schedule
+    parse_usize!("N_INTERIOR", cfg.n_interior);
+    parse_usize!("N_BOUNDARY", cfg.n_boundary);
+    parse_usize!("MAX_STEPS",  cfg.max_steps);
+    if let Some(v) = env.get("VIS_GRID_NX") {
+        if let Ok(n) = v.parse::<usize>() { cfg.vis_grid[0] = n; }
+    }
+    if let Some(v) = env.get("VIS_GRID_NY") {
+        if let Ok(n) = v.parse::<usize>() { cfg.vis_grid[1] = n; }
+    }
+
+    // Network
+    parse_usize!("HIDDEN_DIM", cfg.hidden_dim);
+    parse_usize!("N_HIDDEN",   cfg.n_hidden);
+    parse_f32!("FD_H",         cfg.fd_h);
+
+    // Optimizer
+    parse_bool!("USE_SOAP_MUON", cfg.use_soap_muon);
+
+    // Decision maker
+    {
+        let dm = &mut cfg.decision_maker;
+        parse_bool!("DM_ENABLED",               dm.enabled);
+        parse_usize!("DM_CHECK_INTERVAL",        dm.check_interval);
+        parse_f32!("DM_CONFLICT_THRESHOLD",      dm.conflict_threshold);
+        parse_f32!("DM_ALIGNMENT_THRESHOLD",     dm.alignment_threshold);
+        parse_f32!("DM_CONVERGE_COSINE_MIN",     dm.converge_cosine_min);
+        parse_f32!("DM_CONVERGE_GRAD_THRESHOLD", dm.converge_grad_threshold);
+        parse_bool!("DM_USE_EXACT_COSINE",       dm.use_exact_cosine);
+        parse_usize!("DM_MIN_DWELL_STEPS",       dm.min_dwell_steps);
+        parse_usize!("DM_LBFGS_MAX_ITER",        dm.lbfgs_max_iter);
+    }
+
+    // Material (US Customary → SI)
+    if let Some(v) = env.get("MATERIAL_E_MSI") {
+        if let Ok(n) = v.parse::<f64>() { cfg.material.e = n * MSI_TO_PA; }
+    }
+    parse_f64!("MATERIAL_NU", cfg.material.nu);
+
+    // Load (ksi → Pa)
+    if let Some(v) = env.get("LOAD_PX_KSI") {
+        if let Ok(n) = v.parse::<f64>() { cfg.load.px = n * KSI_TO_PA; }
+    }
+    if let Some(v) = env.get("LOAD_PY_KSI") {
+        if let Ok(n) = v.parse::<f64>() { cfg.load.py = n * KSI_TO_PA; }
+    }
+
+    // Geometry (inches → m)
+    if let Some(v) = env.get("GEOM_HALF_W_IN") {
+        if let Ok(n) = v.parse::<f64>() { cfg.geometry.half_w = n * IN_TO_M; }
+    }
+    if let Some(v) = env.get("GEOM_HALF_H_IN") {
+        if let Ok(n) = v.parse::<f64>() { cfg.geometry.half_h = n * IN_TO_M; }
+    }
+    if let Some(v) = env.get("HOLE_RADIUS_IN") {
+        if let Ok(n) = v.parse::<f64>() {
+            cfg.geometry.hole = HoleType::Circular { radius: n * IN_TO_M };
+        }
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let env_path_str = env::var("PINN_ENV").unwrap_or_else(|_| "pinn.env".to_string());
+    let env_map = load_pinn_env(Path::new(&env_path_str));
+
+    let mut config = SolverConfig::default_kirsch();
+    apply_env(&mut config, &env_map);
+
+    if !env_map.is_empty() {
+        eprintln!("[pinn.env] loaded {} key(s) from {env_path_str}",  env_map.len());
+    }
+
+    let headless = env::args().any(|a| a == "--headless" || a == "-H");
+
+    if headless {
+        if !pinn_solver::run_headless(config) {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // GUI mode
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1400.0, 820.0])
+            .with_min_inner_size([900.0, 600.0])
+            .with_title("PINN Structural Stress Solver"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "PINN Stress Solver",
+        native_options,
+        Box::new(|cc| Ok(Box::new(pinn_gui::StressSolverApp::new(cc, config)))),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}

@@ -1,0 +1,14 @@
+[package]
+name    = "pinn-gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pinn-core         = { path = "../pinn-core" }
+pinn-solver       = { path = "../pinn-solver" }
+egui              = { workspace = true }
+eframe            = { workspace = true }
+egui_plot         = { workspace = true }
+crossbeam-channel = { workspace = true }
+ndarray           = { workspace = true }
+anyhow            = { workspace = true }

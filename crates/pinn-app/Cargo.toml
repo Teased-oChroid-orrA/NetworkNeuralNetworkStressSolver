@@ -1,0 +1,16 @@
+[package]
+name    = "pinn-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "stress-solver"
+path = "src/main.rs"
+
+[dependencies]
+pinn-core   = { path = "../pinn-core" }
+pinn-solver = { path = "../pinn-solver" }
+pinn-gui    = { path = "../pinn-gui" }
+egui        = { workspace = true }
+eframe      = { workspace = true }
+anyhow      = { workspace = true }
