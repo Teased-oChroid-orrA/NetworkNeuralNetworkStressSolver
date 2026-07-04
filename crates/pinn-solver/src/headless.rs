@@ -665,11 +665,18 @@ pub(crate) fn run_headless_pinlug_inner(
                 cosine_sim: None,
             }
         } else {
-            // IDENTICAL call to pre-decision-maker code: same tier_u8 literal (0), same
-            // 1.0/1.0 boost/mult placeholders (pin-in-lug has no StiffnessController) — this
-            // is the zero-regression bar when `dm_config.enabled == false`.
+            // tier_u8 is a pure logging passthrough (StepOutput.optimizer_tier) — never
+            // read computationally by step_physics_multi (grep confirms its only two uses
+            // are both `optimizer_tier: tier_u8` field assignments) — so threading the real
+            // current tier through here (rather than a hardcoded 0) fixes the Align→Converge
+            // transition's console message without affecting the zero-regression bar: when
+            // `dm_config.enabled == false`, current_tier never leaves Explore (as_u8()==0),
+            // so this is behavior-identical to the literal-0 call in that case, and only
+            // improves accuracy when enabled. Same 1.0/1.0 boost/mult placeholders
+            // (pin-in-lug has no StiffnessController).
             let (new_models, out) = step_physics_multi(
-                vec![model_pin, model_lug], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+                vec![model_pin, model_lug], &mut optims, &ctx, &mut saw, &mut lr_sched, &device,
+                decision_maker.current_tier.as_u8(), 1.0, 1.0,
             );
             let mut it = new_models.into_iter();
             model_pin = it.next().unwrap();
