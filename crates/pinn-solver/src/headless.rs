@@ -27,9 +27,11 @@ use crate::{
     engine::EngineParams,
     energy::dem_energy_per_point,
     fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig},
+    kirsch_problem::KirschProblem,
     lr_schedule::LrSchedule,
     network::{fwd, ElasticityNet, ElasticityNetConfig},
     optim::{make_bias_optim, make_gate_optim, WeightOptim},
+    problem::validate_loss_terms,
     saw_brdr::SawBrdr,
     stiffness::StiffnessController,
     training_core::{
@@ -106,6 +108,11 @@ pub fn run_headless(config: SolverConfig) -> bool {
     let mut frozen_lbfgs_lams: Option<LbfgsLams> = None;
 
     let (u_ref, ref_energy, ref_stress2) = compute_reference_scales(&config);
+
+    let problem = KirschProblem::new(
+        config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
+    );
+    validate_loss_terms(&problem);
 
     let mut saw = SawBrdr::with_base(engine.init_weights(), 0.95);
     let mut lr_sched = LrSchedule::new(engine.peak_lr, 200, 1000);
@@ -215,6 +222,7 @@ pub fn run_headless(config: SolverConfig) -> bool {
         let ctx = StepCtx {
             config:            &config,
             engine:            &engine,
+            problem:           &problem,
             fd:                &fd,
             k,
             u_ref,

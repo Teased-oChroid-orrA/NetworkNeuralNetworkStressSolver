@@ -2,18 +2,19 @@
 /// onto the generic `BoundaryValueProblem`/`DomainSamplingStrategy`/`DirichletAnsatz`/
 /// `LossTerm` trait family (`problem.rs`, `pinn_core::problem`).
 ///
-/// This is slice 1 of the pluggable-BVP work: `step_physics` in `training_core.rs` — the
-/// single source of truth for the *actual* per-step training computation (one combined
-/// `.backward()` over all weighted loss terms; SAW-BRDR weighting is applied before that
-/// single backward pass, not per-term) — is intentionally left unchanged, because
-/// decomposing it into independently-backpropagated `LossTerm`s would change training
-/// dynamics (gradient accumulation, SOAP-Muon/AdamW update behavior) and violate the
-/// "ZERO behavior change" requirement. Instead, `KirschProblem`'s `LossTerm` impls
-/// faithfully describe the same six additive terms (same formulas, same base weights) so a
-/// future generic curriculum driver can introspect/weight/validate them the same way
-/// `step_physics` does today, and so a second (pin-in-lug) problem can plug into the same
-/// trait shape. See `kirsch_regression_matches_hardcoded_step_physics` below for the
-/// numerical equivalence check.
+/// `step_physics` in `training_core.rs` — the single source of truth for the *actual*
+/// per-step training computation — is now DRIVEN by this file's `LossTerm` impls: it
+/// computes each domain's forward pass once per point-set exactly as before, then routes
+/// the resulting tensors through `KirschProblem::loss_terms()` (this file) IN THEIR STABLE
+/// ORDER to build the SAW-BRDR component vector, sums all weighted terms into ONE scalar,
+/// and calls `.backward()` exactly once — preserving the original gradient-accumulation
+/// semantics (SOAP-Muon/AdamW update behavior unchanged). See
+/// `kirsch_sampling_strategy_matches_pinn_core_sampling_bit_identical` /
+/// `kirsch_regression_matches_hardcoded_step_physics` here, and
+/// `training_core::tests::step_physics_trait_driven_matches_independently_reimplemented_old_formula`
+/// (the load-bearing numerical-equivalence proof: independently reimplemented old
+/// hardcoded formula vs. the new trait-driven `step_physics`, run on identical starting
+/// weights for 2 real optimizer steps, loss scalars AND resulting parameters compared).
 use burn::tensor::Tensor;
 
 use pinn_core::{
@@ -375,9 +376,9 @@ pub struct EquilibriumRingTerm {
     pub ref_div2: f64,
     /// Pre-computed (sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym) at the
     /// four FD meta-shifts, since assembling these needs a 4x-shifted forward pass this
-    /// trait's single `DomainForwardOutputs` shape doesn't carry. Callers (`step_physics`)
-    /// compute these directly today; this term exists for introspection/weight-validation
-    /// of the decomposition, not as the live per-step call path (see module doc comment).
+    /// trait's single `DomainForwardOutputs` shape doesn't carry. `step_physics` computes
+    /// the 4-shift forward pass itself (once per step) and populates `components` from it
+    /// before calling `compute` — this IS the live per-step call path.
     pub components: Option<[Tensor<B, 1>; 8]>,
 }
 
@@ -514,10 +515,14 @@ impl BoundaryValueProblem for KirschProblem {
     }
 
     fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
-        // Descriptive/zero-sized placeholders: real tensors are supplied per-step by the
-        // (unchanged) `step_physics` call site. These exist so `validate_loss_terms` and
-        // future generic tooling can enumerate names/domains/phase2_only without running
-        // a step. See `EquilibriumRingTerm`/`KirschStressTerm` doc comments.
+        // `step_physics` calls this to enumerate the STABLE NAME/ORDER/phase2_only set
+        // that drives the SAW-BRDR component vector, then builds its OWN real-tensor
+        // instances of these same term structs (populated with this step's actual
+        // forward-pass outputs) to call `.compute()` on — see `training_core::step_physics`.
+        // The placeholder tensors below (zeros, ref_energy=1.0, etc.) are never computed
+        // on; they exist only so `validate_loss_terms` and other introspection can walk
+        // names/domains/phase2_only without a live step. See `EquilibriumRingTerm`/
+        // `KirschStressTerm` doc comments for why some fields can't be filled here.
         let material = self.domains[0].material.clone();
         vec![
             Box::new(InteriorEnergyTerm { domain: KIRSCH_DOMAIN, material: material.clone(), ref_energy: 1.0 }),
@@ -718,8 +723,11 @@ mod tests {
         let eq_ring_norm: Vec<[f32; 2]> = eq_ring_old.iter()
             .map(|&[x, y]| normalize_point(x, y, &config)).collect();
 
+        let problem_for_ctx = KirschProblem::new(
+            config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
+        );
         let ctx = StepCtx {
-            config: &config, engine: &engine, fd: &fd,
+            config: &config, engine: &engine, problem: &problem_for_ctx, fd: &fd,
             k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm: &int_norm, bnd_norm: &bnd_norm,
             bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,

@@ -18,8 +18,10 @@ use crate::{
     engine::EngineParams,
     energy::dem_energy_per_point,
     fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig},
+    kirsch_problem::KirschProblem,
     network::{fwd, ElasticityNet, ElasticityNetConfig},
     optim::{make_bias_optim, make_gate_optim, BiasOptim, GateOptim, WeightOptim},
+    problem::validate_loss_terms,
     saw_brdr::SawBrdr,
     stiffness::StiffnessController,
     lr_schedule::LrSchedule,
@@ -29,6 +31,16 @@ use crate::{
         LbfgsCtxScalars, LbfgsLams, StepCtx, StepOutput,
     },
 };
+
+/// Build the `KirschProblem` driving `step_physics` for the given (post-`apply_to`) config
+/// + engine. Rebuilt on warm-start since material/expected_kt can change.
+fn make_kirsch_problem(config: &SolverConfig, engine: &EngineParams) -> KirschProblem {
+    let problem = KirschProblem::new(
+        config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
+    );
+    validate_loss_terms(&problem);
+    problem
+}
 
 type B = Autodiff<Wgpu>;
 type BInner = Wgpu;
@@ -84,6 +96,9 @@ struct TrainingState {
     lbfgs_opt:           Option<burn::optim::LBFGS<B>>,
     frozen_lbfgs_ctx:    Option<LbfgsCtxScalars>,
     frozen_lbfgs_lams:   Option<LbfgsLams>,
+
+    /// Boundary-value problem driving `step_physics`'s loss-term set/order/base-weights.
+    problem: KirschProblem,
 }
 
 impl TrainingState {
@@ -142,6 +157,7 @@ impl TrainingState {
             lbfgs_opt:         None,
             frozen_lbfgs_ctx:  None,
             frozen_lbfgs_lams: None,
+            problem:           make_kirsch_problem(config, engine),
         }
     }
 
@@ -217,6 +233,7 @@ impl TrainingState {
         self.current_cy = self.current_fd.sy / (2.0 * self.current_fd.hy as f64);
         self.current_ref_div2 = (new_cfg.load.px * self.current_cx).powi(2).max(1.0);
         self.current_k = new_engine.ansatz_k;
+        self.problem = make_kirsch_problem(&new_cfg, &new_engine);
         self.current_engine = new_engine;
         self.current_config = new_cfg;
     }
@@ -351,6 +368,7 @@ pub fn run_training(
         let ctx = StepCtx {
             config:            &state.current_config,
             engine:            &state.current_engine,
+            problem:           &state.problem,
             fd:                &state.current_fd,
             k:                 state.current_k,
             u_ref:             state.u_ref,
