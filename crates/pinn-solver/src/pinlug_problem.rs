@@ -71,6 +71,17 @@ use crate::{
 pub const PIN_DOMAIN: DomainId = DomainId(0);
 pub const LUG_DOMAIN: DomainId = DomainId(1);
 
+/// Which stress magnitude `PinLugProblem`'s internal `ref_energy`/`ref_stress2`/`ref_gap2`
+/// normalize against. Mirrors `SolverConfig::use_ultimate_strength_scaling` for the
+/// two-domain pin-lug path, which has no `SolverConfig` of its own to read the flag from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinLugScalingMode {
+    /// Normalize by the driving equivalent bearing traction (existing, default behavior).
+    AppliedLoad,
+    /// Normalize by `material.ultimate_strength_pa` (opt-in).
+    UltimateStrength,
+}
+
 const SEED_LUG_INTERIOR: u64 = 13_37;
 const SEED_PIN_INTERIOR: u64 = 24_68;
 const SEED_LUG_BOUNDARY: u64 = 55_55;
@@ -443,14 +454,27 @@ pub struct PinLugProblem {
 
 impl PinLugProblem {
     /// `n_interface`: number of shared-theta interface points (index-aligned across pin and
-    /// lug — see `InterfaceParametrization` doc comment).
-    pub fn new(material: MaterialProps, output_dim: usize, phase1_steps: usize, n_interface: usize) -> Self {
+    /// lug — see `InterfaceParametrization` doc comment). `scaling_mode` selects which
+    /// stress magnitude `ref_energy`/`ref_stress2`/`ref_gap2` normalize against (see
+    /// `PinLugScalingMode`).
+    pub fn new(
+        material: MaterialProps,
+        output_dim: usize,
+        phase1_steps: usize,
+        n_interface: usize,
+        scaling_mode: PinLugScalingMode,
+    ) -> Self {
         let lug_geometry = GeometryConfig::pinlug_lug_inches();
         let pin_geometry = GeometryConfig::pinlug_pin_inches();
         let HoleType::Circular { radius: r_lug } = lug_geometry.hole else {
             panic!("PinLugProblem::new: lug geometry must have a circular hole");
         };
         let r_pin = pin_geometry.half_w; // pin disk radius (see pinlug_pin_inches doc comment)
+
+        // Read scalar material properties BEFORE `material` gets partially moved/cloned
+        // into the `DomainSpec`s below.
+        let material_e = material.e;
+        let material_uts = material.ultimate_strength_pa;
 
         let thetas: Vec<f64> = (0..n_interface)
             .map(|i| 2.0 * std::f64::consts::PI * i as f64 / n_interface.max(1) as f64)
@@ -464,11 +488,16 @@ impl PinLugProblem {
         let projected_area_m2 = 2.0 * r_pin * lug_geometry.thickness;
         let equivalent_traction_pa = total_force_n / projected_area_m2;
 
-        // Same formula as `training_core::compute_reference_scales`, with
-        // `equivalent_traction_pa` standing in for Kirsch's far-field `config.load.px`.
-        let ref_energy = (0.5 * equivalent_traction_pa * equivalent_traction_pa / material.e) as f32;
-        let ref_stress2 = (equivalent_traction_pa * equivalent_traction_pa) as f32;
-        let u_ref = (equivalent_traction_pa / material.e) * r_pin;
+        let stress_ref = match scaling_mode {
+            PinLugScalingMode::AppliedLoad => equivalent_traction_pa,
+            PinLugScalingMode::UltimateStrength => material_uts,
+        };
+
+        // Same formula as `training_core::compute_reference_scales`, with `stress_ref`
+        // standing in for Kirsch's far-field `config.load.px`.
+        let ref_energy = (0.5 * stress_ref * stress_ref / material_e) as f32;
+        let ref_stress2 = (stress_ref * stress_ref) as f32;
+        let u_ref = (stress_ref / material_e) * r_pin;
         let ref_gap2 = (u_ref * u_ref) as f32;
 
         Self {
@@ -490,6 +519,11 @@ impl PinLugProblem {
 
     pub fn interface_thetas(&self) -> &[f64] { &self.interface.thetas }
     pub fn equivalent_traction_pa(&self) -> f64 { self.equivalent_traction_pa }
+
+    #[cfg(test)]
+    pub(crate) fn ref_stress2_for_test(&self) -> f32 { self.ref_stress2 }
+    #[cfg(test)]
+    pub(crate) fn ref_energy_for_test(&self) -> f32 { self.ref_energy }
 }
 
 impl BoundaryValueProblem for PinLugProblem {
@@ -644,13 +678,13 @@ mod tests {
 
     #[test]
     fn convergence_metric_pinlug_returns_none_when_state_slice_empty() {
-        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16);
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
         assert_eq!(problem.convergence_metric(&[]), None);
     }
 
     #[test]
     fn validate_loss_terms_accepts_well_formed_pinlug_problem() {
-        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16);
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
         crate::problem::validate_loss_terms(&problem); // must not panic
     }
 
@@ -692,7 +726,7 @@ mod tests {
         use crate::network::ElasticityNetConfig;
         use crate::problem::DomainState;
 
-        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16);
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
         let device: burn::backend::wgpu::WgpuDevice = Default::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(3)
@@ -729,7 +763,7 @@ mod tests {
         use crate::network::ElasticityNetConfig;
         use crate::problem::DomainState;
 
-        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16);
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
         let device: burn::backend::wgpu::WgpuDevice = Default::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(3)
@@ -787,5 +821,44 @@ mod tests {
         let loss = term.compute(&[pin_fwd, lug_fwd]);
         let v: f32 = loss.into_data().to_vec::<f32>().unwrap()[0];
         assert_eq!(v, 0.0, "zero displacement + equal radii must give exactly zero gap everywhere -> zero penalty");
+    }
+
+    #[test]
+    fn pinlug_scaling_mode_applied_load_matches_existing_traction_based_formula() {
+        let material = MaterialProps::steel_4340();
+        let problem = PinLugProblem::new(material.clone(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
+
+        let traction = problem.equivalent_traction_pa();
+        let expected_ref_stress2 = (traction * traction) as f32;
+        let expected_ref_energy = (0.5 * traction * traction / material.e) as f32;
+
+        let ref_stress2 = problem.ref_stress2_for_test();
+        let ref_energy = problem.ref_energy_for_test();
+
+        assert!((ref_stress2 - expected_ref_stress2).abs() / expected_ref_stress2 < 1e-5);
+        assert!((ref_energy - expected_ref_energy).abs() / expected_ref_energy < 1e-5);
+    }
+
+    #[test]
+    fn pinlug_scaling_mode_ultimate_strength_diverges_from_applied_load() {
+        let material = MaterialProps::steel_4340();
+        let problem_applied = PinLugProblem::new(material.clone(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
+        let problem_uts = PinLugProblem::new(material.clone(), 5, 2000, 16, PinLugScalingMode::UltimateStrength);
+
+        let ref_stress2_applied = problem_applied.ref_stress2_for_test();
+        let ref_stress2_uts = problem_uts.ref_stress2_for_test();
+
+        assert!(
+            (ref_stress2_uts - ref_stress2_applied).abs() / ref_stress2_applied > 0.01,
+            "UltimateStrength mode must diverge from AppliedLoad mode by >1% relative"
+        );
+
+        let uts = material.ultimate_strength_pa;
+        let expected_ref_stress2 = (uts * uts) as f32;
+        let expected_ref_energy = (0.5 * uts * uts / material.e) as f32;
+
+        assert!((ref_stress2_uts - expected_ref_stress2).abs() / expected_ref_stress2 < 1e-5);
+        let ref_energy_uts = problem_uts.ref_energy_for_test();
+        assert!((ref_energy_uts - expected_ref_energy).abs() / expected_ref_energy < 1e-5);
     }
 }
