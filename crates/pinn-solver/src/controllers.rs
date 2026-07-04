@@ -35,7 +35,7 @@ const CONVERGED_STDDEV_FRACTION: f64 = 0.015;
 /// would fool a stdev-based check into thinking training is still active.
 /// Each restart resets LR + Adam and tightens `lam_h_cap` (50 → 30 → 18 → 15) to
 /// increase kirsch gradient dominance over hole traction penalty.
-pub(crate) struct ConvergenceTracker {
+pub struct ConvergenceTracker {
     kt_history: std::collections::VecDeque<f64>,
     pub plateau_restarts: usize,
     pub crash_restarts: usize,
@@ -43,7 +43,7 @@ pub(crate) struct ConvergenceTracker {
 }
 
 impl ConvergenceTracker {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             kt_history: std::collections::VecDeque::with_capacity(200),
             plateau_restarts: 0,
@@ -53,17 +53,17 @@ impl ConvergenceTracker {
     }
 
     /// Total restarts across both budgets — used only for display (e.g. "[WARM RESTART #N]").
-    pub(crate) fn total_restarts(&self) -> usize {
+    pub fn total_restarts(&self) -> usize {
         self.plateau_restarts + self.crash_restarts
     }
 
-    pub(crate) fn push(&mut self, kt: f64) {
+    pub fn push(&mut self, kt: f64) {
         self.kt_history.push_back(kt);
         while self.kt_history.len() > 200 { self.kt_history.pop_front(); }
     }
 
     /// True when K_t has been within 2% of `target` and stable for the last `CONVERGENCE_WINDOW` readings.
-    pub(crate) fn is_kt_converged(&self, target: f64) -> bool {
+    pub fn is_kt_converged(&self, target: f64) -> bool {
         if target <= 0.0 || self.kt_history.len() < CONVERGENCE_WINDOW { return false; }
         let recent: Vec<f64> = self.kt_history.iter().rev().take(CONVERGENCE_WINDOW).cloned().collect();
         let mean = recent.iter().sum::<f64>() / recent.len() as f64;
@@ -83,7 +83,7 @@ impl ConvergenceTracker {
 
     /// If plateau detected and the plateau-restart budget remains, returns `Some(new_lam_h_cap)`.
     /// Caller is responsible for resetting LR and Adam.
-    pub(crate) fn check_plateau(&mut self) -> Option<f64> {
+    pub fn check_plateau(&mut self) -> Option<f64> {
         // Need 2×window readings: recent window vs previous window
         if self.kt_history.len() < PLATEAU_WINDOW * 2 { return None; }
         if self.plateau_restarts >= MAX_PLATEAU_RESTARTS { return None; }
@@ -110,7 +110,7 @@ impl ConvergenceTracker {
     /// Fires when K_t < `CRASH_DROP_FRACTION` × max_prev5 and max_prev5 > `CRASH_MIN_PEAK_KT`,
     /// indicating the network has escaped the converged basin. Caller should clear
     /// kt_history after triggering to prevent cascade detections while K_t is recovering.
-    pub(crate) fn check_kt_crash(&mut self, current_kt: f64) -> Option<f64> {
+    pub fn check_kt_crash(&mut self, current_kt: f64) -> Option<f64> {
         if self.crash_restarts >= MAX_CRASH_RESTARTS { return None; }
         // Need ≥6 readings so we have 5 prior readings before the current push.
         if self.kt_history.len() < 6 { return None; }
@@ -127,7 +127,7 @@ impl ConvergenceTracker {
     }
 
     /// Clears K_t history (call after crash recovery to avoid cascade detections).
-    pub(crate) fn clear_history(&mut self) {
+    pub fn clear_history(&mut self) {
         self.kt_history.clear();
     }
 }

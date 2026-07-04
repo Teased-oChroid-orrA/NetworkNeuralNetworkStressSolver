@@ -59,3 +59,12 @@ pub type BiasOptim = OptimizerAdaptor<burn::optim::AdamW, ElasticityNet<B>, B>;
 pub fn make_bias_optim() -> BiasOptim {
     AdamWConfig::new().init()
 }
+
+/// PirateNet gate-scalar optimizer — always plain AdamW, stepped with a stiffness-scaled
+/// learning rate. Its gradient set is empty when `use_piratenet=false`, making `step()` a
+/// no-op in that case.
+pub type GateOptim = OptimizerAdaptor<burn::optim::AdamW, ElasticityNet<B>, B>;
+
+pub fn make_gate_optim() -> GateOptim {
+    AdamWConfig::new().init()
+}

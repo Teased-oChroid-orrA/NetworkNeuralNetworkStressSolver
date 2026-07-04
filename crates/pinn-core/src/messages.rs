@@ -91,6 +91,45 @@ impl Default for DecisionMakerConfig {
     }
 }
 
+/// Configuration for the stiffness-coupled SAW-BRDR / PirateNet-gate accelerator
+/// (opt-in, disabled by default). When `enabled = false`, no extra gradient-conflict
+/// computation is scheduled by this subsystem and `step_physics()` receives
+/// `physics_boost = 1.0`, `alpha_lr_mult = 1.0` (both no-ops).
+///
+/// Architecture invariant: like [`DecisionMakerConfig`], this is driven purely by the
+/// real-time gradient-conflict cosine-similarity metric — K_t is never read here.
+#[derive(Clone, Debug)]
+pub struct StiffnessConfig {
+    /// Enable the stiffness controller (default: false — opt-in).
+    pub enabled: bool,
+    /// Steps between gradient-conflict evaluations (default: 50).
+    pub check_interval: usize,
+    /// EMA smoothing factor for the held stiffness value (default: 0.7).
+    pub ema_beta: f32,
+    /// Gain for the SAW-BRDR physics-loss boost; boost = `1 + gain * stiffness`,
+    /// hard-clamped to `[1, 4]` regardless of this value (default: 1.0).
+    pub physics_boost_gain: f32,
+    /// Gain for the PirateNet gate-LR multiplier; mult = `1 + gain * stiffness`,
+    /// hard-clamped to `[1, 5]` regardless of this value (default: 2.0).
+    pub alpha_accel_gain: f32,
+    /// Gate magnitude above which a PirateNet block is considered "awake" and its
+    /// weights are included in the SOAP-Muon optimizer step (default: 1e-4).
+    pub gate_awake_epsilon: f32,
+}
+
+impl Default for StiffnessConfig {
+    fn default() -> Self {
+        Self {
+            enabled:            false,
+            check_interval:     50,
+            ema_beta:           0.7,
+            physics_boost_gain: 1.0,
+            alpha_accel_gain:   2.0,
+            gate_awake_epsilon: 1e-4,
+        }
+    }
+}
+
 /// Complete solver configuration (passed when spawning the solver thread)
 #[derive(Clone)]
 pub struct SolverConfig {
@@ -111,6 +150,12 @@ pub struct SolverConfig {
     pub use_soap_muon: bool,
     /// Meta-optimizer decision maker configuration (disabled by default).
     pub decision_maker: DecisionMakerConfig,
+    /// Opt-in PirateNet adaptive-residual gating (disabled by default). See
+    /// [`ElasticityNetConfig::use_piratenet`] in `pinn-solver`.
+    pub use_piratenet: bool,
+    /// Stiffness-coupled SAW-BRDR / gate-LR accelerator configuration (disabled by
+    /// default).
+    pub stiffness: StiffnessConfig,
 }
 
 impl SolverConfig {
@@ -128,6 +173,52 @@ impl SolverConfig {
             fd_h:       1e-3,
             use_soap_muon:  true,
             decision_maker: DecisionMakerConfig::default(),
+            use_piratenet:  false,
+            stiffness:      StiffnessConfig::default(),
+        }
+    }
+
+    /// Pin-in-lug contact problem defaults. This single-domain `SolverConfig` shape can't
+    /// carry two domains' geometry/material — it's populated here with the LUG domain's
+    /// values (the driven/output-of-interest domain) purely so CLI/env plumbing that reads
+    /// `config.geometry`/`config.material`/`config.load` for display (see
+    /// `pinn-app/src/main.rs`, `headless.rs`'s startup banner) has *something* sensible to
+    /// show; the actual two-domain geometry/material/load setup used for training lives in
+    /// `pinn_solver::pinlug_problem::PinLugProblem::new`, which is the single source of
+    /// truth for both domains.
+    ///
+    /// Force→traction conversion for the driving load (see `PinLugProblem::new`'s doc
+    /// comment for the full derivation): `load.px` here is set to the SAME equivalent
+    /// traction magnitude used for the pin's driving boundary condition, expressed as a
+    /// far-field-style stress purely for display consistency with `default_kirsch()`.
+    pub fn default_pinlug() -> Self {
+        use crate::units::{IN_TO_M, LBF_TO_N};
+        let pin_radius = 0.5 * IN_TO_M;
+        let thickness = 0.4 * IN_TO_M;
+        // P = 20,000 lbf total axial force / (projected diametral contact area = 2*r*t).
+        // See PinLugProblem::new doc comment for why diametral projection is the right
+        // denominator (Hertzian/pin-bearing convention: the resultant force is reacted by
+        // the pressure distribution's projection onto the loading axis, whose max extent is
+        // the pin diameter times thickness).
+        let total_force_lbf = 20_000.0;
+        let total_force_n = total_force_lbf * LBF_TO_N;
+        let projected_area_m2 = 2.0 * pin_radius * thickness;
+        let equivalent_traction_pa = total_force_n / projected_area_m2;
+        Self {
+            material:   MaterialProps::steel_4340(),
+            geometry:   GeometryConfig::pinlug_lug_inches(),
+            load:       LoadConfig::uniaxial_x(equivalent_traction_pa),
+            n_interior: 2048,
+            n_boundary: 512,
+            max_steps:  20000,
+            vis_grid:   [64, 64],
+            hidden_dim: 128,
+            n_hidden:   5,
+            fd_h:       1e-3,
+            use_soap_muon:  true,
+            decision_maker: DecisionMakerConfig::default(),
+            use_piratenet:  false,
+            stiffness:      StiffnessConfig::default(),
         }
     }
 }
