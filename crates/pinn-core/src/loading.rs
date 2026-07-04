@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::problem::DomainId;
+
 /// Far-field applied loads [Pa]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LoadConfig {
@@ -44,4 +46,8 @@ pub enum BoundaryKind {
     NeumannLoad,
     /// Stress-free (hole edge, free edges)
     NeumannFree,
+    /// Contact/interface boundary shared with another domain (e.g. pin-in-lug contact
+    /// surface) — traction here is not prescribed in closed form but resolved against the
+    /// partner domain's state by a cross-domain loss term.
+    Interface { partner_domain: DomainId },
 }

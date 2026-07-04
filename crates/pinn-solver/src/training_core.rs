@@ -35,8 +35,8 @@ use crate::{
     saw_brdr::SawBrdr,
 };
 
-pub(crate) type B = Autodiff<Wgpu>;
-pub(crate) type BInner = Wgpu;
+pub type B = Autodiff<Wgpu>;
+pub type BInner = Wgpu;
 
 /// Normalize a physical (x, y) coordinate to [-1, 1]² using the config's geometry ranges.
 pub fn normalize_point(x: f64, y: f64, config: &SolverConfig) -> [f32; 2] {

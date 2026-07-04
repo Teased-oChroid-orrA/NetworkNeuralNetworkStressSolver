@@ -11,7 +11,7 @@
 /// (non-penetration satisfied), quadratic in the overlap depth otherwise.
 #[allow(dead_code)]
 pub fn penetration_penalty(gap: f64) -> f64 {
-    todo!()
+    (-gap).max(0.0).powi(2)
 }
 
 /// Penalty for tensile (pulling) contact pressure, which is non-physical for
@@ -20,14 +20,19 @@ pub fn penetration_penalty(gap: f64) -> f64 {
 /// contact_pressure <= 0, quadratic in the tensile magnitude otherwise.
 #[allow(dead_code)]
 pub fn non_tension_penalty(contact_pressure: f64) -> f64 {
-    todo!()
+    contact_pressure.max(0.0).powi(2)
 }
 
 /// Decompose Cartesian stress components (sxx, syy, sxy) into polar/radial components
 /// (s_rr, s_tt, s_rt) at angle `theta` (radians), via standard 2D stress-tensor rotation.
 #[allow(dead_code)]
 pub fn decompose_radial(sxx: f64, syy: f64, sxy: f64, theta: f64) -> (f64, f64, f64) {
-    todo!()
+    let c = theta.cos();
+    let s = theta.sin();
+    let s_rr = sxx * c * c + syy * s * s + 2.0 * sxy * s * c;
+    let s_tt = sxx * s * s + syy * c * c - 2.0 * sxy * s * c;
+    let s_rt = (syy - sxx) * s * c + sxy * (c * c - s * s);
+    (s_rr, s_tt, s_rt)
 }
 
 #[cfg(test)]

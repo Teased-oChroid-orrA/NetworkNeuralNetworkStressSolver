@@ -4,6 +4,7 @@ pub mod kirsch;
 pub mod loading;
 pub mod material;
 pub mod messages;
+pub mod problem;
 pub mod sampling;
 pub mod state;
 pub mod units;
@@ -16,5 +17,6 @@ pub use messages::{
     ControlMsg, DecisionMakerConfig, SolverConfig, StiffnessConfig, TrainingMsg, TrainingUpdate,
     VisFields,
 };
+pub use problem::{DirichletAnsatz, DomainId, DomainSamplingStrategy, DomainSpec, NamedPointSet};
 pub use sampling::{CollocationSet, LcgRng, sample_eq_ring};
 pub use state::{FieldType, SolverStatus, TrainingState};
