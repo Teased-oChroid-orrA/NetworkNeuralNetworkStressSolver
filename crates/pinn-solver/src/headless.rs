@@ -8,6 +8,8 @@
 ///     K_t is REPORTED from probe_kt_shared() as a verification metric — not used as a loss.
 /// - No hardcoded constants — everything flows from SolverConfig via EngineParams.
 
+use std::collections::HashMap;
+
 use burn::{
     backend::{Autodiff, Wgpu},
     module::AutodiffModule,
@@ -438,32 +440,63 @@ pub fn run_headless(config: SolverConfig) -> bool {
     converged
 }
 
+/// Richer result of [`run_headless_pinlug_inner`] — the public [`run_headless_pinlug`] only
+/// exposes `converged` (via its `bool` return), but tests need the final decision-maker tier
+/// to assert on (see `run_headless_pinlug_with_decision_maker_enabled_reaches_align_tier`).
+pub(crate) struct PinLugHeadlessResult {
+    pub converged: bool,
+    // Read only by `#[cfg(test)]` assertions (see module doc comment) — the production
+    // `run_headless_pinlug` wrapper only surfaces `converged`.
+    #[allow(dead_code)]
+    pub final_tier: OptimizerTier,
+    /// Per-step `total_scalar` trajectory — used by the zero-regression baseline test.
+    #[allow(dead_code)]
+    pub trajectory: Vec<f32>,
+}
+
 /// Headless-only entry point for the pin-in-lug 2-domain contact problem — routes through
 /// `step_physics_multi` (`training_core.rs`) instead of the frozen 1-domain `step_physics`
 /// Kirsch path. GUI/vis-grid support for pin-in-lug is explicitly OUT OF SCOPE for this
 /// slice (`runner.rs`'s GUI path remains Kirsch-only) — this headless entry point matches
 /// the CSV-export post-processing use case pin-in-lug is for.
 ///
-/// Deliberately does not replicate Kirsch's AMR / decision-maker / stiffness-controller /
-/// warm-restart-cascade machinery — those are tightly coupled to K_t-based convergence
-/// diagnostics that don't apply to a contact problem without a closed-form K_t. A fixed
-/// SAW-BRDR schedule (base weights from `PinLugProblem::base_weight`) over `max_steps` is
-/// the minimal correct training loop for this problem.
+/// Deliberately does not replicate Kirsch's AMR / stiffness-controller / warm-restart-cascade
+/// machinery — those are tightly coupled to K_t-based convergence diagnostics that don't
+/// apply to a contact problem without a closed-form K_t. A fixed SAW-BRDR schedule (base
+/// weights from `PinLugProblem::base_weight`) over `max_steps` is the minimal correct
+/// training loop for this problem. The decision maker (`PinnDecisionMaker`) IS wired in
+/// (opt-in via `config.decision_maker.enabled`, default false) — see
+/// `run_headless_pinlug_inner`'s Converge-tier branch below.
 pub fn run_headless_pinlug(config: SolverConfig) -> bool {
+    run_headless_pinlug_inner(config, None).converged
+}
+
+/// `initial_models`: test-only hook (always `None` from the public `run_headless_pinlug`) so
+/// the zero-regression baseline test can inject the SAME randomly-initialized starting
+/// weights into two separate calls — this repo's `ElasticityNetConfig::init` has no exposed
+/// seed control (confirmed: `burn::tensor::backend::Backend::seed` does not make Wgpu weight
+/// initialization deterministic, see the investigation note on the test itself), so
+/// process-level RNG determinism is not achievable; injecting identical pre-built models is
+/// the only way to get a literal apples-to-apples trajectory comparison.
+pub(crate) fn run_headless_pinlug_inner(
+    config: SolverConfig,
+    initial_models: Option<(ElasticityNet<B>, ElasticityNet<B>)>,
+) -> PinLugHeadlessResult {
     use pinn_core::problem::InterfaceParametrization;
     use crate::{
         network::ElasticityNetConfig,
         pinlug_problem::{PinLugProblem, PinLugScalingMode, LUG_DOMAIN, PIN_DOMAIN},
         problem::{
             validate_loss_terms, BoundaryValueProblem, DomainOptim, DomainStepCtx,
-            DomainStepData, MultiStepCtx, PointSetData,
+            DomainStepData, FrozenMultiStepCtx, MultiStepCtx, PointSetData,
         },
-        training_core::step_physics_multi,
+        training_core::{compute_gradient_conflict_multi, step_lbfgs_multi, step_physics_multi, TwoDomainModels},
     };
 
     const N_INTERFACE: usize = 64;
     const OUTPUT_DIM: usize = 5; // mDEM (u, v, sxx, syy, sxy)
     const PHASE1_STEPS: usize = usize::MAX; // no phase-2 cascade for pin-in-lug (see doc comment)
+    const PHASE2_ACTIVE: bool = false; // pin-in-lug has no phase-2 cascade — always Phase 1.
 
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║   PINN Structural Stress Solver — Pin-in-Lug (Headless)  ║");
@@ -506,8 +539,13 @@ pub fn run_headless_pinlug(config: SolverConfig) -> bool {
             .with_output_dim(OUTPUT_DIM)
             .with_use_piratenet(false)
     };
-    let mut model_pin: ElasticityNet<B> = net_cfg(pin_geom.half_w, pin_geom.half_h).init(&device);
-    let mut model_lug: ElasticityNet<B> = net_cfg(lug_geom.half_w, lug_geom.half_h).init(&device);
+    let (mut model_pin, mut model_lug): (ElasticityNet<B>, ElasticityNet<B>) = match initial_models {
+        Some((pin, lug)) => (pin, lug),
+        None => (
+            net_cfg(pin_geom.half_w, pin_geom.half_h).init(&device),
+            net_cfg(lug_geom.half_w, lug_geom.half_h).init(&device),
+        ),
+    };
 
     let mut optims = vec![
         DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() },
@@ -539,8 +577,22 @@ pub fn run_headless_pinlug(config: SolverConfig) -> bool {
         }
     };
 
+    // Decision maker: pin-in-lug has no phase-2 cascade (see PHASE2_ACTIVE), so `phase2_active`
+    // is always `false` at construction, mirroring `run_headless`'s Phase-1 initialization
+    // (`PinnDecisionMaker::new(dm_config.clone(), false)`).
+    let dm_config = config.decision_maker.clone();
+    let mut decision_maker = PinnDecisionMaker::new(dm_config.clone(), false);
+    let mut lbfgs_opt: Option<burn::optim::LBFGS<B>> = None;
+    // Frozen at Converge-tier ENTRY, re-frozen every time Converge is (re-)entered, and
+    // cleared on exit — pin-in-lug resamples its collocation points every step
+    // unconditionally (unlike Kirsch's AMR-gated resampling), so a frozen context that
+    // persisted across a demote-then-repromote cycle would silently train on stale points.
+    let mut frozen_ctx: Option<FrozenMultiStepCtx> = None;
+    let mut frozen_lams: Option<HashMap<&'static str, f64>> = None;
+
     let start = std::time::Instant::now();
     let mut last_total = f32::MAX;
+    let mut trajectory: Vec<f32> = Vec::with_capacity(config.max_steps);
 
     for step in 0..config.max_steps {
         let pin_int = pin_sampling.sample_interior(&pin_geom, config.n_interior);
@@ -579,17 +631,107 @@ pub fn run_headless_pinlug(config: SolverConfig) -> bool {
             ],
             dynamic_lam_h_cap: 50.0,
             dynamic_lam_d_cap: 50.0,
-            phase2_active: false,
+            phase2_active: PHASE2_ACTIVE,
             step,
         };
 
-        let (new_models, out) = step_physics_multi(
-            vec![model_pin, model_lug], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
-        );
-        let mut it = new_models.into_iter();
-        model_pin = it.next().unwrap();
-        model_lug = it.next().unwrap();
+        let out = if dm_config.enabled && decision_maker.current_tier == OptimizerTier::Converge {
+            // Converge tier: freeze context + lams ONCE per Converge entry (never mid-dwell —
+            // freshly (re-)frozen by the `evaluate()` transition branch below), lazily build
+            // L-BFGS, then run one quasi-Newton step over BOTH domains via TwoDomainModels.
+            if frozen_ctx.is_none() {
+                frozen_ctx = Some(FrozenMultiStepCtx::from_ctx(&ctx));
+                let mut lams: HashMap<&'static str, f64> = HashMap::new();
+                for term in problem.loss_terms() {
+                    lams.insert(term.name(), problem.base_weight(term.name()) as f64);
+                }
+                frozen_lams = Some(lams);
+            }
+            let lbfgs = lbfgs_opt.get_or_insert_with(|| make_lbfgs(dm_config.lbfgs_max_iter));
+            let fctx = frozen_ctx.as_ref().unwrap();
+            let lams = frozen_lams.as_ref().expect("lams must be set when entering Converge");
+            let lr = lr_sched.current_lr();
+            let models = TwoDomainModels { pin: model_pin, lug: model_lug };
+            let (new_models, loss_f64) = step_lbfgs_multi(models, lbfgs, lr, fctx, &problem, lams, &device);
+            model_pin = new_models.pin;
+            model_lug = new_models.lug;
+            StepOutput {
+                e_scalar: 0.0, n_scalar: 0.0, h_scalar: 0.0, d_scalar: 0.0,
+                eq_scalar: 0.0, w_scalar: 0.0, kirsch_scalar: 0.0, const_scalar: 0.0,
+                total_scalar: loss_f64 as f32, lr,
+                lam_e: 0.0, lam_n: 0.0, lam_h: 0.0, lam_d: 0.0, lam_eq: 0.0, lam_kirsch: 0.0,
+                proxy_ratio: 0.0,
+                optimizer_tier: OptimizerTier::Converge.as_u8(),
+                cosine_sim: None,
+            }
+        } else {
+            // IDENTICAL call to pre-decision-maker code: same tier_u8 literal (0), same
+            // 1.0/1.0 boost/mult placeholders (pin-in-lug has no StiffnessController) — this
+            // is the zero-regression bar when `dm_config.enabled == false`.
+            let (new_models, out) = step_physics_multi(
+                vec![model_pin, model_lug], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+            );
+            let mut it = new_models.into_iter();
+            model_pin = it.next().unwrap();
+            model_lug = it.next().unwrap();
+            out
+        };
         last_total = out.total_scalar;
+        trajectory.push(out.total_scalar);
+
+        // `advance()` unconditionally (even when `dm_config.enabled == false`) so its
+        // internal step counters stay correct regardless — mirrors `run_headless`'s
+        // invariant at its equivalent call site.
+        let dm_fire = decision_maker.advance();
+        if dm_fire {
+            let want_conflict = decision_maker.current_tier != OptimizerTier::Converge
+                && dm_config.use_exact_cosine;
+            let conflict = if want_conflict {
+                let models = TwoDomainModels { pin: model_pin, lug: model_lug };
+                let c = compute_gradient_conflict_multi(&models, &ctx, &device);
+                model_pin = models.pin;
+                model_lug = models.lug;
+                Some(c)
+            } else {
+                None
+            };
+
+            if let Some(t) = decision_maker.evaluate(conflict, out.proxy_ratio, PHASE2_ACTIVE) {
+                let old_tier_name = match out.optimizer_tier { 0 => "Explore", 1 => "Align", _ => "Converge" };
+                let new_tier_name = match t.new_tier {
+                    OptimizerTier::Explore  => "Explore",
+                    OptimizerTier::Align    => "Align",
+                    OptimizerTier::Converge => "Converge",
+                };
+                println!("\n  [DM@{step}] {old_tier_name} → {new_tier_name}");
+                if t.reset_optim {
+                    optims = vec![
+                        DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &t.new_tier), bias: make_bias_optim(), gate: make_gate_optim() },
+                        DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &t.new_tier), bias: make_bias_optim(), gate: make_gate_optim() },
+                    ];
+                }
+                if t.reset_lr {
+                    lr_sched.reset_for_phase2();
+                }
+                match t.new_tier {
+                    OptimizerTier::Converge => {
+                        // Freeze fresh collocation points/lams for this Converge entry.
+                        frozen_ctx = Some(FrozenMultiStepCtx::from_ctx(&ctx));
+                        let mut lams: HashMap<&'static str, f64> = HashMap::new();
+                        for term in problem.loss_terms() {
+                            lams.insert(term.name(), problem.base_weight(term.name()) as f64);
+                        }
+                        frozen_lams = Some(lams);
+                        lbfgs_opt = None;
+                    }
+                    _ => {
+                        // Leaving Converge (or any other transition): clear frozen state so
+                        // the next Converge entry re-freezes on fresh collocation points.
+                        frozen_ctx = None; frozen_lams = None; lbfgs_opt = None;
+                    }
+                }
+            }
+        }
 
         if step % 200 == 0 || step == config.max_steps - 1 {
             println!("{step:>6}  total={:>10.3e}  lr={:>8.2e}", out.total_scalar, out.lr);
@@ -623,7 +765,11 @@ pub fn run_headless_pinlug(config: SolverConfig) -> bool {
     }
 
     println!("════════════════════════════════════════════════════════════════════════════════════════════════════════");
-    last_total.is_finite()
+    PinLugHeadlessResult {
+        converged: last_total.is_finite(),
+        final_tier: decision_maker.current_tier,
+        trajectory,
+    }
 }
 
 /// Normalize a physical coordinate to [-1,1]^2 for an arbitrary (non-Kirsch) domain's own
@@ -635,4 +781,112 @@ fn normalize_point_generic(x: f64, y: f64, geom: &pinn_core::geometry::GeometryC
     let dw = x1 - x0;
     let dh = y1 - y0;
     [(2.0 * (x - x0) / dw - 1.0) as f32, (2.0 * (y - y0) / dh - 1.0) as f32]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn small_pinlug_config() -> SolverConfig {
+        let mut config = SolverConfig::default_pinlug();
+        config.n_interior = 32;
+        config.n_boundary = 24;
+        config.hidden_dim = 8;
+        config.n_hidden = 2;
+        config.max_steps = 10;
+        config
+    }
+
+    /// THE MOST IMPORTANT TEST in this task: with `decision_maker.enabled == false` (the
+    /// default), the decision-maker wiring added to `run_headless_pinlug_inner` must be a
+    /// complete no-op — byte-for-byte (within float tolerance) identical training behavior
+    /// to the pre-wiring code.
+    ///
+    /// Investigation note: network weight initialization is NOT made deterministic by
+    /// `burn::tensor::backend::Backend::seed` on this repo's `Autodiff<Wgpu>` stack (verified
+    /// experimentally: calling `B::seed(&device, N)` before two separate
+    /// `ElasticityNetConfig::init` calls still produces different weight sums), so a literal
+    /// cross-process "paste in the exact fixture Vec<f32>" trajectory comparison is not
+    /// reproducible here. Instead, `run_headless_pinlug_inner` takes an `initial_models`
+    /// test-only injection hook (always `None` from the public, production
+    /// `run_headless_pinlug`) — this test builds ONE pair of randomly-initialized models,
+    /// then runs the SAME pair (via `.clone()`, since `ElasticityNet` is a plain `Module`)
+    /// through two separate calls, achieving the literal apples-to-apples comparison the
+    /// task described, adapted to this backend's actual determinism surface.
+    #[test]
+    fn run_headless_pinlug_with_decision_maker_disabled_matches_pre_change_trajectory() {
+        use crate::network::ElasticityNetConfig;
+        use burn::module::Module;
+        use burn::tensor::Tensor;
+
+        let device = WgpuDevice::default();
+        let mut config_off = small_pinlug_config();
+        config_off.decision_maker.enabled = false;
+
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(3)
+            .with_hidden_dim(config_off.hidden_dim)
+            .with_n_hidden(config_off.n_hidden)
+            .with_output_dim(5)
+            .with_use_piratenet(false);
+        let model_pin: ElasticityNet<B> = net_cfg.init(&device);
+        let model_lug: ElasticityNet<B> = net_cfg.init(&device);
+
+        // Force-materialize every lazily-initialized `Param` BEFORE cloning: burn's `Param`
+        // defers random-weight materialization until first access (`SyncOnceCell`), so
+        // cloning an as-yet-untouched `Param` clones its *lazy init state*, not a value —
+        // each clone then independently (and differently) materializes its own random
+        // weights on first use, silently defeating the "same starting models" premise this
+        // test depends on. Touching every param's `.val()` once first forces materialization
+        // so `.clone()` below is a genuine deep-value clone (see `Param::clone`'s doc
+        // comment in burn-core's source for the two code paths this distinguishes).
+        struct TouchVisitor;
+        impl burn::module::ModuleVisitor<B> for TouchVisitor {
+            fn visit_float<const D: usize>(&mut self, param: &burn::module::Param<Tensor<B, D>>) {
+                let _ = param.val();
+            }
+        }
+        model_pin.visit(&mut TouchVisitor);
+        model_lug.visit(&mut TouchVisitor);
+
+        let result_a = run_headless_pinlug_inner(config_off.clone(), Some((model_pin.clone(), model_lug.clone())));
+        let result_b = run_headless_pinlug_inner(config_off, Some((model_pin, model_lug)));
+
+        assert_eq!(result_a.trajectory.len(), result_b.trajectory.len());
+        assert_eq!(result_a.final_tier, OptimizerTier::Explore,
+            "decision_maker.enabled=false must never transition current_tier away from Explore");
+        assert_eq!(result_b.final_tier, OptimizerTier::Explore);
+
+        for (i, (a, b)) in result_a.trajectory.iter().zip(result_b.trajectory.iter()).enumerate() {
+            let scale = a.abs().max(b.abs()).max(1e-8);
+            let rel = (a - b).abs() / scale;
+            // This repo's established GPU-float-under-test-contention tolerance (see
+            // training_core.rs's `param_l2_sq` regression tests' `1e-4` precedent).
+            assert!(rel < 1e-4,
+                "step {i}: trajectories diverge beyond tolerance with decision_maker disabled \
+                 (must be a complete no-op): a={a} b={b} rel_err={rel}");
+        }
+    }
+
+    #[test]
+    fn run_headless_pinlug_with_decision_maker_enabled_reaches_align_tier() {
+        let mut config = small_pinlug_config();
+        config.max_steps = 60;
+        config.decision_maker.enabled = true;
+        config.decision_maker.check_interval = 5;
+        config.decision_maker.min_dwell_steps = 5;
+        config.decision_maker.conflict_threshold = 0.99;
+        // Never satisfied (cosine similarity is clamped to [-1, 1]) — once Explore -> Align
+        // fires, prevents the Align -> Explore hysteresis transition from firing again and
+        // masking the tier change this test asserts on.
+        config.decision_maker.alignment_threshold = 1.1;
+        config.decision_maker.use_exact_cosine = true;
+
+        let result = run_headless_pinlug_inner(config, None);
+
+        assert_ne!(result.final_tier, OptimizerTier::Explore,
+            "with a permissive conflict_threshold and enabled=true, the decision maker must \
+             transition out of Explore within {} steps; final_tier={:?}",
+            60, result.final_tier);
+    }
 }

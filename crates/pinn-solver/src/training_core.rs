@@ -42,6 +42,21 @@ use crate::{
 pub type B = Autodiff<Wgpu>;
 pub type BInner = Wgpu;
 
+/// Two-domain model wrapper so `burn::optim::LBFGS::step()` (which requires a SINGLE
+/// `AutodiffModule<B>`) can take one combined quasi-Newton step across pin-in-lug's two
+/// domains' parameter spaces. `#[derive(Module, Debug)]` auto-derives `Module<B>`/
+/// `AutodiffModule<B>` exactly as it does for `ElasticityNet<B>` itself — no blanket tuple
+/// `Module` impl exists in burn-core 0.21.0, so a bare tuple does NOT satisfy this bound;
+/// this named struct is the only option that compiles. Named (not positional-tuple) per
+/// this repo's established aversion to bare-positional footguns (see `PinLugScalingMode`).
+/// Concrete 2-domain, not a generic `Vec<ElasticityNet<B>>` wrapper — YAGNI, nothing in
+/// `BoundaryValueProblem` today produces >2 domains.
+#[derive(Module, Debug)]
+pub struct TwoDomainModels<B: burn::tensor::backend::Backend> {
+    pub pin: ElasticityNet<B>,
+    pub lug: ElasticityNet<B>,
+}
+
 /// Normalize a physical (x, y) coordinate to [-1, 1]² using the config's geometry ranges.
 pub fn normalize_point(x: f64, y: f64, config: &SolverConfig) -> [f32; 2] {
     let (x0, x1) = config.geometry.x_range();
@@ -669,19 +684,33 @@ pub fn step_physics(
 ///       matter here (this is the single highest-risk assumption in this design; see
 ///       `gradient_split_attributes_domain_b_step_only_to_domain_b_params` /
 ///       `gradient_split_two_domains_both_receive_nonzero_updates_when_both_contribute`).
-#[allow(clippy::too_many_arguments)]
-pub fn step_physics_multi(
-    models: Vec<ElasticityNet<B>>,
-    optims: &mut [crate::problem::DomainOptim],
+/// Owned forward-pass output for one `(DomainId, point_set_name)` pair — the storage that
+/// backs a `DomainForwardOutputs<'_, B>` borrow. Kept in a stable `Vec` (see
+/// `compute_domain_forwards`'s doc comment) so borrowing `DomainForwardOutputs` built from it
+/// remain valid for as long as the `Vec` itself is alive.
+struct Computed {
+    key: (pinn_core::problem::DomainId, &'static str),
+    raw_out: Tensor<B, 2>,
+    strains: Option<(Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>)>,
+    normals: Option<(Tensor<B, 1>, Tensor<B, 1>)>,
+}
+
+/// Enumerate which `(DomainId, point_set_name)` pairs at least one of `active_terms` needs,
+/// then run exactly one forward pass per pair (never twice, even if several terms share it).
+/// Shared by `step_physics_multi` and `compute_loss_for_lbfgs_multi`/
+/// `compute_gradient_conflict_multi` so the forward-pass enumeration/scaling logic exists in
+/// exactly one place.
+///
+/// Forward-pass results are computed into owned storage first (raw_out tensor + optional
+/// strains/normals), returned as a `Vec<Computed>` — Rust's borrow checker requires the
+/// owning Vec to be fully populated (and therefore stable) before any `&Tensor` into it is
+/// taken, so callers build their borrowing `DomainForwardOutputs` map from the returned Vec.
+fn compute_domain_forwards(
     ctx: &crate::problem::MultiStepCtx,
-    saw: &mut SawBrdr,
-    lr_sched: &mut LrSchedule,
+    models: &[&ElasticityNet<B>],
+    active_terms: &[Box<dyn LossTerm>],
     device: &WgpuDevice,
-    tier_u8: u8,
-    physics_boost: f64,
-    alpha_lr_mult: f64,
-) -> (Vec<ElasticityNet<B>>, StepOutput) {
-    use crate::problem::DomainForwardOutputs as DFO;
+) -> Vec<Computed> {
     use pinn_core::problem::DomainId;
 
     // Multi-domain problems (pin-in-lug) use plain-DEM output (no Fourier embedding, no
@@ -690,16 +719,8 @@ pub fn step_physics_multi(
     // structure). This mirrors `PinLugSamplingStrategy`'s geometry (see pinlug_problem.rs).
     let n_fourier = 0usize;
 
-    // (a) Enumerate which (DomainId, point_set_name) pairs at least one active LossTerm
-    // needs, then run exactly one forward pass per pair (never twice, even if several
-    // terms share it).
-    let active_terms: Vec<Box<dyn LossTerm>> = ctx.problem.loss_terms().into_iter()
-        .filter(|t| t.name() != "constitutive_consistency")
-        .filter(|t| ctx.phase2_active || !t.phase2_only())
-        .collect();
-
     let mut needed: Vec<(DomainId, &'static str)> = Vec::new();
-    for term in &active_terms {
+    for term in active_terms {
         for (&id, &ps) in term.domains().iter().zip(term.point_sets().iter()) {
             if !needed.contains(&(id, ps)) {
                 needed.push((id, ps));
@@ -707,27 +728,17 @@ pub fn step_physics_multi(
         }
     }
 
-    // Forward-pass results are computed into owned storage first (raw_out tensor +
-    // optional strains/normals), then wrapped into borrowing `DomainForwardOutputs` in a
-    // second pass — Rust's borrow checker requires the owning Vec to be fully populated
-    // (and therefore stable) before any `&Tensor` into it is taken.
-    struct Computed {
-        key: (DomainId, &'static str),
-        raw_out: Tensor<B, 2>,
-        strains: Option<(Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>)>,
-        normals: Option<(Tensor<B, 1>, Tensor<B, 1>)>,
-    }
     let mut computed: Vec<Computed> = Vec::with_capacity(needed.len());
 
     for &(domain_id, ps_name) in &needed {
         let dctx = ctx.domains.iter().find(|d| d.data.id == domain_id)
             .unwrap_or_else(|| panic!(
-                "step_physics_multi: LossTerm references DomainId({}) not present in \
+                "compute_domain_forwards: LossTerm references DomainId({}) not present in \
                  ctx.domains — this should have been caught by validate_loss_terms",
                 domain_id.0,
             ));
         let model_idx = ctx.domains.iter().position(|d| d.data.id == domain_id).unwrap();
-        let model = &models[model_idx];
+        let model = models[model_idx];
         let u_ref_f64 = dctx.u_ref as f64;
 
         let domain_idx = ctx.problem.domains().iter().position(|d| d.id == domain_id).unwrap();
@@ -801,6 +812,35 @@ pub fn step_physics_multi(
             normals,
         });
     }
+
+    computed
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn step_physics_multi(
+    models: Vec<ElasticityNet<B>>,
+    optims: &mut [crate::problem::DomainOptim],
+    ctx: &crate::problem::MultiStepCtx,
+    saw: &mut SawBrdr,
+    lr_sched: &mut LrSchedule,
+    device: &WgpuDevice,
+    tier_u8: u8,
+    physics_boost: f64,
+    alpha_lr_mult: f64,
+) -> (Vec<ElasticityNet<B>>, StepOutput) {
+    use crate::problem::DomainForwardOutputs as DFO;
+    use pinn_core::problem::DomainId;
+
+    // (a) Enumerate which (DomainId, point_set_name) pairs at least one active LossTerm
+    // needs, then run exactly one forward pass per pair (never twice, even if several
+    // terms share it).
+    let active_terms: Vec<Box<dyn LossTerm>> = ctx.problem.loss_terms().into_iter()
+        .filter(|t| t.name() != "constitutive_consistency")
+        .filter(|t| ctx.phase2_active || !t.phase2_only())
+        .collect();
+
+    let model_refs: Vec<&ElasticityNet<B>> = models.iter().collect();
+    let computed = compute_domain_forwards(ctx, &model_refs, &active_terms, device);
 
     let forwards: HashMap<(DomainId, &'static str), DFO<'_, B>> = computed.iter()
         .map(|c| (c.key, DFO {
@@ -1686,6 +1726,237 @@ pub fn make_lbfgs(max_iter: usize) -> burn::optim::LBFGS<B> {
         .with_max_iter(max_iter)
         .with_line_search_fn(burn::optim::LineSearchFn::StrongWolfe)
         .init()
+}
+
+// ─── Multi-domain L-BFGS / gradient-conflict support ────────────────────────────────────
+
+/// Visitor that flattens all gradient tensors in `GradientsParams` for a `TwoDomainModels<B>`
+/// to a 1-D inner-backend tensor, substituting an explicit zero tensor (same shape as the
+/// param) for any parameter `GradientsParams::get` has no entry for.
+///
+/// Unlike the single-model `GradFlattenVisitor` (which can safely SKIP untouched params,
+/// since a single model is always fully present in both dual-pass backward graphs — the
+/// worst case is a zero gradient, and skipping it vs. keeping a zero contributes nothing to
+/// a shared-alignment dot product anyway), `TwoDomainModels` genuinely has an entire
+/// sub-model's worth of params that ONE pass's loss may not touch at all (e.g. a
+/// Physics-only term that reads only `pin`, leaving every `lug` param absent from that
+/// pass's `GradientsParams`). Skipping in that case would silently misalign the two flattened
+/// vectors positionally between the physics-pass and BC-pass calls, corrupting the cosine
+/// similarity dot product with cross-domain garbage instead of the intended zero
+/// contribution — hence the explicit zero-substitution here (not just cosmetic; load-bearing
+/// for `compute_gradient_conflict_multi`'s correctness).
+struct ZeroFillFlattenVisitor<'a> {
+    grads:   &'a GradientsParams,
+    tensors: Vec<Tensor<BInner, 1>>,
+}
+
+impl ModuleVisitor<B> for ZeroFillFlattenVisitor<'_> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        let numel = param.val().shape().num_elements();
+        let flat = match self.grads.get::<BInner, D>(param.id) {
+            Some(g) => g.reshape([numel]),
+            None => Tensor::<BInner, D>::zeros(param.val().shape(), &param.val().device()).reshape([numel]),
+        };
+        self.tensors.push(flat);
+    }
+}
+
+/// Flatten all gradient tensors in `grads` for a `TwoDomainModels<B>` to a 1-D inner-backend
+/// tensor, in a FIXED param-visit order with zero-substitution for absent gradients (see
+/// `ZeroFillFlattenVisitor`) — required so the physics-pass and BC-pass flattened vectors
+/// from `compute_gradient_conflict_multi` are positionally aligned even when one pass's loss
+/// doesn't touch one entire sub-model's parameters.
+pub fn flatten_grads_multi(models: &TwoDomainModels<B>, grads: &GradientsParams) -> Tensor<BInner, 1> {
+    let mut vis = ZeroFillFlattenVisitor { grads, tensors: Vec::new() };
+    models.visit(&mut vis);
+    if vis.tensors.is_empty() {
+        return Tensor::empty([0], &models.devices()[0]);
+    }
+    Tensor::cat(vis.tensors, 0)
+}
+
+/// Sum a group of active `LossTerm`s (all sharing the same `ConflictGroup`) into ONE combined
+/// tensor via the shared `compute_domain_forwards` forward-pass enumeration. Returns `None`
+/// when `terms` is empty — distinguishes "no active loss term in this group" (no autodiff
+/// graph; calling `.backward()` on a bare `zeros()` tensor panics with "Node should have a
+/// step registered") from a genuine zero-valued but graph-connected loss.
+fn sum_group_loss(
+    ctx: &crate::problem::MultiStepCtx,
+    model_refs: &[&ElasticityNet<B>],
+    terms: &[Box<dyn LossTerm>],
+    device: &WgpuDevice,
+) -> Option<Tensor<B, 1>> {
+    use crate::problem::DomainForwardOutputs as DFO;
+    use pinn_core::problem::DomainId;
+
+    if terms.is_empty() {
+        return None;
+    }
+    let computed = compute_domain_forwards(ctx, model_refs, terms, device);
+    let forwards: HashMap<(DomainId, &'static str), DFO<'_, B>> = computed.iter()
+        .map(|c| (c.key, DFO {
+            domain: c.key.0,
+            raw_out: &c.raw_out,
+            strains: c.strains.clone(),
+            normals: c.normals.clone(),
+        }))
+        .collect();
+    let mut total: Option<Tensor<B, 1>> = None;
+    for term in terms {
+        let inputs: Vec<DFO<'_, B>> = term.domains().iter().zip(term.point_sets().iter())
+            .filter_map(|(&id, &ps)| forwards.get(&(id, ps)).map(|f| DFO {
+                domain: f.domain, raw_out: f.raw_out,
+                strains: f.strains.clone(), normals: f.normals.clone(),
+            }))
+            .collect();
+        let t = term.compute(&inputs);
+        total = Some(match total {
+            Some(acc) => acc + t,
+            None => t,
+        });
+    }
+    total
+}
+
+/// N-domain generalization of `compute_gradient_conflict` — same TWO-backward-pass structure
+/// (Physics group, then Bc group per `LossTerm::conflict_group()`), but each pass sums ALL
+/// active domains' classified-group terms into ONE combined loss before backward — exactly
+/// 2 backward passes total, not 2*N. Unweighted (no SAW scaling) — direction, not magnitude,
+/// matters.
+pub fn compute_gradient_conflict_multi(
+    models: &TwoDomainModels<B>,
+    ctx: &crate::problem::MultiStepCtx,
+    device: &WgpuDevice,
+) -> GradientConflict {
+    let active_terms: Vec<Box<dyn LossTerm>> = ctx.problem.loss_terms().into_iter()
+        .filter(|t| t.name() != "constitutive_consistency")
+        .filter(|t| ctx.phase2_active || !t.phase2_only())
+        .collect();
+
+    type TermVec = Vec<Box<dyn LossTerm>>;
+    let (physics_terms, bc_terms): (TermVec, TermVec) = active_terms
+        .into_iter()
+        .partition(|t| t.conflict_group() == crate::problem::ConflictGroup::Physics);
+
+    let model_refs: Vec<&ElasticityNet<B>> = vec![&models.pin, &models.lug];
+
+    // A group's flattened gradient is the all-zero vector, SAME LENGTH as a real flattened
+    // gradient (total param count across both domains — not a length-1 stub), when that
+    // group has no active terms. Matching length is load-bearing: `flatten_grads_multi`
+    // zero-fills per-param on a MISSING gradient entry (see `ZeroFillFlattenVisitor`), so an
+    // entirely-empty group must produce the same total length or the two passes'
+    // elementwise `mul` below would panic/misalign — NOT skipped/NaN, so cosine similarity's
+    // `+1e-8` epsilon guard still produces a well-defined (0.0) result.
+    let empty_grads = GradientsParams::new();
+    let flat_or_zero = |loss: Option<Tensor<B, 1>>| -> Tensor<BInner, 1> {
+        match loss {
+            Some(l) => {
+                let grads_raw = l.backward();
+                let grads_p = GradientsParams::from_grads(grads_raw, models);
+                flatten_grads_multi(models, &grads_p)
+            }
+            None => flatten_grads_multi(models, &empty_grads),
+        }
+    };
+
+    // ── Pass 1: physics group ────────────────────────────────────────────────
+    let g_pde_flat = flat_or_zero(sum_group_loss(ctx, &model_refs, &physics_terms, device));
+
+    // ── Pass 2: BC group ─────────────────────────────────────────────────────
+    let g_bc_flat = flat_or_zero(sum_group_loss(ctx, &model_refs, &bc_terms, device));
+
+    // ── Cosine similarity — formula/epsilon guard identical to compute_gradient_conflict ──
+    let pde_norm_sq = g_pde_flat.clone().powf_scalar(2.0_f64).sum();
+    let bc_norm_sq  = g_bc_flat.clone().powf_scalar(2.0_f64).sum();
+    let dot         = g_pde_flat.mul(g_bc_flat).sum();
+
+    let g_pde_norm_v = pde_norm_sq.clone().sqrt().into_scalar() as f32;
+    let g_bc_norm_v  = bc_norm_sq.clone().sqrt().into_scalar() as f32;
+    let denom_f64    = (pde_norm_sq.sqrt() * bc_norm_sq.sqrt()).into_scalar() + 1e-8;
+    let cosine_sim   = (dot.into_scalar() / denom_f64) as f32;
+
+    GradientConflict {
+        cosine_sim: cosine_sim.clamp(-1.0, 1.0),
+        g_pde_norm: g_pde_norm_v,
+        g_bc_norm:  g_bc_norm_v,
+    }
+}
+
+/// Compute one combined loss over BOTH domains on the frozen collocation points, using fixed
+/// per-term base weights (`lams`) — the multi-domain analogue of `compute_loss_for_lbfgs`.
+/// Reuses `compute_domain_forwards` (the SAME term-summation logic `step_physics_multi` uses)
+/// via `frozen_ctx.as_multi_step_ctx(problem)` — no second loss-assembly implementation.
+fn compute_loss_for_lbfgs_multi(
+    models: &TwoDomainModels<B>,
+    frozen_ctx: &crate::problem::FrozenMultiStepCtx,
+    problem: &dyn BoundaryValueProblem,
+    lams: &HashMap<&'static str, f64>,
+    device: &WgpuDevice,
+) -> (Tensor<B, 1>, f32) {
+    use crate::problem::DomainForwardOutputs as DFO;
+    use pinn_core::problem::DomainId;
+
+    let ctx = frozen_ctx.as_multi_step_ctx(problem);
+
+    let active_terms: Vec<Box<dyn LossTerm>> = ctx.problem.loss_terms().into_iter()
+        .filter(|t| t.name() != "constitutive_consistency")
+        .filter(|t| ctx.phase2_active || !t.phase2_only())
+        .collect();
+
+    let model_refs: Vec<&ElasticityNet<B>> = vec![&models.pin, &models.lug];
+    let computed = compute_domain_forwards(&ctx, &model_refs, &active_terms, device);
+
+    let forwards: HashMap<(DomainId, &'static str), DFO<'_, B>> = computed.iter()
+        .map(|c| (c.key, DFO {
+            domain: c.key.0,
+            raw_out: &c.raw_out,
+            strains: c.strains.clone(),
+            normals: c.normals.clone(),
+        }))
+        .collect();
+
+    let mut total: Option<Tensor<B, 1>> = None;
+    let mut total_scalar = 0.0_f32;
+    for term in &active_terms {
+        let lam = *lams.get(term.name()).unwrap_or(&0.0);
+        let inputs: Vec<DFO<'_, B>> = term.domains().iter().zip(term.point_sets().iter())
+            .filter_map(|(&id, &ps)| forwards.get(&(id, ps)).map(|f| DFO {
+                domain: f.domain, raw_out: f.raw_out,
+                strains: f.strains.clone(), normals: f.normals.clone(),
+            }))
+            .collect();
+        let t = term.compute(&inputs);
+        let s = t_scalar(&t);
+        let weighted = t.mul_scalar(lam);
+        total_scalar += s * lam as f32;
+        total = Some(match total {
+            Some(acc) => acc + weighted,
+            None => weighted,
+        });
+    }
+    let total = total.unwrap_or_else(|| Tensor::<B, 1>::zeros([1], device));
+    (total, total_scalar)
+}
+
+/// Run a single L-BFGS outer step over BOTH domains' parameter spaces at once, via
+/// `TwoDomainModels<B>` — the multi-domain analogue of `step_lbfgs`.
+pub fn step_lbfgs_multi(
+    models: TwoDomainModels<B>,
+    lbfgs: &mut burn::optim::LBFGS<B>,
+    lr: f64,
+    frozen_ctx: &crate::problem::FrozenMultiStepCtx,
+    problem: &dyn BoundaryValueProblem,
+    lams: &HashMap<&'static str, f64>,
+    device: &WgpuDevice,
+) -> (TwoDomainModels<B>, f64) {
+    let closure = |m: TwoDomainModels<B>| -> (f64, GradientsParams) {
+        let (total_loss, total_scalar) = compute_loss_for_lbfgs_multi(&m, frozen_ctx, problem, lams, device);
+        let loss_f64 = total_scalar as f64;
+        let grads_raw = total_loss.backward();
+        let grads_p = GradientsParams::from_grads(grads_raw, &m);
+        (loss_f64, grads_p)
+    };
+    lbfgs.step(lr, models, closure)
 }
 
 #[cfg(test)]
@@ -2816,6 +3087,286 @@ mod tests {
 
         assert_ne!(a_after, a_before, "domain A's params must change — loss depends on A's output");
         assert_ne!(b_after, b_before, "domain B's params must change — loss depends on B's output");
+    }
+
+    // ─── TwoDomainModels / multi-domain L-BFGS ──────────────────────────────────────────
+
+    fn param_l2_sq_wrapper(models: &TwoDomainModels<B>) -> f64 {
+        param_l2_sq(&models.pin) + param_l2_sq(&models.lug)
+    }
+
+    #[test]
+    fn two_domain_models_wrapper_visits_both_inner_models_params() {
+        let device = WgpuDevice::default();
+        let pin = tiny_net(&device);
+        let lug = tiny_net(&device);
+        let expected = param_l2_sq(&pin) + param_l2_sq(&lug);
+        let wrapper = TwoDomainModels { pin, lug };
+        let actual = param_l2_sq_wrapper(&wrapper);
+        assert!((actual - expected).abs() < 1e-9,
+            "wrapper visitor sum must equal sum of visiting each inner model separately: \
+             actual={actual} expected={expected}");
+    }
+
+    /// Highest-risk smoke test in this task: does `TwoDomainModels` (a named struct wrapping
+    /// two `ElasticityNet<B>`s) actually satisfy `LBFGS::step`'s `M: AutodiffModule<B> +
+    /// Clone` bound via its `#[derive(Module, Debug)]`? Get this compiling/passing FIRST.
+    #[test]
+    fn two_domain_models_round_trips_through_lbfgs_flatten_params() {
+        let device = WgpuDevice::default();
+        let pin = tiny_net(&device);
+        let lug = tiny_net(&device);
+        let models = TwoDomainModels { pin, lug };
+
+        let mut lbfgs = make_lbfgs(5);
+        let closure = |m: TwoDomainModels<B>| -> (f64, GradientsParams) {
+            let pin_out = fwd::<B>(
+                &m.pin,
+                Tensor::<B, 2>::from_data(TensorData::new(vec![0.1_f32, 0.2, 0.0], vec![1, 3]), &device),
+                0, &device,
+            );
+            let lug_out = fwd::<B>(
+                &m.lug,
+                Tensor::<B, 2>::from_data(TensorData::new(vec![0.3_f32, -0.1, 0.0], vec![1, 3]), &device),
+                0, &device,
+            );
+            let loss = pin_out.powf_scalar(2.0_f64).sum() + lug_out.powf_scalar(2.0_f64).sum();
+            let loss_scalar = t_scalar(&loss.clone().reshape([1])) as f64;
+            let grads_raw = loss.backward();
+            let grads_p = GradientsParams::from_grads(grads_raw, &m);
+            (loss_scalar, grads_p)
+        };
+        let (_new_models, loss) = lbfgs.step(1e-3, models, closure);
+        assert!(loss.is_finite(), "L-BFGS step over TwoDomainModels must return a finite loss, got {loss}");
+    }
+
+    #[test]
+    fn step_lbfgs_multi_reduces_loss_and_updates_both_domains_params() {
+        let device = WgpuDevice::default();
+        let pin = tiny_net(&device);
+        let lug = tiny_net(&device);
+        let models = TwoDomainModels { pin, lug };
+
+        let domain_a = pinn_core::problem::DomainId(300);
+        let domain_b = pinn_core::problem::DomainId(301);
+        let geom = toy_geom_2d();
+        let material = pinn_core::material::MaterialProps::al7075_t6();
+        let problem = TwoDomainToyProblem {
+            domains: vec![
+                pinn_core::problem::DomainSpec { id: domain_a, geometry: geom.clone(), material: material.clone(), output_dim: 2 },
+                pinn_core::problem::DomainSpec { id: domain_b, geometry: geom, material, output_dim: 2 },
+            ],
+            sampling: crate::kirsch_problem::KirschSamplingStrategy,
+            ansatz: crate::kirsch_problem::QuarterSymmAnsatz,
+            only_a: false, // loss depends on BOTH domains
+        };
+
+        let data_a = toy_domain_data(domain_a);
+        let data_b = toy_domain_data(domain_b);
+        let fd = FdConfig::new(1e-3, 2.0, 2.0);
+        let ctx = crate::problem::MultiStepCtx {
+            config: &SolverConfig::default_kirsch(),
+            problem: &problem,
+            fd: &fd,
+            k: 1.0,
+            domains: vec![
+                crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+                crate::problem::DomainStepCtx { data: &data_b, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+            ],
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+            step: 0,
+        };
+        let frozen_ctx = crate::problem::FrozenMultiStepCtx::from_ctx(&ctx);
+
+        let mut lams: HashMap<&'static str, f64> = HashMap::new();
+        lams.insert("combined_term", 1.0);
+
+        let a_before = param_l2_sq(&models.pin);
+        let b_before = param_l2_sq(&models.lug);
+
+        let mut lbfgs = make_lbfgs(5);
+        let mut current = models;
+        let mut last_loss = f64::MAX;
+        let mut first_loss = None;
+        for _ in 0..5 {
+            let (new_models, loss) = step_lbfgs_multi(current, &mut lbfgs, 1e-2, &frozen_ctx, &problem, &lams, &device);
+            if first_loss.is_none() { first_loss = Some(loss); }
+            last_loss = loss;
+            current = new_models;
+        }
+
+        let a_after = param_l2_sq(&current.pin);
+        let b_after = param_l2_sq(&current.lug);
+
+        assert!(last_loss < first_loss.unwrap(),
+            "loss must strictly decrease over 5 outer L-BFGS iterations: first={} last={last_loss}",
+            first_loss.unwrap());
+        assert_ne!(a_after, a_before, "domain A (pin)'s params must change");
+        assert_ne!(b_after, b_before, "domain B (lug)'s params must change");
+    }
+
+    /// Extends `TwoDomainToyProblem` with a Physics-tagged term reading domain A only and a
+    /// Bc-tagged term reading domain B only — disjoint params, so cosine similarity must be
+    /// near-zero (gradients touch entirely different parameters, dot product ~ 0).
+    struct PhysicsOnlyATerm { domain: pinn_core::problem::DomainId }
+    impl LossTerm for PhysicsOnlyATerm {
+        fn name(&self) -> &'static str { "physics_only_a" }
+        fn domains(&self) -> Vec<pinn_core::problem::DomainId> { vec![self.domain] }
+        fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
+        fn compute(&self, inputs: &[crate::problem::DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+            let d = inputs.iter().find(|i| i.domain == self.domain).unwrap();
+            let n = d.raw_out.dims()[0];
+            d.raw_out.clone().slice([0..n, 0..1]).reshape([n]).powf_scalar(2.0_f64).mean()
+        }
+    }
+    struct BcOnlyBTerm { domain: pinn_core::problem::DomainId }
+    impl LossTerm for BcOnlyBTerm {
+        fn name(&self) -> &'static str { "bc_only_b" }
+        fn domains(&self) -> Vec<pinn_core::problem::DomainId> { vec![self.domain] }
+        fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+        fn compute(&self, inputs: &[crate::problem::DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+            let d = inputs.iter().find(|i| i.domain == self.domain).unwrap();
+            let n = d.raw_out.dims()[0];
+            d.raw_out.clone().slice([0..n, 1..2]).reshape([n]).powf_scalar(2.0_f64).mean()
+        }
+    }
+
+    struct DisjointConflictToyProblem {
+        domains: Vec<pinn_core::problem::DomainSpec>,
+        sampling: crate::kirsch_problem::KirschSamplingStrategy,
+        ansatz: crate::kirsch_problem::QuarterSymmAnsatz,
+        /// When true, both terms are Physics-classified (used for the empty-Bc-group test).
+        all_physics: bool,
+    }
+    impl BoundaryValueProblem for DisjointConflictToyProblem {
+        fn domains(&self) -> &[pinn_core::problem::DomainSpec] { &self.domains }
+        fn sampling_strategy(&self, _domain_idx: usize) -> &dyn pinn_core::problem::DomainSamplingStrategy { &self.sampling }
+        fn ansatz(&self, _domain_idx: usize) -> &dyn pinn_core::problem::DirichletAnsatz { &self.ansatz }
+        fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
+            if self.all_physics {
+                vec![
+                    Box::new(PhysicsOnlyATerm { domain: self.domains[0].id }),
+                    Box::new({
+                        struct PhysicsOnlyBTerm { domain: pinn_core::problem::DomainId }
+                        impl LossTerm for PhysicsOnlyBTerm {
+                            fn name(&self) -> &'static str { "physics_only_b" }
+                            fn domains(&self) -> Vec<pinn_core::problem::DomainId> { vec![self.domain] }
+                            fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
+                            fn compute(&self, inputs: &[crate::problem::DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+                                let d = inputs.iter().find(|i| i.domain == self.domain).unwrap();
+                                let n = d.raw_out.dims()[0];
+                                d.raw_out.clone().slice([0..n, 1..2]).reshape([n]).powf_scalar(2.0_f64).mean()
+                            }
+                        }
+                        PhysicsOnlyBTerm { domain: self.domains[1].id }
+                    }),
+                ]
+            } else {
+                vec![
+                    Box::new(PhysicsOnlyATerm { domain: self.domains[0].id }),
+                    Box::new(BcOnlyBTerm { domain: self.domains[1].id }),
+                ]
+            }
+        }
+        fn base_weight(&self, _term_name: &str) -> f32 { 1.0 }
+        fn phase1_steps(&self) -> usize { usize::MAX }
+        fn convergence_metric(&self, _state: &[DomainState<B>]) -> Option<f64> { None }
+        fn convergence_target(&self) -> f64 { 0.0 }
+    }
+
+    #[test]
+    fn compute_gradient_conflict_multi_produces_finite_cosine_and_norms_on_toy_problem() {
+        let device = WgpuDevice::default();
+        let pin = tiny_net(&device);
+        let lug = tiny_net(&device);
+        let models = TwoDomainModels { pin, lug };
+
+        let domain_a = pinn_core::problem::DomainId(400);
+        let domain_b = pinn_core::problem::DomainId(401);
+        let geom = toy_geom_2d();
+        let material = pinn_core::material::MaterialProps::al7075_t6();
+        let problem = DisjointConflictToyProblem {
+            domains: vec![
+                pinn_core::problem::DomainSpec { id: domain_a, geometry: geom.clone(), material: material.clone(), output_dim: 2 },
+                pinn_core::problem::DomainSpec { id: domain_b, geometry: geom, material, output_dim: 2 },
+            ],
+            sampling: crate::kirsch_problem::KirschSamplingStrategy,
+            ansatz: crate::kirsch_problem::QuarterSymmAnsatz,
+            all_physics: false,
+        };
+
+        let data_a = toy_domain_data(domain_a);
+        let data_b = toy_domain_data(domain_b);
+        let fd = FdConfig::new(1e-3, 2.0, 2.0);
+        let ctx = crate::problem::MultiStepCtx {
+            config: &SolverConfig::default_kirsch(),
+            problem: &problem,
+            fd: &fd,
+            k: 1.0,
+            domains: vec![
+                crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+                crate::problem::DomainStepCtx { data: &data_b, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+            ],
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+            step: 0,
+        };
+
+        let conflict = compute_gradient_conflict_multi(&models, &ctx, &device);
+        assert!(conflict.cosine_sim.is_finite());
+        assert!(conflict.g_pde_norm.is_finite() && conflict.g_pde_norm > 0.0);
+        assert!(conflict.g_bc_norm.is_finite() && conflict.g_bc_norm > 0.0);
+        assert!(conflict.cosine_sim.abs() < 1e-3,
+            "disjoint-parameter gradients must have ~zero cosine similarity, got {}", conflict.cosine_sim);
+    }
+
+    #[test]
+    fn compute_gradient_conflict_multi_bc_group_empty_yields_finite_not_nan_cosine() {
+        let device = WgpuDevice::default();
+        let pin = tiny_net(&device);
+        let lug = tiny_net(&device);
+        let models = TwoDomainModels { pin, lug };
+
+        let domain_a = pinn_core::problem::DomainId(500);
+        let domain_b = pinn_core::problem::DomainId(501);
+        let geom = toy_geom_2d();
+        let material = pinn_core::material::MaterialProps::al7075_t6();
+        let problem = DisjointConflictToyProblem {
+            domains: vec![
+                pinn_core::problem::DomainSpec { id: domain_a, geometry: geom.clone(), material: material.clone(), output_dim: 2 },
+                pinn_core::problem::DomainSpec { id: domain_b, geometry: geom, material, output_dim: 2 },
+            ],
+            sampling: crate::kirsch_problem::KirschSamplingStrategy,
+            ansatz: crate::kirsch_problem::QuarterSymmAnsatz,
+            all_physics: true,
+        };
+
+        let data_a = toy_domain_data(domain_a);
+        let data_b = toy_domain_data(domain_b);
+        let fd = FdConfig::new(1e-3, 2.0, 2.0);
+        let ctx = crate::problem::MultiStepCtx {
+            config: &SolverConfig::default_kirsch(),
+            problem: &problem,
+            fd: &fd,
+            k: 1.0,
+            domains: vec![
+                crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+                crate::problem::DomainStepCtx { data: &data_b, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+            ],
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+            step: 0,
+        };
+
+        let conflict = compute_gradient_conflict_multi(&models, &ctx, &device);
+        assert_eq!(conflict.cosine_sim, 0.0,
+            "empty BC group (all terms Physics-classified) must yield exactly 0.0 cosine via the epsilon guard, not NaN");
+        assert!(conflict.g_bc_norm.is_finite());
+        assert!(conflict.g_pde_norm.is_finite());
     }
 }
 
