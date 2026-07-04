@@ -32,18 +32,27 @@ pub struct StressSolverApp {
 }
 
 impl StressSolverApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, config: SolverConfig) -> Self {
-        Self::from_config(config)
+    /// `problem_kind` seeds the initial problem-kind radio selection (e.g. from
+    /// `--problem pinlug` on the CLI) — the user can still switch it at runtime via the
+    /// GUI's own selector regardless of what's passed here.
+    pub fn new(_cc: &eframe::CreationContext<'_>, config: SolverConfig, problem_kind: ProblemKind) -> Self {
+        Self::from_config_with_problem_kind(config, problem_kind)
     }
 
+    /// Defaults to `ProblemKind::Kirsch` — see [`Self::from_config_with_problem_kind`] to
+    /// seed a different starting selection.
     pub fn from_config(config: SolverConfig) -> Self {
+        Self::from_config_with_problem_kind(config, ProblemKind::Kirsch)
+    }
+
+    pub fn from_config_with_problem_kind(config: SolverConfig, problem_kind: ProblemKind) -> Self {
         let [nx, ny] = config.vis_grid;
         let state = Arc::new(Mutex::new(TrainingState::new([nx, ny])));
         let geo_hash = config.geometry.geometry_hash();
         Self {
             config,
             state,
-            problem_kind: ProblemKind::Kirsch,
+            problem_kind,
             tx_control:    None,
             rx_training:   None,
             selected_field: FieldType::VonMises,
@@ -317,6 +326,20 @@ mod tests {
 
     fn fresh_app() -> StressSolverApp {
         StressSolverApp::from_config(SolverConfig::default_kirsch())
+    }
+
+    #[test]
+    fn from_config_with_problem_kind_seeds_the_starting_selection() {
+        let app = StressSolverApp::from_config_with_problem_kind(
+            SolverConfig::default_pinlug(), ProblemKind::PinLug,
+        );
+        assert_eq!(app.problem_kind, ProblemKind::PinLug);
+    }
+
+    #[test]
+    fn from_config_defaults_to_kirsch() {
+        let app = fresh_app();
+        assert_eq!(app.problem_kind, ProblemKind::Kirsch);
     }
 
     fn tiny_vis_fields() -> pinn_core::messages::VisFields {

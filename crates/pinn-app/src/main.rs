@@ -183,22 +183,14 @@ fn main() -> anyhow::Result<()> {
 
     let headless = env::args().any(|a| a == "--headless" || a == "-H");
 
-    if problem_kind == ProblemKind::PinLug {
-        // Pin-in-lug is headless-only in this slice (see run_headless_pinlug doc comment) —
-        // routes through the NEW step_physics_multi 2-domain driver, not the GUI's runner.rs
-        // (which stays wired to the frozen 1-domain Kirsch step_physics path).
-        if !headless {
-            eprintln!("[pinn] --problem pinlug requires --headless (GUI path is Kirsch-only in this slice)");
-            std::process::exit(1);
-        }
-        if !pinn_solver::run_headless_pinlug(config) {
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-
     if headless {
-        if !pinn_solver::run_headless(config) {
+        let ok = match problem_kind {
+            // Routes through the step_physics_multi 2-domain driver, not run_headless's
+            // frozen 1-domain Kirsch step_physics path.
+            ProblemKind::PinLug => pinn_solver::run_headless_pinlug(config),
+            ProblemKind::Kirsch => pinn_solver::run_headless(config),
+        };
+        if !ok {
             std::process::exit(1);
         }
         return Ok(());
@@ -216,7 +208,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "PINN Stress Solver",
         native_options,
-        Box::new(|cc| Ok(Box::new(pinn_gui::StressSolverApp::new(cc, config)))),
+        Box::new(move |cc| Ok(Box::new(pinn_gui::StressSolverApp::new(cc, config, problem_kind)))),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
