@@ -91,6 +91,45 @@ impl Default for DecisionMakerConfig {
     }
 }
 
+/// Configuration for the stiffness-coupled SAW-BRDR / PirateNet-gate accelerator
+/// (opt-in, disabled by default). When `enabled = false`, no extra gradient-conflict
+/// computation is scheduled by this subsystem and `step_physics()` receives
+/// `physics_boost = 1.0`, `alpha_lr_mult = 1.0` (both no-ops).
+///
+/// Architecture invariant: like [`DecisionMakerConfig`], this is driven purely by the
+/// real-time gradient-conflict cosine-similarity metric — K_t is never read here.
+#[derive(Clone, Debug)]
+pub struct StiffnessConfig {
+    /// Enable the stiffness controller (default: false — opt-in).
+    pub enabled: bool,
+    /// Steps between gradient-conflict evaluations (default: 50).
+    pub check_interval: usize,
+    /// EMA smoothing factor for the held stiffness value (default: 0.7).
+    pub ema_beta: f32,
+    /// Gain for the SAW-BRDR physics-loss boost; boost = `1 + gain * stiffness`,
+    /// hard-clamped to `[1, 4]` regardless of this value (default: 1.0).
+    pub physics_boost_gain: f32,
+    /// Gain for the PirateNet gate-LR multiplier; mult = `1 + gain * stiffness`,
+    /// hard-clamped to `[1, 5]` regardless of this value (default: 2.0).
+    pub alpha_accel_gain: f32,
+    /// Gate magnitude above which a PirateNet block is considered "awake" and its
+    /// weights are included in the SOAP-Muon optimizer step (default: 1e-4).
+    pub gate_awake_epsilon: f32,
+}
+
+impl Default for StiffnessConfig {
+    fn default() -> Self {
+        Self {
+            enabled:            false,
+            check_interval:     50,
+            ema_beta:           0.7,
+            physics_boost_gain: 1.0,
+            alpha_accel_gain:   2.0,
+            gate_awake_epsilon: 1e-4,
+        }
+    }
+}
+
 /// Complete solver configuration (passed when spawning the solver thread)
 #[derive(Clone)]
 pub struct SolverConfig {
@@ -111,6 +150,12 @@ pub struct SolverConfig {
     pub use_soap_muon: bool,
     /// Meta-optimizer decision maker configuration (disabled by default).
     pub decision_maker: DecisionMakerConfig,
+    /// Opt-in PirateNet adaptive-residual gating (disabled by default). See
+    /// [`ElasticityNetConfig::use_piratenet`] in `pinn-solver`.
+    pub use_piratenet: bool,
+    /// Stiffness-coupled SAW-BRDR / gate-LR accelerator configuration (disabled by
+    /// default).
+    pub stiffness: StiffnessConfig,
 }
 
 impl SolverConfig {
@@ -128,6 +173,8 @@ impl SolverConfig {
             fd_h:       1e-3,
             use_soap_muon:  true,
             decision_maker: DecisionMakerConfig::default(),
+            use_piratenet:  false,
+            stiffness:      StiffnessConfig::default(),
         }
     }
 }

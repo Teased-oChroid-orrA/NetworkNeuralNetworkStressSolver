@@ -19,8 +19,9 @@ use crate::{
     energy::dem_energy_per_point,
     fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig},
     network::{fwd, ElasticityNet, ElasticityNetConfig},
-    optim::{make_bias_optim, BiasOptim, WeightOptim},
+    optim::{make_bias_optim, make_gate_optim, BiasOptim, GateOptim, WeightOptim},
     saw_brdr::SawBrdr,
+    stiffness::StiffnessController,
     lr_schedule::LrSchedule,
     training_core::{
         compute_gradient_conflict, compute_reference_scales, extract_boundary_indices,
@@ -41,6 +42,8 @@ struct TrainingState {
     model: ElasticityNet<B>,
     optim_w: WeightOptim,
     optim_b: BiasOptim,
+    optim_gate: GateOptim,
+    stiffness_controller: StiffnessController,
 
     u_ref: f32,
     ref_energy: f32,
@@ -114,6 +117,8 @@ impl TrainingState {
             model: net_cfg.init(device),
             optim_w,
             optim_b: make_bias_optim(),
+            optim_gate: make_gate_optim(),
+            stiffness_controller: StiffnessController::new(config.stiffness.clone()),
             u_ref, ref_energy, ref_stress2,
             saw: SawBrdr::with_base(engine.init_weights(), 0.95),
             lr_sched: LrSchedule::new(engine.peak_lr, 200, 1000),
@@ -140,11 +145,12 @@ impl TrainingState {
         }
     }
 
-    /// Reconstruct both optimizers from scratch and reset the decision maker.
+    /// Reconstruct all three optimizers from scratch and reset the decision maker.
     /// Used on warm-start, phase transition, and convergence-cascade restarts.
     fn reset_optimizers(&mut self, use_soap_muon: bool) {
         self.optim_w = WeightOptim::from_tier(use_soap_muon, &self.decision_maker.current_tier);
         self.optim_b = make_bias_optim();
+        self.optim_gate = make_gate_optim();
     }
 
     /// Clear all L-BFGS / Converge-tier state.
@@ -198,6 +204,7 @@ impl TrainingState {
         self.saw.reset();
         self.lr_sched.reset_for_warmstart();
         self.decision_maker = PinnDecisionMaker::new(new_cfg.decision_maker.clone(), false);
+        self.stiffness_controller = StiffnessController::new(new_cfg.stiffness.clone());
         self.clear_lbfgs();
         self.reset_optimizers(new_cfg.use_soap_muon);
 
@@ -262,14 +269,15 @@ pub fn run_training(
     engine.apply_to(&mut config);
 
     let device = WgpuDevice::default();
-    let net_cfg = ElasticityNetConfig {
-        input_dim:  engine.net_input_dim(),
-        hidden_dim: config.hidden_dim,
-        n_hidden:   config.n_hidden,
-        output_dim: engine.output_dim(),
-    };
+    let net_cfg = ElasticityNetConfig::new()
+        .with_input_dim(engine.net_input_dim())
+        .with_hidden_dim(config.hidden_dim)
+        .with_n_hidden(config.n_hidden)
+        .with_output_dim(engine.output_dim())
+        .with_use_piratenet(config.use_piratenet);
     let use_soap_muon = config.use_soap_muon;
     let dm_config = config.decision_maker.clone();
+    let stiff_config = config.stiffness.clone();
 
     let mut state = TrainingState::new(&config, &engine, &net_cfg, &device);
     let [nx_vis, ny_vis] = config.vis_grid;
@@ -293,6 +301,7 @@ pub fn run_training(
             state.amr = Some(grid);
             state.lr_sched.reset_for_phase2();
             state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
+            state.stiffness_controller = StiffnessController::new(stiff_config.clone());
             state.clear_lbfgs();
             state.reset_optimizers(use_soap_muon);
         }
@@ -389,51 +398,70 @@ pub fn run_training(
             };
             (new_m, synthetic)
         } else {
+            let physics_boost = state.stiffness_controller.physics_boost();
+            let alpha_lr_mult = state.stiffness_controller.alpha_lr_mult();
             step_physics(
-                state.model, &mut state.optim_w, &mut state.optim_b,
+                state.model, &mut state.optim_w, &mut state.optim_b, &mut state.optim_gate,
                 &ctx, &mut state.saw, &mut state.lr_sched, &device,
                 state.decision_maker.current_tier.as_u8(),
+                physics_boost, alpha_lr_mult,
             )
         };
         state.model = new_model;
 
-        // Decision maker gate.
-        if state.decision_maker.advance() {
-            let conflict = if dm_config.use_exact_cosine
-                && state.decision_maker.current_tier != OptimizerTier::Converge
-            {
+        // Decision maker / stiffness controller gate — both `advance()` unconditionally
+        // (never short-circuited) so their internal step counters stay correct regardless
+        // of whether the other subsystem is enabled. At most one GradientConflict is
+        // computed per step, shared by whichever subsystem's gate fired.
+        let dm_fire    = state.decision_maker.advance();
+        let stiff_fire = state.stiffness_controller.advance();
+        if dm_fire || stiff_fire {
+            let want_conflict = state.decision_maker.current_tier != OptimizerTier::Converge
+                && ((dm_config.use_exact_cosine && dm_fire) || stiff_fire);
+            let conflict = if want_conflict {
                 Some(compute_gradient_conflict(&state.model, &ctx, step, &device))
             } else {
                 None
             };
             out.cosine_sim = conflict.map(|c| c.cosine_sim);
-            if let Some(t) = state.decision_maker.evaluate(conflict, out.proxy_ratio, state.phase2_started) {
-                let new_tier_name = match t.new_tier {
-                    OptimizerTier::Explore  => "Explore",
-                    OptimizerTier::Align    => "Align",
-                    OptimizerTier::Converge => "Converge",
-                };
-                println!("\n  [DM@{step}] → {new_tier_name}");
-                if t.reset_optim {
-                    state.optim_w = WeightOptim::from_tier(use_soap_muon, &t.new_tier);
-                    state.optim_b = make_bias_optim();
-                }
-                if t.reset_lr { state.lr_sched.reset_for_phase2(); }
-                match t.new_tier {
-                    OptimizerTier::Converge => {
-                        state.frozen_lbfgs_ctx  = Some(LbfgsCtxScalars::from_ctx(&ctx));
-                        state.frozen_lbfgs_lams = Some(LbfgsLams {
-                            lam_e:      out.lam_e,
-                            lam_n:      out.lam_n,
-                            lam_h:      out.lam_h,
-                            lam_d:      out.lam_d,
-                            lam_eq:     out.lam_eq,
-                            lam_kirsch: out.lam_kirsch,
-                            lam_const:  state.current_engine.lam_const as f64,
-                        });
-                        state.lbfgs_opt = None;
+
+            if dm_fire {
+                if let Some(t) = state.decision_maker.evaluate(conflict, out.proxy_ratio, state.phase2_started) {
+                    let new_tier_name = match t.new_tier {
+                        OptimizerTier::Explore  => "Explore",
+                        OptimizerTier::Align    => "Align",
+                        OptimizerTier::Converge => "Converge",
+                    };
+                    println!("\n  [DM@{step}] → {new_tier_name}");
+                    if t.reset_optim {
+                        state.optim_w = WeightOptim::from_tier(use_soap_muon, &t.new_tier);
+                        state.optim_b = make_bias_optim();
                     }
-                    _ => state.clear_lbfgs(),
+                    if t.reset_lr { state.lr_sched.reset_for_phase2(); }
+                    match t.new_tier {
+                        OptimizerTier::Converge => {
+                            state.frozen_lbfgs_ctx  = Some(LbfgsCtxScalars::from_ctx(&ctx));
+                            state.frozen_lbfgs_lams = Some(LbfgsLams {
+                                lam_e:      out.lam_e,
+                                lam_n:      out.lam_n,
+                                lam_h:      out.lam_h,
+                                lam_d:      out.lam_d,
+                                lam_eq:     out.lam_eq,
+                                lam_kirsch: out.lam_kirsch,
+                                lam_const:  state.current_engine.lam_const as f64,
+                            });
+                            state.lbfgs_opt = None;
+                        }
+                        _ => state.clear_lbfgs(),
+                    }
+                }
+            }
+
+            if stiff_fire {
+                if let Some(c) = conflict {
+                    let factor = state.stiffness_controller.update(&c);
+                    println!("\n  [Stiffness@{step}] factor={factor:.3} boost={:.2} gate_lr_mult={:.2}",
+                        state.stiffness_controller.physics_boost(), state.stiffness_controller.alpha_lr_mult());
                 }
             }
         }
@@ -461,6 +489,7 @@ pub fn run_training(
                         state.saw.reset();
                         state.lr_sched.reset_for_phase2();
                         state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
+                        state.stiffness_controller = StiffnessController::new(stiff_config.clone());
                         state.clear_lbfgs();
                         state.reset_optimizers(use_soap_muon);
                         println!("\n  [CRASH RECOVERY #{}] K_t={kt_val:.3} collapsed → restart, lam_caps→{new_cap:.0}",
@@ -471,6 +500,7 @@ pub fn run_training(
                         state.saw.reset();
                         state.lr_sched.reset_for_phase2();
                         state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
+                        state.stiffness_controller = StiffnessController::new(stiff_config.clone());
                         state.clear_lbfgs();
                         state.reset_optimizers(use_soap_muon);
                         println!("\n  [WARM RESTART #{}] K_t plateau → reset: lr+adam+SAW, lam_caps→{new_cap:.0}",

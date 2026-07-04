@@ -29,8 +29,9 @@ use crate::{
     fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig},
     lr_schedule::LrSchedule,
     network::{fwd, ElasticityNet, ElasticityNetConfig},
-    optim::{make_bias_optim, WeightOptim},
+    optim::{make_bias_optim, make_gate_optim, WeightOptim},
     saw_brdr::SawBrdr,
+    stiffness::StiffnessController,
     training_core::{
         compute_gradient_conflict, compute_reference_scales, extract_boundary_indices,
         make_lbfgs, normalize_point, probe_kt_shared, step_lbfgs, step_physics,
@@ -85,18 +86,21 @@ pub fn run_headless(config: SolverConfig) -> bool {
     let cy = fd.sy / (2.0 * fd.hy as f64);
     let ref_div2 = (config.load.px * cx).powi(2).max(1.0);
 
-    let net_cfg = ElasticityNetConfig {
-        input_dim:  engine.net_input_dim(),
-        hidden_dim: config.hidden_dim,
-        n_hidden:   config.n_hidden,
-        output_dim: engine.output_dim(),
-    };
+    let net_cfg = ElasticityNetConfig::new()
+        .with_input_dim(engine.net_input_dim())
+        .with_hidden_dim(config.hidden_dim)
+        .with_n_hidden(config.n_hidden)
+        .with_output_dim(engine.output_dim())
+        .with_use_piratenet(config.use_piratenet);
     let mut model: ElasticityNet<B> = net_cfg.init(&device);
     let use_soap_muon = config.use_soap_muon;
     let dm_config = config.decision_maker.clone();
     let mut decision_maker = PinnDecisionMaker::new(dm_config.clone(), false);
     let mut optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
     let mut optim_b = make_bias_optim();
+    let mut optim_gate = make_gate_optim();
+    let stiff_config = config.stiffness.clone();
+    let mut stiffness_controller = StiffnessController::new(stiff_config.clone());
     let mut lbfgs_opt: Option<burn::optim::LBFGS<B>> = None;
     let mut frozen_lbfgs_ctx: Option<LbfgsCtxScalars> = None;
     let mut frozen_lbfgs_lams: Option<LbfgsLams> = None;
@@ -155,6 +159,8 @@ pub fn run_headless(config: SolverConfig) -> bool {
             decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
             optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
             optim_b = make_bias_optim();
+            optim_gate = make_gate_optim();
+            stiffness_controller = StiffnessController::new(stiff_config.clone());
             lbfgs_opt = None; frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None;
         }
 
@@ -255,56 +261,75 @@ pub fn run_headless(config: SolverConfig) -> bool {
             };
             (new_m, synthetic_out)
         } else {
-            step_physics(model, &mut optim_w, &mut optim_b, &ctx, &mut saw, &mut lr_sched, &device,
-                decision_maker.current_tier.as_u8())
+            let physics_boost = stiffness_controller.physics_boost();
+            let alpha_lr_mult = stiffness_controller.alpha_lr_mult();
+            step_physics(model, &mut optim_w, &mut optim_b, &mut optim_gate, &ctx, &mut saw,
+                &mut lr_sched, &device, decision_maker.current_tier.as_u8(),
+                physics_boost, alpha_lr_mult)
         };
         model = new_model;
 
-        // Decision maker gate (fires every check_interval steps when enabled).
-        if decision_maker.advance() {
-            let conflict = if dm_config.use_exact_cosine
-                && decision_maker.current_tier != OptimizerTier::Converge
-            {
+        // Decision maker / stiffness controller gate — both `advance()` unconditionally
+        // (never short-circuited) so their internal step counters stay correct regardless
+        // of whether the other subsystem is enabled. At most one GradientConflict is
+        // computed per step, shared by whichever subsystem's gate fired.
+        let dm_fire    = decision_maker.advance();
+        let stiff_fire = stiffness_controller.advance();
+        if dm_fire || stiff_fire {
+            let want_conflict = decision_maker.current_tier != OptimizerTier::Converge
+                && ((dm_config.use_exact_cosine && dm_fire) || stiff_fire);
+            let conflict = if want_conflict {
                 Some(compute_gradient_conflict(&model, &ctx, step, &device))
             } else {
                 None
             };
             out.cosine_sim = conflict.map(|c| c.cosine_sim);
-            if let Some(t) = decision_maker.evaluate(conflict, out.proxy_ratio, phase2_started) {
-                let old_tier_name = match out.optimizer_tier {
-                    0 => "Explore", 1 => "Align", _ => "Converge",
-                };
-                let new_tier_name = match t.new_tier {
-                    OptimizerTier::Explore  => "Explore",
-                    OptimizerTier::Align    => "Align",
-                    OptimizerTier::Converge => "Converge",
-                };
-                println!("\n  [DM@{step}] {old_tier_name} → {new_tier_name}");
-                if t.reset_optim {
-                    optim_w = WeightOptim::from_tier(use_soap_muon, &t.new_tier);
-                    optim_b = make_bias_optim();
-                }
-                if t.reset_lr {
-                    lr_sched.reset_for_phase2();
-                }
-                match t.new_tier {
-                    OptimizerTier::Converge => {
-                        // Freeze current collocation points and SAW lambdas for L-BFGS.
-                        frozen_lbfgs_ctx  = Some(LbfgsCtxScalars::from_ctx(&ctx));
-                        frozen_lbfgs_lams = Some(LbfgsLams {
-                            lam_e:      out.lam_e,
-                            lam_n:      out.lam_n,
-                            lam_h:      out.lam_h,
-                            lam_d:      out.lam_d,
-                            lam_eq:     out.lam_eq,
-                            lam_kirsch: out.lam_kirsch,
-                            lam_const:  engine.lam_const as f64,
-                        });
-                        lbfgs_opt = None;
+
+            if dm_fire {
+                if let Some(t) = decision_maker.evaluate(conflict, out.proxy_ratio, phase2_started) {
+                    let old_tier_name = match out.optimizer_tier {
+                        0 => "Explore", 1 => "Align", _ => "Converge",
+                    };
+                    let new_tier_name = match t.new_tier {
+                        OptimizerTier::Explore  => "Explore",
+                        OptimizerTier::Align    => "Align",
+                        OptimizerTier::Converge => "Converge",
+                    };
+                    println!("\n  [DM@{step}] {old_tier_name} → {new_tier_name}");
+                    if t.reset_optim {
+                        optim_w = WeightOptim::from_tier(use_soap_muon, &t.new_tier);
+                        optim_b = make_bias_optim();
                     }
-                    _ => {
-                        frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None; lbfgs_opt = None;
+                    if t.reset_lr {
+                        lr_sched.reset_for_phase2();
                     }
+                    match t.new_tier {
+                        OptimizerTier::Converge => {
+                            // Freeze current collocation points and SAW lambdas for L-BFGS.
+                            frozen_lbfgs_ctx  = Some(LbfgsCtxScalars::from_ctx(&ctx));
+                            frozen_lbfgs_lams = Some(LbfgsLams {
+                                lam_e:      out.lam_e,
+                                lam_n:      out.lam_n,
+                                lam_h:      out.lam_h,
+                                lam_d:      out.lam_d,
+                                lam_eq:     out.lam_eq,
+                                lam_kirsch: out.lam_kirsch,
+                                lam_const:  engine.lam_const as f64,
+                            });
+                            lbfgs_opt = None;
+                        }
+                        _ => {
+                            frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None; lbfgs_opt = None;
+                        }
+                    }
+                }
+            }
+
+            if stiff_fire {
+                if let Some(c) = conflict {
+                    let factor = stiffness_controller.update(&c);
+                    println!("\n  [Stiffness@{step}] factor={factor:.3} boost={:.2} gate_lr_mult={:.2}",
+                        stiffness_controller.physics_boost(), stiffness_controller.alpha_lr_mult());
                 }
             }
         }
@@ -340,6 +365,8 @@ pub fn run_headless(config: SolverConfig) -> bool {
                             decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
                             optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
                             optim_b = make_bias_optim();
+                            optim_gate = make_gate_optim();
+                            stiffness_controller = StiffnessController::new(stiff_config.clone());
                             lbfgs_opt = None; frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None;
                             println!("\n  [CRASH RECOVERY #{}] K_t={kt:.3} collapsed → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
                                 tracker.total_restarts());
@@ -351,6 +378,8 @@ pub fn run_headless(config: SolverConfig) -> bool {
                             decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
                             optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
                             optim_b = make_bias_optim();
+                            optim_gate = make_gate_optim();
+                            stiffness_controller = StiffnessController::new(stiff_config.clone());
                             lbfgs_opt = None; frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None;
                             println!("\n  [WARM RESTART #{}] K_t plateau → reset: lr+adam+SAW, lam_caps→{new_cap:.0}",
                                 tracker.total_restarts());

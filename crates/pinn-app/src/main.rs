@@ -83,6 +83,7 @@ fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>) {
 
     // Optimizer
     parse_bool!("USE_SOAP_MUON", cfg.use_soap_muon);
+    parse_bool!("USE_PIRATENET", cfg.use_piratenet);
 
     // Decision maker
     {
@@ -96,6 +97,17 @@ fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>) {
         parse_bool!("DM_USE_EXACT_COSINE",       dm.use_exact_cosine);
         parse_usize!("DM_MIN_DWELL_STEPS",       dm.min_dwell_steps);
         parse_usize!("DM_LBFGS_MAX_ITER",        dm.lbfgs_max_iter);
+    }
+
+    // Stiffness-coupled SAW-BRDR / PirateNet-gate accelerator
+    {
+        let st = &mut cfg.stiffness;
+        parse_bool!("STIFF_ENABLED",             st.enabled);
+        parse_usize!("STIFF_CHECK_INTERVAL",     st.check_interval);
+        parse_f32!("STIFF_EMA_BETA",             st.ema_beta);
+        parse_f32!("STIFF_PHYSICS_BOOST_GAIN",   st.physics_boost_gain);
+        parse_f32!("STIFF_ALPHA_ACCEL_GAIN",     st.alpha_accel_gain);
+        parse_f32!("STIFF_GATE_AWAKE_EPSILON",   st.gate_awake_epsilon);
     }
 
     // Material (US Customary → SI)

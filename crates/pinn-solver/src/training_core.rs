@@ -31,7 +31,7 @@ use crate::{
     fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig},
     lr_schedule::LrSchedule,
     network::{fwd, ElasticityNet},
-    optim::{BiasOptim, WeightOptim},
+    optim::{BiasOptim, GateOptim, WeightOptim},
     saw_brdr::SawBrdr,
 };
 
@@ -213,11 +213,14 @@ pub fn step_physics(
     model: ElasticityNet<B>,
     optim_w: &mut WeightOptim,
     optim_b: &mut BiasOptim,
+    optim_gate: &mut GateOptim,
     ctx: &StepCtx,
     saw: &mut SawBrdr,
     lr_sched: &mut LrSchedule,
     device: &WgpuDevice,
     tier_u8: u8,
+    physics_boost: f64,
+    alpha_lr_mult: f64,
 ) -> (ElasticityNet<B>, StepOutput) {
     let n_int      = ctx.int_norm.len();
     let n_fourier  = ctx.engine.n_fourier;
@@ -485,17 +488,21 @@ pub fn step_physics(
     };
     let lams = saw.update(&saw_inputs);
 
-    let lam_e   = lams[0] as f64;
+    // Stiffness-coupled boost (external modulation, applied after SAW-BRDR itself —
+    // mirrors how dynamic_lam_h_cap/dynamic_lam_d_cap are clamped below, outside SawBrdr).
+    // `physics_boost = 1.0` (StiffnessController disabled) is a no-op.
+    let lam_e   = lams[0] as f64 * physics_boost;
     let lam_n   = lams[1] as f64;
     let lam_h_  = lams[2] as f64;
     let lam_d_  = lams[3] as f64;
-    let lam_eq  = lams[4] as f64;
+    let lam_eq  = lams[4] as f64 * physics_boost;
     // Phase 2: cap lam_h so kirsch gradient dominates hole traction. Tightens on plateau.
     let lam_h   = if ctx.phase2_active { lam_h_.min(ctx.dynamic_lam_h_cap) } else { lam_h_ };
     // Phase 2: cap lam_d so displacement-anchor gradient doesn't overwhelm kirsch at near-convergence.
     // Uncapped lam_d grows to ~46-50 while lam_k ≈ 2 → 23:1 ratio causes Adam overshoot when K_t → 3.
     let lam_d   = if ctx.phase2_active { lam_d_.min(ctx.dynamic_lam_d_cap) } else { lam_d_ };
     let lam_kirsch = if ctx.phase2_active { lams[5] as f64 } else { 0.0 };
+    let lam_const  = ctx.engine.lam_const as f64 * physics_boost;
 
     // Total potential energy: Π = (e_loss − W_neumann)·λ_e + BC penalties + kirsch + const
     let loss = (e_loss - w_neumann).mul_scalar(lam_e)
@@ -504,7 +511,7 @@ pub fn step_physics(
         + d_loss.mul_scalar(lam_d)
         + eq_loss.mul_scalar(lam_eq)
         + kirsch_loss.mul_scalar(lam_kirsch)
-        + const_loss.mul_scalar(ctx.engine.lam_const as f64);
+        + const_loss.mul_scalar(lam_const);
 
     let total_scalar = (e_scalar - w_scalar) * lam_e as f32
         + n_scalar  * lam_n  as f32
@@ -512,15 +519,28 @@ pub fn step_physics(
         + d_scalar  * lam_d  as f32
         + eq_scalar * lam_eq as f32
         + kirsch_scalar * lam_kirsch as f32
-        + const_scalar  * ctx.engine.lam_const;
+        + const_scalar  * lam_const as f32;
 
     let lr = lr_sched.step(total_scalar.abs() as f64);
-    let (weight_ids, bias_ids) = model.param_ids();
+    let (default_weight_ids, bias_ids) = model.param_ids();
+    // Dormant PirateNet blocks (|gate| <= gate_awake_epsilon) are excluded from the SOAP-Muon
+    // weight set — their true gradient is exactly zero at alpha=0 (see network.rs tests), so
+    // this skips the eigendecomposition/Shampoo update for capacity the network isn't using
+    // yet. No-op (full weight set) when use_piratenet=false.
+    let weight_ids = if ctx.config.use_piratenet {
+        model.awake_weight_ids(ctx.config.stiffness.gate_awake_epsilon)
+    } else {
+        default_weight_ids
+    };
+    let gate_ids = model.gate_ids();
     let mut grads = loss.backward();
     let weight_grads = GradientsParams::from_params(&mut grads, &model, &weight_ids);
     let bias_grads = GradientsParams::from_params(&mut grads, &model, &bias_ids);
+    let gate_grads = GradientsParams::from_params(&mut grads, &model, &gate_ids);
     let model = optim_w.step(lr, model, weight_grads);
     let model = optim_b.step(lr, model, bias_grads);
+    // Stiffness-accelerated gate LR; empty gate_grads (use_piratenet=false) makes this a no-op.
+    let model = optim_gate.step(lr * alpha_lr_mult, model, gate_grads);
 
     let proxy_ratio = (e_scalar + eq_scalar + const_scalar)
         / (n_scalar + h_scalar + d_scalar + w_scalar + 1e-8);
