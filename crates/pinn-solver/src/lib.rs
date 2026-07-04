@@ -10,6 +10,7 @@ pub mod network;
 pub mod optim;
 pub mod runner;
 pub mod saw_brdr;
+pub mod signorini;
 pub mod stiffness;
 pub mod training_core;
 
