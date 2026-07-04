@@ -6,7 +6,7 @@ use std::{
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use egui::TextureHandle;
 use pinn_core::{
-    messages::{ControlMsg, SolverConfig, TrainingMsg},
+    messages::{ControlMsg, ProblemKind, SolverConfig, TrainingMsg},
     FieldType, SolverStatus, TrainingState,
 };
 
@@ -15,6 +15,7 @@ use crate::panels;
 pub struct StressSolverApp {
     config: SolverConfig,
     state:  Arc<Mutex<TrainingState>>,
+    problem_kind: ProblemKind,
 
     // Channels
     tx_control: Option<Sender<ControlMsg>>,
@@ -25,22 +26,31 @@ pub struct StressSolverApp {
     texture: Option<TextureHandle>,
     colorbar_range: (f32, f32),
     prev_geo_hash: u64,
+    /// Informational status text from the last completed export (path or error) — purely
+    /// for display, never affects `state.status`.
+    export_status: Option<String>,
 }
 
 impl StressSolverApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, config: SolverConfig) -> Self {
+        Self::from_config(config)
+    }
+
+    pub fn from_config(config: SolverConfig) -> Self {
         let [nx, ny] = config.vis_grid;
         let state = Arc::new(Mutex::new(TrainingState::new([nx, ny])));
         let geo_hash = config.geometry.geometry_hash();
         Self {
             config,
             state,
+            problem_kind: ProblemKind::Kirsch,
             tx_control:    None,
             rx_training:   None,
             selected_field: FieldType::VonMises,
             texture:        None,
             colorbar_range: (0.0, 1.0),
             prev_geo_hash:  geo_hash,
+            export_status:  None,
         }
     }
 
@@ -63,10 +73,16 @@ impl StressSolverApp {
         self.tx_control  = Some(tx_ctrl);
         self.prev_geo_hash = config.geometry.geometry_hash();
 
+        let problem_kind = self.problem_kind;
         thread::Builder::new()
             .name("pinn-solver".into())
-            .spawn(move || {
-                pinn_solver::run_training(config, tx_train, rx_ctrl);
+            .spawn(move || match problem_kind {
+                ProblemKind::Kirsch => {
+                    pinn_solver::run_training(config, tx_train, rx_ctrl);
+                }
+                ProblemKind::PinLug => {
+                    pinn_solver::runner::run_training_pinlug(config, tx_train, rx_ctrl);
+                }
             })
             .expect("failed to spawn solver thread");
     }
@@ -166,6 +182,24 @@ impl StressSolverApp {
                     s.disp_v    = vis.disp_v;
                 }
             }
+            TrainingMsg::PinLugUpdate(upd) => {
+                let mut s = self.state.lock().expect("state mutex poisoned");
+                s.step = upd.step;
+                s.total_loss.push(upd.total_loss);
+                s.energy_loss.push(upd.energy_loss);
+                s.neumann_loss.push(upd.neumann_loss);
+                s.lr_history.push(upd.lr);
+                s.lam_energy.push(upd.lam_energy);
+                s.lam_neumann.push(upd.lam_neumann);
+                s.n_colloc = upd.n_colloc;
+                s.convergence_metric = upd.convergence_metric;
+                s.status = SolverStatus::Running;
+
+                if let Some(vis) = upd.vis {
+                    s.pinlug_pin = Some(vis.pin);
+                    s.pinlug_lug = Some(vis.lug);
+                }
+            }
             TrainingMsg::Done => {
                 let mut s = self.state.lock().expect("state mutex poisoned");
                 s.status = SolverStatus::Converged;
@@ -178,6 +212,11 @@ impl StressSolverApp {
                 s.error_msg = Some(e);
                 self.tx_control  = None;
                 self.rx_training = None;
+            }
+            TrainingMsg::ExportComplete(path) => {
+                // Purely informational — must NOT change state.status (Running stays
+                // Running, Converged stays Converged).
+                self.export_status = Some(format!("Exported: {path}"));
             }
         }
     }
@@ -203,6 +242,8 @@ impl eframe::App for StressSolverApp {
         let mut on_solve      = false;
         let mut on_warm_start = false;
         let mut on_stop       = false;
+        let mut on_export     = false;
+        let prev_problem_kind = self.problem_kind;
 
         // ── Left panel: parameters ──────────────────────────────
         egui::SidePanel::left("params_panel")
@@ -215,12 +256,23 @@ impl eframe::App for StressSolverApp {
                         &mut self.config,
                         &state_snap,
                         &mut self.selected_field,
+                        &mut self.problem_kind,
+                        self.export_status.as_deref(),
                         &mut on_solve,
                         &mut on_warm_start,
                         &mut on_stop,
+                        &mut on_export,
                     );
                 });
             });
+
+        // Problem kind flipped this frame — swap in the matching default config.
+        if self.problem_kind != prev_problem_kind {
+            self.config = match self.problem_kind {
+                ProblemKind::Kirsch => SolverConfig::default_kirsch(),
+                ProblemKind::PinLug => SolverConfig::default_pinlug(),
+            };
+        }
 
         // ── Right panel: stress heatmap ─────────────────────────
         egui::SidePanel::right("heatmap_panel")
@@ -230,6 +282,7 @@ impl eframe::App for StressSolverApp {
                     ui,
                     &state_snap,
                     &self.config,
+                    self.problem_kind,
                     self.selected_field,
                     &mut self.texture,
                     &mut self.colorbar_range,
@@ -249,5 +302,82 @@ impl eframe::App for StressSolverApp {
             let mut s = self.state.lock().expect("state mutex poisoned");
             s.status = SolverStatus::Idle;
         }
+        if on_export {
+            if let Some(ref tx) = self.tx_control {
+                let _ = tx.send(ControlMsg::ExportContactPressure);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pinn_core::messages::{PinLugTrainingUpdate, PinLugVisFields};
+
+    fn fresh_app() -> StressSolverApp {
+        StressSolverApp::from_config(SolverConfig::default_kirsch())
+    }
+
+    fn tiny_vis_fields() -> pinn_core::messages::VisFields {
+        let grid = ndarray::Array2::zeros((2, 2));
+        pinn_core::messages::VisFields {
+            von_mises: grid.clone(),
+            sigma_xx:  grid.clone(),
+            sigma_yy:  grid.clone(),
+            sigma_xy:  grid.clone(),
+            disp_u:    grid.clone(),
+            disp_v:    grid,
+        }
+    }
+
+    #[test]
+    fn apply_msg_pinlug_update_populates_pinlug_vis_fields_not_kirsch_fields() {
+        let mut app = fresh_app();
+
+        let upd = PinLugTrainingUpdate {
+            step: 42,
+            total_loss:   1.0,
+            energy_loss:  0.5,
+            neumann_loss: 0.5,
+            lr:           1e-3,
+            lam_energy:   1.0,
+            lam_neumann:  1.0,
+            n_colloc:     128,
+            convergence_metric: Some(0.0012),
+            vis: Some(PinLugVisFields { pin: tiny_vis_fields(), lug: tiny_vis_fields() }),
+        };
+
+        app.apply_msg(TrainingMsg::PinLugUpdate(Box::new(upd)));
+
+        let s = app.state.lock().expect("state mutex poisoned");
+        assert!(s.pinlug_pin.is_some(), "pinlug_pin must be populated");
+        assert!(s.pinlug_lug.is_some(), "pinlug_lug must be populated");
+        assert_eq!(s.convergence_metric, Some(0.0012));
+        assert_eq!(s.step, 42);
+        assert!(s.kt_estimate.is_none(), "PinLugUpdate must never populate the Kirsch-only field");
+    }
+
+    #[test]
+    fn apply_msg_export_complete_does_not_change_solver_status() {
+        let mut app = fresh_app();
+        {
+            let mut s = app.state.lock().expect("state mutex poisoned");
+            s.status = SolverStatus::Running;
+        }
+
+        app.apply_msg(TrainingMsg::ExportComplete("out/contact_pressure.csv".to_string()));
+
+        let s = app.state.lock().expect("state mutex poisoned");
+        assert_eq!(s.status, SolverStatus::Running, "export completion must not change status");
+    }
+
+    #[test]
+    fn apply_msg_existing_kirsch_variants_still_handled() {
+        let mut app = fresh_app();
+        app.apply_msg(TrainingMsg::Done);
+
+        let s = app.state.lock().expect("state mutex poisoned");
+        assert_eq!(s.status, SolverStatus::Converged);
     }
 }
