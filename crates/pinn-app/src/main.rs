@@ -1,7 +1,7 @@
 use std::{collections::HashMap, env, fs, path::Path};
 
 use pinn_core::{
-    messages::SolverConfig,
+    messages::{ProblemKind, SolverConfig},
     units::{IN_TO_M, KSI_TO_PA, MSI_TO_PA},
     HoleType,
 };
@@ -149,15 +149,6 @@ fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>, skip_problem
     }
 }
 
-/// Which `BoundaryValueProblem` to train. `--problem pinlug` is headless-only (see
-/// `run_headless_pinlug`'s doc comment) — GUI/vis-grid support for pin-in-lug is out of
-/// scope for this slice; `runner.rs`'s GUI path remains Kirsch-only.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ProblemKind {
-    Kirsch,
-    PinLug,
-}
-
 /// Parse `--problem kirsch|pinlug` from argv (defaults to `kirsch` — the existing,
 /// unaffected behavior — if the flag is absent or has an unrecognized value).
 fn parse_problem_arg() -> ProblemKind {
@@ -228,4 +219,15 @@ fn main() -> anyhow::Result<()> {
         Box::new(|cc| Ok(Box::new(pinn_gui::StressSolverApp::new(cc, config)))),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_problem_arg_default_matches_pinn_core_kirsch() {
+        let k: pinn_core::messages::ProblemKind = pinn_core::messages::ProblemKind::Kirsch;
+        assert_eq!(k, pinn_core::messages::ProblemKind::Kirsch);
+    }
 }

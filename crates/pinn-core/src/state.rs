@@ -1,6 +1,8 @@
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
+use crate::messages::VisFields;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SolverStatus {
     Idle,
@@ -71,6 +73,16 @@ pub struct TrainingState {
 
     /// [Nx_vis, Ny_vis]
     pub vis_grid: [usize; 2],
+
+    /// Pin domain visualization fields for the pin-in-lug problem. `None` until the first
+    /// `TrainingMsg::PinLugUpdate` arrives (unused/untouched for the Kirsch problem).
+    pub pinlug_pin: Option<VisFields>,
+    /// Lug domain visualization fields for the pin-in-lug problem. `None` until the first
+    /// `TrainingMsg::PinLugUpdate` arrives (unused/untouched for the Kirsch problem).
+    pub pinlug_lug: Option<VisFields>,
+    /// Generic (non-K_t) convergence metric — e.g. pin-in-lug's interface-gap RMS.
+    /// `kt_estimate` above stays untouched/unused by the pin-in-lug path.
+    pub convergence_metric: Option<f32>,
 }
 
 impl TrainingState {
@@ -96,6 +108,9 @@ impl TrainingState {
             status: SolverStatus::Idle,
             error_msg: None,
             vis_grid,
+            pinlug_pin: None,
+            pinlug_lug: None,
+            convergence_metric: None,
         }
     }
 
