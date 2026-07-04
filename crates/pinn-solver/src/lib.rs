@@ -1,4 +1,5 @@
 pub mod bc;
+pub mod contact_export;
 pub mod controllers; // ConvergenceTracker is `pub` (see controllers.rs) for cross-crate curriculum reuse
 pub mod decision_maker;
 pub mod engine;

@@ -597,6 +597,29 @@ pub fn run_headless_pinlug(config: SolverConfig) -> bool {
     let elapsed = start.elapsed().as_secs_f32();
     println!("──────────────────────────────────────────────────────────────────────────────────────────────");
     println!("  Done! {elapsed:.0}s   Final total loss: {last_total:.4e}");
+
+    // Post-processing: export the trained LUG network's contact-pressure profile
+    // (sigma_rr(theta) over the pin-loaded half of the hole boundary) to CSV — see
+    // `contact_export.rs` module doc comment. Uses the same raw-output -> physical-stress
+    // scale (`config.load.px`, Pa) `step_physics_multi` applied to the mDEM stress columns
+    // during training, so exported values match what training actually optimized against.
+    {
+        let model_lug_val: ElasticityNet<BInner> = model_lug.valid();
+        match crate::contact_export::export_contact_pressure::<BInner>(
+            &model_lug_val, &lug_geom, config.load.px, &device,
+        ) {
+            Ok(samples) => println!(
+                "  Contact pressure profile: {} samples written to {}",
+                samples.len(), crate::contact_export::DEFAULT_CONTACT_EXPORT_PATH,
+            ),
+            Err(e) => eprintln!(
+                "  [WARN] failed to write contact-pressure CSV to {}: {e}",
+                crate::contact_export::DEFAULT_CONTACT_EXPORT_PATH,
+            ),
+        }
+    }
+
+    println!("════════════════════════════════════════════════════════════════════════════════════════════════════════");
     last_total.is_finite()
 }
 
