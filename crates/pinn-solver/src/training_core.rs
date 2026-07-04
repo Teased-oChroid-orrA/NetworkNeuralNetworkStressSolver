@@ -96,9 +96,14 @@ fn compute_kirsch_probes(ctx: &StepCtx, radius: f64) -> KirschProbes {
 /// `ref_stress2` [Pa²]. Shared by `runner` and `headless`, and recomputed by both whenever
 /// the load or material changes (warm-start).
 pub fn compute_reference_scales(config: &SolverConfig) -> (f32, f32, f32) {
-    let u_ref       = ((config.load.px / config.material.e) * config.geometry.half_w) as f32;
-    let ref_energy  = (0.5 * config.load.px * config.load.px / config.material.e) as f32;
-    let ref_stress2 = (config.load.px * config.load.px) as f32;
+    let stress_ref = if config.use_ultimate_strength_scaling {
+        config.material.ultimate_strength_pa
+    } else {
+        config.load.px
+    };
+    let u_ref       = ((stress_ref / config.material.e) * config.geometry.half_w) as f32;
+    let ref_energy  = (0.5 * stress_ref * stress_ref / config.material.e) as f32;
+    let ref_stress2 = (stress_ref * stress_ref) as f32;
     (u_ref, ref_energy, ref_stress2)
 }
 
@@ -1713,6 +1718,74 @@ mod tests {
         let half_w = config.geometry.half_w as f32;
         let expected_u_ref = ref_stress2.sqrt() / e * half_w;
         assert!((u_ref - expected_u_ref).abs() / u_ref < 1e-5);
+    }
+
+    #[test]
+    fn compute_reference_scales_flag_off_matches_existing_load_based_formula() {
+        let config = SolverConfig::default_kirsch();
+        assert!(!config.use_ultimate_strength_scaling);
+        let (u_ref, ref_energy, ref_stress2) = compute_reference_scales(&config);
+
+        let px = config.load.px;
+        let expected_u_ref = ((px / config.material.e) * config.geometry.half_w) as f32;
+        let expected_ref_energy = (0.5 * px * px / config.material.e) as f32;
+        let expected_ref_stress2 = (px * px) as f32;
+
+        assert!((u_ref - expected_u_ref).abs() / expected_u_ref < 1e-6);
+        assert!((ref_energy - expected_ref_energy).abs() / expected_ref_energy < 1e-6);
+        assert!((ref_stress2 - expected_ref_stress2).abs() / expected_ref_stress2 < 1e-6);
+    }
+
+    #[test]
+    fn compute_reference_scales_flag_on_uses_ultimate_strength_not_applied_load() {
+        let mut config_off = SolverConfig::default_kirsch();
+        config_off.use_ultimate_strength_scaling = false;
+        let mut config_on = SolverConfig::default_kirsch();
+        config_on.use_ultimate_strength_scaling = true;
+
+        let (_u_ref_off, _ref_energy_off, ref_stress2_off) = compute_reference_scales(&config_off);
+        let (u_ref_on, ref_energy_on, ref_stress2_on) = compute_reference_scales(&config_on);
+
+        // Must diverge by >1% relative (config's Px and ultimate_strength_pa are very
+        // different magnitudes, so this is a coarse sanity check, not a precision one).
+        assert!((ref_stress2_on - ref_stress2_off).abs() / ref_stress2_off > 0.01);
+
+        let uts = config_on.material.ultimate_strength_pa;
+        let expected_u_ref = ((uts / config_on.material.e) * config_on.geometry.half_w) as f32;
+        let expected_ref_energy = (0.5 * uts * uts / config_on.material.e) as f32;
+        let expected_ref_stress2 = (uts * uts) as f32;
+
+        assert!((u_ref_on - expected_u_ref).abs() / expected_u_ref < 1e-6);
+        assert!((ref_energy_on - expected_ref_energy).abs() / expected_ref_energy < 1e-6);
+        assert!((ref_stress2_on - expected_ref_stress2).abs() / expected_ref_stress2 < 1e-6);
+
+        assert!(u_ref_on.is_finite() && u_ref_on > 0.0);
+        assert!(ref_energy_on.is_finite() && ref_energy_on > 0.0);
+        assert!(ref_stress2_on.is_finite() && ref_stress2_on > 0.0);
+    }
+
+    #[test]
+    fn compute_reference_scales_length_reference_is_per_domain_not_shared_constant() {
+        use pinn_core::geometry::GeometryConfig;
+
+        let mut kirsch_cfg = SolverConfig::default_kirsch();
+        kirsch_cfg.use_ultimate_strength_scaling = true;
+
+        let mut pinlug_geom_cfg = SolverConfig::default_kirsch();
+        pinlug_geom_cfg.use_ultimate_strength_scaling = true;
+        pinlug_geom_cfg.geometry = GeometryConfig::pinlug_lug_inches();
+
+        // Same material for both, so any u_ref difference must come from geometry.half_w.
+        let (u_ref_kirsch, _, _) = compute_reference_scales(&kirsch_cfg);
+        let (u_ref_pinlug, _, _) = compute_reference_scales(&pinlug_geom_cfg);
+
+        let expected_ratio = pinlug_geom_cfg.geometry.half_w as f32 / kirsch_cfg.geometry.half_w as f32;
+        let actual_ratio = u_ref_pinlug / u_ref_kirsch;
+
+        assert!(
+            (actual_ratio - expected_ratio).abs() / expected_ratio < 1e-5,
+            "expected u_ref ratio {expected_ratio}, got {actual_ratio}"
+        );
     }
 
     /// Numerical-equivalence proof for the `step_physics` trait-driven cutover.

@@ -453,7 +453,7 @@ pub fn run_headless_pinlug(config: SolverConfig) -> bool {
     use pinn_core::problem::InterfaceParametrization;
     use crate::{
         network::ElasticityNetConfig,
-        pinlug_problem::{PinLugProblem, LUG_DOMAIN, PIN_DOMAIN},
+        pinlug_problem::{PinLugProblem, PinLugScalingMode, LUG_DOMAIN, PIN_DOMAIN},
         problem::{
             validate_loss_terms, BoundaryValueProblem, DomainOptim, DomainStepCtx,
             DomainStepData, MultiStepCtx, PointSetData,
@@ -469,7 +469,10 @@ pub fn run_headless_pinlug(config: SolverConfig) -> bool {
     println!("║   PINN Structural Stress Solver — Pin-in-Lug (Headless)  ║");
     println!("╚══════════════════════════════════════════════════════════╝");
 
-    let problem = PinLugProblem::new(config.material.clone(), OUTPUT_DIM, PHASE1_STEPS, N_INTERFACE);
+    let problem = PinLugProblem::new(
+        config.material.clone(), OUTPUT_DIM, PHASE1_STEPS, N_INTERFACE,
+        if config.use_ultimate_strength_scaling { PinLugScalingMode::UltimateStrength } else { PinLugScalingMode::AppliedLoad },
+    );
     validate_loss_terms(&problem);
 
     println!("  Material : E={:.2} Msi  ν={:.3}", config.material.e / MSI_TO_PA, config.material.nu);

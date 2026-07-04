@@ -177,7 +177,7 @@ mod tests {
     type TB = Autodiff<Wgpu>;
 
     fn material(e: f64, nu: f64) -> MaterialProps {
-        MaterialProps { e, nu, density: 0.0 }
+        MaterialProps { e, nu, density: 0.0, ultimate_strength_pa: 1.0 }
     }
 
     fn t1(v: f32) -> Tensor<TB, 1> {

@@ -54,6 +54,35 @@ hand-rolled literals. `Px`/`Py` (`pinn_core::loading::LoadConfig`) are far-field
 (traction) boundary conditions — not forces — which is why they're in Pa/ksi like any other
 stress quantity, not N/lbf.
 
+## Reference-scale normalization
+
+Every loss term is normalized to O(1) before SAW-BRDR weighting (see `compute_reference_scales`
+in `pinn-solver::training_core`) by dividing by a physical reference stress `P` squared
+(`ref_stress2 = P²`) and its energy-scale derivative (`ref_energy = 0.5*P²/E`); the length
+reference is always `config.geometry.half_w` — that domain's own `GeometryConfig`, never a
+shared/hardcoded constant, since a different problem's domain has a different characteristic
+length. By default `P` is the applied far-field load (`config.load.px` for Kirsch,
+`equivalent_traction_pa` for pin-lug) — the convention this codebase's K_t=3.0 validation and
+pin-lug's tuned SAW-BRDR/LR/`ConvergenceTracker` thresholds were established against.
+
+Setting `SolverConfig::use_ultimate_strength_scaling = true` (default `false`, opt-in) switches
+`P` to `config.material.ultimate_strength_pa` (`PinLugProblem` takes the equivalent
+`PinLugScalingMode::UltimateStrength` instead, since it has no `SolverConfig` of its own) — the
+material's ultimate tensile strength (`MaterialProps::al7075_t6()`: 83,000 psi, ASTM B209
+minimum spec; `MaterialProps::steel_4340()`: 200,000 psi, a representative quenched-and-tempered
+condition — actual 4340 UTS spans 125,000–287,000 psi by temper, unlike `e`/`nu` which are
+treatment-invariant). This makes the reference stress **itself** normalize to exactly 1.0 by
+construction (it's the denominator: `P²/P² = 1`) — it is **not** a claim that the solved stress
+field will reach or approach the material's ultimate strength. Changing this flag changes every
+normalized loss term's magnitude by roughly `(P_load/F_c)²` and has not been validated against
+the existing training hyperparameters — treat it as an experimental alternate scaling, not a
+drop-in improvement.
+
+`MaterialProps::dimensionless_modulus(f_c) -> f64` (`E/f_c`) is a pure diagnostic helper only —
+it is never wired into `energy.rs`'s constitutive law (`compute_stress`/`compute_strains`).
+Nondimensionalization lives only at the reference-scale/loss-normalization layer described
+above; the constitutive law itself always operates on physical SI values.
+
 ## Optimizer
 
 Weight matrices (2D) in `ElasticityNet`'s `Linear` layers are trained with a custom

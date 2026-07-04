@@ -156,6 +156,14 @@ pub struct SolverConfig {
     /// Stiffness-coupled SAW-BRDR / gate-LR accelerator configuration (disabled by
     /// default).
     pub stiffness: StiffnessConfig,
+    /// If true, `training_core::compute_reference_scales` (and `PinLugProblem::new`'s
+    /// internal equivalent) normalizes stress by `config.material.ultimate_strength_pa`
+    /// instead of the applied load (`config.load.px`). Disabled by default — the applied-
+    /// load normalization is what the K_t=3.0 Kirsch validation and pin-lug's tuned
+    /// SAW-BRDR/LR/ConvergenceTracker thresholds were established against; switching the
+    /// stress reference changes every loss term's O(1) magnitude by roughly
+    /// `(Px/ultimate_strength_pa)^2` and must be an explicit, informed choice.
+    pub use_ultimate_strength_scaling: bool,
 }
 
 impl SolverConfig {
@@ -175,6 +183,7 @@ impl SolverConfig {
             decision_maker: DecisionMakerConfig::default(),
             use_piratenet:  false,
             stiffness:      StiffnessConfig::default(),
+            use_ultimate_strength_scaling: false,
         }
     }
 
@@ -219,6 +228,22 @@ impl SolverConfig {
             decision_maker: DecisionMakerConfig::default(),
             use_piratenet:  false,
             stiffness:      StiffnessConfig::default(),
+            use_ultimate_strength_scaling: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_kirsch_has_ultimate_strength_scaling_disabled() {
+        assert!(!SolverConfig::default_kirsch().use_ultimate_strength_scaling);
+    }
+
+    #[test]
+    fn default_pinlug_has_ultimate_strength_scaling_disabled() {
+        assert!(!SolverConfig::default_pinlug().use_ultimate_strength_scaling);
     }
 }
