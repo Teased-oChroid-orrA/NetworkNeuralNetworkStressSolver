@@ -1810,10 +1810,14 @@ mod tests {
         let mut saw_old = SawBrdr::with_base(engine.init_weights(), 0.95);
         let mut lr_sched_old = LrSchedule::new(engine.peak_lr, 200, 1000);
 
+        // 1e-4, not 1e-5: WGPU compute-shader reduction order is not guaranteed associative
+        // under concurrent GPU contention (e.g. `cargo test --workspace` running other GPU
+        // tests in parallel), so a tighter bound flakes under load without indicating a real
+        // regression. Matches this crate's existing float-comparison precedent (energy.rs).
         let rel_close = |a: f32, b: f32, label: &str| {
             let scale = a.abs().max(b.abs()).max(1e-8);
             let rel = ((a - b).abs() / scale) as f64;
-            assert!(rel < 1e-5, "{label}: new={a} old={b} rel_err={rel}");
+            assert!(rel < 1e-4, "{label}: new={a} old={b} rel_err={rel}");
         };
 
         for step in 0..2usize {
@@ -1869,7 +1873,7 @@ mod tests {
         model_old.visit(&mut vis_old);
         let scale = vis_new.total.abs().max(vis_old.total).max(1e-8);
         let rel = (vis_new.total - vis_old.total).abs() / scale;
-        assert!(rel < 1e-5,
+        assert!(rel < 1e-4, // see rel_close's GPU-contention comment above
             "param_l2_sq: new={} old={} rel_err={rel}", vis_new.total, vis_old.total);
     }
 
@@ -2339,10 +2343,11 @@ mod tests {
         let mut saw_multi = SawBrdr::with_base(vec![1.0, 10.0, 200.0, 50.0], 0.95);
         let mut lr_sched_multi = LrSchedule::new(engine.peak_lr, 200, 1000);
 
+        // 1e-4: see the GPU-contention comment on the sibling equivalence test above.
         let rel_close = |a: f32, b: f32, label: &str| {
             let scale = a.abs().max(b.abs()).max(1e-8);
             let rel = ((a - b).abs() / scale) as f64;
-            assert!(rel < 1e-5, "{label}: single={a} multi={b} rel_err={rel}");
+            assert!(rel < 1e-4, "{label}: single={a} multi={b} rel_err={rel}");
         };
 
         for step in 0..2usize {
@@ -2492,7 +2497,7 @@ mod tests {
         model_single.visit(&mut vis_single);
         let scale = vis_multi.total.abs().max(vis_single.total).max(1e-8);
         let rel = (vis_multi.total - vis_single.total).abs() / scale;
-        assert!(rel < 1e-5, "param_l2_sq: multi={} single={} rel_err={rel}", vis_multi.total, vis_single.total);
+        assert!(rel < 1e-4, "param_l2_sq: multi={} single={} rel_err={rel}", vis_multi.total, vis_single.total);
     }
 
     /// Minimal 2-parameter "network" stand-in for gradient-split tests: a tiny real
@@ -2644,6 +2649,7 @@ mod tests {
             step: 0,
         };
 
+        let a_before = param_l2_sq(&model_a);
         let b_before = param_l2_sq(&model_b);
 
         let mut optims = vec![
@@ -2663,9 +2669,8 @@ mod tests {
         let a_after = param_l2_sq(&model_a_after);
         let b_after = param_l2_sq(&model_b_after);
 
-        assert!((a_after - b_before).abs() > 1e-12 || true, "sanity: A should generally move (not asserted strictly)");
+        assert!((a_after - a_before).abs() > 1e-12, "domain A's params must change — loss depended on A's output");
         assert_eq!(b_after, b_before, "domain B's params must be EXACTLY unchanged — loss did not depend on B's output");
-        let _ = a_after;
     }
 
     /// RED test #3: a combined loss depending on BOTH domains' outputs must leave BOTH

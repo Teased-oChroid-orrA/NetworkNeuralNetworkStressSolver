@@ -31,7 +31,14 @@ fn load_pinn_env(path: &Path) -> HashMap<String, String> {
 }
 
 /// Apply parsed env map to config in-place. Unknown keys are silently ignored.
-fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>) {
+///
+/// `skip_problem_specific`: when `true`, the material/load/geometry overrides below are NOT
+/// applied. `pinn.env`'s MATERIAL_E_MSI/MATERIAL_NU/LOAD_*/GEOM_*/HOLE_RADIUS_IN keys are
+/// tuned for the Kirsch problem (e.g. Al 7075-T6, 10 ksi far-field tension) and would silently
+/// overwrite `SolverConfig::default_pinlug()`'s fixed 4340-steel material with those Kirsch
+/// defaults otherwise — pass `true` for `ProblemKind::PinLug`, whose material/geometry/load are
+/// part of the problem definition, not user-tunable via this shared env file in this slice.
+fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>, skip_problem_specific: bool) {
     macro_rules! parse_usize {
         ($key:expr, $field:expr) => {
             if let Some(v) = env.get($key) {
@@ -110,6 +117,10 @@ fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>) {
         parse_f32!("STIFF_GATE_AWAKE_EPSILON",   st.gate_awake_epsilon);
     }
 
+    if skip_problem_specific {
+        return;
+    }
+
     // Material (US Customary → SI)
     if let Some(v) = env.get("MATERIAL_E_MSI") {
         if let Ok(n) = v.parse::<f64>() { cfg.material.e = n * MSI_TO_PA; }
@@ -173,7 +184,7 @@ fn main() -> anyhow::Result<()> {
         ProblemKind::Kirsch => SolverConfig::default_kirsch(),
         ProblemKind::PinLug => SolverConfig::default_pinlug(),
     };
-    apply_env(&mut config, &env_map);
+    apply_env(&mut config, &env_map, problem_kind == ProblemKind::PinLug);
 
     if !env_map.is_empty() {
         eprintln!("[pinn.env] loaded {} key(s) from {env_path_str}",  env_map.len());

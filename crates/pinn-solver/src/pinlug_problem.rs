@@ -76,6 +76,10 @@ const SEED_PIN_INTERIOR: u64 = 24_68;
 const SEED_LUG_BOUNDARY: u64 = 55_55;
 const SEED_PIN_BOUNDARY: u64 = 77_77;
 const REJECTION_SAMPLE_ATTEMPTS_FACTOR: usize = 20;
+/// Point count for the pin's "driving" named point-set (see `named_point_sets`) — shared
+/// with `loss_terms()`'s `PinDrivingTractionTerm` construction so the target-tensor length
+/// always matches the actual sampled point count.
+const N_DRIVE_POINTS: usize = 32;
 
 const LAM_E: f32 = 1.0;
 const LAM_N: f32 = 10.0;
@@ -222,7 +226,7 @@ impl DomainSamplingStrategy for PinLugSamplingStrategy {
             // Represented as a small angular band of boundary points at r=contact_radius
             // (the pin's outer surface) with a prescribed traction.
             let mut rng = LcgRng::new(SEED_PIN_BOUNDARY);
-            let n_drive = 32;
+            let n_drive = N_DRIVE_POINTS;
             let drive_pts: Vec<BoundaryPoint> = (0..n_drive).map(|_| {
                 let theta = std::f64::consts::PI + (rng.next_f64() - 0.5) * (std::f64::consts::PI / 6.0);
                 let x = self.contact_radius * theta.cos();
@@ -339,6 +343,12 @@ pub struct InterfacePenetrationTerm {
     pub thetas: Vec<f64>,
     pub r_pin: f64,
     pub r_lug: f64,
+    /// Normalizes the raw gap² [m²] penalty to O(1), mirroring how every other term here
+    /// divides by a reference physical scale (`ref_energy`/`ref_stress2`) before SAW-BRDR
+    /// weighting — without this, `gap²` at meter scale is negligible but at the sub-mm
+    /// scale actually expected here would still be many orders of magnitude off from the
+    /// O(1)-normalized energy/stress terms it's summed against.
+    pub ref_gap2: f32,
 }
 impl LossTerm for InterfacePenetrationTerm {
     fn name(&self) -> &'static str { "interface_penetration" }
@@ -363,7 +373,7 @@ impl LossTerm for InterfacePenetrationTerm {
             let gap = (self.r_lug + u_r_lug) - (self.r_pin + u_r_pin);
             total += penetration_penalty(gap);
         }
-        let mean = total / n.max(1) as f64;
+        let mean = total / n.max(1) as f64 / self.ref_gap2 as f64;
         let device = pin.raw_out.device();
         Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(vec![mean as f32], vec![1]), &device)
     }
@@ -379,6 +389,11 @@ impl LossTerm for InterfacePenetrationTerm {
 /// if the interface sampling strategy ever changes.
 pub struct InterfaceNonTensionTerm {
     pub thetas: Vec<f64>,
+    /// Normalizes the raw `s_rr²` [Pa²] penalty to O(1), same convention as `ref_stress2`
+    /// on every other stress-based term (`LugFreeEdgeTractionTerm`, `PinDrivingTractionTerm`)
+    /// — without this, raw steel-stress-scale (`s_rr` ~1e8 Pa) squared dwarfs every
+    /// O(1)-normalized term it's summed against in the SAW-BRDR total.
+    pub ref_stress2: f32,
 }
 impl LossTerm for InterfaceNonTensionTerm {
     fn name(&self) -> &'static str { "interface_non_tension" }
@@ -395,7 +410,7 @@ impl LossTerm for InterfaceNonTensionTerm {
             let (s_rr, _s_tt, _s_rt) = decompose_radial(sxx[i] as f64, syy[i] as f64, sxy[i] as f64, self.thetas[i]);
             total += non_tension_penalty(s_rr);
         }
-        let mean = total / n.max(1) as f64;
+        let mean = total / n.max(1) as f64 / self.ref_stress2 as f64;
         let device = pin.raw_out.device();
         Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(vec![mean as f32], vec![1]), &device)
     }
@@ -411,6 +426,19 @@ pub struct PinLugProblem {
     interface: Arc<InterfaceParametrization>,
     equivalent_traction_pa: f64,
     phase1_steps: usize,
+    /// O(1)-normalization reference scales, computed the same way
+    /// `training_core::compute_reference_scales` does for Kirsch (`ref_energy = 0.5*P²/E`,
+    /// `ref_stress2 = P²`), using `equivalent_traction_pa` as the load magnitude `P`. Both
+    /// domains share one material (steel 4340) here, so one shared pair suffices — a future
+    /// problem with per-domain materials would need per-domain values instead. Without this,
+    /// raw-Pa-squared loss terms sit at ~1e15-1e18 (steel stresses are ~1e8-1e9 Pa), which
+    /// badly conditions the SAW-BRDR weighting and optimizer step size.
+    ref_energy: f32,
+    ref_stress2: f32,
+    /// `(equivalent_traction_pa / material.e * r_pin)²` — same `u_ref` formula Kirsch uses
+    /// (`compute_reference_scales`), squared, so `InterfacePenetrationTerm`'s raw gap² [m²]
+    /// normalizes to O(1) the same way `ref_stress2` normalizes raw Pa² terms.
+    ref_gap2: f32,
 }
 
 impl PinLugProblem {
@@ -436,6 +464,13 @@ impl PinLugProblem {
         let projected_area_m2 = 2.0 * r_pin * lug_geometry.thickness;
         let equivalent_traction_pa = total_force_n / projected_area_m2;
 
+        // Same formula as `training_core::compute_reference_scales`, with
+        // `equivalent_traction_pa` standing in for Kirsch's far-field `config.load.px`.
+        let ref_energy = (0.5 * equivalent_traction_pa * equivalent_traction_pa / material.e) as f32;
+        let ref_stress2 = (equivalent_traction_pa * equivalent_traction_pa) as f32;
+        let u_ref = (equivalent_traction_pa / material.e) * r_pin;
+        let ref_gap2 = (u_ref * u_ref) as f32;
+
         Self {
             domains: [
                 DomainSpec { id: PIN_DOMAIN, geometry: pin_geometry, material: material.clone(), output_dim },
@@ -447,6 +482,9 @@ impl PinLugProblem {
             interface,
             equivalent_traction_pa,
             phase1_steps,
+            ref_energy,
+            ref_stress2,
+            ref_gap2,
         }
     }
 
@@ -470,22 +508,32 @@ impl BoundaryValueProblem for PinLugProblem {
     fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
         let material = self.domains[0].material.clone();
         let device = Default::default();
+        // Driving traction points in +x (pin pushed into the lug along the loading axis),
+        // uniform magnitude `equivalent_traction_pa` — see module doc comment's force-to-
+        // traction derivation. Length must match `N_DRIVE_POINTS` (the "driving" named
+        // point-set's actual sampled count in `PinLugSamplingStrategy::named_point_sets`).
+        let tx_target = Tensor::<B, 1>::from_data(
+            burn::tensor::TensorData::new(vec![self.equivalent_traction_pa as f32; N_DRIVE_POINTS], vec![N_DRIVE_POINTS]),
+            &device,
+        );
+        let ty_target = Tensor::<B, 1>::zeros([N_DRIVE_POINTS], &device);
         vec![
-            Box::new(InteriorEnergyTerm { domain: PIN_DOMAIN, material: material.clone(), ref_energy: 1.0 }),
-            Box::new(InteriorEnergyTerm { domain: LUG_DOMAIN, material: material.clone(), ref_energy: 1.0 }),
+            Box::new(InteriorEnergyTerm { domain: PIN_DOMAIN, material: material.clone(), ref_energy: self.ref_energy }),
+            Box::new(InteriorEnergyTerm { domain: LUG_DOMAIN, material: material.clone(), ref_energy: self.ref_energy }),
             Box::new(LugShankAnchorTerm),
-            Box::new(LugFreeEdgeTractionTerm { ref_stress2: 1.0 }),
+            Box::new(LugFreeEdgeTractionTerm { ref_stress2: self.ref_stress2 }),
             Box::new(PinDrivingTractionTerm {
-                material, ref_stress2: 1.0,
-                tx_target: Tensor::<B, 1>::zeros([1], &device),
-                ty_target: Tensor::<B, 1>::zeros([1], &device),
+                material, ref_stress2: self.ref_stress2,
+                tx_target,
+                ty_target,
             }),
             Box::new(InterfacePenetrationTerm {
                 thetas: self.interface.thetas.clone(),
                 r_pin: self.domains[0].geometry.half_w,
                 r_lug: match self.domains[1].geometry.hole { HoleType::Circular { radius } => radius, HoleType::None => 0.0 },
+                ref_gap2: self.ref_gap2,
             }),
-            Box::new(InterfaceNonTensionTerm { thetas: self.interface.thetas.clone() }),
+            Box::new(InterfaceNonTensionTerm { thetas: self.interface.thetas.clone(), ref_stress2: self.ref_stress2 }),
         ]
     }
 
@@ -735,7 +783,7 @@ mod tests {
         let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
         let lug_fwd = DomainForwardOutputs { domain: LUG_DOMAIN, raw_out: &lug_raw, strains: None, normals: None };
 
-        let term = InterfacePenetrationTerm { thetas, r_pin, r_lug };
+        let term = InterfacePenetrationTerm { thetas, r_pin, r_lug, ref_gap2: 1e-8 };
         let loss = term.compute(&[pin_fwd, lug_fwd]);
         let v: f32 = loss.into_data().to_vec::<f32>().unwrap()[0];
         assert_eq!(v, 0.0, "zero displacement + equal radii must give exactly zero gap everywhere -> zero penalty");
