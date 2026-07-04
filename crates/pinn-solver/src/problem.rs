@@ -73,7 +73,21 @@ pub trait LossTerm: Send + Sync {
     fn point_sets(&self) -> Vec<&'static str> {
         self.domains().iter().map(|_| "interior").collect()
     }
+
+    /// Classifies this term as either enforcing interior PDE/equilibrium physics or a
+    /// boundary/interface condition — used by `compute_gradient_conflict_multi`'s dual-backward
+    /// split. Defaults to `Bc`. Every concrete LossTerm impl in pinlug_problem.rs must override
+    /// this explicitly (do not rely on the default silently) — a RED test pins each term's
+    /// expected classification so a future term added without an override is caught immediately.
+    fn conflict_group(&self) -> ConflictGroup {
+        ConflictGroup::Bc
+    }
 }
+
+/// Classifies a [`LossTerm`] as either enforcing interior PDE/equilibrium physics or a
+/// boundary/interface condition. See [`LossTerm::conflict_group`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictGroup { Physics, Bc }
 
 /// A complete boundary-value problem: its domain(s), their sampling/ansatz strategies, loss
 /// terms, base SAW-BRDR weights, curriculum length, and convergence metric/target.
@@ -140,6 +154,7 @@ pub struct PointSetData {
 
 /// All per-step sampled data for one domain, keyed by named point-set (`"interior"`,
 /// `"interface"`, etc. — see [`LossTerm::point_sets`]).
+#[derive(Clone)]
 pub struct DomainStepData {
     pub id: DomainId,
     /// Normalized interior collocation points for this domain.
@@ -197,6 +212,75 @@ pub struct MultiStepCtx<'a> {
     pub dynamic_lam_d_cap: f64,
     pub phase2_active: bool,
     pub step: usize,
+}
+
+/// Owned, per-domain analogue of `DomainStepCtx` — clones `data` instead of borrowing it, so
+/// it can be stored alongside `FrozenMultiStepCtx` (which must outlive the loop body that
+/// produced the original `MultiStepCtx`).
+#[derive(Clone)]
+pub struct FrozenDomainStepCtx {
+    pub data: DomainStepData,
+    pub u_ref: f32,
+    pub ref_energy: f32,
+    pub ref_stress2: f32,
+}
+
+/// Owned, 'static-lifetime copy of MultiStepCtx's per-step data, frozen at Converge-tier
+/// entry so the L-BFGS closure can outlive the loop body — the multi-domain analogue of
+/// training_core::LbfgsCtxScalars::from_ctx.
+#[derive(Clone)]
+pub struct FrozenMultiStepCtx {
+    pub config: SolverConfig,
+    pub fd: FdConfig,
+    pub k: f32,
+    pub domains: Vec<FrozenDomainStepCtx>,
+    pub dynamic_lam_h_cap: f64,
+    pub dynamic_lam_d_cap: f64,
+    pub phase2_active: bool,
+}
+
+impl FrozenMultiStepCtx {
+    /// Clone every field of `ctx` into an owned, borrow-free snapshot.
+    pub fn from_ctx(ctx: &MultiStepCtx) -> Self {
+        Self {
+            config: ctx.config.clone(),
+            fd: *ctx.fd,
+            k: ctx.k,
+            domains: ctx.domains.iter().map(|d| FrozenDomainStepCtx {
+                data: d.data.clone(),
+                u_ref: d.u_ref,
+                ref_energy: d.ref_energy,
+                ref_stress2: d.ref_stress2,
+            }).collect(),
+            dynamic_lam_h_cap: ctx.dynamic_lam_h_cap,
+            dynamic_lam_d_cap: ctx.dynamic_lam_d_cap,
+            phase2_active: ctx.phase2_active,
+        }
+    }
+
+    /// Rebuild a borrowing `MultiStepCtx` view over this frozen snapshot's owned data, so the
+    /// existing `step_physics_multi`/`compute_domain_forwards` machinery (which takes
+    /// `&MultiStepCtx`) can be reused verbatim inside the L-BFGS closure. `step` is not
+    /// tracked by `FrozenMultiStepCtx` (irrelevant once frozen — no phase transitions happen
+    /// mid-Converge), so it is always reported as `0`.
+    pub fn as_multi_step_ctx<'a>(&'a self, problem: &'a dyn BoundaryValueProblem) -> MultiStepCtx<'a> {
+        MultiStepCtx {
+            config: &self.config,
+            problem,
+            fd: &self.fd,
+            k: self.k,
+            domains: self.domains.iter().map(|d| DomainStepCtx {
+                data: &d.data,
+                u_ref: d.u_ref,
+                ref_energy: d.ref_energy,
+                ref_stress2: d.ref_stress2,
+            }).collect(),
+            dynamic_lam_h_cap: self.dynamic_lam_h_cap,
+            dynamic_lam_d_cap: self.dynamic_lam_d_cap,
+            phase2_active: self.phase2_active,
+            step: 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -285,5 +369,22 @@ mod tests {
             named: HashMap::new(),
         };
         let _ = data.named("interface");
+    }
+
+    /// Minimal fixture `LossTerm` that does NOT override `conflict_group()` — must fall back
+    /// to the trait default, `ConflictGroup::Bc`.
+    struct DefaultConflictGroupTerm;
+    impl LossTerm for DefaultConflictGroupTerm {
+        fn name(&self) -> &'static str { "default_conflict_group_term" }
+        fn domains(&self) -> Vec<DomainId> { vec![DomainId(0)] }
+        fn compute(&self, _inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+            Tensor::<B, 1>::zeros([1], &Default::default())
+        }
+    }
+
+    #[test]
+    fn loss_term_conflict_group_defaults_to_bc_when_not_overridden() {
+        let term = DefaultConflictGroupTerm;
+        assert_eq!(term.conflict_group(), ConflictGroup::Bc);
     }
 }

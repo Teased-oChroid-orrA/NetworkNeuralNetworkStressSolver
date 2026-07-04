@@ -270,6 +270,9 @@ fn handle_control_messages(stop_rx: &Receiver<ControlMsg>) -> ControlAction {
         },
         Ok(ControlMsg::WarmStart { config, geometry_changed }) =>
             ControlAction::WarmStart { config, geometry_changed },
+        // Nothing to export on the single-domain Kirsch path this function drives — a no-op
+        // that just proceeds with the current step, same as no control message at all.
+        Ok(ControlMsg::ExportContactPressure) => ControlAction::Continue,
         _ => ControlAction::Continue,
     }
 }
@@ -551,6 +554,376 @@ pub fn run_training(
     let _ = tx.send(TrainingMsg::Done);
 }
 
+// ─── Pin-in-lug (GUI-driving) training loop ────────────────────────────────────
+
+/// GUI-driving analog of [`run_headless_pinlug`](crate::headless::run_headless_pinlug) — same
+/// two-domain `PinLugProblem` / `step_physics_multi` training loop, but wired to the
+/// `TrainingMsg`/`ControlMsg` channel pair instead of stdout, matching `run_training`'s
+/// zero-stdout-I/O convention.
+///
+/// Scope cuts (see `run_headless_pinlug`'s doc comment for the shared rationale — none of
+/// Kirsch's AMR / decision-maker / stiffness-controller / warm-restart-cascade machinery
+/// applies to a contact problem without a closed-form K_t):
+/// - `ControlMsg::WarmStart` here only honors the tunable scalar fields pin-lug's config
+///   actually reads (`max_steps`, `n_interior`, `n_boundary`, `hidden_dim`, `n_hidden`,
+///   `use_soap_muon`) rather than doing a full two-domain resample/reinit. A full pin-lug
+///   warm-restart (resampling both domains' interior/boundary/interface point sets and
+///   reinitializing both networks) is explicitly OUT OF SCOPE for this slice.
+/// - `energy_loss`/`neumann_loss` on the emitted `PinLugTrainingUpdate` are documented
+///   approximations, not exact per-term sums: `step_physics_multi`'s `StepOutput` scalar
+///   fields (`e_scalar`/`n_scalar`/...) are keyed to Kirsch's single-domain term names
+///   ("interior_energy", "neumann_traction", ...), which never match pin-lug's actual term
+///   names ("pin_interior_energy", "lug_shank_anchor", ...) — so those fields are always
+///   0.0 for this path. `energy_loss` is reported as `e_scalar + eq_scalar` (0.0 today) and
+///   `neumann_loss` as `total_scalar - energy_loss`, i.e. "everything else" — an honest
+///   approximation given `step_physics_multi`'s current generic-name gap, not a re-derived
+///   per-term breakdown (fixing that gap belongs to `training_core.rs`, outside this slice).
+pub fn run_training_pinlug(
+    config: SolverConfig,
+    tx: Sender<TrainingMsg>,
+    stop_rx: Receiver<ControlMsg>,
+) {
+    use pinn_core::messages::{PinLugTrainingUpdate, PinLugVisFields};
+    use crate::{
+        pinlug_problem::{PinLugProblem, PinLugScalingMode, LUG_DOMAIN, PIN_DOMAIN},
+        problem::{
+            BoundaryValueProblem, DomainOptim, DomainState, DomainStepCtx, DomainStepData,
+            MultiStepCtx, PointSetData,
+        },
+        training_core::step_physics_multi,
+    };
+
+    const N_INTERFACE: usize = 64;
+    const OUTPUT_DIM: usize = 5; // mDEM (u, v, sxx, syy, sxy)
+    const PHASE1_STEPS: usize = usize::MAX; // no phase-2 cascade for pin-in-lug
+
+    let mut config = config;
+    let device = WgpuDevice::default();
+
+    let mut problem = PinLugProblem::new(
+        config.material.clone(), OUTPUT_DIM, PHASE1_STEPS, N_INTERFACE,
+        if config.use_ultimate_strength_scaling { PinLugScalingMode::UltimateStrength } else { PinLugScalingMode::AppliedLoad },
+    );
+    validate_loss_terms(&problem);
+
+    let pin_geom = problem.domains()[0].geometry.clone();
+    let lug_geom = problem.domains()[1].geometry.clone();
+    let lug_fd = FdConfig::new(config.fd_h, 2.0 * lug_geom.half_w, 2.0 * lug_geom.half_h);
+    let mut fd = lug_fd;
+
+    let net_cfg = |hidden_dim: usize, n_hidden: usize| {
+        ElasticityNetConfig::new()
+            .with_input_dim(3)
+            .with_hidden_dim(hidden_dim)
+            .with_n_hidden(n_hidden)
+            .with_output_dim(OUTPUT_DIM)
+            .with_use_piratenet(false)
+    };
+    let mut model_pin: ElasticityNet<B> = net_cfg(config.hidden_dim, config.n_hidden).init(&device);
+    let mut model_lug: ElasticityNet<B> = net_cfg(config.hidden_dim, config.n_hidden).init(&device);
+
+    let mut optims = vec![
+        DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() },
+        DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() },
+    ];
+
+    let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+    let mut saw = SawBrdr::with_base(base_weights, 0.95);
+    let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
+
+    let mut equiv_traction = problem.equivalent_traction_pa();
+    let mut e = config.material.e;
+    let mut u_ref = ((equiv_traction / e) * lug_geom.half_w) as f32;
+    let mut ref_energy = (0.5 * equiv_traction * equiv_traction / e) as f32;
+    let mut ref_stress2 = (equiv_traction * equiv_traction) as f32;
+
+    let mut pin_geom = pin_geom;
+    let mut lug_geom = lug_geom;
+
+    let build_pointset = |pts: &[pinn_core::loading::BoundaryPoint], geom: &pinn_core::geometry::GeometryConfig| -> PointSetData {
+        PointSetData {
+            norm: pts.iter().map(|p| normalize_point_generic_pinlug(p.x, p.y, geom)).collect(),
+            nx: pts.iter().map(|p| p.nx as f32).collect(),
+            ny: pts.iter().map(|p| p.ny as f32).collect(),
+            tx: pts.iter().map(|p| p.tx as f32).collect(),
+            ty: pts.iter().map(|p| p.ty as f32).collect(),
+        }
+    };
+
+    let mut last_total = f32::MAX;
+
+    for step in 0..config.max_steps {
+        match handle_control_messages_pinlug(&stop_rx) {
+            PinLugControlAction::StopAndFinish => break,
+            PinLugControlAction::StopImmediately => return,
+            PinLugControlAction::ExportContactPressure => {
+                let model_lug_val: ElasticityNet<BInner> = model_lug.valid();
+                match crate::contact_export::export_contact_pressure::<BInner>(
+                    &model_lug_val, &lug_geom, config.load.px, &device,
+                ) {
+                    Ok(_) => {
+                        let _ = tx.send(TrainingMsg::ExportComplete(
+                            crate::contact_export::DEFAULT_CONTACT_EXPORT_PATH.to_string(),
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(TrainingMsg::Error(format!(
+                            "failed to write contact-pressure CSV to {}: {e}",
+                            crate::contact_export::DEFAULT_CONTACT_EXPORT_PATH,
+                        )));
+                    }
+                }
+            }
+            PinLugControlAction::WarmStart { config: new_cfg } => {
+                // Scope cut (see doc comment): only honor tunable scalar fields, no full
+                // two-domain resample/reinit.
+                config.max_steps = new_cfg.max_steps;
+                config.n_interior = new_cfg.n_interior;
+                config.n_boundary = new_cfg.n_boundary;
+                config.hidden_dim = new_cfg.hidden_dim;
+                config.n_hidden = new_cfg.n_hidden;
+                config.use_soap_muon = new_cfg.use_soap_muon;
+
+                problem = PinLugProblem::new(
+                    config.material.clone(), OUTPUT_DIM, PHASE1_STEPS, N_INTERFACE,
+                    if config.use_ultimate_strength_scaling { PinLugScalingMode::UltimateStrength } else { PinLugScalingMode::AppliedLoad },
+                );
+                validate_loss_terms(&problem);
+                pin_geom = problem.domains()[0].geometry.clone();
+                lug_geom = problem.domains()[1].geometry.clone();
+                fd = FdConfig::new(config.fd_h, 2.0 * lug_geom.half_w, 2.0 * lug_geom.half_h);
+                model_pin = net_cfg(config.hidden_dim, config.n_hidden).init(&device);
+                model_lug = net_cfg(config.hidden_dim, config.n_hidden).init(&device);
+                optims = vec![
+                    DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() },
+                    DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() },
+                ];
+                let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+                saw = SawBrdr::with_base(base_weights, 0.95);
+                lr_sched = LrSchedule::new(1e-3, 200, 1000);
+                equiv_traction = problem.equivalent_traction_pa();
+                e = config.material.e;
+                u_ref = ((equiv_traction / e) * lug_geom.half_w) as f32;
+                ref_energy = (0.5 * equiv_traction * equiv_traction / e) as f32;
+                ref_stress2 = (equiv_traction * equiv_traction) as f32;
+            }
+            PinLugControlAction::Continue => {}
+        }
+
+        let pin_sampling = problem.sampling_strategy(0);
+        let lug_sampling = problem.sampling_strategy(1);
+
+        let pin_int = pin_sampling.sample_interior(&pin_geom, config.n_interior);
+        let lug_int = lug_sampling.sample_interior(&lug_geom, config.n_interior);
+        let lug_bnd = lug_sampling.sample_boundary(&lug_geom, &config.load, config.n_boundary);
+
+        let pin_int_norm: Vec<[f32; 2]> = pin_int.iter().map(|&[x, y]| normalize_point_generic_pinlug(x, y, &pin_geom)).collect();
+        let lug_int_norm: Vec<[f32; 2]> = lug_int.iter().map(|&[x, y]| normalize_point_generic_pinlug(x, y, &lug_geom)).collect();
+        let n_colloc = pin_int_norm.len() + lug_int_norm.len();
+
+        let mut pin_named = std::collections::HashMap::new();
+        let mut lug_named = std::collections::HashMap::new();
+        for set in pin_sampling.named_point_sets(&[]) {
+            pin_named.insert(set.name, build_pointset(&set.points, &pin_geom));
+        }
+        for set in lug_sampling.named_point_sets(&[]) {
+            lug_named.insert(set.name, build_pointset(&set.points, &lug_geom));
+        }
+        lug_named.insert("boundary", build_pointset(&lug_bnd, &lug_geom));
+        if let Some(driving) = pin_named.get_mut("driving") {
+            for t in driving.tx.iter_mut() { *t = equiv_traction as f32; }
+        }
+
+        let pin_data = DomainStepData { id: PIN_DOMAIN, int_norm: pin_int_norm, extra_ring_norm: Vec::new(), named: pin_named };
+        let lug_data = DomainStepData { id: LUG_DOMAIN, int_norm: lug_int_norm, extra_ring_norm: Vec::new(), named: lug_named };
+
+        let ctx = MultiStepCtx {
+            config: &config,
+            problem: &problem,
+            fd: &fd,
+            k: 1.0,
+            domains: vec![
+                DomainStepCtx { data: &pin_data, u_ref, ref_energy, ref_stress2 },
+                DomainStepCtx { data: &lug_data, u_ref, ref_energy, ref_stress2 },
+            ],
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+            step,
+        };
+
+        let (new_models, out) = step_physics_multi(
+            vec![model_pin, model_lug], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+        let mut it = new_models.into_iter();
+        model_pin = it.next().unwrap();
+        model_lug = it.next().unwrap();
+        last_total = out.total_scalar;
+
+        if step % 50 == 0 {
+            let model_pin_val: ElasticityNet<BInner> = model_pin.valid();
+            let model_lug_val: ElasticityNet<BInner> = model_lug.valid();
+
+            let [nx_vis, ny_vis] = config.vis_grid;
+            let pin_vis = evaluate_vis_grid_mdem(
+                &model_pin_val, &pin_geom, [nx_vis, ny_vis], &fd, u_ref, config.load.px, &device,
+            );
+            let lug_vis = evaluate_vis_grid_mdem(
+                &model_lug_val, &lug_geom, [nx_vis, ny_vis], &fd, u_ref, config.load.px, &device,
+            );
+
+            // Interface-gap RMS via PinLugProblem::convergence_metric — needs autodiff-typed
+            // (B) model clones, not the inference-only `.valid()` views above.
+            let state = vec![
+                DomainState { id: PIN_DOMAIN, model: model_pin.clone(), u_ref, ref_energy, ref_stress2 },
+                DomainState { id: LUG_DOMAIN, model: model_lug.clone(), u_ref, ref_energy, ref_stress2 },
+            ];
+            let convergence_metric = problem.convergence_metric(&state).map(|v| v as f32);
+
+            let energy_loss = out.e_scalar + out.eq_scalar;
+            let neumann_loss = out.total_scalar - energy_loss;
+
+            let update = PinLugTrainingUpdate {
+                step,
+                total_loss: out.total_scalar,
+                energy_loss,
+                neumann_loss,
+                lr: out.lr as f32,
+                lam_energy: out.lam_e as f32,
+                lam_neumann: out.lam_n as f32,
+                n_colloc,
+                convergence_metric,
+                vis: Some(PinLugVisFields { pin: pin_vis, lug: lug_vis }),
+            };
+            let _ = tx.try_send(TrainingMsg::PinLugUpdate(Box::new(update)));
+        }
+    }
+
+    let _ = last_total;
+    let _ = tx.send(TrainingMsg::Done);
+}
+
+/// `ControlAction` analogue for `run_training_pinlug` — unlike the Kirsch `ControlAction`,
+/// `WarmStart` here only carries the new `SolverConfig` (no `geometry_changed` flag: this
+/// slice's warm-start scope cut always does a scalar-only update, see the doc comment on
+/// `run_training_pinlug`), and there's a dedicated `ExportContactPressure` action instead of
+/// treating it as a no-op `Continue` (that no-op behavior is specific to the Kirsch path).
+enum PinLugControlAction {
+    Continue,
+    WarmStart { config: SolverConfig },
+    ExportContactPressure,
+    StopAndFinish,
+    StopImmediately,
+}
+
+/// Pin-in-lug's own control-message handler — mirrors `handle_control_messages`'s
+/// Stop/Pause/Resume/WarmStart semantics exactly, but additionally acts on
+/// `ControlMsg::ExportContactPressure` (a no-op on the Kirsch path) by returning a dedicated
+/// action the caller uses to trigger a CSV export.
+fn handle_control_messages_pinlug(stop_rx: &Receiver<ControlMsg>) -> PinLugControlAction {
+    match stop_rx.try_recv() {
+        Ok(ControlMsg::Stop) => PinLugControlAction::StopAndFinish,
+        Ok(ControlMsg::Pause) => loop {
+            match stop_rx.recv() {
+                Ok(ControlMsg::Resume) => return PinLugControlAction::Continue,
+                Ok(ControlMsg::Stop) => return PinLugControlAction::StopImmediately,
+                Ok(ControlMsg::WarmStart { config, .. }) =>
+                    return PinLugControlAction::WarmStart { config },
+                Ok(ControlMsg::ExportContactPressure) =>
+                    return PinLugControlAction::ExportContactPressure,
+                Err(_) => return PinLugControlAction::StopImmediately,
+                _ => {}
+            }
+        },
+        Ok(ControlMsg::WarmStart { config, .. }) => PinLugControlAction::WarmStart { config },
+        Ok(ControlMsg::ExportContactPressure) => PinLugControlAction::ExportContactPressure,
+        _ => PinLugControlAction::Continue,
+    }
+}
+
+/// Normalize a physical coordinate to [-1,1]^2 for an arbitrary (non-Kirsch) domain's own
+/// geometry bounds. Duplicated (deliberately, matching `headless::normalize_point_generic`'s
+/// own doc comment rationale) rather than making that helper `pub` across modules for one
+/// small, well-understood formula.
+fn normalize_point_generic_pinlug(x: f64, y: f64, geom: &pinn_core::geometry::GeometryConfig) -> [f32; 2] {
+    let (x0, x1) = geom.x_range();
+    let (y0, y1) = geom.y_range();
+    let dw = x1 - x0;
+    let dh = y1 - y0;
+    [(2.0 * (x - x0) / dw - 1.0) as f32, (2.0 * (y - y0) / dh - 1.0) as f32]
+}
+
+/// Visualization-grid evaluator for a single plain-mDEM pin-lug domain (identity ansatz, raw
+/// output columns `[u, v, sxx, syy, sxy]`) — the pin-lug analogue of `evaluate_vis_grid`,
+/// which is Kirsch-ansatz-specific (`apply_dirichlet_ansatz`) and therefore not reusable
+/// here. `px_pa` is the same mDEM stress-column scale `step_physics_multi`/`contact_export`
+/// use (`config.load.px`).
+#[allow(clippy::too_many_arguments)]
+fn evaluate_vis_grid_mdem(
+    model:    &ElasticityNet<BInner>,
+    geom:     &pinn_core::geometry::GeometryConfig,
+    [nx, ny]: [usize; 2],
+    fd:       &FdConfig,
+    u_ref:    f32,
+    px_pa:    f64,
+    device:   &WgpuDevice,
+) -> VisFields {
+    let n_total = nx * ny;
+    let mut pts = Vec::with_capacity(n_total);
+    let mut mask = Vec::with_capacity(n_total);
+    for iy in 0..ny {
+        for ix in 0..nx {
+            let xn = -1.0 + 2.0 * ix as f64 / (nx.max(2) - 1) as f64;
+            let yn = -1.0 + 2.0 * iy as f64 / (ny.max(2) - 1) as f64;
+            pts.push([xn as f32, yn as f32]);
+            let (xp, yp) = geom.denormalize(xn, yn);
+            mask.push(geom.contains(xp, yp));
+        }
+    }
+
+    let mut s_vm = vec![f32::NAN; n_total];
+    let mut s_xx = vec![f32::NAN; n_total];
+    let mut s_yy = vec![f32::NAN; n_total];
+    let mut s_xy = vec![f32::NAN; n_total];
+    let mut d_u  = vec![f32::NAN; n_total];
+    let mut d_v  = vec![f32::NAN; n_total];
+
+    let active: Vec<usize> = mask.iter().enumerate().filter(|(_, &m)| m).map(|(i, _)| i).collect();
+    if active.is_empty() { return make_vis(nx, ny, s_vm, s_xx, s_yy, s_xy, d_u, d_v); }
+
+    let active_pts: Vec<[f32; 2]> = active.iter().map(|&i| pts[i]).collect();
+    let n_act = active_pts.len();
+
+    let pts_t = norm_pts_to_tensor::<BInner>(&active_pts, device);
+    const N_FOURIER: usize = 0;
+    let raw = fwd::<BInner>(model, pts_t, N_FOURIER, device);
+
+    let u_vals: Vec<f32> = raw.clone().slice([0..n_act, 0..1]).reshape([n_act])
+        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
+    let v_vals: Vec<f32> = raw.clone().slice([0..n_act, 1..2]).reshape([n_act])
+        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
+    let sxx_vals: Vec<f32> = raw.clone().slice([0..n_act, 2..3]).reshape([n_act])
+        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
+    let syy_vals: Vec<f32> = raw.clone().slice([0..n_act, 3..4]).reshape([n_act])
+        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
+    let sxy_vals: Vec<f32> = raw.slice([0..n_act, 4..5]).reshape([n_act])
+        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
+
+    let _ = fd; // fd is not needed by the plain-mDEM identity-ansatz path (no FD stencil/strains)
+
+    for (i_act, &i_full) in active.iter().enumerate() {
+        let u   = u_vals[i_act] * u_ref;
+        let v   = v_vals[i_act] * u_ref;
+        let sxx = sxx_vals[i_act] as f64 * px_pa;
+        let syy = syy_vals[i_act] as f64 * px_pa;
+        let sxy = sxy_vals[i_act] as f64 * px_pa;
+        let vm  = (sxx*sxx - sxx*syy + syy*syy + 3.0*sxy*sxy).sqrt();
+        s_xx[i_full] = sxx as f32; s_yy[i_full] = syy as f32; s_xy[i_full] = sxy as f32;
+        s_vm[i_full] = vm as f32;  d_u[i_full]  = u; d_v[i_full] = v;
+    }
+    make_vis(nx, ny, s_vm, s_xx, s_yy, s_xy, d_u, d_v)
+}
+
 // ─── Visualisation grid ───────────────────────────────────────────────────────
 
 /// Build the normalized [-1,1]² visualization grid and its in-domain mask for `config`.
@@ -643,5 +1016,157 @@ fn make_vis(nx: usize, ny: usize,
     VisFields {
         von_mises: a(vm), sigma_xx: a(sxx), sigma_yy: a(syy), sigma_xy: a(sxy),
         disp_u: a(u), disp_v: a(v),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_kirsch_config() -> SolverConfig {
+        let mut cfg = SolverConfig::default_kirsch();
+        cfg.max_steps = 12;
+        cfg.n_interior = 32;
+        cfg.n_boundary = 16;
+        cfg.hidden_dim = 8;
+        cfg.n_hidden = 2;
+        cfg.vis_grid = [4, 4];
+        cfg
+    }
+
+    fn tiny_pinlug_config() -> SolverConfig {
+        let mut cfg = SolverConfig::default_pinlug();
+        cfg.max_steps = 12;
+        cfg.n_interior = 16;
+        cfg.n_boundary = 8;
+        cfg.hidden_dim = 8;
+        cfg.n_hidden = 2;
+        cfg.vis_grid = [4, 4];
+        cfg
+    }
+
+    /// Drains `rx` on the calling thread while `run_training`/`run_training_pinlug` runs on a
+    /// background thread — required because the channel is `bounded(1)` (matching
+    /// `pinn-gui`'s real wiring) and the trainer's final `tx.send(TrainingMsg::Done)` blocks
+    /// if the channel is full and nobody is reading concurrently.
+    fn run_and_drain<F>(train: F) -> Vec<TrainingMsg>
+    where
+        F: FnOnce(Sender<TrainingMsg>) + Send + 'static,
+    {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let handle = std::thread::spawn(move || train(tx));
+        let mut msgs = Vec::new();
+        while let Ok(msg) = rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            let is_done = matches!(msg, TrainingMsg::Done);
+            msgs.push(msg);
+            if is_done { break; }
+        }
+        handle.join().expect("training thread must not panic");
+        msgs
+    }
+
+    #[test]
+    fn run_training_signature_is_unchanged() {
+        let _f: fn(SolverConfig, crossbeam_channel::Sender<pinn_core::messages::TrainingMsg>,
+                   crossbeam_channel::Receiver<pinn_core::messages::ControlMsg>) = run_training;
+    }
+
+    #[test]
+    fn handle_control_messages_treats_export_contact_pressure_as_continue() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ControlMsg::ExportContactPressure).unwrap();
+        let action = handle_control_messages(&rx);
+        assert!(matches!(action, ControlAction::Continue));
+    }
+
+    #[test]
+    fn run_training_kirsch_path_still_sends_update_variant_with_vis_and_kt_fields() {
+        let config = tiny_kirsch_config();
+        let (_stop_tx, stop_rx) = crossbeam_channel::unbounded();
+        let msgs = run_and_drain(move |tx| run_training(config, tx, stop_rx));
+
+        assert!(msgs.iter().any(|m| matches!(m, TrainingMsg::Done)), "must send Done");
+        let mut saw_update = false;
+        for m in &msgs {
+            if let TrainingMsg::Update(u) = m {
+                saw_update = true;
+                assert!(u.total_loss.is_finite(), "total_loss must be finite, got {}", u.total_loss);
+                assert!(u.vis.is_some(), "Kirsch Update must carry Some(vis)");
+            }
+            assert!(!matches!(m, TrainingMsg::PinLugUpdate(_)), "Kirsch path must never send PinLugUpdate");
+        }
+        assert!(saw_update, "expected at least one TrainingMsg::Update");
+    }
+
+    #[test]
+    fn run_training_pinlug_completes_without_panic_and_sends_done() {
+        let config = tiny_pinlug_config();
+        let [nx_vis, ny_vis] = config.vis_grid;
+        let n_interior = config.n_interior;
+        let (_stop_tx, stop_rx) = crossbeam_channel::unbounded();
+        let msgs = run_and_drain(move |tx| run_training_pinlug(config, tx, stop_rx));
+
+        assert!(msgs.iter().any(|m| matches!(m, TrainingMsg::Done)), "must send Done");
+
+        let mut saw_pinlug_update = false;
+        for m in &msgs {
+            assert!(!matches!(m, TrainingMsg::Update(_)), "pin-lug path must never send plain Update");
+            if let TrainingMsg::PinLugUpdate(u) = m {
+                saw_pinlug_update = true;
+                assert!(u.total_loss.is_finite(), "total_loss must be finite, got {}", u.total_loss);
+                let vis = u.vis.as_ref().expect("PinLugUpdate must carry Some(vis)");
+                assert_eq!(vis.pin.von_mises.dim(), (ny_vis, nx_vis));
+                assert_eq!(vis.lug.von_mises.dim(), (ny_vis, nx_vis));
+                // n_colloc == pin + lug interior point counts, summed (both sampled with the
+                // same config.n_interior in this tiny config).
+                assert_eq!(u.n_colloc, 2 * n_interior);
+            }
+        }
+        assert!(saw_pinlug_update, "expected at least one TrainingMsg::PinLugUpdate");
+    }
+
+    #[test]
+    fn run_training_pinlug_stop_message_ends_loop_before_max_steps() {
+        let mut config = tiny_pinlug_config();
+        config.max_steps = 100_000;
+        let (stop_tx, stop_rx) = crossbeam_channel::unbounded();
+        stop_tx.send(ControlMsg::Stop).unwrap();
+
+        let start = std::time::Instant::now();
+        let msgs = run_and_drain(move |tx| run_training_pinlug(config, tx, stop_rx));
+        assert!(start.elapsed().as_secs() < 30, "Stop must short-circuit well under 30s");
+        assert!(msgs.iter().any(|m| matches!(m, TrainingMsg::Done)), "Done must still be sent after Stop");
+    }
+
+    #[test]
+    fn run_training_pinlug_export_contact_pressure_writes_csv_and_reports_path() {
+        let config = tiny_pinlug_config();
+        let (stop_tx, stop_rx) = crossbeam_channel::unbounded();
+        stop_tx.send(ControlMsg::ExportContactPressure).unwrap();
+        stop_tx.send(ControlMsg::Stop).unwrap();
+
+        let msgs = run_and_drain(move |tx| run_training_pinlug(config, tx, stop_rx));
+
+        let export_path = msgs.iter().find_map(|m| match m {
+            TrainingMsg::ExportComplete(p) => Some(p.clone()),
+            _ => None,
+        }).expect("expected TrainingMsg::ExportComplete");
+        assert_eq!(export_path, crate::contact_export::DEFAULT_CONTACT_EXPORT_PATH);
+        assert!(std::path::Path::new(&export_path).exists(), "exported CSV must exist on disk");
+        let _ = std::fs::remove_file(&export_path);
+    }
+
+    #[test]
+    fn run_training_pinlug_with_max_steps_one_still_emits_step_zero_update_and_done() {
+        let mut config = tiny_pinlug_config();
+        config.max_steps = 1;
+        let (_stop_tx, stop_rx) = crossbeam_channel::unbounded();
+        let msgs = run_and_drain(move |tx| run_training_pinlug(config, tx, stop_rx));
+
+        assert!(msgs.iter().any(|m| matches!(m, TrainingMsg::Done)), "must send Done");
+        assert!(
+            msgs.iter().any(|m| matches!(m, TrainingMsg::PinLugUpdate(u) if u.step == 0)),
+            "max_steps=1 must still hit the step%50==0 branch at step 0",
+        );
     }
 }
