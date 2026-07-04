@@ -149,7 +149,14 @@ impl DomainSamplingStrategy for PinLugSamplingStrategy {
         }
         let (x0, x1) = geom.x_range();
         let (y0, y1) = geom.y_range();
-        let n_per_edge = (n / 4).max(1);
+        // Only 3 of the 4 outer edges are traction-free here: the shank edge (x=x0) is
+        // EXCLUDED because it is rigidly clamped (fixed grip), enforced via the dedicated
+        // "shank_anchor" named point set / LugShankAnchorTerm instead — sampling it here too
+        // as NeumannFree would impose a contradictory traction-free condition on the same
+        // physical points LugShankAnchorTerm pins to u=v=0 (see module doc comment / Issue 1
+        // in the review that prompted this fix). n_per_edge is therefore based on 3 edges,
+        // not 4, to keep the total boundary point count close to the caller's requested `n`.
+        let n_per_edge = (n / 3).max(1);
         let mut rng = LcgRng::new(SEED_LUG_BOUNDARY);
         // Outer edges: traction-free (grip is modeled via LugShankAnchorTerm on the far
         // edge x=x0 instead of a hard BC — see module doc comment).
@@ -160,10 +167,6 @@ impl DomainSamplingStrategy for PinLugSamplingStrategy {
         for _ in 0..n_per_edge {
             let x = x0 + rng.next_f64() * (x1 - x0);
             pts.push(BoundaryPoint { x, y: y1, nx: 0.0, ny: 1.0, tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannFree });
-        }
-        for _ in 0..n_per_edge {
-            let y = y0 + rng.next_f64() * (y1 - y0);
-            pts.push(BoundaryPoint { x: x0, y, nx: -1.0, ny: 0.0, tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannFree });
         }
         for _ in 0..n_per_edge {
             let x = x0 + rng.next_f64() * (x1 - x0);
@@ -503,18 +506,85 @@ impl BoundaryValueProblem for PinLugProblem {
     /// Read-only diagnostic forward pass over the shared thetas (no backward) — RMS
     /// interface gap across all shared angles. 0.0 = perfect contact (the target). `None`
     /// when `state` is empty or doesn't have one entry per `domains()` (2).
+    ///
+    /// Mirrors `InterfacePenetrationTerm::compute`'s gap formula and sign convention exactly
+    /// (module doc comment): `gap(theta) = (r_lug + u_r_lug) - (r_pin + u_r_pin)`. Unlike that
+    /// loss term (which reads `raw_out` already produced mid-training-step by
+    /// `step_physics_multi`), this diagnostic runs its own tiny forward pass per domain over
+    /// just the shared interface points — cheap (`n_interface` points, no FD stencil/strains
+    /// needed since only the raw displacement columns 0/1 are read).
+    ///
+    /// `n_fourier=0` and identity ansatz scaling (raw output x `u_ref` = physical
+    /// displacement in meters) match `step_physics_multi`'s pin-in-lug convention exactly
+    /// (see its doc comment: "Multi-domain problems (pin-in-lug) use plain-DEM output (no
+    /// Fourier embedding...")) — NOT Kirsch's `has_hole`-gated `n_fourier=8`.
     fn convergence_metric(&self, state: &[DomainState<B>]) -> Option<f64> {
         if state.len() != self.domains.len() {
             return None;
         }
-        // Full evaluation requires a live forward pass through each domain's model at the
-        // shared interface thetas — deferred to a dedicated helper analogous to
-        // `probe_kt_shared` (kept out of this trait method's signature, which only has
-        // `DomainState` — no FdConfig/device context). Returning `None` here documents that
-        // this trait method alone cannot complete the computation; a `PinLugProblem::
-        // probe_interface_gap_rms` companion (mirroring `KirschProblem::probe_kt`'s
-        // delegation pattern) would need the same context `probe_kt_shared` takes.
-        None
+        use crate::fd_stencil::norm_pts_to_tensor;
+        use crate::network::fwd;
+        use crate::training_core::normalize_point;
+        use pinn_core::messages::SolverConfig;
+
+        const N_FOURIER: usize = 0; // see doc comment above
+
+        let pin_state = state.iter().find(|s| s.id == PIN_DOMAIN)?;
+        let lug_state = state.iter().find(|s| s.id == LUG_DOMAIN)?;
+        let pin_geom = &self.domains[0].geometry;
+        let lug_geom = &self.domains[1].geometry;
+        let r_pin = pin_geom.half_w;
+        let r_lug = match lug_geom.hole {
+            HoleType::Circular { radius } => radius,
+            HoleType::None => 0.0,
+        };
+
+        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+
+        // normalize_point only needs geometry ranges, threaded through a SolverConfig — build
+        // a throwaway one per domain purely to reuse the exact normalization formula (single
+        // source of truth) rather than reimplementing it.
+        let cfg_for = |geom: &GeometryConfig| SolverConfig {
+            geometry: geom.clone(),
+            ..SolverConfig::default_pinlug()
+        };
+        let pin_cfg = cfg_for(pin_geom);
+        let lug_cfg = cfg_for(lug_geom);
+
+        let thetas = &self.interface.thetas;
+        let pin_pts: Vec<[f32; 2]> = thetas.iter()
+            .map(|&theta| normalize_point(r_pin * theta.cos(), r_pin * theta.sin(), &pin_cfg))
+            .collect();
+        let lug_pts: Vec<[f32; 2]> = thetas.iter()
+            .map(|&theta| normalize_point(r_lug * theta.cos(), r_lug * theta.sin(), &lug_cfg))
+            .collect();
+
+        let pin_in = norm_pts_to_tensor::<B>(&pin_pts, &device);
+        let lug_in = norm_pts_to_tensor::<B>(&lug_pts, &device);
+        let pin_raw = fwd::<B>(&pin_state.model, pin_in, N_FOURIER, &device);
+        let lug_raw = fwd::<B>(&lug_state.model, lug_in, N_FOURIER, &device);
+
+        let n = thetas.len();
+        let pin_u: Vec<f32> = pin_raw.clone().slice([0..n, 0..1]).reshape([n]).into_data().to_vec().unwrap_or_default();
+        let pin_v: Vec<f32> = pin_raw.slice([0..n, 1..2]).reshape([n]).into_data().to_vec().unwrap_or_default();
+        let lug_u: Vec<f32> = lug_raw.clone().slice([0..n, 0..1]).reshape([n]).into_data().to_vec().unwrap_or_default();
+        let lug_v: Vec<f32> = lug_raw.slice([0..n, 1..2]).reshape([n]).into_data().to_vec().unwrap_or_default();
+
+        let pin_u_ref = pin_state.u_ref as f64;
+        let lug_u_ref = lug_state.u_ref as f64;
+
+        let mut sum_sq = 0.0_f64;
+        for i in 0..n {
+            let theta = thetas[i];
+            let c = theta.cos();
+            let s = theta.sin();
+            let u_r_pin = (pin_u[i] as f64 * pin_u_ref) * c + (pin_v[i] as f64 * pin_u_ref) * s;
+            let u_r_lug = (lug_u[i] as f64 * lug_u_ref) * c + (lug_v[i] as f64 * lug_u_ref) * s;
+            let gap = (r_lug + u_r_lug) - (r_pin + u_r_pin);
+            sum_sq += gap * gap;
+        }
+        let rms = (sum_sq / n.max(1) as f64).sqrt();
+        Some(rms)
     }
 
     fn convergence_target(&self) -> f64 { 0.0 }
@@ -534,6 +604,117 @@ mod tests {
     fn validate_loss_terms_accepts_well_formed_pinlug_problem() {
         let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16);
         crate::problem::validate_loss_terms(&problem); // must not panic
+    }
+
+    /// Issue 1 regression: the lug's shank edge (x = x0) must NOT appear in the general
+    /// `sample_boundary` traction-free point set consumed by `LugFreeEdgeTractionTerm` — that
+    /// physical edge is exclusively owned by the "shank_anchor" named point set /
+    /// `LugShankAnchorTerm` (fixed-displacement). A boundary point cannot be both
+    /// traction-free and rigidly clamped.
+    #[test]
+    fn lug_sample_boundary_excludes_shank_edge_owned_by_anchor_term() {
+        let lug_geometry = GeometryConfig::pinlug_lug_inches();
+        let (x0, _x1) = lug_geometry.x_range();
+        let interface = Arc::new(InterfaceParametrization { thetas: vec![0.0] });
+        let strategy = PinLugSamplingStrategy { is_pin: false, interface, contact_radius: 0.5 * pinn_core::units::IN_TO_M };
+        let load = LoadConfig::uniaxial_x(1.0);
+        let pts = strategy.sample_boundary(&lug_geometry, &load, 300);
+
+        assert!(!pts.is_empty(), "sanity: sample_boundary should still produce points on the other 3 edges");
+        const TOL: f64 = 1e-9;
+        for p in &pts {
+            assert!(
+                (p.x - x0).abs() > TOL,
+                "found a NeumannFree boundary point at x={} (shank edge x0={}) — this edge must only \
+                 be constrained via the dedicated shank_anchor point set, not the general traction-free \
+                 boundary loop (contradictory BCs)",
+                p.x, x0,
+            );
+            assert_eq!(p.kind, BoundaryKind::NeumannFree);
+        }
+    }
+
+    /// Real `convergence_metric` test: freshly-initialized (lazy-Param, force-materialized)
+    /// 2-domain state must produce `Some(finite, non-negative)` RMS gap, not `None`/NaN/panic.
+    /// A hand-computed exact value isn't practical here (`ElasticityNet`'s random init means
+    /// the raw network output at the interface points is not analytically predictable), but
+    /// the zero-weights case below pins down the exact formula/convention instead.
+    #[test]
+    fn convergence_metric_pinlug_returns_finite_nonnegative_rms_for_fresh_state() {
+        use crate::network::ElasticityNetConfig;
+        use crate::problem::DomainState;
+
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16);
+        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(3)
+            .with_hidden_dim(8)
+            .with_n_hidden(2)
+            .with_output_dim(5)
+            .with_use_piratenet(false);
+
+        let model_pin: crate::network::ElasticityNet<B> = net_cfg.init(&device);
+        let model_lug: crate::network::ElasticityNet<B> = net_cfg.init(&device);
+
+        let state = vec![
+            DomainState { id: PIN_DOMAIN, model: model_pin, u_ref: 1e-4, ref_energy: 1.0, ref_stress2: 1.0 },
+            DomainState { id: LUG_DOMAIN, model: model_lug, u_ref: 1e-4, ref_energy: 1.0, ref_stress2: 1.0 },
+        ];
+
+        let metric = problem.convergence_metric(&state);
+        assert!(metric.is_some(), "convergence_metric must return Some for a well-formed 2-domain state");
+        let rms = metric.unwrap();
+        assert!(rms.is_finite(), "RMS gap must be finite, got {rms}");
+        assert!(rms >= 0.0, "RMS is a root-mean-square, must be non-negative, got {rms}");
+        assert!(rms > 0.0, "a freshly-initialized (non-degenerate) network's raw output is essentially \
+            never exactly 0 at every interface theta, so a hard 0.0 here would suggest the forward \
+            pass silently short-circuited rather than actually running");
+    }
+
+    /// Pins down the exact gap formula/sign convention `convergence_metric` must use, using
+    /// zero-initialized weights+biases so every raw network output is deterministically 0 —
+    /// then gap(theta) reduces to `r_lug - r_pin` at every theta (u_r terms vanish), letting
+    /// the expected RMS be computed by hand instead of merely checked for finiteness.
+    #[test]
+    fn convergence_metric_pinlug_matches_hand_computed_gap_at_zero_displacement() {
+        use burn::module::{Module, ModuleMapper, Param};
+        use crate::network::ElasticityNetConfig;
+        use crate::problem::DomainState;
+
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16);
+        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(3)
+            .with_hidden_dim(8)
+            .with_n_hidden(2)
+            .with_output_dim(5)
+            .with_use_piratenet(false);
+
+        // Zero out every float param so the network outputs exactly 0 for any input
+        // (all-zero weights/biases -> every linear layer outputs 0 regardless of input).
+        struct ZeroMapper;
+        impl<B: burn::tensor::backend::Backend> ModuleMapper<B> for ZeroMapper {
+            fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+                param.map(|t| t.zeros_like())
+            }
+        }
+        let model_pin: crate::network::ElasticityNet<B> = net_cfg.init(&device).map(&mut ZeroMapper);
+        let model_lug: crate::network::ElasticityNet<B> = net_cfg.init(&device).map(&mut ZeroMapper);
+
+        let state = vec![
+            DomainState { id: PIN_DOMAIN, model: model_pin, u_ref: 1e-4, ref_energy: 1.0, ref_stress2: 1.0 },
+            DomainState { id: LUG_DOMAIN, model: model_lug, u_ref: 1e-4, ref_energy: 1.0, ref_stress2: 1.0 },
+        ];
+
+        let rms = problem.convergence_metric(&state).expect("must be Some for well-formed state");
+
+        let r_pin = problem.domains[0].geometry.half_w;
+        let r_lug = match problem.domains[1].geometry.hole { HoleType::Circular { radius } => radius, HoleType::None => 0.0 };
+        let expected = (r_lug - r_pin).abs(); // gap is identical at every theta -> RMS = |gap|
+        assert!(
+            (rms - expected).abs() < 1e-9,
+            "expected RMS gap {expected} (= |r_lug - r_pin| at zero displacement), got {rms}"
+        );
     }
 
     #[test]
