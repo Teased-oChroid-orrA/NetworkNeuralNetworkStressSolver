@@ -300,6 +300,7 @@ pub struct NeumannTractionTerm {
 impl LossTerm for NeumannTractionTerm {
     fn name(&self) -> &'static str { "neumann_traction" }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
+    fn point_sets(&self) -> Vec<&'static str> { vec!["traction"] }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("neumann_traction: domain not present in inputs");
@@ -328,6 +329,7 @@ pub struct HoleTractionTerm {
 impl LossTerm for HoleTractionTerm {
     fn name(&self) -> &'static str { "hole_traction" }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
+    fn point_sets(&self) -> Vec<&'static str> { vec!["hole"] }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("hole_traction: domain not present in inputs");
@@ -357,6 +359,7 @@ pub struct DisplacementAnchorTerm {
 impl LossTerm for DisplacementAnchorTerm {
     fn name(&self) -> &'static str { "displacement_anchor" }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
+    fn point_sets(&self) -> Vec<&'static str> { vec!["right_edge"] }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("displacement_anchor: domain not present in inputs");
@@ -385,6 +388,9 @@ pub struct EquilibriumRingTerm {
 impl LossTerm for EquilibriumRingTerm {
     fn name(&self) -> &'static str { "equilibrium_ring" }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
+    // `compute` ignores `inputs` entirely (reads pre-populated `components` instead — see
+    // its doc comment), so the point-set name here is purely documentary.
+    fn point_sets(&self) -> Vec<&'static str> { vec!["eq_ring"] }
     fn compute(&self, _inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let [sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym] =
             self.components.clone().expect(
@@ -414,6 +420,7 @@ impl LossTerm for KirschStressTerm {
     fn name(&self) -> &'static str { "kirsch_stress" }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn phase2_only(&self) -> bool { true }
+    fn point_sets(&self) -> Vec<&'static str> { vec!["kirsch_probes"] }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("kirsch_stress: domain not present in inputs");

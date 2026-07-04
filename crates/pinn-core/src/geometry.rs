@@ -41,6 +41,41 @@ impl GeometryConfig {
         }
     }
 
+    /// Pin-in-lug problem: LUG domain. W=1.5in (half_w=0.75in), t=0.4in, central hole
+    /// R=0.5in, full (not quarter-symmetric — contact loading breaks the Kirsch-style
+    /// symmetry) plate geometry.
+    pub fn pinlug_lug_inches() -> Self {
+        use crate::units::IN_TO_M;
+        Self {
+            half_w:    0.75 * IN_TO_M,
+            half_h:    0.75 * IN_TO_M,
+            thickness: 0.4 * IN_TO_M,
+            hole:      HoleType::Circular { radius: 0.5 * IN_TO_M },
+            symmetry:  SymmetryMode::Full,
+        }
+    }
+
+    /// Pin-in-lug problem: PIN domain — a solid disk of radius 0.5in. `GeometryConfig` is
+    /// fundamentally plate-with-(optional)-hole shaped and cannot represent a solid disk
+    /// directly; the simplest correct representation within the existing type is a square
+    /// bounding box (`half_w=half_h=radius`) with `HoleType::None` (no interior exclusion)
+    /// — `contains()` then reduces to the bounding-box check alone. The pin's sampling
+    /// strategy (`PinLugSamplingStrategy` in `pinn_solver::pinlug_problem`) is responsible
+    /// for rejecting points outside the disk (`x²+y² <= radius²`) itself, the same way
+    /// `HoleType::Circular` sampling rejects points *inside* a hole today — this is a
+    /// documented scope choice, not an oversight (flagged per the design brief).
+    pub fn pinlug_pin_inches() -> Self {
+        use crate::units::IN_TO_M;
+        let radius = 0.5 * IN_TO_M;
+        Self {
+            half_w:    radius,
+            half_h:    radius,
+            thickness: 0.4 * IN_TO_M,
+            hole:      HoleType::None,
+            symmetry:  SymmetryMode::Full,
+        }
+    }
+
     /// Domain bounds in physical coords based on symmetry mode
     pub fn x_range(&self) -> (f64, f64) {
         match self.symmetry {

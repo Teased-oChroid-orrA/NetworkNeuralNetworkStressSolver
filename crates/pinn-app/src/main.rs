@@ -138,11 +138,41 @@ fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>) {
     }
 }
 
+/// Which `BoundaryValueProblem` to train. `--problem pinlug` is headless-only (see
+/// `run_headless_pinlug`'s doc comment) — GUI/vis-grid support for pin-in-lug is out of
+/// scope for this slice; `runner.rs`'s GUI path remains Kirsch-only.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProblemKind {
+    Kirsch,
+    PinLug,
+}
+
+/// Parse `--problem kirsch|pinlug` from argv (defaults to `kirsch` — the existing,
+/// unaffected behavior — if the flag is absent or has an unrecognized value).
+fn parse_problem_arg() -> ProblemKind {
+    let args: Vec<String> = env::args().collect();
+    for i in 0..args.len() {
+        if args[i] == "--problem" {
+            if let Some(v) = args.get(i + 1) {
+                return match v.as_str() {
+                    "pinlug" => ProblemKind::PinLug,
+                    _ => ProblemKind::Kirsch,
+                };
+            }
+        }
+    }
+    ProblemKind::Kirsch
+}
+
 fn main() -> anyhow::Result<()> {
     let env_path_str = env::var("PINN_ENV").unwrap_or_else(|_| "pinn.env".to_string());
     let env_map = load_pinn_env(Path::new(&env_path_str));
 
-    let mut config = SolverConfig::default_kirsch();
+    let problem_kind = parse_problem_arg();
+    let mut config = match problem_kind {
+        ProblemKind::Kirsch => SolverConfig::default_kirsch(),
+        ProblemKind::PinLug => SolverConfig::default_pinlug(),
+    };
     apply_env(&mut config, &env_map);
 
     if !env_map.is_empty() {
@@ -150,6 +180,20 @@ fn main() -> anyhow::Result<()> {
     }
 
     let headless = env::args().any(|a| a == "--headless" || a == "-H");
+
+    if problem_kind == ProblemKind::PinLug {
+        // Pin-in-lug is headless-only in this slice (see run_headless_pinlug doc comment) —
+        // routes through the NEW step_physics_multi 2-domain driver, not the GUI's runner.rs
+        // (which stays wired to the frozen 1-domain Kirsch step_physics path).
+        if !headless {
+            eprintln!("[pinn] --problem pinlug requires --headless (GUI path is Kirsch-only in this slice)");
+            std::process::exit(1);
+        }
+        if !pinn_solver::run_headless_pinlug(config) {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     if headless {
         if !pinn_solver::run_headless(config) {

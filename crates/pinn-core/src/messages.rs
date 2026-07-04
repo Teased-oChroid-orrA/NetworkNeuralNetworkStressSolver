@@ -177,4 +177,48 @@ impl SolverConfig {
             stiffness:      StiffnessConfig::default(),
         }
     }
+
+    /// Pin-in-lug contact problem defaults. This single-domain `SolverConfig` shape can't
+    /// carry two domains' geometry/material — it's populated here with the LUG domain's
+    /// values (the driven/output-of-interest domain) purely so CLI/env plumbing that reads
+    /// `config.geometry`/`config.material`/`config.load` for display (see
+    /// `pinn-app/src/main.rs`, `headless.rs`'s startup banner) has *something* sensible to
+    /// show; the actual two-domain geometry/material/load setup used for training lives in
+    /// `pinn_solver::pinlug_problem::PinLugProblem::new`, which is the single source of
+    /// truth for both domains.
+    ///
+    /// Force→traction conversion for the driving load (see `PinLugProblem::new`'s doc
+    /// comment for the full derivation): `load.px` here is set to the SAME equivalent
+    /// traction magnitude used for the pin's driving boundary condition, expressed as a
+    /// far-field-style stress purely for display consistency with `default_kirsch()`.
+    pub fn default_pinlug() -> Self {
+        use crate::units::{IN_TO_M, LBF_TO_N};
+        let pin_radius = 0.5 * IN_TO_M;
+        let thickness = 0.4 * IN_TO_M;
+        // P = 20,000 lbf total axial force / (projected diametral contact area = 2*r*t).
+        // See PinLugProblem::new doc comment for why diametral projection is the right
+        // denominator (Hertzian/pin-bearing convention: the resultant force is reacted by
+        // the pressure distribution's projection onto the loading axis, whose max extent is
+        // the pin diameter times thickness).
+        let total_force_lbf = 20_000.0;
+        let total_force_n = total_force_lbf * LBF_TO_N;
+        let projected_area_m2 = 2.0 * pin_radius * thickness;
+        let equivalent_traction_pa = total_force_n / projected_area_m2;
+        Self {
+            material:   MaterialProps::steel_4340(),
+            geometry:   GeometryConfig::pinlug_lug_inches(),
+            load:       LoadConfig::uniaxial_x(equivalent_traction_pa),
+            n_interior: 2048,
+            n_boundary: 512,
+            max_steps:  20000,
+            vis_grid:   [64, 64],
+            hidden_dim: 128,
+            n_hidden:   5,
+            fd_h:       1e-3,
+            use_soap_muon:  true,
+            decision_maker: DecisionMakerConfig::default(),
+            use_piratenet:  false,
+            stiffness:      StiffnessConfig::default(),
+        }
+    }
 }

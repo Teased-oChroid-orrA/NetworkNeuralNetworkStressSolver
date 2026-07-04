@@ -437,3 +437,176 @@ pub fn run_headless(config: SolverConfig) -> bool {
 
     converged
 }
+
+/// Headless-only entry point for the pin-in-lug 2-domain contact problem — routes through
+/// `step_physics_multi` (`training_core.rs`) instead of the frozen 1-domain `step_physics`
+/// Kirsch path. GUI/vis-grid support for pin-in-lug is explicitly OUT OF SCOPE for this
+/// slice (`runner.rs`'s GUI path remains Kirsch-only) — this headless entry point matches
+/// the CSV-export post-processing use case pin-in-lug is for.
+///
+/// Deliberately does not replicate Kirsch's AMR / decision-maker / stiffness-controller /
+/// warm-restart-cascade machinery — those are tightly coupled to K_t-based convergence
+/// diagnostics that don't apply to a contact problem without a closed-form K_t. A fixed
+/// SAW-BRDR schedule (base weights from `PinLugProblem::base_weight`) over `max_steps` is
+/// the minimal correct training loop for this problem.
+pub fn run_headless_pinlug(config: SolverConfig) -> bool {
+    use pinn_core::problem::InterfaceParametrization;
+    use crate::{
+        network::ElasticityNetConfig,
+        pinlug_problem::{PinLugProblem, LUG_DOMAIN, PIN_DOMAIN},
+        problem::{
+            validate_loss_terms, BoundaryValueProblem, DomainOptim, DomainStepCtx,
+            DomainStepData, MultiStepCtx, PointSetData,
+        },
+        training_core::step_physics_multi,
+    };
+
+    const N_INTERFACE: usize = 64;
+    const OUTPUT_DIM: usize = 5; // mDEM (u, v, sxx, syy, sxy)
+    const PHASE1_STEPS: usize = usize::MAX; // no phase-2 cascade for pin-in-lug (see doc comment)
+
+    println!("╔══════════════════════════════════════════════════════════╗");
+    println!("║   PINN Structural Stress Solver — Pin-in-Lug (Headless)  ║");
+    println!("╚══════════════════════════════════════════════════════════╝");
+
+    let problem = PinLugProblem::new(config.material.clone(), OUTPUT_DIM, PHASE1_STEPS, N_INTERFACE);
+    validate_loss_terms(&problem);
+
+    println!("  Material : E={:.2} Msi  ν={:.3}", config.material.e / MSI_TO_PA, config.material.nu);
+    println!("  Steps    : {}   Interior: {}  Boundary: {}  Interface pts: {N_INTERFACE}",
+        config.max_steps, config.n_interior, config.n_boundary);
+    println!("  Load     : {:.2} ksi equivalent bearing traction (P=20,000 lbf / (2*r_pin*t))",
+        problem.equivalent_traction_pa() / KSI_TO_PA);
+    println!("──────────────────────────────────────────────────────────────────────────────────────────────");
+
+    let device = WgpuDevice::default();
+
+    let pin_geom = problem.domains()[0].geometry.clone();
+    let lug_geom = problem.domains()[1].geometry.clone();
+    let pin_fd = FdConfig::new(config.fd_h, 2.0 * pin_geom.half_w, 2.0 * pin_geom.half_h);
+    let lug_fd = FdConfig::new(config.fd_h, 2.0 * lug_geom.half_w, 2.0 * lug_geom.half_h);
+    // step_physics_multi takes a single shared FdConfig; both domains here use the same
+    // normalized fd_h, and since both are normalized to [-1,1]^2 the physical hx/hy differ
+    // only via sx/sy (used solely for strain scaling, computed per-domain by the caller
+    // below) — the shared FdConfig's hx/hy (normalized step) is what matters for stencil
+    // assembly, so either pin_fd or lug_fd's hx/hy works; we use the lug's (chosen
+    // arbitrarily, since hx/hy only depends on config.fd_h, identical for both).
+    let fd = lug_fd;
+    let _ = pin_fd;
+
+    let net_cfg = |geom_half_w: f64, geom_half_h: f64| {
+        let _ = (geom_half_w, geom_half_h);
+        ElasticityNetConfig::new()
+            .with_input_dim(3)
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(OUTPUT_DIM)
+            .with_use_piratenet(false)
+    };
+    let mut model_pin: ElasticityNet<B> = net_cfg(pin_geom.half_w, pin_geom.half_h).init(&device);
+    let mut model_lug: ElasticityNet<B> = net_cfg(lug_geom.half_w, lug_geom.half_h).init(&device);
+
+    let mut optims = vec![
+        DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() },
+        DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() },
+    ];
+
+    let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+    let mut saw = SawBrdr::with_base(base_weights, 0.95);
+    let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
+
+    // Reference scales — u_ref derived from the equivalent driving traction (analogous role
+    // to Kirsch's Px-derived u_ref; ref_energy/ref_stress2 follow the same pattern).
+    let equiv_traction = problem.equivalent_traction_pa();
+    let e = config.material.e;
+    let u_ref = ((equiv_traction / e) * lug_geom.half_w) as f32;
+    let ref_energy = (0.5 * equiv_traction * equiv_traction / e) as f32;
+    let ref_stress2 = (equiv_traction * equiv_traction) as f32;
+
+    let pin_sampling = problem.sampling_strategy(0);
+    let lug_sampling = problem.sampling_strategy(1);
+
+    let build_pointset = |pts: &[pinn_core::loading::BoundaryPoint], geom: &pinn_core::geometry::GeometryConfig| -> PointSetData {
+        PointSetData {
+            norm: pts.iter().map(|p| normalize_point_generic(p.x, p.y, geom)).collect(),
+            nx: pts.iter().map(|p| p.nx as f32).collect(),
+            ny: pts.iter().map(|p| p.ny as f32).collect(),
+            tx: pts.iter().map(|p| p.tx as f32).collect(),
+            ty: pts.iter().map(|p| p.ty as f32).collect(),
+        }
+    };
+
+    let start = std::time::Instant::now();
+    let mut last_total = f32::MAX;
+
+    for step in 0..config.max_steps {
+        let pin_int = pin_sampling.sample_interior(&pin_geom, config.n_interior);
+        let lug_int = lug_sampling.sample_interior(&lug_geom, config.n_interior);
+        let lug_bnd = lug_sampling.sample_boundary(&lug_geom, &config.load, config.n_boundary);
+
+        let pin_int_norm: Vec<[f32; 2]> = pin_int.iter().map(|&[x, y]| normalize_point_generic(x, y, &pin_geom)).collect();
+        let lug_int_norm: Vec<[f32; 2]> = lug_int.iter().map(|&[x, y]| normalize_point_generic(x, y, &lug_geom)).collect();
+
+        let mut pin_named = std::collections::HashMap::new();
+        let mut lug_named = std::collections::HashMap::new();
+        for set in pin_sampling.named_point_sets(&[]) {
+            pin_named.insert(set.name, build_pointset(&set.points, &pin_geom));
+        }
+        for set in lug_sampling.named_point_sets(&[]) {
+            lug_named.insert(set.name, build_pointset(&set.points, &lug_geom));
+        }
+        lug_named.insert("boundary", build_pointset(&lug_bnd, &lug_geom));
+        // Wire the real driving-traction target (equivalent_traction, +x direction) into
+        // the pin's "driving" point-set (named_point_sets leaves tx/ty as placeholders).
+        if let Some(driving) = pin_named.get_mut("driving") {
+            for t in driving.tx.iter_mut() { *t = equiv_traction as f32; }
+        }
+
+        let pin_data = DomainStepData { id: PIN_DOMAIN, int_norm: pin_int_norm, extra_ring_norm: Vec::new(), named: pin_named };
+        let lug_data = DomainStepData { id: LUG_DOMAIN, int_norm: lug_int_norm, extra_ring_norm: Vec::new(), named: lug_named };
+
+        let ctx = MultiStepCtx {
+            config: &config,
+            problem: &problem,
+            fd: &fd,
+            k: 1.0,
+            domains: vec![
+                DomainStepCtx { data: &pin_data, u_ref, ref_energy, ref_stress2 },
+                DomainStepCtx { data: &lug_data, u_ref, ref_energy, ref_stress2 },
+            ],
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+            step,
+        };
+
+        let (new_models, out) = step_physics_multi(
+            vec![model_pin, model_lug], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+        let mut it = new_models.into_iter();
+        model_pin = it.next().unwrap();
+        model_lug = it.next().unwrap();
+        last_total = out.total_scalar;
+
+        if step % 200 == 0 || step == config.max_steps - 1 {
+            println!("{step:>6}  total={:>10.3e}  lr={:>8.2e}", out.total_scalar, out.lr);
+        }
+    }
+
+    let _ = InterfaceParametrization { thetas: Vec::new() }; // silence unused-import lint if the type is otherwise unused here
+    let elapsed = start.elapsed().as_secs_f32();
+    println!("──────────────────────────────────────────────────────────────────────────────────────────────");
+    println!("  Done! {elapsed:.0}s   Final total loss: {last_total:.4e}");
+    last_total.is_finite()
+}
+
+/// Normalize a physical coordinate to [-1,1]^2 for an arbitrary (non-Kirsch) domain's own
+/// geometry bounds — the pin-in-lug analogue of `training_core::normalize_point`, which is
+/// hardwired to `SolverConfig`'s single shared geometry.
+fn normalize_point_generic(x: f64, y: f64, geom: &pinn_core::geometry::GeometryConfig) -> [f32; 2] {
+    let (x0, x1) = geom.x_range();
+    let (y0, y1) = geom.y_range();
+    let dw = x1 - x0;
+    let dh = y1 - y0;
+    [(2.0 * (x - x0) / dw - 1.0) as f32, (2.0 * (y - y0) / dh - 1.0) as f32]
+}

@@ -28,6 +28,17 @@ impl MaterialProps {
         }
     }
 
+    /// 4340 steel (heat-treated) defaults: E=30 Msi, ν=0.29, ρ=7850 kg/m³. Used for the
+    /// pin-in-lug contact problem (`pinn_solver::pinlug_problem::PinLugProblem`).
+    pub fn steel_4340() -> Self {
+        use crate::units::MSI_TO_PA;
+        Self {
+            e: 30.0 * MSI_TO_PA,
+            nu: 0.29,
+            density: 7850.0,
+        }
+    }
+
     pub fn lame(&self) -> LameConsts {
         let e = self.e;
         let nu = self.nu;

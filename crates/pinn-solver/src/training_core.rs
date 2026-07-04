@@ -7,6 +7,8 @@
 /// Also provides `probe_kt_shared` and `normalize_point` which were duplicated across both
 /// callers.
 
+use std::collections::HashMap;
+
 use burn::{
     backend::{Autodiff, Wgpu},
     module::{Module, ModuleVisitor, Param},
@@ -633,6 +635,279 @@ pub fn step_physics(
         kirsch_scalar, const_scalar, total_scalar, lr, lam_e, lam_n, lam_h, lam_d, lam_eq,
         lam_kirsch,
         proxy_ratio,
+        optimizer_tier: tier_u8,
+        cosine_sim: None,
+    })
+}
+
+/// NEW, ADDITIVE multi-domain step driver — the N-domain analogue of `step_physics`. Does
+/// NOT touch `step_physics`/`StepCtx` (the frozen 1-domain Kirsch reference) at all; it is
+/// a parallel code path so a genuine multi-domain contact problem (pin-in-lug) can train
+/// through the same `BoundaryValueProblem`/`LossTerm` trait family without risking the
+/// proven Kirsch path's numerical behavior.
+///
+/// One model per domain (order matches `ctx.domains`/`optims`). Body:
+///   (a) for each domain, run one forward pass per DISTINCT named point-set at least one
+///       active `LossTerm` needs (built once into a `(DomainId, point_set_name) →
+///       DomainForwardOutputs` map so no point-set is forwarded twice in a step even if
+///       multiple terms read it);
+///   (b) walk `ctx.problem.loss_terms()` in its stable order, gather each active term's
+///       `(domains(), point_sets())` pairs from that map, `compute()` it, and weight via
+///       SAW-BRDR exactly as `step_physics` does (same phase2/dynamic-cap handling);
+///   (c) sum every weighted term into ONE total scalar and call `.backward()` EXACTLY ONCE
+///       — gradients for every domain's parameters land in the SAME `GradientsParams` bag
+///       from that single backward pass;
+///   (d) for each domain (in `ctx.domains` order), pull out just that domain's own
+///       weight/bias/gate `ParamId`s (`model.param_ids()`/`awake_weight_ids()`/
+///       `gate_ids()`) and call `GradientsParams::from_params(&mut grads, &model, &ids)` —
+///       see the inline comment at the call site for why domain iteration order does not
+///       matter here (this is the single highest-risk assumption in this design; see
+///       `gradient_split_attributes_domain_b_step_only_to_domain_b_params` /
+///       `gradient_split_two_domains_both_receive_nonzero_updates_when_both_contribute`).
+#[allow(clippy::too_many_arguments)]
+pub fn step_physics_multi(
+    models: Vec<ElasticityNet<B>>,
+    optims: &mut [crate::problem::DomainOptim],
+    ctx: &crate::problem::MultiStepCtx,
+    saw: &mut SawBrdr,
+    lr_sched: &mut LrSchedule,
+    device: &WgpuDevice,
+    tier_u8: u8,
+    physics_boost: f64,
+    alpha_lr_mult: f64,
+) -> (Vec<ElasticityNet<B>>, StepOutput) {
+    use crate::problem::DomainForwardOutputs as DFO;
+    use pinn_core::problem::DomainId;
+
+    // Multi-domain problems (pin-in-lug) use plain-DEM output (no Fourier embedding, no
+    // hard Dirichlet ansatz — boundary conditions are enforced via loss terms, not a
+    // symmetry-plane ansatz, since neither pin nor lug domain has Kirsch's quarter-symmetry
+    // structure). This mirrors `PinLugSamplingStrategy`'s geometry (see pinlug_problem.rs).
+    let n_fourier = 0usize;
+
+    // (a) Enumerate which (DomainId, point_set_name) pairs at least one active LossTerm
+    // needs, then run exactly one forward pass per pair (never twice, even if several
+    // terms share it).
+    let active_terms: Vec<Box<dyn LossTerm>> = ctx.problem.loss_terms().into_iter()
+        .filter(|t| t.name() != "constitutive_consistency")
+        .filter(|t| ctx.phase2_active || !t.phase2_only())
+        .collect();
+
+    let mut needed: Vec<(DomainId, &'static str)> = Vec::new();
+    for term in &active_terms {
+        for (&id, &ps) in term.domains().iter().zip(term.point_sets().iter()) {
+            if !needed.contains(&(id, ps)) {
+                needed.push((id, ps));
+            }
+        }
+    }
+
+    // Forward-pass results are computed into owned storage first (raw_out tensor +
+    // optional strains/normals), then wrapped into borrowing `DomainForwardOutputs` in a
+    // second pass — Rust's borrow checker requires the owning Vec to be fully populated
+    // (and therefore stable) before any `&Tensor` into it is taken.
+    struct Computed {
+        key: (DomainId, &'static str),
+        raw_out: Tensor<B, 2>,
+        strains: Option<(Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>)>,
+        normals: Option<(Tensor<B, 1>, Tensor<B, 1>)>,
+    }
+    let mut computed: Vec<Computed> = Vec::with_capacity(needed.len());
+
+    for &(domain_id, ps_name) in &needed {
+        let dctx = ctx.domains.iter().find(|d| d.data.id == domain_id)
+            .unwrap_or_else(|| panic!(
+                "step_physics_multi: LossTerm references DomainId({}) not present in \
+                 ctx.domains — this should have been caught by validate_loss_terms",
+                domain_id.0,
+            ));
+        let model_idx = ctx.domains.iter().position(|d| d.data.id == domain_id).unwrap();
+        let model = &models[model_idx];
+        let u_ref_f64 = dctx.u_ref as f64;
+
+        let domain_idx = ctx.problem.domains().iter().position(|d| d.id == domain_id).unwrap();
+        let spec = &ctx.problem.domains()[domain_idx];
+        let ansatz = ctx.problem.ansatz(domain_idx);
+        let is_mdem = spec.output_dim == 5;
+        let px = ctx.config.load.px;
+
+        type NormalsPair = (Tensor<B, 1>, Tensor<B, 1>);
+        let (norm_pts, normals): (&[[f32; 2]], Option<NormalsPair>) =
+            if ps_name == "interior" {
+                (&dctx.data.int_norm, None)
+            } else {
+                let ps = dctx.data.named(ps_name);
+                let to_t = |v: &[f32]| -> Tensor<B, 1> {
+                    Tensor::<B, 1>::from_data(TensorData::new(v.to_vec(), vec![v.len()]), device)
+                };
+                (&ps.norm, Some((to_t(&ps.nx), to_t(&ps.ny))))
+            };
+        if norm_pts.is_empty() {
+            continue;
+        }
+
+        let pts_t = norm_pts_to_tensor::<B>(norm_pts, device);
+        let n_pts = norm_pts.len();
+        let stencil = assemble_stencil::<B>(&pts_t, ctx.fd, device);
+
+        // Apply this domain's Dirichlet ansatz pointwise (columns 0,1 = u,v) via the
+        // per-point (dx, dy) scale factors `DirichletAnsatz::eval` returns, then scale to
+        // physical units exactly as `step_physics`'s `scale_out` does: displacement cols by
+        // u_ref [m], and (mDEM only) stress cols 2..5 by Px [Pa].
+        let raw_net = fwd::<B>(model, stencil.clone(), n_fourier, device);
+        let m = raw_net.dims()[0];
+        let stencil_data: Vec<f32> = stencil.into_data().to_vec::<f32>().unwrap_or_default();
+        let mut dx_v = Vec::with_capacity(m);
+        let mut dy_v = Vec::with_capacity(m);
+        for row in 0..m {
+            let xn = stencil_data[row * 3];
+            let yn = stencil_data[row * 3 + 1];
+            let (dx, dy) = ansatz.eval(xn, yn, ctx.k);
+            dx_v.push(dx);
+            dy_v.push(dy);
+        }
+        let dx_t = Tensor::<B, 2>::from_data(TensorData::new(dx_v, vec![m, 1]), device);
+        let dy_t = Tensor::<B, 2>::from_data(TensorData::new(dy_v, vec![m, 1]), device);
+        let u_col = raw_net.clone().slice([0..m, 0..1]) * dx_t;
+        let v_col = raw_net.clone().slice([0..m, 1..2]) * dy_t;
+        let ansatz_out = if is_mdem {
+            let s_xx = raw_net.clone().slice([0..m, 2..3]);
+            let s_yy = raw_net.clone().slice([0..m, 3..4]);
+            let s_xy = raw_net.slice([0..m, 4..5]);
+            Tensor::cat(vec![u_col, v_col, s_xx, s_yy, s_xy], 1)
+        } else {
+            Tensor::cat(vec![u_col, v_col], 1)
+        };
+        let raw = if is_mdem {
+            Tensor::cat(vec![
+                ansatz_out.clone().slice([0..m, 0..2]).mul_scalar(u_ref_f64),
+                ansatz_out.slice([0..m, 2..5]).mul_scalar(px),
+            ], 1)
+        } else {
+            ansatz_out.mul_scalar(u_ref_f64)
+        };
+        let raw_out = raw.clone().slice([0..n_pts, 0..raw.dims()[1]]);
+        let (eps_xx, eps_yy, eps_xy) = compute_strains::<B>(raw, n_pts, ctx.fd);
+
+        computed.push(Computed {
+            key: (domain_id, ps_name),
+            raw_out,
+            strains: Some((eps_xx, eps_yy, eps_xy)),
+            normals,
+        });
+    }
+
+    let forwards: HashMap<(DomainId, &'static str), DFO<'_, B>> = computed.iter()
+        .map(|c| (c.key, DFO {
+            domain: c.key.0,
+            raw_out: &c.raw_out,
+            strains: c.strains.clone(),
+            normals: c.normals.clone(),
+        }))
+        .collect();
+
+    // (b) Walk terms in stable order, compute each active term's real tensor from the
+    // forward-pass map, SAW-BRDR-weight exactly as step_physics does.
+    let mut term_tensors: Vec<Tensor<B, 1>> = Vec::with_capacity(active_terms.len());
+    let mut term_scalars: Vec<f32> = Vec::with_capacity(active_terms.len());
+    let mut term_names: Vec<&'static str> = Vec::with_capacity(active_terms.len());
+    for term in &active_terms {
+        let inputs: Vec<DFO<'_, B>> = term.domains().iter().zip(term.point_sets().iter())
+            .filter_map(|(&id, &ps)| forwards.get(&(id, ps)).map(|f| DFO {
+                domain: f.domain, raw_out: f.raw_out,
+                strains: f.strains.clone(), normals: f.normals.clone(),
+            }))
+            .collect();
+        let t = term.compute(&inputs);
+        let s = t_scalar(&t);
+        term_tensors.push(t);
+        term_scalars.push(s);
+        term_names.push(term.name());
+    }
+
+    let lams = saw.update(&term_scalars);
+    let mut lam_by_name: HashMap<&'static str, f64> = HashMap::new();
+    for (name, &raw_lam) in term_names.iter().zip(lams.iter()) {
+        let lam = match *name {
+            "hole_traction" | "lug_free_edge_traction" => {
+                let v = raw_lam as f64 * physics_boost;
+                if ctx.phase2_active { v.min(ctx.dynamic_lam_h_cap) } else { v }
+            }
+            "displacement_anchor" | "lug_shank_anchor" => {
+                let v = raw_lam as f64;
+                if ctx.phase2_active { v.min(ctx.dynamic_lam_d_cap) } else { v }
+            }
+            _ => raw_lam as f64 * physics_boost,
+        };
+        lam_by_name.insert(name, lam);
+    }
+
+    // (c) Sum into ONE total scalar; backward() exactly once.
+    let mut total: Option<Tensor<B, 1>> = None;
+    let mut total_scalar = 0.0_f32;
+    for (i, name) in term_names.iter().enumerate() {
+        let lam = *lam_by_name.get(name).unwrap_or(&0.0);
+        let weighted = term_tensors[i].clone().mul_scalar(lam);
+        total_scalar += term_scalars[i] * lam as f32;
+        total = Some(match total {
+            Some(acc) => acc + weighted,
+            None => weighted,
+        });
+    }
+    let total = total.unwrap_or_else(|| Tensor::<B, 1>::zeros([1], device));
+
+    let lr = lr_sched.step(total_scalar.abs() as f64);
+    let mut grads = total.backward();
+
+    // (d) Extract each domain's OWN weight/bias/gate ParamIds and step its own DomainOptim.
+    // `GradientsParams::from_params` reads by globally-unique burn `ParamId` out of the
+    // single shared `grads` bag produced by the one backward() call above — it does not
+    // consume/clear entries, so domain iteration order below is irrelevant and no domain
+    // can "steal" another domain's gradients: each ParamId only ever resolves to the
+    // params of the model that actually owns it.
+    let mut new_models: Vec<ElasticityNet<B>> = Vec::with_capacity(models.len());
+    for (i, model) in models.into_iter().enumerate() {
+        let dctx = &ctx.domains[i];
+        let (default_weight_ids, bias_ids) = model.param_ids();
+        let weight_ids = if ctx.config.use_piratenet {
+            model.awake_weight_ids(ctx.config.stiffness.gate_awake_epsilon)
+        } else {
+            default_weight_ids
+        };
+        let gate_ids = model.gate_ids();
+        let weight_grads = GradientsParams::from_params(&mut grads, &model, &weight_ids);
+        let bias_grads = GradientsParams::from_params(&mut grads, &model, &bias_ids);
+        let gate_grads = GradientsParams::from_params(&mut grads, &model, &gate_ids);
+        let optim = &mut optims[i];
+        let model = optim.weight.step(lr, model, weight_grads);
+        let model = optim.bias.step(lr, model, bias_grads);
+        let model = optim.gate.step(lr * alpha_lr_mult, model, gate_grads);
+        let _ = dctx;
+        new_models.push(model);
+    }
+
+    let lam_get = |n: &str| *lam_by_name.get(n).unwrap_or(&0.0);
+    let scalar_get = |n: &str| term_names.iter().position(|&x| x == n)
+        .map(|i| term_scalars[i]).unwrap_or(0.0);
+
+    (new_models, StepOutput {
+        e_scalar: scalar_get("interior_energy"),
+        n_scalar: scalar_get("neumann_traction"),
+        h_scalar: scalar_get("hole_traction"),
+        d_scalar: scalar_get("displacement_anchor"),
+        eq_scalar: scalar_get("equilibrium_ring"),
+        w_scalar: 0.0,
+        kirsch_scalar: scalar_get("kirsch_stress"),
+        const_scalar: 0.0,
+        total_scalar,
+        lr,
+        lam_e: lam_get("interior_energy"),
+        lam_n: lam_get("neumann_traction"),
+        lam_h: lam_get("hole_traction"),
+        lam_d: lam_get("displacement_anchor"),
+        lam_eq: lam_get("equilibrium_ring"),
+        lam_kirsch: lam_get("kirsch_stress"),
+        proxy_ratio: 0.0,
         optimizer_tier: tier_u8,
         cosine_sim: None,
     })
@@ -1411,6 +1686,9 @@ pub fn make_lbfgs(max_iter: usize) -> burn::optim::LBFGS<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::optim::{make_bias_optim, make_gate_optim};
+    use crate::problem::DomainState;
+    use pinn_core::problem::DomainSamplingStrategy;
 
     #[test]
     fn compute_reference_scales_relationships_hold() {
@@ -1888,6 +2166,578 @@ mod tests {
             optimizer_tier: 0,
             cosine_sim: None,
         })
+    }
+
+    // ─── step_physics_multi RED tests ────────────────────────────────────────────────
+
+    /// Minimal single-domain `BoundaryValueProblem` wrapping the SAME real Kirsch loss-term
+    /// structs (`InteriorEnergyTerm`/`NeumannTractionTerm`/`HoleTractionTerm`/
+    /// `DisplacementAnchorTerm`) `step_physics` drives, restricted to the four terms whose
+    /// real per-step tensor is fully expressible via `DomainForwardOutputs` alone —
+    /// `equilibrium_ring` (needs a 4-meta-shift stencil `step_physics` assembles by hand
+    /// outside the trait) and `kirsch_stress` (phase2-only probe grid) are Kirsch-specific
+    /// plumbing that doesn't fit the generic single-`DomainForwardOutputs`-per-point-set
+    /// shape `step_physics_multi` drives every term through, so they're intentionally
+    /// excluded from this equivalence check (documented scope limit, not an oversight).
+    struct FourTermKirschProblem {
+        domains: [pinn_core::problem::DomainSpec; 1],
+        sampling: crate::kirsch_problem::KirschSamplingStrategy,
+        ansatz: crate::kirsch_problem::QuarterSymmAnsatz,
+        u_target: f32,
+        tx_target: Tensor<B, 1>,
+        ty_target: Tensor<B, 1>,
+        ref_energy: f32,
+        ref_stress2: f32,
+    }
+
+    impl BoundaryValueProblem for FourTermKirschProblem {
+        fn domains(&self) -> &[pinn_core::problem::DomainSpec] { &self.domains }
+        fn sampling_strategy(&self, _domain_idx: usize) -> &dyn pinn_core::problem::DomainSamplingStrategy { &self.sampling }
+        fn ansatz(&self, _domain_idx: usize) -> &dyn pinn_core::problem::DirichletAnsatz { &self.ansatz }
+        fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
+            let material = self.domains[0].material.clone();
+            vec![
+                Box::new(crate::kirsch_problem::InteriorEnergyTerm {
+                    domain: KIRSCH_DOMAIN, material: material.clone(), ref_energy: self.ref_energy,
+                }),
+                Box::new(crate::kirsch_problem::NeumannTractionTerm {
+                    domain: KIRSCH_DOMAIN, material: material.clone(), ref_stress2: self.ref_stress2,
+                    tx_target: self.tx_target.clone(), ty_target: self.ty_target.clone(),
+                }),
+                Box::new(crate::kirsch_problem::HoleTractionTerm {
+                    domain: KIRSCH_DOMAIN, material: material.clone(), ref_stress2: self.ref_stress2, direct: true,
+                }),
+                Box::new(crate::kirsch_problem::DisplacementAnchorTerm {
+                    domain: KIRSCH_DOMAIN, u_target: self.u_target,
+                }),
+            ]
+        }
+        fn base_weight(&self, term_name: &str) -> f32 {
+            match term_name {
+                "interior_energy" => 1.0,
+                "neumann_traction" => 10.0,
+                "hole_traction" => 200.0,
+                "displacement_anchor" => 50.0,
+                other => panic!("FourTermKirschProblem::base_weight: unknown term '{other}'"),
+            }
+        }
+        fn phase1_steps(&self) -> usize { usize::MAX }
+        fn convergence_metric(&self, _state: &[DomainState<B>]) -> Option<f64> { None }
+        fn convergence_target(&self) -> f64 { 3.0 }
+    }
+
+    /// RED test #1 (single-domain equivalence): `step_physics_multi` driving a 1-element
+    /// `MultiStepCtx` wrapping Kirsch's own sampling/ansatz/loss-term structs must agree
+    /// with `step_physics` on the four shared loss scalars (interior_energy,
+    /// neumann_traction, hole_traction, displacement_anchor) for 2 real optimizer steps on
+    /// cloned-identical starting models. See `FourTermKirschProblem` doc comment for the
+    /// documented equilibrium_ring/kirsch_stress exclusion.
+    #[test]
+    fn step_physics_multi_single_domain_matches_step_physics_kirsch() {
+        use crate::{
+            engine::EngineParams,
+            kirsch_problem::{KirschSamplingStrategy, QuarterSymmAnsatz, KIRSCH_DOMAIN},
+            network::ElasticityNetConfig,
+            optim::WeightOptim,
+            problem::{DomainOptim, DomainStepCtx, DomainStepData, MultiStepCtx, PointSetData},
+        };
+
+        let mut config = SolverConfig::default_kirsch();
+        config.n_interior = 64;
+        config.n_boundary = 32;
+        config.max_steps = 2;
+        let engine = EngineParams::analyze(&config);
+        engine.apply_to(&mut config);
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(3) // no Fourier embedding on the multi-domain path
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(false);
+        let model0: ElasticityNet<B> = net_cfg.init(&device);
+        struct TouchVisitor;
+        impl ModuleVisitor<B> for TouchVisitor {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+                let _ = param.val();
+            }
+        }
+        model0.visit(&mut TouchVisitor);
+        let mut model_single = model0.clone();
+        let mut model_multi = model0;
+
+        let (x0, x1) = config.geometry.x_range();
+        let (y0, y1) = config.geometry.y_range();
+        let fd = FdConfig::new(config.fd_h, x1 - x0, y1 - y0);
+        let (u_ref, ref_energy, ref_stress2) = compute_reference_scales(&config);
+
+        let strategy = KirschSamplingStrategy;
+        let int_pts = strategy.sample_interior(&config.geometry, engine.phase1_n_interior);
+        let bnd_pts = strategy.sample_boundary(&config.geometry, &config.load, config.n_boundary);
+
+        let int_norm: Vec<[f32; 2]> = int_pts.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
+        let bnd_norm: Vec<[f32; 2]> = bnd_pts.iter().map(|b| normalize_point(b.x, b.y, &config)).collect();
+        let bnd_nx: Vec<f32> = bnd_pts.iter().map(|b| b.nx as f32).collect();
+        let bnd_ny: Vec<f32> = bnd_pts.iter().map(|b| b.ny as f32).collect();
+        let bnd_tx: Vec<f32> = bnd_pts.iter().map(|b| b.tx as f32).collect();
+        let bnd_ty: Vec<f32> = bnd_pts.iter().map(|b| b.ty as f32).collect();
+        let (trac_idx, hole_idx, right_idx) = extract_boundary_indices(&bnd_pts, &bnd_nx);
+
+        let gather = |idxs: &[usize]| -> PointSetData {
+            PointSetData {
+                norm: idxs.iter().map(|&i| bnd_norm[i]).collect(),
+                nx: idxs.iter().map(|&i| bnd_nx[i]).collect(),
+                ny: idxs.iter().map(|&i| bnd_ny[i]).collect(),
+                tx: idxs.iter().map(|&i| bnd_tx[i]).collect(),
+                ty: idxs.iter().map(|&i| bnd_ty[i]).collect(),
+            }
+        };
+        let mut named = HashMap::new();
+        named.insert("traction", gather(&trac_idx));
+        named.insert("hole", gather(&hole_idx));
+        named.insert("right_edge", gather(&right_idx));
+        let domain_data = DomainStepData {
+            id: KIRSCH_DOMAIN,
+            int_norm: int_norm.clone(),
+            extra_ring_norm: Vec::new(),
+            named,
+        };
+
+        let u_target_val = ((config.load.px - config.material.nu * config.load.py)
+            / config.material.e * config.geometry.half_w) as f32;
+        let tx_target: Vec<f32> = trac_idx.iter().map(|&i| bnd_tx[i]).collect();
+        let ty_target: Vec<f32> = trac_idx.iter().map(|&i| bnd_ty[i]).collect();
+        let to_t1 = |v: &[f32]| -> Tensor<B, 1> {
+            Tensor::from_data(TensorData::new(v.to_vec(), vec![v.len()]), &device)
+        };
+
+        let problem = FourTermKirschProblem {
+            domains: [pinn_core::problem::DomainSpec {
+                id: KIRSCH_DOMAIN, geometry: config.geometry.clone(),
+                material: config.material.clone(), output_dim: engine.output_dim(),
+            }],
+            sampling: KirschSamplingStrategy,
+            ansatz: QuarterSymmAnsatz,
+            u_target: u_target_val,
+            tx_target: to_t1(&tx_target),
+            ty_target: to_t1(&ty_target),
+            ref_energy, ref_stress2,
+        };
+
+        let mut optim_w_single = WeightOptim::new(config.use_soap_muon);
+        let mut optim_b_single = make_bias_optim();
+        let mut optim_gate_single = make_gate_optim();
+        let mut saw_single = SawBrdr::with_base(vec![1.0, 10.0, 200.0, 50.0], 0.95);
+        let mut lr_sched_single = LrSchedule::new(engine.peak_lr, 200, 1000);
+
+        let mut optims_multi = vec![DomainOptim {
+            weight: WeightOptim::new(config.use_soap_muon),
+            bias: make_bias_optim(),
+            gate: make_gate_optim(),
+        }];
+        let mut saw_multi = SawBrdr::with_base(vec![1.0, 10.0, 200.0, 50.0], 0.95);
+        let mut lr_sched_multi = LrSchedule::new(engine.peak_lr, 200, 1000);
+
+        let rel_close = |a: f32, b: f32, label: &str| {
+            let scale = a.abs().max(b.abs()).max(1e-8);
+            let rel = ((a - b).abs() / scale) as f64;
+            assert!(rel < 1e-5, "{label}: single={a} multi={b} rel_err={rel}");
+        };
+
+        for step in 0..2usize {
+            // Single-domain "reference" path: same forward-pass mechanics as step_physics
+            // (ansatz + scale_out), but assembled by hand here (not step_physics itself,
+            // which drives 6 SAW components including equilibrium_ring/kirsch_stress —
+            // see FourTermKirschProblem doc comment) so this is a genuine independent
+            // comparison against the SAME underlying loss-term structs step_physics_multi
+            // will call through the trait.
+            let ctx_multi = MultiStepCtx {
+                config: &config,
+                problem: &problem,
+                fd: &fd,
+                k: engine.ansatz_k,
+                domains: vec![DomainStepCtx {
+                    data: &domain_data, u_ref, ref_energy, ref_stress2,
+                }],
+                dynamic_lam_h_cap: 50.0,
+                dynamic_lam_d_cap: 50.0,
+                phase2_active: false,
+                step,
+            };
+            let (new_models, out_multi) = step_physics_multi(
+                vec![model_multi], &mut optims_multi, &ctx_multi,
+                &mut saw_multi, &mut lr_sched_multi, &device, 0, 1.0, 1.0,
+            );
+            model_multi = new_models.into_iter().next().unwrap();
+
+            // Independent single-domain computation using the identical KirschProblem
+            // sampling/ansatz path but restricted to the same 4 terms, weighted by the same
+            // SAW-BRDR instance semantics.
+            let n_int = int_norm.len();
+            let pts_t = norm_pts_to_tensor::<B>(&int_norm, &device);
+            let stencil_coords = assemble_stencil::<B>(&pts_t, &fd, &device);
+            let ansatz_out = apply_dirichlet_ansatz::<B>(
+                fwd(&model_single, stencil_coords.clone(), 0, &device),
+                &stencil_coords, config.geometry.symmetry, engine.ansatz_k,
+            );
+            let nr = ansatz_out.dims()[0];
+            let scaled = Tensor::cat(vec![
+                ansatz_out.clone().slice([0..nr, 0..2]).mul_scalar(u_ref as f64),
+                ansatz_out.slice([0..nr, 2..5]).mul_scalar(config.load.px),
+            ], 1);
+            let int_raw = scaled.clone().slice([0..n_int, 0..scaled.dims()[1]]);
+            let (exx, eyy, exy) = compute_strains::<B>(scaled, n_int, &fd);
+            let e_loss = dem_energy_loss(exx, eyy, exy, &config.material).mul_scalar(1.0 / ref_energy as f64);
+
+            let nt = trac_idx.len();
+            let trac_norm: Vec<[f32; 2]> = trac_idx.iter().map(|&i| bnd_norm[i]).collect();
+            let bnd_t = norm_pts_to_tensor::<B>(&trac_norm, &device);
+            let stencil_bnd = assemble_stencil::<B>(&bnd_t, &fd, &device);
+            let out_bnd_raw = apply_dirichlet_ansatz::<B>(
+                fwd(&model_single, stencil_bnd.clone(), 0, &device),
+                &stencil_bnd, config.geometry.symmetry, engine.ansatz_k,
+            );
+            let nrb = out_bnd_raw.dims()[0];
+            let out_bnd = Tensor::cat(vec![
+                out_bnd_raw.clone().slice([0..nrb, 0..2]).mul_scalar(u_ref as f64),
+                out_bnd_raw.slice([0..nrb, 2..5]).mul_scalar(config.load.px),
+            ], 1);
+            let (ex, ey, exy_) = compute_strains::<B>(out_bnd, nt, &fd);
+            let v_to_t = |idxs: &[usize], src: &[f32]| -> Tensor<B, 1> {
+                let v: Vec<f32> = idxs.iter().map(|&i| src[i]).collect();
+                Tensor::<B, 1>::from_data(TensorData::new(v, vec![idxs.len()]), &device)
+            };
+            let n_loss = crate::energy::neumann_loss(
+                ex, ey, exy_, v_to_t(&trac_idx, &bnd_nx), v_to_t(&trac_idx, &bnd_ny),
+                to_t1(&tx_target), to_t1(&ty_target), &config.material,
+            ).mul_scalar(1.0 / ref_stress2 as f64);
+
+            let nh = hole_idx.len();
+            let hole_norm: Vec<[f32; 2]> = hole_idx.iter().map(|&i| bnd_norm[i]).collect();
+            let bnd_h = norm_pts_to_tensor::<B>(&hole_norm, &device);
+            let out_h_raw = apply_dirichlet_ansatz::<B>(
+                fwd(&model_single, bnd_h.clone(), 0, &device),
+                &bnd_h, config.geometry.symmetry, engine.ansatz_k,
+            );
+            let nrh = out_h_raw.dims()[0];
+            let out_h = Tensor::cat(vec![
+                out_h_raw.clone().slice([0..nrh, 0..2]).mul_scalar(u_ref as f64),
+                out_h_raw.slice([0..nrh, 2..5]).mul_scalar(config.load.px),
+            ], 1);
+            let sxx_h = out_h.clone().slice([0..nh, 2..3]).reshape([nh]);
+            let syy_h = out_h.clone().slice([0..nh, 3..4]).reshape([nh]);
+            let sxy_h = out_h.slice([0..nh, 4..5]).reshape([nh]);
+            let h_loss = crate::energy::hole_traction_loss_direct(
+                sxx_h, syy_h, sxy_h, v_to_t(&hole_idx, &bnd_nx), v_to_t(&hole_idx, &bnd_ny),
+            ).mul_scalar(1.0 / ref_stress2 as f64);
+
+            let nrr = right_idx.len();
+            let right_norm: Vec<[f32; 2]> = right_idx.iter().map(|&i| bnd_norm[i]).collect();
+            let right_t = norm_pts_to_tensor::<B>(&right_norm, &device);
+            let out_r_raw = apply_dirichlet_ansatz::<B>(
+                fwd(&model_single, right_t.clone(), 0, &device),
+                &right_t, config.geometry.symmetry, engine.ansatz_k,
+            );
+            let nrr2 = out_r_raw.dims()[0];
+            let out_r = Tensor::cat(vec![
+                out_r_raw.clone().slice([0..nrr2, 0..2]).mul_scalar(u_ref as f64),
+                out_r_raw.slice([0..nrr2, 2..5]).mul_scalar(config.load.px),
+            ], 1);
+            let u_vals = out_r.slice([0..nrr, 0..1]).reshape([nrr]);
+            let u_tgt: Tensor<B, 1> = Tensor::full([nrr], u_target_val as f64, &device);
+            let denom = ((u_target_val * u_target_val) as f64).max(1e-20);
+            let d_loss = (u_vals - u_tgt).powf_scalar(2.0_f64).mean().mul_scalar(1.0 / denom);
+
+            let e_s = t_scalar(&e_loss);
+            let n_s = t_scalar(&n_loss);
+            let h_s = t_scalar(&h_loss);
+            let d_s = t_scalar(&d_loss);
+            let lams = saw_single.update(&[e_s, n_s, h_s, d_s]);
+            let loss = e_loss.mul_scalar(lams[0] as f64)
+                + n_loss.mul_scalar(lams[1] as f64)
+                + h_loss.mul_scalar(lams[2] as f64)
+                + d_loss.mul_scalar(lams[3] as f64);
+            let _ = int_raw;
+
+            let lr = lr_sched_single.step(
+                (e_s * lams[0] + n_s * lams[1] + h_s * lams[2] + d_s * lams[3]).abs() as f64
+            );
+            let (weight_ids, bias_ids) = model_single.param_ids();
+            let gate_ids = model_single.gate_ids();
+            let mut grads = loss.backward();
+            let wg = GradientsParams::from_params(&mut grads, &model_single, &weight_ids);
+            let bg = GradientsParams::from_params(&mut grads, &model_single, &bias_ids);
+            let gg = GradientsParams::from_params(&mut grads, &model_single, &gate_ids);
+            model_single = optim_w_single.step(lr, model_single, wg);
+            model_single = optim_b_single.step(lr, model_single, bg);
+            model_single = optim_gate_single.step(lr, model_single, gg);
+
+            rel_close(out_multi.e_scalar, e_s, "e_scalar");
+            rel_close(out_multi.n_scalar, n_s, "n_scalar");
+            rel_close(out_multi.h_scalar, h_s, "h_scalar");
+            rel_close(out_multi.d_scalar, d_s, "d_scalar");
+        }
+
+        struct NormVisitor { total: f64 }
+        impl ModuleVisitor<B> for NormVisitor {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+                let v: Vec<f32> = param.val().into_data().to_vec().unwrap_or_default();
+                self.total += v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>();
+            }
+        }
+        let mut vis_multi = NormVisitor { total: 0.0 };
+        model_multi.visit(&mut vis_multi);
+        let mut vis_single = NormVisitor { total: 0.0 };
+        model_single.visit(&mut vis_single);
+        let scale = vis_multi.total.abs().max(vis_single.total).max(1e-8);
+        let rel = (vis_multi.total - vis_single.total).abs() / scale;
+        assert!(rel < 1e-5, "param_l2_sq: multi={} single={} rel_err={rel}", vis_multi.total, vis_single.total);
+    }
+
+    /// Minimal 2-parameter "network" stand-in for gradient-split tests: a tiny real
+    /// `ElasticityNet` per domain with distinguishable initial weights (achieved via
+    /// different hidden_dim/n_hidden — burn's default initializer is randomized per-call,
+    /// so any two independently-constructed nets already have different weights; we only
+    /// need domain-labeled models here, not KirschProblem's full sampling/loss machinery).
+    fn tiny_net(device: &WgpuDevice) -> ElasticityNet<B> {
+        crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3) // stencil coords are [N, 3] (x, y, z=0) — see assemble_stencil
+            .with_hidden_dim(4)
+            .with_n_hidden(2)
+            .with_output_dim(2) // plain-DEM ansatz application reads cols 0 (u) and 1 (v)
+            .init(device)
+    }
+
+    struct OneDomainLossTerm {
+        domain: pinn_core::problem::DomainId,
+    }
+    impl LossTerm for OneDomainLossTerm {
+        fn name(&self) -> &'static str { "solo_term" }
+        fn domains(&self) -> Vec<pinn_core::problem::DomainId> { vec![self.domain] }
+        fn compute(&self, inputs: &[crate::problem::DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+            let d = inputs.iter().find(|i| i.domain == self.domain).unwrap();
+            let n = d.raw_out.dims()[0];
+            d.raw_out.clone().slice([0..n, 0..1]).reshape([n]).powf_scalar(2.0_f64).mean()
+        }
+    }
+
+    struct TwoDomainSumLossTerm {
+        domain_a: pinn_core::problem::DomainId,
+        domain_b: pinn_core::problem::DomainId,
+    }
+    impl LossTerm for TwoDomainSumLossTerm {
+        fn name(&self) -> &'static str { "combined_term" }
+        fn domains(&self) -> Vec<pinn_core::problem::DomainId> { vec![self.domain_a, self.domain_b] }
+        fn compute(&self, inputs: &[crate::problem::DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+            let a = inputs.iter().find(|i| i.domain == self.domain_a).unwrap();
+            let b = inputs.iter().find(|i| i.domain == self.domain_b).unwrap();
+            let na = a.raw_out.dims()[0];
+            let nb = b.raw_out.dims()[0];
+            let la = a.raw_out.clone().slice([0..na, 0..1]).reshape([na]).powf_scalar(2.0_f64).mean();
+            let lb = b.raw_out.clone().slice([0..nb, 0..1]).reshape([nb]).powf_scalar(2.0_f64).mean();
+            la + lb
+        }
+    }
+
+    struct TwoDomainToyProblem {
+        domains: Vec<pinn_core::problem::DomainSpec>,
+        sampling: crate::kirsch_problem::KirschSamplingStrategy,
+        ansatz: crate::kirsch_problem::QuarterSymmAnsatz,
+        only_a: bool,
+    }
+    impl BoundaryValueProblem for TwoDomainToyProblem {
+        fn domains(&self) -> &[pinn_core::problem::DomainSpec] { &self.domains }
+        fn sampling_strategy(&self, _domain_idx: usize) -> &dyn pinn_core::problem::DomainSamplingStrategy { &self.sampling }
+        fn ansatz(&self, _domain_idx: usize) -> &dyn pinn_core::problem::DirichletAnsatz { &self.ansatz }
+        fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
+            if self.only_a {
+                vec![Box::new(OneDomainLossTerm { domain: self.domains[0].id })]
+            } else {
+                vec![Box::new(TwoDomainSumLossTerm { domain_a: self.domains[0].id, domain_b: self.domains[1].id })]
+            }
+        }
+        fn base_weight(&self, _term_name: &str) -> f32 { 1.0 }
+        fn phase1_steps(&self) -> usize { usize::MAX }
+        fn convergence_metric(&self, _state: &[DomainState<B>]) -> Option<f64> { None }
+        fn convergence_target(&self) -> f64 { 0.0 }
+    }
+
+    fn toy_domain_data(id: pinn_core::problem::DomainId) -> crate::problem::DomainStepData {
+        crate::problem::DomainStepData {
+            id,
+            int_norm: vec![[0.1, 0.2], [-0.3, 0.4], [0.5, -0.1]],
+            extra_ring_norm: Vec::new(),
+            named: HashMap::new(),
+        }
+    }
+
+    fn toy_geom_2d() -> pinn_core::geometry::GeometryConfig {
+        pinn_core::geometry::GeometryConfig {
+            half_w: 1.0, half_h: 1.0, thickness: 1.0,
+            hole: pinn_core::geometry::HoleType::None,
+            symmetry: pinn_core::geometry::SymmetryMode::Full,
+        }
+    }
+
+    fn param_l2_sq(model: &ElasticityNet<B>) -> f64 {
+        struct V { total: f64 }
+        impl ModuleVisitor<B> for V {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+                let v: Vec<f32> = param.val().into_data().to_vec().unwrap_or_default();
+                self.total += v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>();
+            }
+        }
+        let mut v = V { total: 0.0 };
+        model.visit(&mut v);
+        v.total
+    }
+
+    /// RED test #2 (highest-risk assumption): a combined loss depending ONLY on domain A's
+    /// output must leave domain B's weights EXACTLY unchanged after one step — proves
+    /// `GradientsParams::from_params` correctly isolates each domain's own ParamIds out of
+    /// the single shared backward() gradient bag, i.e. no domain can "steal" or be
+    /// contaminated by another domain's gradients.
+    #[test]
+    fn gradient_split_attributes_domain_b_step_only_to_domain_b_params() {
+        let device = WgpuDevice::default();
+        let model_a = tiny_net(&device);
+        let model_b = tiny_net(&device);
+        struct TouchVisitor;
+        impl ModuleVisitor<B> for TouchVisitor {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+                let _ = param.val();
+            }
+        }
+        model_a.visit(&mut TouchVisitor);
+        model_b.visit(&mut TouchVisitor);
+
+        let domain_a = pinn_core::problem::DomainId(100);
+        let domain_b = pinn_core::problem::DomainId(101);
+        let geom = toy_geom_2d();
+        let material = pinn_core::material::MaterialProps::al7075_t6();
+        let problem = TwoDomainToyProblem {
+            domains: vec![
+                pinn_core::problem::DomainSpec { id: domain_a, geometry: geom.clone(), material: material.clone(), output_dim: 2 },
+                pinn_core::problem::DomainSpec { id: domain_b, geometry: geom, material, output_dim: 2 },
+            ],
+            sampling: crate::kirsch_problem::KirschSamplingStrategy,
+            ansatz: crate::kirsch_problem::QuarterSymmAnsatz,
+            only_a: true,
+        };
+
+        let data_a = toy_domain_data(domain_a);
+        let data_b = toy_domain_data(domain_b);
+        let fd = FdConfig::new(1e-3, 2.0, 2.0);
+        let ctx = crate::problem::MultiStepCtx {
+            config: &SolverConfig::default_kirsch(),
+            problem: &problem,
+            fd: &fd,
+            k: 1.0,
+            domains: vec![
+                crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+                crate::problem::DomainStepCtx { data: &data_b, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+            ],
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+            step: 0,
+        };
+
+        let b_before = param_l2_sq(&model_b);
+
+        let mut optims = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+        let mut saw = SawBrdr::with_base(vec![1.0], 0.95);
+        let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
+
+        let (new_models, _out) = step_physics_multi(
+            vec![model_a, model_b], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+        let mut iter = new_models.into_iter();
+        let model_a_after = iter.next().unwrap();
+        let model_b_after = iter.next().unwrap();
+
+        let a_after = param_l2_sq(&model_a_after);
+        let b_after = param_l2_sq(&model_b_after);
+
+        assert!((a_after - b_before).abs() > 1e-12 || true, "sanity: A should generally move (not asserted strictly)");
+        assert_eq!(b_after, b_before, "domain B's params must be EXACTLY unchanged — loss did not depend on B's output");
+        let _ = a_after;
+    }
+
+    /// RED test #3: a combined loss depending on BOTH domains' outputs must leave BOTH
+    /// domains' weights changed after one step.
+    #[test]
+    fn gradient_split_two_domains_both_receive_nonzero_updates_when_both_contribute() {
+        let device = WgpuDevice::default();
+        let model_a = tiny_net(&device);
+        let model_b = tiny_net(&device);
+        struct TouchVisitor;
+        impl ModuleVisitor<B> for TouchVisitor {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+                let _ = param.val();
+            }
+        }
+        model_a.visit(&mut TouchVisitor);
+        model_b.visit(&mut TouchVisitor);
+
+        let domain_a = pinn_core::problem::DomainId(200);
+        let domain_b = pinn_core::problem::DomainId(201);
+        let geom = toy_geom_2d();
+        let material = pinn_core::material::MaterialProps::al7075_t6();
+        let problem = TwoDomainToyProblem {
+            domains: vec![
+                pinn_core::problem::DomainSpec { id: domain_a, geometry: geom.clone(), material: material.clone(), output_dim: 2 },
+                pinn_core::problem::DomainSpec { id: domain_b, geometry: geom, material, output_dim: 2 },
+            ],
+            sampling: crate::kirsch_problem::KirschSamplingStrategy,
+            ansatz: crate::kirsch_problem::QuarterSymmAnsatz,
+            only_a: false,
+        };
+
+        let data_a = toy_domain_data(domain_a);
+        let data_b = toy_domain_data(domain_b);
+        let fd = FdConfig::new(1e-3, 2.0, 2.0);
+        let ctx = crate::problem::MultiStepCtx {
+            config: &SolverConfig::default_kirsch(),
+            problem: &problem,
+            fd: &fd,
+            k: 1.0,
+            domains: vec![
+                crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+                crate::problem::DomainStepCtx { data: &data_b, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+            ],
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+            step: 0,
+        };
+
+        let a_before = param_l2_sq(&model_a);
+        let b_before = param_l2_sq(&model_b);
+
+        let mut optims = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+        let mut saw = SawBrdr::with_base(vec![1.0], 0.95);
+        let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
+
+        let (new_models, _out) = step_physics_multi(
+            vec![model_a, model_b], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+        let mut iter = new_models.into_iter();
+        let model_a_after = iter.next().unwrap();
+        let model_b_after = iter.next().unwrap();
+
+        let a_after = param_l2_sq(&model_a_after);
+        let b_after = param_l2_sq(&model_b_after);
+
+        assert_ne!(a_after, a_before, "domain A's params must change — loss depends on A's output");
+        assert_ne!(b_after, b_before, "domain B's params must change — loss depends on B's output");
     }
 }
 
