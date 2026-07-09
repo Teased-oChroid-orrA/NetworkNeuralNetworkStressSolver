@@ -275,6 +275,7 @@ impl LossTerm for InteriorEnergyTerm {
         if self.domain == PIN_DOMAIN { "pin_interior_energy" } else { "lug_interior_energy" }
     }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain).expect("interior_energy: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("interior_energy: strains must be Some");
@@ -290,6 +291,7 @@ impl LossTerm for LugShankAnchorTerm {
     fn name(&self) -> &'static str { "lug_shank_anchor" }
     fn domains(&self) -> Vec<DomainId> { vec![LUG_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["shank_anchor"] }
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("lug_shank_anchor: domain missing");
         let n = d.raw_out.dims()[0];
@@ -309,6 +311,7 @@ impl LossTerm for LugFreeEdgeTractionTerm {
     fn name(&self) -> &'static str { "lug_free_edge_traction" }
     fn domains(&self) -> Vec<DomainId> { vec![LUG_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["boundary"] }
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("lug_free_edge_traction: domain missing");
         let (nx, ny) = d.normals.clone().expect("lug_free_edge_traction: normals must be Some");
@@ -331,6 +334,7 @@ impl LossTerm for PinDrivingTractionTerm {
     fn name(&self) -> &'static str { "pin_driving_traction" }
     fn domains(&self) -> Vec<DomainId> { vec![PIN_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["driving"] }
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("pin_driving_traction: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("pin_driving_traction: strains must be Some");
@@ -365,6 +369,8 @@ impl LossTerm for InterfacePenetrationTerm {
     fn name(&self) -> &'static str { "interface_penetration" }
     fn domains(&self) -> Vec<DomainId> { vec![PIN_DOMAIN, LUG_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["interface", "interface"] }
+    // Signorini KKT boundary/interface condition, not an interior PDE residual.
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let pin = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("interface_penetration: pin missing");
         let lug = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("interface_penetration: lug missing");
@@ -410,6 +416,8 @@ impl LossTerm for InterfaceNonTensionTerm {
     fn name(&self) -> &'static str { "interface_non_tension" }
     fn domains(&self) -> Vec<DomainId> { vec![PIN_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["interface"] }
+    // Same reasoning as InterfacePenetrationTerm: Signorini KKT boundary condition.
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let pin = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("interface_non_tension: pin missing");
         let n = self.thetas.len();
@@ -860,5 +868,39 @@ mod tests {
         assert!((ref_stress2_uts - expected_ref_stress2).abs() / expected_ref_stress2 < 1e-5);
         let ref_energy_uts = problem_uts.ref_energy_for_test();
         assert!((ref_energy_uts - expected_ref_energy).abs() / expected_ref_energy < 1e-5);
+    }
+
+    /// Pins each of PinLugProblem's 7 loss terms' expected `conflict_group()` classification
+    /// AND the exact 2-Physics/5-Bc count split — catches a future term silently defaulting
+    /// to `Bc` without an explicit override (see `LossTerm::conflict_group`'s default).
+    #[test]
+    fn pinlug_loss_terms_have_expected_conflict_group_classification() {
+        use crate::problem::ConflictGroup;
+
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
+        let terms = problem.loss_terms();
+        assert_eq!(terms.len(), 7, "expected exactly 7 loss terms (2 interior-energy + 5 BC/interface)");
+
+        let expected: &[(&str, ConflictGroup)] = &[
+            ("pin_interior_energy", ConflictGroup::Physics),
+            ("lug_interior_energy", ConflictGroup::Physics),
+            ("lug_shank_anchor", ConflictGroup::Bc),
+            ("lug_free_edge_traction", ConflictGroup::Bc),
+            ("pin_driving_traction", ConflictGroup::Bc),
+            ("interface_penetration", ConflictGroup::Bc),
+            ("interface_non_tension", ConflictGroup::Bc),
+        ];
+
+        for term in &terms {
+            let (_, expected_group) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.conflict_group(), *expected_group,
+                "term '{}' has conflict_group {:?}, expected {:?}", term.name(), term.conflict_group(), expected_group);
+        }
+
+        let n_physics = terms.iter().filter(|t| t.conflict_group() == ConflictGroup::Physics).count();
+        let n_bc = terms.iter().filter(|t| t.conflict_group() == ConflictGroup::Bc).count();
+        assert_eq!(n_physics, 2, "expected exactly 2 Physics-group terms (pin+lug interior energy)");
+        assert_eq!(n_bc, 5, "expected exactly 5 Bc-group terms");
     }
 }

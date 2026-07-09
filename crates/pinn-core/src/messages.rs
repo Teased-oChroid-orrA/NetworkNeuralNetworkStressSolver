@@ -10,13 +10,22 @@ pub enum ControlMsg {
     Resume,
     /// Trigger a warm-start with new configuration
     WarmStart { config: SolverConfig, geometry_changed: bool },
+    /// Request that the pin-in-lug training loop export the current contact-pressure
+    /// profile to CSV (see `pinn_solver::contact_export`). No-op (treated as `Continue`)
+    /// on the single-domain Kirsch path — there is nothing to export there.
+    ExportContactPressure,
 }
 
 /// Data sent from solver thread → GUI thread (bounded channel capacity=1)
 pub enum TrainingMsg {
     Update(Box<TrainingUpdate>),
+    /// Pin-in-lug analogue of `Update` — carries both domains' visualization fields and a
+    /// generic convergence metric instead of Kirsch's K_t.
+    PinLugUpdate(Box<PinLugTrainingUpdate>),
     Done,
     Error(String),
+    /// Contact-pressure CSV export finished successfully; carries the written file path.
+    ExportComplete(String),
 }
 
 pub struct TrainingUpdate {
@@ -32,7 +41,28 @@ pub struct TrainingUpdate {
     pub vis: Option<VisFields>,
 }
 
+/// Pin-in-lug analogue of `TrainingUpdate` — one entry per domain's visualization fields,
+/// plus a generic (non-K_t) convergence metric.
+pub struct PinLugTrainingUpdate {
+    pub step: usize,
+    pub total_loss:   f32,
+    /// Documented approximation: sum of both domains' interior-energy scalars.
+    pub energy_loss:  f32,
+    /// Documented approximation: sum of all non-energy BC-term scalars.
+    pub neumann_loss: f32,
+    pub lr:           f32,
+    pub lam_energy:   f32,
+    pub lam_neumann:  f32,
+    /// Pin + lug interior point counts, summed.
+    pub n_colloc:     usize,
+    /// Interface-gap RMS (see `PinLugProblem::convergence_metric`) — deliberately NOT named
+    /// `kt_estimate`; pin-in-lug has no closed-form K_t.
+    pub convergence_metric: Option<f32>,
+    pub vis: Option<PinLugVisFields>,
+}
+
 /// Visualization fields — sent every 10 steps (not every step, to keep channel fast)
+#[derive(Debug, Clone)]
 pub struct VisFields {
     pub von_mises: Array2<f32>,
     pub sigma_xx:  Array2<f32>,
@@ -40,6 +70,21 @@ pub struct VisFields {
     pub sigma_xy:  Array2<f32>,
     pub disp_u:    Array2<f32>,
     pub disp_v:    Array2<f32>,
+}
+
+/// Per-domain visualization fields for the pin-in-lug 2-domain problem.
+pub struct PinLugVisFields {
+    pub pin: VisFields,
+    pub lug: VisFields,
+}
+
+/// Which `BoundaryValueProblem` a `SolverConfig`/GUI session is driving. Single source of
+/// truth shared by `pinn-app`'s CLI parsing and `pinn-gui`'s problem selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ProblemKind {
+    #[default]
+    Kirsch,
+    PinLug,
 }
 
 /// Configuration for the meta-optimizer decision maker (opt-in, disabled by default).

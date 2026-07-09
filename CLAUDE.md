@@ -4,7 +4,7 @@ A physics-informed neural network (PINN) solver for structural boundary-value pr
 on `burn` (ML framework) + `egui`/`wgpu` (GUI). Ships two problems: **Kirsch** (a plate with a
 circular hole under remote tension; validation target K_t = 3.0 at the hole boundary) and
 **pin-in-lug** (a two-domain pin/lug contact-mechanics problem with a Signorini contact
-interface; headless-only, `--problem pinlug`).
+interface; `--problem pinlug` headless, or select "Pin-in-Lug" in the GUI's problem-kind radio).
 
 Workspace crates: `pinn-core` (geometry/material/sampling, no ML deps), `pinn-solver`
 (training loop, optimizer, losses), `pinn-gui` (egui panels), `pinn-app` (binary; `--headless`
@@ -82,6 +82,45 @@ drop-in improvement.
 it is never wired into `energy.rs`'s constitutive law (`compute_stress`/`compute_strains`).
 Nondimensionalization lives only at the reference-scale/loss-normalization layer described
 above; the constitutive law itself always operates on physical SI values.
+
+## Multi-domain Converge-tier L-BFGS
+
+`pinn_solver::decision_maker::PinnDecisionMaker` (Explore/Align/Converge, gated by
+`SolverConfig::decision_maker.enabled`, default `false`) is opt-in for pin-in-lug just as it is
+for Kirsch — wired into `run_headless_pinlug` behind the same flag, byte-identical to the
+pre-wiring trajectory when disabled (`run_headless_pinlug_with_decision_maker_disabled_
+matches_pre_change_trajectory`). `training_core::TwoDomainModels<B>` (`#[derive(Module, Debug)]`
+on a named 2-field struct, `pin`/`lug`) is the wrapper that makes pin-lug's Converge-tier L-BFGS
+step possible: `burn` 0.21's `LBFGS::step` requires a single `AutodiffModule<B>`, and no blanket
+`Module` impl exists for tuples in burn-core — a bare `(ElasticityNet<B>, ElasticityNet<B>)`
+does not satisfy that bound, so a named wrapper (not a tuple) is required, not merely preferred.
+`step_lbfgs_multi`/`compute_gradient_conflict_multi` are the N-domain generalizations of the
+single-model `step_lbfgs`/`compute_gradient_conflict`, reusing `ctx.problem.loss_terms()` (never
+a second hand-rolled loss assembly) and partitioning terms by the new `LossTerm::conflict_group()`
+(`Physics` — interior energy/equilibrium; `Bc` — every boundary or interface condition,
+including Signorini contact terms, which constrain state *at* a boundary rather than *throughout*
+a domain's interior, the same classification logic that puts Kirsch's boundary/Neumann terms in
+the `Bc` group). `FrozenMultiStepCtx` is the multi-domain analogue of `LbfgsCtxScalars` — frozen
+fresh on every Converge-tier *entry* (not just the first) and cleared on exit, since pin-lug
+resamples every step unconditionally, unlike Kirsch's AMR-gated resampling.
+
+## GUI
+
+`pinn_core::messages::ProblemKind` (`Kirsch`/`PinLug`) is the single shared selector — `pinn-app`'s
+CLI parsing and `pinn-gui`'s problem-kind radio both read/write the same enum, not independently
+drifting copies. `pinn_solver::run_training` (Kirsch) and `run_training_pinlug` (pin-lug) are two
+separate GUI-driving functions, not one branching function, mirroring the `step_physics`/
+`step_physics_multi` precedent: forcing two structurally different training loops through a
+shared abstraction increases regression risk on the proven Kirsch path for no benefit. Pin-lug's
+two domains are visualized via `PinLugVisFields { pin: VisFields, lug: VisFields }`, sent as a
+dedicated `TrainingMsg::PinLugUpdate` variant (not an extension of the existing `Update`/
+`VisFields`, which stay exactly as they were — zero regression risk on the Kirsch GUI path).
+Pin-lug's contact-pressure CSV export is triggered via `ControlMsg::ExportContactPressure`
+(solver-side write, confirmed back to the GUI via `TrainingMsg::ExportComplete`) rather than
+sending the trained model over the channel. Pin-lug's `WarmStart` handling is a deliberate scope
+cut in this slice: only scalar config fields are honored (no full two-domain resample) — the
+GUI disables the warm-start button entirely when `ProblemKind::PinLug` is selected rather than
+silently doing a partial warm-start.
 
 ## Optimizer
 

@@ -1,12 +1,55 @@
 use egui::{ColorImage, TextureHandle, TextureOptions, Ui};
-use pinn_core::{messages::SolverConfig, units::{IN_TO_M, KSI_TO_PA}, FieldType, TrainingState};
+use ndarray::Array2;
+use pinn_core::{
+    messages::{ProblemKind, SolverConfig},
+    units::{IN_TO_M, KSI_TO_PA},
+    FieldType, TrainingState,
+};
 
 use crate::colormap::field_to_pixels;
 
+/// Which pin-lug domain is currently selected for display (only meaningful when
+/// `problem_kind == ProblemKind::PinLug`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinLugDomain {
+    Pin,
+    Lug,
+}
+
+/// Resolve the `&Array2<f32>` to render for the current (problem_kind, domain, field)
+/// selection. Both the Kirsch single-domain path and the pin-lug two-domain path feed
+/// into the exact same downstream texture-upload/colorbar rendering code below.
+fn select_field(
+    state: &TrainingState,
+    config_problem_kind: ProblemKind,
+    domain: PinLugDomain,
+    selected_field: FieldType,
+) -> Option<&Array2<f32>> {
+    match config_problem_kind {
+        ProblemKind::Kirsch => Some(state.field(selected_field)),
+        ProblemKind::PinLug => {
+            let vis = match domain {
+                PinLugDomain::Pin => state.pinlug_pin.as_ref(),
+                PinLugDomain::Lug => state.pinlug_lug.as_ref(),
+            }?;
+            Some(match selected_field {
+                FieldType::VonMises => &vis.von_mises,
+                FieldType::SigmaXX  => &vis.sigma_xx,
+                FieldType::SigmaYY  => &vis.sigma_yy,
+                FieldType::SigmaXY  => &vis.sigma_xy,
+                FieldType::DispU    => &vis.disp_u,
+                FieldType::DispV    => &vis.disp_v,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     state: &TrainingState,
     config: &SolverConfig,
+    problem_kind: ProblemKind,
     selected_field: FieldType,
     texture: &mut Option<TextureHandle>,
     colorbar_range: &mut (f32, f32),
@@ -14,7 +57,28 @@ pub fn show(
     ui.heading("Stress Field");
     ui.separator();
 
-    let field = state.field(selected_field);
+    // ── Domain selector (pin-lug only) ──────────────────────
+    // Kept as UI-local `static`-like state via `ui.memory` would be overkill here; a
+    // simple `Id`-scoped temp var keeps this panel self-contained without threading
+    // another field through `StressSolverApp`.
+    let domain_id = ui.id().with("heatmap_domain");
+    let mut domain = ui.data(|d| d.get_temp::<PinLugDomain>(domain_id)).unwrap_or(PinLugDomain::Lug);
+    if problem_kind == ProblemKind::PinLug {
+        ui.horizontal(|ui| {
+            ui.label("Domain:");
+            ui.radio_value(&mut domain, PinLugDomain::Pin, "Pin");
+            ui.radio_value(&mut domain, PinLugDomain::Lug, "Lug");
+        });
+        ui.data_mut(|d| d.insert_temp(domain_id, domain));
+    }
+
+    let field = match select_field(state, problem_kind, domain, selected_field) {
+        Some(f) => f,
+        None => {
+            ui.label("No data yet — start training to populate this field.");
+            return;
+        }
+    };
     let [nx, ny] = state.vis_grid;
 
     // Flip rows so physical y=0 (hole edge) appears at screen bottom, not top.

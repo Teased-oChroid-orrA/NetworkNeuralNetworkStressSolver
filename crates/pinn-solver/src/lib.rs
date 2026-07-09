@@ -18,5 +18,5 @@ pub mod signorini;
 pub mod stiffness;
 pub mod training_core;
 
-pub use runner::run_training;
+pub use runner::{run_training, run_training_pinlug};
 pub use headless::{run_headless, run_headless_pinlug};
