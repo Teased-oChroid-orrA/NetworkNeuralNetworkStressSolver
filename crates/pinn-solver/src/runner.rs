@@ -126,7 +126,7 @@ impl TrainingState {
         let (vis_pts_norm, vis_mask) = build_vis_grid(config);
 
         let dm_cfg   = config.decision_maker.clone();
-        let dm       = PinnDecisionMaker::new(dm_cfg, false);
+        let dm       = PinnDecisionMaker::new(dm_cfg, false, false);
         let optim_w  = WeightOptim::from_tier(config.use_soap_muon, &dm.current_tier);
         Self {
             model: net_cfg.init(device),
@@ -219,7 +219,7 @@ impl TrainingState {
 
         self.saw.reset();
         self.lr_sched.reset_for_warmstart();
-        self.decision_maker = PinnDecisionMaker::new(new_cfg.decision_maker.clone(), false);
+        self.decision_maker = PinnDecisionMaker::new(new_cfg.decision_maker.clone(), false, false);
         self.stiffness_controller = StiffnessController::new(new_cfg.stiffness.clone());
         self.clear_lbfgs();
         self.reset_optimizers(new_cfg.use_soap_muon);
@@ -320,7 +320,7 @@ pub fn run_training(
             state.int_pts_phys = grid.sample_points();
             state.amr = Some(grid);
             state.lr_sched.reset_for_phase2();
-            state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
+            state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
             state.stiffness_controller = StiffnessController::new(stiff_config.clone());
             state.clear_lbfgs();
             state.reset_optimizers(use_soap_muon);
@@ -357,7 +357,7 @@ pub fn run_training(
                     amr_stats.mean_residual, state.int_pts_phys.len());
                 if state.decision_maker.current_tier == OptimizerTier::Converge {
                     println!("  [DM@{step}] AMR → demote Converge→Align");
-                    state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
+                    state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
                     state.clear_lbfgs();
                     state.reset_optimizers(use_soap_muon);
                 }
@@ -416,6 +416,7 @@ pub fn run_training(
                 proxy_ratio: 0.0,
                 optimizer_tier: OptimizerTier::Converge.as_u8(),
                 cosine_sim: None,
+                lam_by_name: None,
             };
             (new_m, synthetic)
         } else {
@@ -509,7 +510,7 @@ pub fn run_training(
                         state.tracker.clear_history();
                         state.saw.reset();
                         state.lr_sched.reset_for_phase2();
-                        state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
+                        state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
                         state.stiffness_controller = StiffnessController::new(stiff_config.clone());
                         state.clear_lbfgs();
                         state.reset_optimizers(use_soap_muon);
@@ -520,7 +521,7 @@ pub fn run_training(
                         state.dynamic_lam_d_cap = new_cap;
                         state.saw.reset();
                         state.lr_sched.reset_for_phase2();
-                        state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
+                        state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
                         state.stiffness_controller = StiffnessController::new(stiff_config.clone());
                         state.clear_lbfgs();
                         state.reset_optimizers(use_soap_muon);
