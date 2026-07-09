@@ -196,6 +196,15 @@ pub struct StepOutput {
     /// Exact cosine similarity from the dual-pass gradient conflict check, when computed.
     /// `None` on steps where the conflict check did not fire.
     pub cosine_sim:    Option<f32>,
+    /// Every active term's final SAW-BRDR-weighted (and, if capped, clamped) lambda by
+    /// name, keyed by `LossTerm::name()`. `None` on Kirsch's frozen `step_physics` path
+    /// (the fixed 6-field `lam_e`/`lam_n`/`lam_h`/`lam_d`/`lam_eq`/`lam_kirsch` schema above
+    /// already covers it exhaustively); `Some(..)` on `step_physics_multi`, which has no
+    /// fixed schema for an arbitrary N-term problem. This is what Converge-entry code must
+    /// snapshot instead of `problem.base_weight(..)` (see `run_headless_pinlug_inner`'s
+    /// `frozen_lams` construction) so L-BFGS inherits the LIVE SAW+cap-adapted weight active
+    /// on the step Converge was entered, not the static Phase-1 SAW-BRDR seed.
+    pub lam_by_name:   Option<std::collections::HashMap<&'static str, f64>>,
 }
 
 /// Extract (σ_xx, σ_yy, σ_xy) from rows `[row_start, row_end)` of an mDEM network output
@@ -657,6 +666,7 @@ pub fn step_physics(
         proxy_ratio,
         optimizer_tier: tier_u8,
         cosine_sim: None,
+        lam_by_name: None,
     })
 }
 
@@ -955,6 +965,7 @@ pub fn step_physics_multi(
         proxy_ratio: 0.0,
         optimizer_tier: tier_u8,
         cosine_sim: None,
+        lam_by_name: Some(lam_by_name),
     })
 }
 
@@ -2513,6 +2524,7 @@ mod tests {
             proxy_ratio,
             optimizer_tier: 0,
             cosine_sim: None,
+            lam_by_name: None,
         })
     }
 
@@ -3367,6 +3379,242 @@ mod tests {
             "empty BC group (all terms Physics-classified) must yield exactly 0.0 cosine via the epsilon guard, not NaN");
         assert!(conflict.g_bc_norm.is_finite());
         assert!(conflict.g_pde_norm.is_finite());
+    }
+
+    // ─── StepOutput.lam_by_name ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn step_physics_step_output_lam_by_name_is_none_on_kirsch_frozen_path() {
+        use crate::{
+            engine::EngineParams,
+            kirsch_problem::KirschProblem,
+            network::ElasticityNetConfig,
+            optim::{make_bias_optim, make_gate_optim, WeightOptim},
+        };
+        use pinn_core::messages::SolverConfig;
+
+        let mut config = SolverConfig::default_kirsch();
+        config.n_interior = 32;
+        config.n_boundary = 24;
+        config.max_steps = 1;
+        let engine = EngineParams::analyze(&config);
+        engine.apply_to(&mut config);
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+
+        let (x0, x1) = config.geometry.x_range();
+        let (y0, y1) = config.geometry.y_range();
+        let fd = FdConfig::new(config.fd_h, x1 - x0, y1 - y0);
+        let cx = fd.sx / (2.0 * fd.hx as f64);
+        let cy = fd.sy / (2.0 * fd.hy as f64);
+        let ref_div2 = (config.load.px * cx).powi(2).max(1.0);
+        let (u_ref, ref_energy, ref_stress2) = compute_reference_scales(&config);
+
+        let int_pts = pinn_core::sampling::sample_interior(&config.geometry, engine.phase1_n_interior);
+        let bnd_pts = pinn_core::sampling::sample_boundary(&config.geometry, &config.load, config.n_boundary);
+        let eq_ring = pinn_core::sampling::sample_eq_ring(&config.geometry, engine.n_eq_ring);
+
+        let int_norm: Vec<[f32; 2]> = int_pts.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
+        let bnd_norm: Vec<[f32; 2]> = bnd_pts.iter().map(|b| normalize_point(b.x, b.y, &config)).collect();
+        let bnd_nx: Vec<f32> = bnd_pts.iter().map(|b| b.nx as f32).collect();
+        let bnd_ny: Vec<f32> = bnd_pts.iter().map(|b| b.ny as f32).collect();
+        let bnd_tx: Vec<f32> = bnd_pts.iter().map(|b| b.tx as f32).collect();
+        let bnd_ty: Vec<f32> = bnd_pts.iter().map(|b| b.ty as f32).collect();
+        let (trac_idx, hole_idx, right_idx) = extract_boundary_indices(&bnd_pts, &bnd_nx);
+        let eq_ring_norm: Vec<[f32; 2]> = eq_ring.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
+
+        let problem = KirschProblem::new(
+            config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
+        );
+
+        let mut optim_w = WeightOptim::new(config.use_soap_muon);
+        let mut optim_b = make_bias_optim();
+        let mut optim_gate = make_gate_optim();
+        let mut saw = SawBrdr::with_base(engine.init_weights(), 0.95);
+        let mut lr_sched = LrSchedule::new(engine.peak_lr, 200, 1000);
+
+        let ctx = StepCtx {
+            config: &config, engine: &engine, problem: &problem, fd: &fd,
+            k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm: &int_norm, bnd_norm: &bnd_norm,
+            bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            eq_ring_norm: &eq_ring_norm,
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            phase2_active: false, step: 0,
+        };
+
+        let (_model, out) = step_physics(
+            model, &mut optim_w, &mut optim_b, &mut optim_gate,
+            &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+
+        assert!(out.lam_by_name.is_none(),
+            "step_physics (Kirsch's frozen single-domain path) must leave lam_by_name None — \
+             the fixed 6-field lam_e/n/h/d/eq/kirsch schema already covers it exhaustively");
+    }
+
+    #[test]
+    fn step_physics_multi_step_output_exposes_lam_by_name_for_every_active_term() {
+        let device = WgpuDevice::default();
+        let model_a = tiny_net(&device);
+        let model_b = tiny_net(&device);
+        struct TouchVisitor;
+        impl ModuleVisitor<B> for TouchVisitor {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+                let _ = param.val();
+            }
+        }
+        model_a.visit(&mut TouchVisitor);
+        model_b.visit(&mut TouchVisitor);
+
+        let domain_a = pinn_core::problem::DomainId(600);
+        let domain_b = pinn_core::problem::DomainId(601);
+        let geom = toy_geom_2d();
+        let material = pinn_core::material::MaterialProps::al7075_t6();
+        let problem = TwoDomainToyProblem {
+            domains: vec![
+                pinn_core::problem::DomainSpec { id: domain_a, geometry: geom.clone(), material: material.clone(), output_dim: 2 },
+                pinn_core::problem::DomainSpec { id: domain_b, geometry: geom, material, output_dim: 2 },
+            ],
+            sampling: crate::kirsch_problem::KirschSamplingStrategy,
+            ansatz: crate::kirsch_problem::QuarterSymmAnsatz,
+            only_a: false, // combined_term reads BOTH domains
+        };
+
+        let data_a = toy_domain_data(domain_a);
+        let data_b = toy_domain_data(domain_b);
+        let fd = FdConfig::new(1e-3, 2.0, 2.0);
+        let ctx = crate::problem::MultiStepCtx {
+            config: &SolverConfig::default_kirsch(),
+            problem: &problem,
+            fd: &fd,
+            k: 1.0,
+            domains: vec![
+                crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+                crate::problem::DomainStepCtx { data: &data_b, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+            ],
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+            step: 0,
+        };
+
+        let mut optims = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+        let mut saw = SawBrdr::with_base(vec![1.0], 0.95);
+        let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
+
+        let (_new_models, out) = step_physics_multi(
+            vec![model_a, model_b], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+
+        let map = out.lam_by_name.expect("step_physics_multi must always populate lam_by_name");
+        for term in problem.loss_terms() {
+            let lam = *map.get(term.name())
+                .unwrap_or_else(|| panic!("lam_by_name missing entry for active term '{}'", term.name()));
+            assert!(lam.is_finite() && lam >= 0.0, "lam_by_name['{}']={} must be finite and non-negative", term.name(), lam);
+        }
+    }
+
+    // ─── frozen_lams regression guard (pin-lug Converge entry) ──────────────────────────
+
+    /// Regression guard for the frozen_lams bug: L-BFGS's frozen lambdas at Converge entry
+    /// must be the LIVE SAW+cap-adapted weights from the step immediately preceding entry,
+    /// not `problem.base_weight()`'s static Phase-1 seed. The end-to-end proof lives in
+    /// `headless.rs`'s `pinlug_frozen_lbfgs_lams_at_converge_entry_match_the_immediately_
+    /// preceding_step_output` test (which exercises the actual `run_headless_pinlug_inner`
+    /// wiring); this test pins down the underlying mechanism `StepOutput.lam_by_name`
+    /// itself is reliable enough to build that fix on — i.e. after SAW has adapted away
+    /// from its base weights, `lam_by_name` reflects the adapted values, not the seed.
+    #[test]
+    fn step_physics_multi_lam_by_name_reflects_saw_adaptation_not_base_weight_seed() {
+        let device = WgpuDevice::default();
+        let model_a = tiny_net(&device);
+        let model_b = tiny_net(&device);
+        struct TouchVisitor;
+        impl ModuleVisitor<B> for TouchVisitor {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+                let _ = param.val();
+            }
+        }
+        model_a.visit(&mut TouchVisitor);
+        model_b.visit(&mut TouchVisitor);
+
+        let domain_a = pinn_core::problem::DomainId(700);
+        let domain_b = pinn_core::problem::DomainId(701);
+        let geom = toy_geom_2d();
+        let material = pinn_core::material::MaterialProps::al7075_t6();
+        // Two INDEPENDENT single-domain terms (not TwoDomainToyProblem's single combined
+        // term) — SAW-BRDR needs >=2 components with differential convergence rates for its
+        // multiplier to move away from the uniform 1/n seed (see SawBrdr::update: with n=1
+        // the multiplier is trivially always 1.0, so `combined_term`'s single-term case
+        // would never demonstrate adaptation).
+        let problem = DisjointConflictToyProblem {
+            domains: vec![
+                pinn_core::problem::DomainSpec { id: domain_a, geometry: geom.clone(), material: material.clone(), output_dim: 2 },
+                pinn_core::problem::DomainSpec { id: domain_b, geometry: geom, material, output_dim: 2 },
+            ],
+            sampling: crate::kirsch_problem::KirschSamplingStrategy,
+            ansatz: crate::kirsch_problem::QuarterSymmAnsatz,
+            all_physics: false,
+        };
+
+        let data_a = toy_domain_data(domain_a);
+        let data_b = toy_domain_data(domain_b);
+        let fd = FdConfig::new(1e-3, 2.0, 2.0);
+        let ctx = crate::problem::MultiStepCtx {
+            config: &SolverConfig::default_kirsch(),
+            problem: &problem,
+            fd: &fd,
+            k: 1.0,
+            domains: vec![
+                crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+                crate::problem::DomainStepCtx { data: &data_b, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+            ],
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+            step: 0,
+        };
+
+        // Base weight seed the SAW-BRDR instance starts from (uniform, both terms equal).
+        let base_seed = 1.0_f64;
+        let mut optims = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+        let mut saw = SawBrdr::with_base(vec![base_seed as f32, base_seed as f32], 0.95);
+        let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
+
+        // Run several steps so SAW-BRDR's adaptive multipliers have room to diverge as the
+        // two terms' convergence rates differ (two independently-initialized tiny nets).
+        let mut models = vec![model_a, model_b];
+        let mut last_lam_a = base_seed;
+        let mut last_lam_b = base_seed;
+        for _ in 0..8 {
+            let (new_models, out) = step_physics_multi(
+                models, &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+            );
+            models = new_models;
+            let map = out.lam_by_name.expect("must be populated");
+            last_lam_a = *map.get("physics_only_a").expect("physics_only_a must be present");
+            last_lam_b = *map.get("bc_only_b").expect("bc_only_b must be present");
+        }
+
+        assert!((last_lam_a - base_seed).abs() > 1e-9 || (last_lam_b - base_seed).abs() > 1e-9,
+            "lam_by_name must reflect SAW-BRDR's adapted weight after several steps, not the \
+             static base_weight seed both terms started from: last_lam_a={last_lam_a} \
+             last_lam_b={last_lam_b} base_seed={base_seed}");
     }
 }
 

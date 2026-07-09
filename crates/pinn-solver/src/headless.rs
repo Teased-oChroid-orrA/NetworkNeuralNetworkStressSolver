@@ -99,7 +99,7 @@ pub fn run_headless(config: SolverConfig) -> bool {
     let mut model: ElasticityNet<B> = net_cfg.init(&device);
     let use_soap_muon = config.use_soap_muon;
     let dm_config = config.decision_maker.clone();
-    let mut decision_maker = PinnDecisionMaker::new(dm_config.clone(), false);
+    let mut decision_maker = PinnDecisionMaker::new(dm_config.clone(), false, false);
     let mut optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
     let mut optim_b = make_bias_optim();
     let mut optim_gate = make_gate_optim();
@@ -165,7 +165,7 @@ pub fn run_headless(config: SolverConfig) -> bool {
             int_pts_dirty = true;
             amr = Some(grid);
             lr_sched.reset_for_phase2();
-            decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
+            decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
             optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
             optim_b = make_bias_optim();
             optim_gate = make_gate_optim();
@@ -205,7 +205,7 @@ pub fn run_headless(config: SolverConfig) -> bool {
                 // AMR invalidates L-BFGS curvature history (new quadrature points).
                 if decision_maker.current_tier == OptimizerTier::Converge {
                     println!("  [DM@{step}] AMR → demote Converge→Align");
-                    decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
+                    decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
                     optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
                     lbfgs_opt = None; frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None;
                 }
@@ -268,6 +268,7 @@ pub fn run_headless(config: SolverConfig) -> bool {
                 proxy_ratio: 0.0,
                 optimizer_tier: OptimizerTier::Converge.as_u8(),
                 cosine_sim: None,
+                lam_by_name: None,
             };
             (new_m, synthetic_out)
         } else {
@@ -372,7 +373,7 @@ pub fn run_headless(config: SolverConfig) -> bool {
                             tracker.clear_history();
                             saw.reset();
                             lr_sched.reset_for_phase2();
-                            decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
+                            decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
                             optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
                             optim_b = make_bias_optim();
                             optim_gate = make_gate_optim();
@@ -385,7 +386,7 @@ pub fn run_headless(config: SolverConfig) -> bool {
                             dynamic_lam_d_cap = new_cap;
                             saw.reset();
                             lr_sched.reset_for_phase2();
-                            decision_maker = PinnDecisionMaker::new(dm_config.clone(), true);
+                            decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
                             optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
                             optim_b = make_bias_optim();
                             optim_gate = make_gate_optim();
@@ -452,21 +453,52 @@ pub(crate) struct PinLugHeadlessResult {
     /// Per-step `total_scalar` trajectory — used by the zero-regression baseline test.
     #[allow(dead_code)]
     pub trajectory: Vec<f32>,
+    /// Number of times `problem.convergence_metric(...)` was successfully probed (`Some`)
+    /// and pushed into the plateau/crash tracker — test-only visibility into the cascade.
+    #[allow(dead_code)]
+    pub metric_probes: usize,
+    /// Final `dynamic_lam_h_cap`/`dynamic_lam_d_cap` after all plateau/crash restarts.
+    #[allow(dead_code)]
+    pub final_lam_h_cap: f64,
+    #[allow(dead_code)]
+    pub final_lam_d_cap: f64,
+    /// `tracker.plateau_restarts + tracker.crash_restarts` at the end of training.
+    #[allow(dead_code)]
+    pub total_restarts: usize,
+    /// The `out.lam_by_name` snapshot from the step IMMEDIATELY BEFORE a Converge-tier
+    /// transition fired — test-only regression guard for the frozen-lams bug (see
+    /// `frozen_lams`'s construction below): L-BFGS's frozen weights at entry must match
+    /// this, not `problem.base_weight()`'s static seed.
+    #[allow(dead_code)]
+    pub last_lam_before_converge: Option<HashMap<&'static str, f64>>,
+    /// The `frozen_lams` snapshot actually captured at Converge-tier entry.
+    #[allow(dead_code)]
+    pub lbfgs_entry_lams: Option<HashMap<&'static str, f64>>,
 }
 
 /// Headless-only entry point for the pin-in-lug 2-domain contact problem — routes through
 /// `step_physics_multi` (`training_core.rs`) instead of the frozen 1-domain `step_physics`
-/// Kirsch path. GUI/vis-grid support for pin-in-lug is explicitly OUT OF SCOPE for this
-/// slice (`runner.rs`'s GUI path remains Kirsch-only) — this headless entry point matches
-/// the CSV-export post-processing use case pin-in-lug is for.
+/// Kirsch path. This entry point matches the CSV-export post-processing use case pin-in-lug
+/// is for. Note: `runner.rs::run_training_pinlug` (the GUI-driving path) DOES also exist and
+/// train pin-in-lug — it is not out of scope in the sense of "unimplemented" — but it does
+/// NOT yet have this function's plateau/crash cascade or Converge-tier decision-maker wiring
+/// (its `dynamic_lam_h_cap`/`dynamic_lam_d_cap` are still hardcoded 50.0, `phase2_active` is
+/// still `false`, and it has no `ConvergenceTracker`/`PinnDecisionMaker` at all) — that gap is
+/// a deliberate, tracked scope cut (see the GitHub issue for porting this cascade to the GUI
+/// path), not an oversight.
 ///
-/// Deliberately does not replicate Kirsch's AMR / stiffness-controller / warm-restart-cascade
-/// machinery — those are tightly coupled to K_t-based convergence diagnostics that don't
-/// apply to a contact problem without a closed-form K_t. A fixed SAW-BRDR schedule (base
-/// weights from `PinLugProblem::base_weight`) over `max_steps` is the minimal correct
-/// training loop for this problem. The decision maker (`PinnDecisionMaker`) IS wired in
-/// (opt-in via `config.decision_maker.enabled`, default false) — see
-/// `run_headless_pinlug_inner`'s Converge-tier branch below.
+/// Deliberately does not replicate Kirsch's AMR / stiffness-controller machinery — those are
+/// tightly coupled to K_t-based diagnostics/AMR sampling that don't apply to a contact
+/// problem without a closed-form K_t or an AMR-gated resample schedule (pin-lug resamples
+/// unconditionally every step). It DOES now replicate Kirsch's plateau/crash warm-restart
+/// cascade (`ConvergenceTracker::for_metric`, driven by `problem.convergence_metric(...)`'s
+/// interface-gap RMS every 200 steps) — see the cascade block inside the training loop below.
+/// A fixed SAW-BRDR schedule (base weights from `PinLugProblem::base_weight`) over
+/// `max_steps` remains the baseline training loop; the cascade only intervenes on plateau/
+/// crash. The decision maker (`PinnDecisionMaker`) IS wired in (opt-in via
+/// `config.decision_maker.enabled`, default false), and — unlike Kirsch — CAN reach the
+/// Converge (L-BFGS) tier: pin-lug has no Phase-1/Phase-2 curriculum split, so it is
+/// constructed with `allow_converge=true` (see `PinnDecisionMaker::new`'s doc comment).
 pub fn run_headless_pinlug(config: SolverConfig) -> bool {
     run_headless_pinlug_inner(config, None).converged
 }
@@ -484,10 +516,11 @@ pub(crate) fn run_headless_pinlug_inner(
 ) -> PinLugHeadlessResult {
     use pinn_core::problem::InterfaceParametrization;
     use crate::{
+        controllers::{ConvergenceTracker, MetricDirection},
         network::ElasticityNetConfig,
         pinlug_problem::{PinLugProblem, PinLugScalingMode, LUG_DOMAIN, PIN_DOMAIN},
         problem::{
-            validate_loss_terms, BoundaryValueProblem, DomainOptim, DomainStepCtx,
+            validate_loss_terms, BoundaryValueProblem, DomainOptim, DomainState, DomainStepCtx,
             DomainStepData, FrozenMultiStepCtx, MultiStepCtx, PointSetData,
         },
         training_core::{compute_gradient_conflict_multi, step_lbfgs_multi, step_physics_multi, TwoDomainModels},
@@ -577,11 +610,13 @@ pub(crate) fn run_headless_pinlug_inner(
         }
     };
 
-    // Decision maker: pin-in-lug has no phase-2 cascade (see PHASE2_ACTIVE), so `phase2_active`
-    // is always `false` at construction, mirroring `run_headless`'s Phase-1 initialization
-    // (`PinnDecisionMaker::new(dm_config.clone(), false)`).
+    // Decision maker: `phase2_active` is always `false` at construction, mirroring
+    // `run_headless`'s Phase-1 initialization — but `allow_converge=true` (pin-in-lug has no
+    // Kirsch-style Phase-1/Phase-2 curriculum split, so Align→Converge is unlocked via the
+    // dedicated `allow_converge` arm, not via `phase2_active`; see `PinnDecisionMaker::new`'s
+    // doc comment).
     let dm_config = config.decision_maker.clone();
-    let mut decision_maker = PinnDecisionMaker::new(dm_config.clone(), false);
+    let mut decision_maker = PinnDecisionMaker::new(dm_config.clone(), false, true);
     let mut lbfgs_opt: Option<burn::optim::LBFGS<B>> = None;
     // Frozen at Converge-tier ENTRY, re-frozen every time Converge is (re-)entered, and
     // cleared on exit — pin-in-lug resamples its collocation points every step
@@ -589,6 +624,35 @@ pub(crate) fn run_headless_pinlug_inner(
     // persisted across a demote-then-repromote cycle would silently train on stale points.
     let mut frozen_ctx: Option<FrozenMultiStepCtx> = None;
     let mut frozen_lams: Option<HashMap<&'static str, f64>> = None;
+
+    // Plateau/crash warm-restart cascade, mirroring `run_headless`'s K_t-based cascade but
+    // driven by `problem.convergence_metric(...)`'s interface-gap RMS (SmallerIsBetter,
+    // target 0.0). `dynamic_lam_h_cap`/`dynamic_lam_d_cap` are declared here as mutable
+    // locals (not per-step 50.0 literals) so restart events can tighten them, mirroring
+    // `run_headless`'s own pattern.
+    //
+    // Physically-derived floor: below ~5x the problem's own characteristic displacement
+    // scale (u_ref — the SAME reference PinLugProblem's own ref_gap2 normalizes against,
+    // see CLAUDE.md's Reference-scale normalization section), a gap-RMS reading is noise,
+    // not signal — mirrors CRASH_MIN_PEAK_KT's role for K_t but derived from the problem,
+    // not a hand-rolled literal.
+    let significant_floor = 5.0 * u_ref as f64;
+    let mut tracker = ConvergenceTracker::for_metric(
+        MetricDirection::SmallerIsBetter,
+        0.05, // plateau_rel_eps: recent-window min must shrink >=5% relative to the older
+              // window's min or a restart fires.
+        2.0,  // crash_spike_factor: metric >=2x its recent best — smaller-is-better mirror
+              // of K_t's CRASH_DROP_FRACTION=0.5 (1/0.5 = 2.0).
+        significant_floor,
+    );
+    let mut dynamic_lam_h_cap = 50.0_f64;
+    let mut dynamic_lam_d_cap = 50.0_f64;
+    let mut metric_probes: usize = 0;
+    let mut last_lam_before_converge: Option<HashMap<&'static str, f64>> = None;
+    let mut lbfgs_entry_lams: Option<HashMap<&'static str, f64>> = None;
+    // Most recent step_physics_multi (real, non-synthetic) StepOutput's lam_by_name — see
+    // the update site inside the loop below for why this is what Converge-entry code reads.
+    let mut prev_lam_by_name: Option<HashMap<&'static str, f64>> = None;
 
     let start = std::time::Instant::now();
     let mut last_total = f32::MAX;
@@ -629,9 +693,18 @@ pub(crate) fn run_headless_pinlug_inner(
                 DomainStepCtx { data: &pin_data, u_ref, ref_energy, ref_stress2 },
                 DomainStepCtx { data: &lug_data, u_ref, ref_energy, ref_stress2 },
             ],
-            dynamic_lam_h_cap: 50.0,
-            dynamic_lam_d_cap: 50.0,
-            phase2_active: PHASE2_ACTIVE,
+            dynamic_lam_h_cap,
+            dynamic_lam_d_cap,
+            // NOTE: `MultiStepCtx::phase2_active` and the `PHASE2_ACTIVE` const below are two
+            // INDEPENDENT booleans that happen to share a value by coincidence, not
+            // architectural coupling. This one gates `step_physics_multi`'s h/d SAW-BRDR cap
+            // dispatch (training_core.rs's "hole_traction" | "lug_free_edge_traction" /
+            // "displacement_anchor" | "lug_shank_anchor" match arms) — hardcoded `true` so the
+            // cap cascade below can actually bind (it was previously dead code for pin-lug
+            // because this field was always `false`). `PHASE2_ACTIVE` (used only by
+            // `decision_maker.evaluate(...)` further down) is the decision-maker's own,
+            // unrelated axis (tier transitions, not loss-term gating) and stays `false`.
+            phase2_active: true,
             step,
         };
 
@@ -641,11 +714,18 @@ pub(crate) fn run_headless_pinlug_inner(
             // L-BFGS, then run one quasi-Newton step over BOTH domains via TwoDomainModels.
             if frozen_ctx.is_none() {
                 frozen_ctx = Some(FrozenMultiStepCtx::from_ctx(&ctx));
-                let mut lams: HashMap<&'static str, f64> = HashMap::new();
-                for term in problem.loss_terms() {
-                    lams.insert(term.name(), problem.base_weight(term.name()) as f64);
-                }
-                frozen_lams = Some(lams);
+                // Snapshot the LIVE SAW+cap-adapted weights from the immediately preceding
+                // step_physics_multi call (`prev_lam_by_name`), NOT `problem.base_weight()`'s
+                // static Phase-1 seed — see the module's frozen-lams bug note (CLAUDE.md /
+                // task doc). Fallback to base weights only if no prior step's lam_by_name was
+                // ever captured (defensive; in practice always Some by the time Converge can
+                // be entered).
+                frozen_lams = Some(prev_lam_by_name.clone().unwrap_or_else(|| {
+                    problem.loss_terms().iter()
+                        .map(|t| (t.name(), problem.base_weight(t.name()) as f64))
+                        .collect()
+                }));
+                lbfgs_entry_lams = frozen_lams.clone();
             }
             let lbfgs = lbfgs_opt.get_or_insert_with(|| make_lbfgs(dm_config.lbfgs_max_iter));
             let fctx = frozen_ctx.as_ref().unwrap();
@@ -663,6 +743,7 @@ pub(crate) fn run_headless_pinlug_inner(
                 proxy_ratio: 0.0,
                 optimizer_tier: OptimizerTier::Converge.as_u8(),
                 cosine_sim: None,
+                lam_by_name: None,
             }
         } else {
             // tier_u8 is a pure logging passthrough (StepOutput.optimizer_tier) — never
@@ -685,6 +766,13 @@ pub(crate) fn run_headless_pinlug_inner(
         };
         last_total = out.total_scalar;
         trajectory.push(out.total_scalar);
+        // Track the most recent REAL (step_physics_multi) SAW+cap-adapted lambda map —
+        // `None` on Converge/L-BFGS steps (synthetic StepOutput), so this naturally holds
+        // steady at "the last real step's weights" across a Converge dwell, which is exactly
+        // what Converge-entry code needs to snapshot from.
+        if out.lam_by_name.is_some() {
+            prev_lam_by_name = out.lam_by_name.clone();
+        }
 
         // `advance()` unconditionally (even when `dm_config.enabled == false`) so its
         // internal step counters stay correct regardless — mirrors `run_headless`'s
@@ -722,13 +810,20 @@ pub(crate) fn run_headless_pinlug_inner(
                 }
                 match t.new_tier {
                     OptimizerTier::Converge => {
-                        // Freeze fresh collocation points/lams for this Converge entry.
+                        // Freeze fresh collocation points/lams for this Converge entry. Uses
+                        // THIS step's `out.lam_by_name` — the LIVE SAW+cap-adapted weights
+                        // from the step immediately preceding entry (transitions fire from
+                        // Align, which always ran through step_physics_multi this step, so
+                        // `out.lam_by_name` is `Some`) — NOT `problem.base_weight()`'s static
+                        // Phase-1 seed. See the module's frozen-lams bug note.
                         frozen_ctx = Some(FrozenMultiStepCtx::from_ctx(&ctx));
-                        let mut lams: HashMap<&'static str, f64> = HashMap::new();
-                        for term in problem.loss_terms() {
-                            lams.insert(term.name(), problem.base_weight(term.name()) as f64);
-                        }
-                        frozen_lams = Some(lams);
+                        last_lam_before_converge = out.lam_by_name.clone();
+                        frozen_lams = Some(out.lam_by_name.clone().unwrap_or_else(|| {
+                            problem.loss_terms().iter()
+                                .map(|t| (t.name(), problem.base_weight(t.name()) as f64))
+                                .collect()
+                        }));
+                        lbfgs_entry_lams = frozen_lams.clone();
                         lbfgs_opt = None;
                     }
                     _ => {
@@ -736,6 +831,54 @@ pub(crate) fn run_headless_pinlug_inner(
                         // the next Converge entry re-freezes on fresh collocation points.
                         frozen_ctx = None; frozen_lams = None; lbfgs_opt = None;
                     }
+                }
+            }
+        }
+
+        // === Plateau/crash warm-restart cascade (mirrors run_headless's K_t-based cascade,
+        // driven by problem.convergence_metric()'s interface-gap RMS instead). Unconditional
+        // on `dm_config.enabled` — same convention as Kirsch's own cascade, which is gated
+        // only on having started its curriculum, not on the decision maker being on. ===
+        if step % 200 == 0 {
+            let state = vec![
+                DomainState { id: PIN_DOMAIN, model: model_pin.clone(), u_ref, ref_energy, ref_stress2 },
+                DomainState { id: LUG_DOMAIN, model: model_lug.clone(), u_ref, ref_energy, ref_stress2 },
+            ];
+            if let Some(rms) = problem.convergence_metric(&state) {
+                metric_probes += 1;
+                tracker.push(rms);
+
+                // Crash recovery: gap RMS spiked >=2x its recent best → fresh restart.
+                // Clear history after to prevent cascade detections while recovering.
+                if let Some(new_cap) = tracker.check_kt_crash(rms) {
+                    dynamic_lam_h_cap = new_cap;
+                    dynamic_lam_d_cap = new_cap;
+                    tracker.clear_history();
+                    saw.reset();
+                    lr_sched.reset_for_phase2();
+                    // Always restart fresh at Align (phase2_active=true), allow_converge
+                    // preserved — mirrors Kirsch's own restart convention exactly.
+                    decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, true);
+                    optims = vec![
+                        DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
+                        DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
+                    ];
+                    lbfgs_opt = None; frozen_ctx = None; frozen_lams = None;
+                    println!("\n  [CRASH RECOVERY #{}] gap_rms={rms:.3e} collapsed → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
+                        tracker.total_restarts());
+                } else if let Some(new_cap) = tracker.check_plateau() {
+                    dynamic_lam_h_cap = new_cap;
+                    dynamic_lam_d_cap = new_cap;
+                    saw.reset();
+                    lr_sched.reset_for_phase2();
+                    decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, true);
+                    optims = vec![
+                        DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
+                        DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
+                    ];
+                    lbfgs_opt = None; frozen_ctx = None; frozen_lams = None;
+                    println!("\n  [WARM RESTART #{}] gap_rms plateau → reset: lr+adam+SAW, lam_caps→{new_cap:.0}",
+                        tracker.total_restarts());
                 }
             }
         }
@@ -776,6 +919,12 @@ pub(crate) fn run_headless_pinlug_inner(
         converged: last_total.is_finite(),
         final_tier: decision_maker.current_tier,
         trajectory,
+        metric_probes,
+        final_lam_h_cap: dynamic_lam_h_cap,
+        final_lam_d_cap: dynamic_lam_d_cap,
+        total_restarts: tracker.plateau_restarts + tracker.crash_restarts,
+        last_lam_before_converge,
+        lbfgs_entry_lams,
     }
 }
 
@@ -895,5 +1044,131 @@ mod tests {
             "with a permissive conflict_threshold and enabled=true, the decision maker must \
              transition out of Explore within {} steps; final_tier={:?}",
             60, result.final_tier);
+    }
+
+    #[test]
+    fn run_headless_pinlug_convergence_metric_probe_wired_into_cascade() {
+        let mut config = small_pinlug_config();
+        config.max_steps = 220;
+        let result = run_headless_pinlug_inner(config, None);
+        assert!(result.metric_probes >= 2);
+        assert!(result.converged);
+    }
+
+    /// Extends the existing zero-regression test's pattern past max_steps=220 (past the
+    /// 200-step cascade probe boundary) — the EXISTING test never reaches that boundary and
+    /// must NOT be modified. This is new, additional coverage: with the decision maker
+    /// disabled, the plateau/crash cascade (unconditional on `decision_maker.enabled`, see
+    /// invariant #3) must still be a fully DETERMINISTIC function of the training
+    /// trajectory — running it twice on the same starting weights must produce identical
+    /// restart counts/caps/trajectories.
+    #[test]
+    fn run_headless_pinlug_disabled_decision_maker_long_run_deterministic_across_two_calls() {
+        use crate::network::ElasticityNetConfig;
+        use burn::module::Module;
+        use burn::tensor::Tensor;
+
+        let device = WgpuDevice::default();
+        let mut config = small_pinlug_config();
+        config.max_steps = 220;
+        config.decision_maker.enabled = false;
+
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(3)
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(5)
+            .with_use_piratenet(false);
+        let model_pin: ElasticityNet<B> = net_cfg.init(&device);
+        let model_lug: ElasticityNet<B> = net_cfg.init(&device);
+
+        struct TouchVisitor;
+        impl burn::module::ModuleVisitor<B> for TouchVisitor {
+            fn visit_float<const D: usize>(&mut self, param: &burn::module::Param<Tensor<B, D>>) {
+                let _ = param.val();
+            }
+        }
+        model_pin.visit(&mut TouchVisitor);
+        model_lug.visit(&mut TouchVisitor);
+
+        let a = run_headless_pinlug_inner(config.clone(), Some((model_pin.clone(), model_lug.clone())));
+        let b = run_headless_pinlug_inner(config, Some((model_pin, model_lug)));
+
+        assert_eq!(a.total_restarts, b.total_restarts);
+        assert_eq!(a.final_lam_h_cap, b.final_lam_h_cap);
+        assert_eq!(a.final_lam_d_cap, b.final_lam_d_cap);
+        assert_eq!(a.trajectory.len(), b.trajectory.len());
+        for (i, (x, y)) in a.trajectory.iter().zip(b.trajectory.iter()).enumerate() {
+            let scale = x.abs().max(y.abs()).max(1e-8);
+            assert!((x - y).abs() / scale < 1e-4, "step {i}: cascade introduced nondeterminism: a={x} b={y}");
+        }
+    }
+
+    fn permissive_converge_config() -> SolverConfig {
+        let mut config = small_pinlug_config();
+        config.max_steps = 80;
+        config.decision_maker.enabled = true;
+        config.decision_maker.check_interval = 5;
+        config.decision_maker.min_dwell_steps = 5;
+        config.decision_maker.conflict_threshold = 0.99;
+        config.decision_maker.alignment_threshold = 1.1;
+        config.decision_maker.converge_cosine_min = -1.0;
+        config.decision_maker.converge_grad_threshold = 1.0e6;
+        config.decision_maker.use_exact_cosine = true; // REQUIRED: Converge entry needs Some(gnorm)
+        config
+    }
+
+    #[test]
+    fn run_headless_pinlug_decision_maker_enabled_can_reach_converge_tier() {
+        let config = permissive_converge_config();
+        let result = run_headless_pinlug_inner(config, None);
+        assert_eq!(result.final_tier, OptimizerTier::Converge);
+    }
+
+    #[test]
+    fn run_headless_pinlug_decision_maker_enabled_stays_in_align_when_converge_thresholds_unfavorable() {
+        let mut config = small_pinlug_config();
+        config.max_steps = 60;
+        config.decision_maker.enabled = true;
+        config.decision_maker.check_interval = 5;
+        config.decision_maker.min_dwell_steps = 5;
+        config.decision_maker.conflict_threshold = 0.99;
+        config.decision_maker.alignment_threshold = 1.1;
+        config.decision_maker.use_exact_cosine = true;
+        config.decision_maker.converge_cosine_min = 1.1; // impossible: cosine clamped to [-1,1]
+        let result = run_headless_pinlug_inner(config, None);
+        assert_eq!(result.final_tier, OptimizerTier::Align);
+    }
+
+    /// THE MOST IMPORTANT training_core-adjacent regression guard in this task: L-BFGS's
+    /// frozen lambdas at Converge entry must be the LIVE SAW+cap-adapted weights from the
+    /// step immediately preceding entry, not `problem.base_weight()`'s static Phase-1 seed
+    /// (the frozen_lams bug — see module doc comment).
+    #[test]
+    fn pinlug_frozen_lbfgs_lams_at_converge_entry_match_the_immediately_preceding_step_output() {
+        let config = permissive_converge_config();
+        let result = run_headless_pinlug_inner(config, None);
+
+        let last = result.last_lam_before_converge.expect("must have captured a pre-entry snapshot");
+        let entry = result.lbfgs_entry_lams.expect("must have entered Converge and frozen lams");
+        assert_eq!(last, entry, "L-BFGS's frozen lambdas at entry must be the LIVE SAW+cap-adapted \
+            weights from the step immediately before entry, not problem.base_weight()'s static seed");
+
+        // Adversarial: prove this isn't vacuously true because SAW hadn't moved from its
+        // seed yet.
+        use crate::pinlug_problem::{PinLugProblem, PinLugScalingMode};
+        use crate::problem::BoundaryValueProblem;
+        let problem = PinLugProblem::new(
+            pinn_core::material::MaterialProps::steel_4340(), 5, usize::MAX, 64,
+            PinLugScalingMode::AppliedLoad,
+        );
+        let base_free_edge = problem.base_weight("lug_free_edge_traction") as f64;
+        let base_penetration = problem.base_weight("interface_penetration") as f64;
+        assert!(
+            (entry["lug_free_edge_traction"] - base_free_edge).abs() > 1e-9 * base_free_edge.max(1.0)
+            || (entry["interface_penetration"] - base_penetration).abs() > 1e-9 * base_penetration.max(1.0),
+            "expected at least one term's SAW-adapted weight to have moved from its static \
+             base_weight by Converge entry"
+        );
     }
 }

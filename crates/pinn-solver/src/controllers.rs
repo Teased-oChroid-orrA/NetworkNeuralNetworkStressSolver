@@ -28,6 +28,37 @@ const CRASH_MIN_PEAK_KT: f64 = 1.5;
 const CONVERGED_MEAN_FRACTION: f64 = 0.98;
 const CONVERGED_STDDEV_FRACTION: f64 = 0.015;
 
+/// Which direction of `ConvergenceTracker`'s tracked metric counts as "better" — K_t wants
+/// `LargerIsBetter` (target 3.0, improving means increasing), pin-lug's interface-gap RMS
+/// wants `SmallerIsBetter` (target 0.0, improving means decreasing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetricDirection {
+    LargerIsBetter,
+    SmallerIsBetter,
+}
+
+/// Internal metric-scale mode. `KtLegacy` reproduces today's K_t-only behavior byte-for-byte
+/// (absolute epsilon/fraction thresholds tuned specifically for K_t's O(1..3) scale);
+/// `Relative` generalizes to any metric whose absolute scale is problem-configuration-
+/// dependent (e.g. pin-lug's interface-gap RMS, unit meters) by expressing every threshold
+/// as a dimensionless fraction of the tracker's own recent history, except
+/// `significant_floor` — an absolute "below this the metric is noise" cutoff the caller
+/// derives from the problem's own physical reference scale.
+#[derive(Clone, Copy)]
+enum MetricMode {
+    KtLegacy {
+        plateau_epsilon: f64,
+        crash_min_peak: f64,
+        crash_drop_fraction: f64,
+    },
+    Relative {
+        direction: MetricDirection,
+        plateau_rel_eps: f64,
+        crash_spike_factor: f64,
+        significant_floor: f64,
+    },
+}
+
 /// Detects K_t plateau in Phase 2 and triggers warm restarts to escape local attractors.
 ///
 /// Plateau = max K_t in the recent window hasn't improved by `PLATEAU_EPSILON` over the
@@ -40,6 +71,7 @@ pub struct ConvergenceTracker {
     pub plateau_restarts: usize,
     pub crash_restarts: usize,
     lam_h_cap: f64,
+    mode: MetricMode,
 }
 
 impl ConvergenceTracker {
@@ -49,6 +81,43 @@ impl ConvergenceTracker {
             plateau_restarts: 0,
             crash_restarts: 0,
             lam_h_cap: LAM_CAP_INITIAL,
+            mode: MetricMode::KtLegacy {
+                plateau_epsilon: PLATEAU_EPSILON,
+                crash_min_peak: CRASH_MIN_PEAK_KT,
+                crash_drop_fraction: CRASH_DROP_FRACTION,
+            },
+        }
+    }
+
+    /// Construct a tracker for a non-K_t metric (e.g. pin-lug's interface-gap RMS), whose
+    /// absolute scale is problem-configuration-dependent — every threshold below is a
+    /// dimensionless fraction of the tracker's own recent history except
+    /// `significant_floor`.
+    ///
+    /// `plateau_rel_eps`: recent-window best must improve by at least this fraction of the
+    /// older window's best, or a plateau restart fires.
+    /// `crash_spike_factor`: metric must spike to at least this multiple of its recent best
+    /// (and that best must exceed `significant_floor`) for a crash restart to fire.
+    /// `significant_floor`: absolute cutoff below which the metric is considered noise, not
+    /// signal (mirrors `CRASH_MIN_PEAK_KT`'s role, but derived from the problem, not a
+    /// hand-rolled literal).
+    pub fn for_metric(
+        direction: MetricDirection,
+        plateau_rel_eps: f64,
+        crash_spike_factor: f64,
+        significant_floor: f64,
+    ) -> Self {
+        Self {
+            kt_history: std::collections::VecDeque::with_capacity(200),
+            plateau_restarts: 0,
+            crash_restarts: 0,
+            lam_h_cap: LAM_CAP_INITIAL,
+            mode: MetricMode::Relative {
+                direction,
+                plateau_rel_eps,
+                crash_spike_factor,
+                significant_floor,
+            },
         }
     }
 
@@ -92,11 +161,28 @@ impl ConvergenceTracker {
         let older: Vec<f64>  = self.kt_history.iter().rev()
             .skip(PLATEAU_WINDOW).take(PLATEAU_WINDOW).cloned().collect();
 
-        let max_recent = recent.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let max_older  = older.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let is_plateau = match self.mode {
+            MetricMode::KtLegacy { plateau_epsilon, .. } => {
+                let max_recent = recent.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let max_older  = older.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                // Plateau: best K_t in recent 4 000 steps didn't improve by PLATEAU_EPSILON
+                max_recent - max_older < plateau_epsilon
+            }
+            MetricMode::Relative { direction, plateau_rel_eps, .. } => match direction {
+                MetricDirection::SmallerIsBetter => {
+                    let min_recent = recent.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let min_older  = older.iter().cloned().fold(f64::INFINITY, f64::min);
+                    min_older > 0.0 && (min_older - min_recent) / min_older < plateau_rel_eps
+                }
+                MetricDirection::LargerIsBetter => {
+                    let max_recent = recent.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let max_older  = older.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    max_older > 0.0 && (max_recent - max_older) / max_older < plateau_rel_eps
+                }
+            },
+        };
 
-        // Plateau: best K_t in recent 4 000 steps didn't improve by PLATEAU_EPSILON
-        if max_recent - max_older < PLATEAU_EPSILON {
+        if is_plateau {
             let new_cap = self.step_down_cap();
             self.plateau_restarts += 1;
             Some(new_cap)
@@ -105,19 +191,50 @@ impl ConvergenceTracker {
         }
     }
 
-    /// Detects a catastrophic K_t collapse (≥50% drop from recent peak).
+    /// Detects a catastrophic metric collapse/spike relative to the recent peak/best.
     ///
-    /// Fires when K_t < `CRASH_DROP_FRACTION` × max_prev5 and max_prev5 > `CRASH_MIN_PEAK_KT`,
-    /// indicating the network has escaped the converged basin. Caller should clear
-    /// kt_history after triggering to prevent cascade detections while K_t is recovering.
+    /// `KtLegacy`: fires when K_t < `CRASH_DROP_FRACTION` × max_prev5 and
+    /// max_prev5 > `CRASH_MIN_PEAK_KT`, indicating the network has escaped the converged
+    /// basin. `Relative`/`SmallerIsBetter` mirrors this: fires when `current` spikes to at
+    /// least `crash_spike_factor` × the recent best (min_prev5), provided that best exceeds
+    /// `significant_floor`. Caller should clear kt_history after triggering to prevent
+    /// cascade detections while the metric is recovering.
     pub fn check_kt_crash(&mut self, current_kt: f64) -> Option<f64> {
         if self.crash_restarts >= MAX_CRASH_RESTARTS { return None; }
-        // Need ≥6 readings so we have 5 prior readings before the current push.
-        if self.kt_history.len() < 6 { return None; }
-        let max_prev5: f64 = self.kt_history.iter().rev()
-            .skip(1).take(5)
-            .cloned().fold(f64::NEG_INFINITY, f64::max);
-        if max_prev5 > CRASH_MIN_PEAK_KT && current_kt < max_prev5 * CRASH_DROP_FRACTION {
+
+        let is_crash = match self.mode {
+            MetricMode::KtLegacy { crash_min_peak, crash_drop_fraction, .. } => {
+                // Need ≥6 readings so we have 5 prior readings before the current push
+                // (Kirsch's convention: caller does `tracker.push(kt); check_kt_crash(kt)`,
+                // so the just-pushed current reading is `skip(1)`-ed past).
+                if self.kt_history.len() < 6 { return None; }
+                let max_prev5: f64 = self.kt_history.iter().rev()
+                    .skip(1).take(5)
+                    .cloned().fold(f64::NEG_INFINITY, f64::max);
+                max_prev5 > crash_min_peak && current_kt < max_prev5 * crash_drop_fraction
+            }
+            MetricMode::Relative { direction, crash_spike_factor, significant_floor, .. } => {
+                // 5 readings suffice — the "recent best" window, not requiring the current
+                // reading to have already been pushed (unlike KtLegacy's convention above).
+                if self.kt_history.len() < 5 { return None; }
+                match direction {
+                    MetricDirection::SmallerIsBetter => {
+                        let min_prev5: f64 = self.kt_history.iter().rev()
+                            .take(5)
+                            .cloned().fold(f64::INFINITY, f64::min);
+                        min_prev5 > significant_floor && current_kt > crash_spike_factor * min_prev5
+                    }
+                    MetricDirection::LargerIsBetter => {
+                        let max_prev5: f64 = self.kt_history.iter().rev()
+                            .take(5)
+                            .cloned().fold(f64::NEG_INFINITY, f64::max);
+                        max_prev5 > significant_floor && current_kt < max_prev5 / crash_spike_factor
+                    }
+                }
+            }
+        };
+
+        if is_crash {
             let new_cap = self.step_down_cap();
             self.crash_restarts += 1;
             Some(new_cap)
@@ -194,5 +311,223 @@ mod tests {
         fill_plateau(&mut t, 3.0, CONVERGENCE_WINDOW);
         assert!(t.is_kt_converged(3.0));
         assert!(!t.is_kt_converged(0.0), "target <= 0 is never considered converged");
+    }
+
+    // ─── Relative-mode (pin-lug) generalization ────────────────────────────────────────
+
+    #[test]
+    fn for_metric_smaller_is_better_plateau_fires_on_insufficient_relative_improvement() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..PLATEAU_WINDOW * 2 { t.push(1e-3); }
+        assert_eq!(t.check_plateau(), Some(LAM_CAP_INITIAL));
+        assert_eq!(t.check_plateau(), Some(30.0));
+        assert_eq!(t.check_plateau(), Some(18.0));
+        assert_eq!(t.check_plateau(), Some(LAM_CAP_FLOOR));
+        assert_eq!(t.plateau_restarts, MAX_PLATEAU_RESTARTS);
+        assert_eq!(t.check_plateau(), None);
+    }
+
+    #[test]
+    fn for_metric_smaller_is_better_plateau_does_not_fire_on_sufficient_relative_improvement() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..PLATEAU_WINDOW { t.push(1.0); }
+        for _ in 0..PLATEAU_WINDOW { t.push(0.90); }
+        assert_eq!(t.check_plateau(), None);
+        assert_eq!(t.plateau_restarts, 0);
+    }
+
+    #[test]
+    fn for_metric_smaller_is_better_plateau_boundary_at_exactly_epsilon_does_not_fire() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..PLATEAU_WINDOW { t.push(1.0); }
+        for _ in 0..PLATEAU_WINDOW { t.push(0.95); } // exactly 5.0% improvement: strict < means this must NOT fire
+        assert_eq!(t.check_plateau(), None);
+    }
+
+    #[test]
+    fn for_metric_smaller_is_better_plateau_just_inside_boundary_fires() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..PLATEAU_WINDOW { t.push(1.0); }
+        for _ in 0..PLATEAU_WINDOW { t.push(0.951); } // 4.9% improvement < 5%
+        assert!(t.check_plateau().is_some());
+    }
+
+    #[test]
+    fn for_metric_smaller_is_better_crash_fires_on_spike_above_floor() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..5 { t.push(1e-4); }
+        assert!(t.check_kt_crash(2.5e-4).is_some());
+        assert_eq!(t.crash_restarts, 1);
+    }
+
+    #[test]
+    fn for_metric_smaller_is_better_crash_does_not_fire_on_sub_spike_ratio() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..5 { t.push(1e-4); }
+        assert_eq!(t.check_kt_crash(1.5e-4), None);
+    }
+
+    #[test]
+    fn for_metric_smaller_is_better_crash_suppressed_below_significant_floor() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..5 { t.push(1e-8); }
+        assert_eq!(t.check_kt_crash(1e-7), None);
+        assert_eq!(t.crash_restarts, 0);
+    }
+
+    #[test]
+    fn for_metric_crash_and_plateau_budgets_independent_in_relative_mode() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..MAX_CRASH_RESTARTS {
+            t.clear_history();
+            for _ in 0..5 { t.push(1e-4); }
+            assert!(t.check_kt_crash(3e-4).is_some());
+        }
+        assert_eq!(t.crash_restarts, MAX_CRASH_RESTARTS);
+        assert_eq!(t.plateau_restarts, 0);
+        t.clear_history();
+        for _ in 0..5 { t.push(1e-4); }
+        assert_eq!(t.check_kt_crash(3e-4), None);
+        for _ in 0..PLATEAU_WINDOW { t.push(1e-4); }
+        for _ in 0..PLATEAU_WINDOW { t.push(1e-4); }
+        assert!(t.check_plateau().is_some());
+    }
+
+    #[test]
+    fn new_kt_legacy_behavior_is_unaffected_by_the_generalization() {
+        let mut t = ConvergenceTracker::new();
+        fill_plateau(&mut t, 1.0, PLATEAU_WINDOW * 2);
+        assert_eq!(t.check_plateau(), Some(LAM_CAP_INITIAL));
+    }
+
+    // ─── Relative-mode LargerIsBetter (unused by pin-lug today, but public API surface —
+    // must be exercised so a flipped comparison/direction bug can't silently ship) ─────────
+
+    #[test]
+    fn for_metric_larger_is_better_plateau_fires_on_insufficient_relative_improvement() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..PLATEAU_WINDOW { t.push(1.0); }
+        for _ in 0..PLATEAU_WINDOW { t.push(1.03); } // 3% improvement < 5% epsilon -> plateau
+        assert!(t.check_plateau().is_some());
+    }
+
+    #[test]
+    fn for_metric_larger_is_better_plateau_does_not_fire_on_sufficient_relative_improvement() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..PLATEAU_WINDOW { t.push(1.0); }
+        for _ in 0..PLATEAU_WINDOW { t.push(1.10); } // 10% improvement >= 5% epsilon -> no plateau
+        assert_eq!(t.check_plateau(), None);
+    }
+
+    #[test]
+    fn for_metric_larger_is_better_plateau_boundary_at_exactly_epsilon_does_not_fire() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..PLATEAU_WINDOW { t.push(1.0); }
+        for _ in 0..PLATEAU_WINDOW { t.push(1.05); } // exactly 5.0% improvement: strict < means this must NOT fire
+        assert_eq!(t.check_plateau(), None);
+    }
+
+    #[test]
+    fn for_metric_larger_is_better_plateau_just_inside_boundary_fires() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..PLATEAU_WINDOW { t.push(1.0); }
+        for _ in 0..PLATEAU_WINDOW { t.push(1.049); } // 4.9% improvement < 5%
+        assert!(t.check_plateau().is_some());
+    }
+
+    #[test]
+    fn for_metric_larger_is_better_crash_fires_on_drop_below_floor_ratio() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..5 { t.push(2.0); } // max_prev5 = 2.0, well above significant_floor
+        // current < max_prev5 / crash_spike_factor = 1.0 -> crash
+        assert!(t.check_kt_crash(0.9).is_some());
+        assert_eq!(t.crash_restarts, 1);
+    }
+
+    #[test]
+    fn for_metric_larger_is_better_crash_does_not_fire_above_drop_ratio() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..5 { t.push(2.0); }
+        assert_eq!(t.check_kt_crash(1.5), None); // 1.5 > 1.0 threshold -> no crash
+    }
+
+    #[test]
+    fn for_metric_larger_is_better_crash_suppressed_below_significant_floor() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..5 { t.push(1e-8); } // max_prev5 below significant_floor=1e-6
+        assert_eq!(t.check_kt_crash(1e-9), None);
+        assert_eq!(t.crash_restarts, 0);
+    }
+
+    // ─── Crash-before-plateau call-site priority ordering ────────────────────────────────
+    //
+    // `ConvergenceTracker` itself does not enforce that crash is checked before plateau —
+    // both `run_headless` (K_t) and `run_headless_pinlug_inner` (interface-gap RMS) rely on
+    // an `if let Some(..) = check_kt_crash(..) { .. } else if let Some(..) = check_plateau()
+    // { .. }` call-site pattern. These tests pin down that pattern's actual behavior: when a
+    // single history snapshot independently satisfies BOTH conditions, crash must win and
+    // the plateau budget must stay untouched — proving an "else if" accidentally weakened to
+    // two independent "if"s (which would double-fire and consume both budgets from one
+    // reading) would be caught.
+
+    #[test]
+    fn relative_mode_call_site_pattern_crash_takes_priority_over_plateau_when_both_conditions_true() {
+        let mk = || ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
+
+        // Adversarial pre-check: prove check_plateau() would ALSO independently fire from
+        // this exact push history, so this isn't a vacuous "crash always wins because
+        // plateau could never have fired anyway" test.
+        let mut t_plateau_only = mk();
+        for _ in 0..PLATEAU_WINDOW * 2 { t_plateau_only.push(1e-4); }
+        assert!(t_plateau_only.check_plateau().is_some(),
+            "test setup invariant broken: plateau must independently be true for this to be a real priority test");
+
+        // Now exercise the actual call-site pattern on a fresh tracker with the same history.
+        let mut t = mk();
+        for _ in 0..PLATEAU_WINDOW * 2 { t.push(1e-4); }
+        let current = 3e-4; // >= crash_spike_factor(2.0) * min_prev5(1e-4) -> crash ALSO true
+
+        if t.check_kt_crash(current).is_some() {
+            // crash path — matches production's ordering exactly.
+        } else if t.check_plateau().is_some() {
+            panic!("plateau must not fire: crash's else-if must short-circuit it when crash already fired");
+        }
+        assert_eq!(t.crash_restarts, 1, "crash must have fired");
+        assert_eq!(t.plateau_restarts, 0,
+            "plateau budget must be untouched because crash fired first (else-if ordering)");
+    }
+
+    #[test]
+    fn kt_legacy_call_site_pattern_crash_takes_priority_over_plateau_when_both_conditions_true() {
+        // Same priority-ordering proof as the Relative-mode test above, but for Kirsch's
+        // pre-existing KtLegacy mode — `run_headless`'s call site uses the identical
+        // `if check_kt_crash { .. } else if check_plateau { .. }` pattern. A uniform history
+        // above CRASH_MIN_PEAK_KT (1.5) satisfies both conditions simultaneously: plateau
+        // fires on ANY uniform value (max_recent - max_older == 0 < PLATEAU_EPSILON,
+        // regardless of magnitude — the same mechanism `fill_plateau`'s existing 1.0-valued
+        // tests rely on), while a uniform 1.6 also clears CRASH_MIN_PEAK_KT so a sufficiently
+        // low `current` triggers the crash-drop condition too.
+        const PEAK: f64 = 1.6;
+        const CURRENT: f64 = 0.5; // < CRASH_DROP_FRACTION(0.5) * PEAK(1.6) = 0.8 -> crash fires
+
+        // Adversarial pre-check: prove check_plateau() would ALSO independently fire from
+        // this exact push history, so this isn't a vacuous "crash always wins because
+        // plateau could never have fired anyway" test.
+        let mut t_plateau_only = ConvergenceTracker::new();
+        fill_plateau(&mut t_plateau_only, PEAK, PLATEAU_WINDOW * 2);
+        assert!(t_plateau_only.check_plateau().is_some(),
+            "test setup invariant broken: plateau must independently be true for this to be a real priority test");
+
+        // Now exercise the actual call-site pattern on a fresh tracker with the same history.
+        let mut t = ConvergenceTracker::new();
+        fill_plateau(&mut t, PEAK, PLATEAU_WINDOW * 2);
+        if t.check_kt_crash(CURRENT).is_some() {
+            // crash path — matches production's ordering exactly.
+        } else if t.check_plateau().is_some() {
+            panic!("plateau must not fire: crash's else-if must short-circuit it when crash already fired");
+        }
+        assert_eq!(t.crash_restarts, 1, "crash must have fired");
+        assert_eq!(t.plateau_restarts, 0,
+            "plateau budget must be untouched because crash fired first (else-if ordering)");
     }
 }

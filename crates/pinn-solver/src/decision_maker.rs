@@ -57,13 +57,22 @@ pub struct PinnDecisionMaker {
     pub current_tier: OptimizerTier,
     steps_in_tier:    usize,
     step_counter:     usize,
+    /// True for problems with no Kirsch-style Phase-1(BC)/Phase-2(physics) curriculum split
+    /// (pin-in-lug). Unlocks Align→Converge entry and Converge's real exit logic WITHOUT
+    /// touching `(Explore, true)`'s force-lock-to-Align semantics (only correct for a
+    /// problem with a short BC-only Phase 1 to graduate out of). Every Kirsch call site
+    /// passes `false` — `evaluate()`'s 6 original match arms stay byte-identical whenever
+    /// this is `false`.
+    allow_converge: bool,
 }
 
 impl PinnDecisionMaker {
     /// Create a new decision maker.
     ///
     /// `phase2_active`: if true, start in Align (Phase 2 default); otherwise start in Explore.
-    pub fn new(config: DecisionMakerConfig, phase2_active: bool) -> Self {
+    /// `allow_converge`: see the field doc comment above — every Kirsch call site passes
+    /// `false`; pin-in-lug passes `true`.
+    pub fn new(config: DecisionMakerConfig, phase2_active: bool, allow_converge: bool) -> Self {
         let current_tier = if phase2_active {
             OptimizerTier::Align
         } else {
@@ -74,6 +83,7 @@ impl PinnDecisionMaker {
             current_tier,
             steps_in_tier: 0,
             step_counter:  0,
+            allow_converge,
         }
     }
 
@@ -133,7 +143,23 @@ impl PinnDecisionMaker {
                 }
             }
             (OptimizerTier::Align, false) => {
-                if effective_cosine > self.config.alignment_threshold {
+                // Pin-in-lug (allow_converge=true, no Phase-1/Phase-2 curriculum split):
+                // Align -> Converge is checked FIRST, before the original hysteresis-exit
+                // check, using the same gradient-alignment+magnitude gate Kirsch's own
+                // (Align, true) arm uses. Falls through to the untouched hysteresis-exit
+                // check below when this doesn't fire (or allow_converge is false).
+                let converge_entry = self.allow_converge
+                    && g_total_norm.is_some_and(|gnorm| {
+                        effective_cosine > self.config.converge_cosine_min
+                            && gnorm < self.config.converge_grad_threshold
+                    });
+                if converge_entry {
+                    Some(TierTransition {
+                        new_tier:    OptimizerTier::Converge,
+                        reset_optim: false,
+                        reset_lr:    true,
+                    })
+                } else if effective_cosine > self.config.alignment_threshold {
                     Some(TierTransition {
                         new_tier:    OptimizerTier::Explore,
                         reset_optim: true,
@@ -186,13 +212,34 @@ impl PinnDecisionMaker {
                     None
                 }
             }
-            // Converge in Phase 1 shouldn't happen; treat same as Align fallback.
+            // Converge without Kirsch's phase2_active flag: for pin-in-lug
+            // (allow_converge=true), use the SAME real exit logic as Kirsch's
+            // (Converge, true) arm — pin-in-lug has no phase2_active curriculum split, so
+            // this is Converge's only reachable exit arm for it. For every Kirsch call site
+            // (allow_converge=false), this "shouldn't happen" and unconditionally demotes,
+            // exactly as before.
             (OptimizerTier::Converge, false) => {
-                Some(TierTransition {
-                    new_tier:    OptimizerTier::Align,
-                    reset_optim: false,
-                    reset_lr:    false,
-                })
+                if self.allow_converge {
+                    let conflict_reemerged = effective_cosine < 0.50;
+                    let grad_spike = g_total_norm.is_some_and(|gnorm| {
+                        gnorm > 3.0 * self.config.converge_grad_threshold
+                    });
+                    if conflict_reemerged || grad_spike {
+                        Some(TierTransition {
+                            new_tier:    OptimizerTier::Align,
+                            reset_optim: false,
+                            reset_lr:    false,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(TierTransition {
+                        new_tier:    OptimizerTier::Align,
+                        reset_optim: false,
+                        reset_lr:    false,
+                    })
+                }
             }
         };
 
@@ -202,5 +249,104 @@ impl PinnDecisionMaker {
         }
 
         transition
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn permissive_config() -> DecisionMakerConfig {
+        let mut c = DecisionMakerConfig::default();
+        c.enabled = true;
+        c.min_dwell_steps = 0;
+        c
+    }
+
+    #[test]
+    fn evaluate_align_allow_converge_true_transitions_to_converge_on_favorable_gradients() {
+        let mut dm = PinnDecisionMaker::new(permissive_config(), false, true);
+        dm.current_tier = OptimizerTier::Align;
+        let conflict = GradientConflict { cosine_sim: 0.9, g_pde_norm: 1.0, g_bc_norm: 1.0 };
+        let t = dm.evaluate(Some(conflict), 1.0, false).expect("must transition");
+        assert_eq!(t.new_tier, OptimizerTier::Converge);
+        assert!(!t.reset_optim);
+        assert!(t.reset_lr);
+        assert_eq!(dm.current_tier, OptimizerTier::Converge);
+    }
+
+    #[test]
+    fn evaluate_align_allow_converge_false_falls_through_to_original_hysteresis_exit() {
+        let mut dm = PinnDecisionMaker::new(permissive_config(), false, false);
+        dm.current_tier = OptimizerTier::Align;
+        let conflict = GradientConflict { cosine_sim: 0.9, g_pde_norm: 1.0, g_bc_norm: 1.0 };
+        let t = dm.evaluate(Some(conflict), 1.0, false).expect("must transition");
+        assert_eq!(t.new_tier, OptimizerTier::Explore);
+    }
+
+    #[test]
+    fn evaluate_converge_allow_converge_exits_on_conflict_reemergence() {
+        let mut dm = PinnDecisionMaker::new(permissive_config(), false, true);
+        dm.current_tier = OptimizerTier::Converge;
+        let conflict = GradientConflict { cosine_sim: 0.3, g_pde_norm: 0.1, g_bc_norm: 0.1 };
+        let t = dm.evaluate(Some(conflict), 1.0, false).expect("must exit Converge");
+        assert_eq!(t.new_tier, OptimizerTier::Align);
+    }
+
+    #[test]
+    fn evaluate_converge_allow_converge_exits_on_grad_spike() {
+        let mut dm = PinnDecisionMaker::new(permissive_config(), false, true);
+        dm.current_tier = OptimizerTier::Converge;
+        let conflict = GradientConflict { cosine_sim: 0.9, g_pde_norm: 10.0, g_bc_norm: 10.0 }; // gnorm=20 > 3*5=15
+        let t = dm.evaluate(Some(conflict), 1.0, false).expect("must exit Converge on grad spike");
+        assert_eq!(t.new_tier, OptimizerTier::Align);
+    }
+
+    #[test]
+    fn evaluate_converge_allow_converge_stays_when_stable() {
+        let mut dm = PinnDecisionMaker::new(permissive_config(), false, true);
+        dm.current_tier = OptimizerTier::Converge;
+        let conflict = GradientConflict { cosine_sim: 0.95, g_pde_norm: 0.5, g_bc_norm: 0.5 };
+        assert!(dm.evaluate(Some(conflict), 1.0, false).is_none());
+        assert_eq!(dm.current_tier, OptimizerTier::Converge);
+    }
+
+    #[test]
+    fn evaluate_converge_allow_converge_false_unconditionally_demotes_regardless_of_gradient_state() {
+        let mut dm = PinnDecisionMaker::new(permissive_config(), false, false);
+        dm.current_tier = OptimizerTier::Converge;
+        let conflict = GradientConflict { cosine_sim: 0.99, g_pde_norm: 0.01, g_bc_norm: 0.01 };
+        let t = dm.evaluate(Some(conflict), 1.0, false).expect("Kirsch's (Converge,false) fallback always demotes");
+        assert_eq!(t.new_tier, OptimizerTier::Align);
+    }
+
+    #[test]
+    fn evaluate_kirsch_transition_table_unaffected_by_allow_converge_field_across_all_six_arms() {
+        // NOTE: the match statement in `evaluate()` has exactly six `(tier, phase2_active)`
+        // arms: (Explore,false), (Align,false), (Explore,true), (Align,true), (Converge,true),
+        // (Converge,false). The array below has 7 rows because (Explore,false) has two
+        // sub-branches (its own internal if/else on `effective_cosine`) that are each worth
+        // covering, but every one of the six MATCH ARMS itself is represented at least once —
+        // in particular (Converge,false) (the arm this diff actually modified, gating its
+        // behavior on `self.allow_converge`) MUST appear here with a favorable/"stable"
+        // gradient state, since that's exactly the state that would silently reveal a
+        // copy-paste bug (allow_converge=true leaking into this arm's dispatch) by wrongly
+        // returning `None` (stay in Converge) instead of the pre-existing unconditional
+        // demote-to-Align fallback.
+        let cases: &[(OptimizerTier, bool, GradientConflict, Option<OptimizerTier>)] = &[
+            (OptimizerTier::Explore,  false, GradientConflict{cosine_sim:0.1,g_pde_norm:1.0,g_bc_norm:1.0}, Some(OptimizerTier::Align)),
+            (OptimizerTier::Explore,  false, GradientConflict{cosine_sim:0.9,g_pde_norm:1.0,g_bc_norm:1.0}, None),
+            (OptimizerTier::Align,    false, GradientConflict{cosine_sim:0.1,g_pde_norm:1.0,g_bc_norm:1.0}, None),
+            (OptimizerTier::Explore,  true,  GradientConflict{cosine_sim:0.9,g_pde_norm:1.0,g_bc_norm:1.0}, Some(OptimizerTier::Align)),
+            (OptimizerTier::Align,    true,  GradientConflict{cosine_sim:0.9,g_pde_norm:1.0,g_bc_norm:1.0}, Some(OptimizerTier::Converge)),
+            (OptimizerTier::Converge, true,  GradientConflict{cosine_sim:0.95,g_pde_norm:0.1,g_bc_norm:0.1}, None),
+            (OptimizerTier::Converge, false, GradientConflict{cosine_sim:0.95,g_pde_norm:0.01,g_bc_norm:0.01}, Some(OptimizerTier::Align)),
+        ];
+        for &(tier, phase2, conflict, expected) in cases {
+            let mut dm = PinnDecisionMaker::new(permissive_config(), false, false);
+            dm.current_tier = tier;
+            let got = dm.evaluate(Some(conflict), 1.0, phase2).map(|t| t.new_tier);
+            assert_eq!(got, expected, "arm (tier={tier:?}, phase2_active={phase2}) diverged from pre-existing behavior");
+        }
     }
 }
