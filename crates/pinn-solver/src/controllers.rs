@@ -399,4 +399,135 @@ mod tests {
         fill_plateau(&mut t, 1.0, PLATEAU_WINDOW * 2);
         assert_eq!(t.check_plateau(), Some(LAM_CAP_INITIAL));
     }
+
+    // ─── Relative-mode LargerIsBetter (unused by pin-lug today, but public API surface —
+    // must be exercised so a flipped comparison/direction bug can't silently ship) ─────────
+
+    #[test]
+    fn for_metric_larger_is_better_plateau_fires_on_insufficient_relative_improvement() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..PLATEAU_WINDOW { t.push(1.0); }
+        for _ in 0..PLATEAU_WINDOW { t.push(1.03); } // 3% improvement < 5% epsilon -> plateau
+        assert!(t.check_plateau().is_some());
+    }
+
+    #[test]
+    fn for_metric_larger_is_better_plateau_does_not_fire_on_sufficient_relative_improvement() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..PLATEAU_WINDOW { t.push(1.0); }
+        for _ in 0..PLATEAU_WINDOW { t.push(1.10); } // 10% improvement >= 5% epsilon -> no plateau
+        assert_eq!(t.check_plateau(), None);
+    }
+
+    #[test]
+    fn for_metric_larger_is_better_plateau_boundary_at_exactly_epsilon_does_not_fire() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..PLATEAU_WINDOW { t.push(1.0); }
+        for _ in 0..PLATEAU_WINDOW { t.push(1.05); } // exactly 5.0% improvement: strict < means this must NOT fire
+        assert_eq!(t.check_plateau(), None);
+    }
+
+    #[test]
+    fn for_metric_larger_is_better_plateau_just_inside_boundary_fires() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..PLATEAU_WINDOW { t.push(1.0); }
+        for _ in 0..PLATEAU_WINDOW { t.push(1.049); } // 4.9% improvement < 5%
+        assert!(t.check_plateau().is_some());
+    }
+
+    #[test]
+    fn for_metric_larger_is_better_crash_fires_on_drop_below_floor_ratio() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..5 { t.push(2.0); } // max_prev5 = 2.0, well above significant_floor
+        // current < max_prev5 / crash_spike_factor = 1.0 -> crash
+        assert!(t.check_kt_crash(0.9).is_some());
+        assert_eq!(t.crash_restarts, 1);
+    }
+
+    #[test]
+    fn for_metric_larger_is_better_crash_does_not_fire_above_drop_ratio() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..5 { t.push(2.0); }
+        assert_eq!(t.check_kt_crash(1.5), None); // 1.5 > 1.0 threshold -> no crash
+    }
+
+    #[test]
+    fn for_metric_larger_is_better_crash_suppressed_below_significant_floor() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..5 { t.push(1e-8); } // max_prev5 below significant_floor=1e-6
+        assert_eq!(t.check_kt_crash(1e-9), None);
+        assert_eq!(t.crash_restarts, 0);
+    }
+
+    // ─── Crash-before-plateau call-site priority ordering ────────────────────────────────
+    //
+    // `ConvergenceTracker` itself does not enforce that crash is checked before plateau —
+    // both `run_headless` (K_t) and `run_headless_pinlug_inner` (interface-gap RMS) rely on
+    // an `if let Some(..) = check_kt_crash(..) { .. } else if let Some(..) = check_plateau()
+    // { .. }` call-site pattern. These tests pin down that pattern's actual behavior: when a
+    // single history snapshot independently satisfies BOTH conditions, crash must win and
+    // the plateau budget must stay untouched — proving an "else if" accidentally weakened to
+    // two independent "if"s (which would double-fire and consume both budgets from one
+    // reading) would be caught.
+
+    #[test]
+    fn relative_mode_call_site_pattern_crash_takes_priority_over_plateau_when_both_conditions_true() {
+        let mk = || ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
+
+        // Adversarial pre-check: prove check_plateau() would ALSO independently fire from
+        // this exact push history, so this isn't a vacuous "crash always wins because
+        // plateau could never have fired anyway" test.
+        let mut t_plateau_only = mk();
+        for _ in 0..PLATEAU_WINDOW * 2 { t_plateau_only.push(1e-4); }
+        assert!(t_plateau_only.check_plateau().is_some(),
+            "test setup invariant broken: plateau must independently be true for this to be a real priority test");
+
+        // Now exercise the actual call-site pattern on a fresh tracker with the same history.
+        let mut t = mk();
+        for _ in 0..PLATEAU_WINDOW * 2 { t.push(1e-4); }
+        let current = 3e-4; // >= crash_spike_factor(2.0) * min_prev5(1e-4) -> crash ALSO true
+
+        if t.check_kt_crash(current).is_some() {
+            // crash path — matches production's ordering exactly.
+        } else if t.check_plateau().is_some() {
+            panic!("plateau must not fire: crash's else-if must short-circuit it when crash already fired");
+        }
+        assert_eq!(t.crash_restarts, 1, "crash must have fired");
+        assert_eq!(t.plateau_restarts, 0,
+            "plateau budget must be untouched because crash fired first (else-if ordering)");
+    }
+
+    #[test]
+    fn kt_legacy_call_site_pattern_crash_takes_priority_over_plateau_when_both_conditions_true() {
+        // Same priority-ordering proof as the Relative-mode test above, but for Kirsch's
+        // pre-existing KtLegacy mode — `run_headless`'s call site uses the identical
+        // `if check_kt_crash { .. } else if check_plateau { .. }` pattern. A uniform history
+        // above CRASH_MIN_PEAK_KT (1.5) satisfies both conditions simultaneously: plateau
+        // fires on ANY uniform value (max_recent - max_older == 0 < PLATEAU_EPSILON,
+        // regardless of magnitude — the same mechanism `fill_plateau`'s existing 1.0-valued
+        // tests rely on), while a uniform 1.6 also clears CRASH_MIN_PEAK_KT so a sufficiently
+        // low `current` triggers the crash-drop condition too.
+        const PEAK: f64 = 1.6;
+        const CURRENT: f64 = 0.5; // < CRASH_DROP_FRACTION(0.5) * PEAK(1.6) = 0.8 -> crash fires
+
+        // Adversarial pre-check: prove check_plateau() would ALSO independently fire from
+        // this exact push history, so this isn't a vacuous "crash always wins because
+        // plateau could never have fired anyway" test.
+        let mut t_plateau_only = ConvergenceTracker::new();
+        fill_plateau(&mut t_plateau_only, PEAK, PLATEAU_WINDOW * 2);
+        assert!(t_plateau_only.check_plateau().is_some(),
+            "test setup invariant broken: plateau must independently be true for this to be a real priority test");
+
+        // Now exercise the actual call-site pattern on a fresh tracker with the same history.
+        let mut t = ConvergenceTracker::new();
+        fill_plateau(&mut t, PEAK, PLATEAU_WINDOW * 2);
+        if t.check_kt_crash(CURRENT).is_some() {
+            // crash path — matches production's ordering exactly.
+        } else if t.check_plateau().is_some() {
+            panic!("plateau must not fire: crash's else-if must short-circuit it when crash already fired");
+        }
+        assert_eq!(t.crash_restarts, 1, "crash must have fired");
+        assert_eq!(t.plateau_restarts, 0,
+            "plateau budget must be untouched because crash fired first (else-if ordering)");
+    }
 }

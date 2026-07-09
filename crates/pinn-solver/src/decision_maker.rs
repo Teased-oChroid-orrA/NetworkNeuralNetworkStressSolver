@@ -322,6 +322,17 @@ mod tests {
 
     #[test]
     fn evaluate_kirsch_transition_table_unaffected_by_allow_converge_field_across_all_six_arms() {
+        // NOTE: the match statement in `evaluate()` has exactly six `(tier, phase2_active)`
+        // arms: (Explore,false), (Align,false), (Explore,true), (Align,true), (Converge,true),
+        // (Converge,false). The array below has 7 rows because (Explore,false) has two
+        // sub-branches (its own internal if/else on `effective_cosine`) that are each worth
+        // covering, but every one of the six MATCH ARMS itself is represented at least once —
+        // in particular (Converge,false) (the arm this diff actually modified, gating its
+        // behavior on `self.allow_converge`) MUST appear here with a favorable/"stable"
+        // gradient state, since that's exactly the state that would silently reveal a
+        // copy-paste bug (allow_converge=true leaking into this arm's dispatch) by wrongly
+        // returning `None` (stay in Converge) instead of the pre-existing unconditional
+        // demote-to-Align fallback.
         let cases: &[(OptimizerTier, bool, GradientConflict, Option<OptimizerTier>)] = &[
             (OptimizerTier::Explore,  false, GradientConflict{cosine_sim:0.1,g_pde_norm:1.0,g_bc_norm:1.0}, Some(OptimizerTier::Align)),
             (OptimizerTier::Explore,  false, GradientConflict{cosine_sim:0.9,g_pde_norm:1.0,g_bc_norm:1.0}, None),
@@ -329,6 +340,7 @@ mod tests {
             (OptimizerTier::Explore,  true,  GradientConflict{cosine_sim:0.9,g_pde_norm:1.0,g_bc_norm:1.0}, Some(OptimizerTier::Align)),
             (OptimizerTier::Align,    true,  GradientConflict{cosine_sim:0.9,g_pde_norm:1.0,g_bc_norm:1.0}, Some(OptimizerTier::Converge)),
             (OptimizerTier::Converge, true,  GradientConflict{cosine_sim:0.95,g_pde_norm:0.1,g_bc_norm:0.1}, None),
+            (OptimizerTier::Converge, false, GradientConflict{cosine_sim:0.95,g_pde_norm:0.01,g_bc_norm:0.01}, Some(OptimizerTier::Align)),
         ];
         for &(tier, phase2, conflict, expected) in cases {
             let mut dm = PinnDecisionMaker::new(permissive_config(), false, false);
