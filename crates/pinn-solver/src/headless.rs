@@ -478,9 +478,14 @@ pub(crate) struct PinLugHeadlessResult {
 
 /// Headless-only entry point for the pin-in-lug 2-domain contact problem — routes through
 /// `step_physics_multi` (`training_core.rs`) instead of the frozen 1-domain `step_physics`
-/// Kirsch path. GUI/vis-grid support for pin-in-lug is explicitly OUT OF SCOPE for this
-/// slice (`runner.rs`'s GUI path remains Kirsch-only) — this headless entry point matches
-/// the CSV-export post-processing use case pin-in-lug is for.
+/// Kirsch path. This entry point matches the CSV-export post-processing use case pin-in-lug
+/// is for. Note: `runner.rs::run_training_pinlug` (the GUI-driving path) DOES also exist and
+/// train pin-in-lug — it is not out of scope in the sense of "unimplemented" — but it does
+/// NOT yet have this function's plateau/crash cascade or Converge-tier decision-maker wiring
+/// (its `dynamic_lam_h_cap`/`dynamic_lam_d_cap` are still hardcoded 50.0, `phase2_active` is
+/// still `false`, and it has no `ConvergenceTracker`/`PinnDecisionMaker` at all) — that gap is
+/// a deliberate, tracked scope cut (see the GitHub issue for porting this cascade to the GUI
+/// path), not an oversight.
 ///
 /// Deliberately does not replicate Kirsch's AMR / stiffness-controller machinery — those are
 /// tightly coupled to K_t-based diagnostics/AMR sampling that don't apply to a contact
