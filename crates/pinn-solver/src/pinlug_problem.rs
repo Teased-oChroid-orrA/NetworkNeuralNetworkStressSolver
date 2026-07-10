@@ -517,9 +517,13 @@ impl PinLugProblem {
         };
 
         // Same formula as `training_core::compute_reference_scales`, with `stress_ref`
-        // standing in for Kirsch's far-field `config.load.px`.
-        let ref_energy = (0.5 * stress_ref * stress_ref / material_e) as f32;
-        let ref_stress2 = (stress_ref * stress_ref) as f32;
+        // standing in for Kirsch's far-field `config.load.px` — including its `.max(1.0)`
+        // floor (both are squared, always >= 0), for the same reason: these are used
+        // downstream as `1.0 / ref_energy`/`1.0 / ref_stress2` divisors, and a degenerate
+        // geometry (e.g. r_pin/thickness driving equivalent_traction_pa toward 0) would
+        // otherwise silently divide by zero.
+        let ref_energy = (0.5 * stress_ref * stress_ref / material_e).max(1.0) as f32;
+        let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
         let u_ref = (stress_ref / material_e) * r_pin;
         let ref_gap2 = (u_ref * u_ref) as f32;
 

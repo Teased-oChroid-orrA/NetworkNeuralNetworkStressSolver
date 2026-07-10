@@ -117,8 +117,16 @@ pub fn compute_reference_scales(config: &SolverConfig) -> (f32, f32, f32) {
         config.load.px
     };
     let u_ref       = ((stress_ref / config.material.e) * config.geometry.half_w) as f32;
-    let ref_energy  = (0.5 * stress_ref * stress_ref / config.material.e) as f32;
-    let ref_stress2 = (stress_ref * stress_ref) as f32;
+    // ref_energy/ref_stress2 are squared quantities (always >= 0, like ref_div2 below), and
+    // are used downstream as `1.0 / ctx.ref_energy` / `1.0 / ctx.ref_stress2` divisors at
+    // ~15 call sites across step_physics/compute_gradient_conflict/compute_loss_for_lbfgs —
+    // at stress_ref=0 (e.g. LOAD_PX_KSI=0, unvalidated on the headless/env path) both are
+    // exactly 0.0, so every one of those sites would silently divide by zero. Floored here,
+    // at the single source, rather than chasing each downstream site individually — mirrors
+    // ref_div2's `.max(1.0)` floor, same arbitrary-but-consistent 1.0 floor value, a no-op
+    // for any physically realistic config (stress_ref is normally 1e7-1e8 Pa).
+    let ref_energy  = (0.5 * stress_ref * stress_ref / config.material.e).max(1.0) as f32;
+    let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
     (u_ref, ref_energy, ref_stress2)
 }
 
@@ -1495,7 +1503,9 @@ fn compute_loss_for_lbfgs(
         (Some(s.0), Some(s.1), Some(s.2))
     } else { (None, None, None) };
     let (exx, eyy, exy) = compute_strains::<B>(stencil_out, n_int, &ctx.fd);
-    let ref_energy = (0.5 * ctx.config.load.px * ctx.config.load.px / ctx.config.material.e) as f32;
+    // Floored: see compute_reference_scales' identical `.max(1.0)` guard on ref_energy — at
+    // px=0 this is exactly 0.0, and `1.0 / ref_energy` below would divide by zero.
+    let ref_energy = (0.5 * ctx.config.load.px * ctx.config.load.px / ctx.config.material.e).max(1.0) as f32;
     let e_loss = dem_energy_loss(exx.clone(), eyy.clone(), exy.clone(), &ctx.config.material)
         .mul_scalar(1.0 / ref_energy as f64);
     let const_loss: Tensor<B, 1> = if let (Some(sxx_n), Some(syy_n), Some(sxy_n)) =
@@ -2017,6 +2027,25 @@ mod tests {
     }
 
     #[test]
+    fn compute_reference_scales_finite_and_floored_at_zero_px() {
+        // px=0 (e.g. LOAD_PX_KSI=0, unvalidated on the headless/env path — see
+        // crates/pinn-app/src/main.rs) makes stress_ref exactly 0.0, so ref_energy/
+        // ref_stress2 would be exactly 0.0 without the .max(1.0) floor — and both are used
+        // downstream as `1.0 / ctx.ref_energy`/`1.0 / ctx.ref_stress2` divisors at ~15 call
+        // sites, so an unfloored zero here would silently NaN out nearly every loss term.
+        let mut config = SolverConfig::default_kirsch();
+        config.load.px = 0.0;
+        let (u_ref, ref_energy, ref_stress2) = compute_reference_scales(&config);
+
+        assert!(u_ref.is_finite(), "u_ref must stay finite at px=0, got {u_ref}");
+        assert_eq!(u_ref, 0.0, "u_ref itself is not divided by anywhere in this function, so it's exactly 0.0 (not floored) at px=0 — only the two divisor-bound outputs need flooring");
+        assert_eq!(ref_energy, 1.0, "ref_energy must floor to 1.0 at px=0, got {ref_energy}");
+        assert_eq!(ref_stress2, 1.0, "ref_stress2 must floor to 1.0 at px=0, got {ref_stress2}");
+        assert!((1.0_f32 / ref_energy).is_finite());
+        assert!((1.0_f32 / ref_stress2).is_finite());
+    }
+
+    #[test]
     fn compute_reference_scales_flag_off_matches_existing_load_based_formula() {
         let config = SolverConfig::default_kirsch();
         assert!(!config.use_ultimate_strength_scaling);
@@ -2097,21 +2126,15 @@ mod tests {
         assert_eq!(floor_signed_divisor(-3502.4), -3502.4, "well outside the floor, negative: passthrough, unchanged");
     }
 
-    /// Shared scaffolding for the 3 `floor_signed_divisor` production-site regression tests
+    /// Shared scaffolding for the `floor_signed_divisor` production-site regression tests
     /// below — builds a Kirsch `StepCtx` with `use_ultimate_strength_scaling = true` so
     /// `ref_energy`/`ref_stress2` (and thus every OTHER loss term's normalization) stay
     /// derived from the material's ultimate strength, not from `config.load.px` — isolating
-    /// the specific `w_val`-divisor bug under test from the separate, out-of-scope fact that
-    /// the DEFAULT (`px`-based) reference-scale path also degrades at `px = 0` (a distinct,
-    /// unguarded divide-by-zero in `compute_reference_scales`, not part of this fix).
+    /// the specific `w_val`-divisor bug under test from `compute_reference_scales`'s own
+    /// (now also floored — see `compute_reference_scales_finite_and_floored_at_zero_px`)
+    /// degradation at `px = 0`.
     ///
-    /// `px`: the value to install into `config.load.px` (the divisor under test). Callers that
-    /// exercise `compute_loss_for_lbfgs`/`step_lbfgs` must pass a small-but-NONZERO value (not
-    /// exactly `0.0`) — that function has its own separate, pre-existing, out-of-scope bug
-    /// (an inline `ref_energy = 0.5*px*px/E` recompute that ignores `use_ultimate_strength_
-    /// scaling` entirely) which independently divides by zero at literal `px = 0.0`; using a
-    /// tiny nonzero `px` still exercises `floor_signed_divisor`'s floor (product magnitude < 1)
-    /// and its sign-preservation (negative `px`) without tripping that unrelated bug.
+    /// `px`: the value to install into `config.load.px` (the divisor under test).
     fn zero_px_test_fixture(px: f64) -> (
         pinn_core::messages::SolverConfig, crate::engine::EngineParams, FdConfig, f32, f32, f32, f64, f64, f64,
         Vec<[f32; 2]>, Vec<[f32; 2]>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>,
@@ -2251,12 +2274,12 @@ mod tests {
         assert!(conflict.g_bc_norm.is_finite(), "g_bc_norm must be finite at px=0.0, got {}", conflict.g_bc_norm);
     }
 
-    /// Uses a tiny NEGATIVE (not exactly zero) `px` — see `zero_px_test_fixture`'s doc comment:
-    /// `compute_loss_for_lbfgs` has its own separate, pre-existing, out-of-scope bug (an inline
-    /// `ref_energy` recompute from raw `px` that ignores `use_ultimate_strength_scaling` and
-    /// divides by exactly zero at `px = 0.0`) that this test must not trip in order to cleanly
-    /// exercise ONLY the in-scope `w_val`-divisor fix (`floor_signed_divisor`) at this call site,
-    /// including its sign-preservation for a legitimate compression (`px < 0`) load.
+    /// Uses a tiny NEGATIVE (not exactly zero) `px` to exercise `floor_signed_divisor`'s
+    /// sign-preservation for a legitimate compression (`px < 0`) load at this call site (the
+    /// `w_val` divisor inside `compute_loss_for_lbfgs`). See
+    /// `step_lbfgs_finite_at_literal_zero_px_load` below for the `px = 0.0` case, which is
+    /// now also safe: `compute_loss_for_lbfgs`'s own inline `ref_energy` recompute (a
+    /// separate divisor from `w_val`'s) is floored too.
     #[test]
     fn step_lbfgs_finite_at_near_zero_negative_px_load() {
         use burn::backend::wgpu::WgpuDevice;
@@ -2309,6 +2332,66 @@ mod tests {
         let mut lbfgs = make_lbfgs(3);
         let (_model_out, loss_out) = step_lbfgs(model, &mut lbfgs, 1e-3, &lbfgs_ctx, &lams, &device);
         assert!(loss_out.is_finite(), "step_lbfgs's returned loss must be finite at px=0.0, got {loss_out}");
+    }
+
+    /// Literal `px = 0.0` (not just near-zero) through `compute_loss_for_lbfgs`'s inline
+    /// `ref_energy` recompute — the second divide-by-zero site found in this same file
+    /// (distinct from `w_val`'s `floor_signed_divisor` fix): `ref_energy = 0.5*px*px/E` was
+    /// exactly `0.0` at `px=0.0` with no floor, and `e_loss.mul_scalar(1.0/ref_energy)` would
+    /// divide by zero. Now floored (`.max(1.0)`, mirroring `compute_reference_scales`'s own
+    /// identical guard).
+    #[test]
+    fn step_lbfgs_finite_at_literal_zero_px_load() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::network::ElasticityNetConfig;
+
+        let (
+            config, engine, fd, u_ref, _ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(0.0);
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+
+        let lbfgs_ctx = LbfgsCtxScalars {
+            config: config.clone(),
+            engine: engine.clone(),
+            fd,
+            k: engine.ansatz_k,
+            u_ref,
+            ref_stress2,
+            cx, cy, ref_div2,
+            int_norm: int_norm.clone(),
+            bnd_norm: bnd_norm.clone(),
+            bnd_nx: bnd_nx.clone(),
+            bnd_ny: bnd_ny.clone(),
+            bnd_tx: bnd_tx.clone(),
+            bnd_ty: bnd_ty.clone(),
+            trac_idx: trac_idx.clone(),
+            hole_idx: hole_idx.clone(),
+            right_idx: right_idx.clone(),
+            eq_ring_norm: eq_ring_norm.clone(),
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+        };
+        let lams = LbfgsLams {
+            lam_e: 1.0, lam_n: 1.0, lam_h: 1.0, lam_d: 1.0, lam_eq: 1.0, lam_kirsch: 1.0, lam_const: 1.0,
+        };
+
+        let (_total, total_scalar) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &lams, &device);
+        assert!(total_scalar.is_finite(), "compute_loss_for_lbfgs's total loss must be finite at literal px=0.0, got {total_scalar}");
+
+        let mut lbfgs = make_lbfgs(3);
+        let (_model_out, loss_out) = step_lbfgs(model, &mut lbfgs, 1e-3, &lbfgs_ctx, &lams, &device);
+        assert!(loss_out.is_finite(), "step_lbfgs's returned loss must be finite at literal px=0.0, got {loss_out}");
     }
 
     /// Numerical-equivalence proof for the `step_physics` trait-driven cutover.
