@@ -56,6 +56,20 @@ pub trait LossTerm: Send + Sync {
     /// cross-domain term (e.g. pin-in-lug contact) returns two.
     fn domains(&self) -> Vec<DomainId>;
 
+    /// Computes this term's (unweighted) scalar loss from the given domains' forward-pass
+    /// outputs. The returned `Tensor<B, 1>` MUST remain connected to the live autodiff graph
+    /// rooted at `inputs`'s `raw_out`/`strains`/`normals` tensors — build the ENTIRE
+    /// computation (including any nonlinear penalty function) out of `Tensor` ops on backend
+    /// `B` all the way to the returned scalar. Calling `.into_data()`/`.to_vec()` (or any
+    /// other host-transferring op) on an operand that needs gradient, then rebuilding a fresh
+    /// tensor from the resulting `Vec` via `Tensor::from_data`, creates a brand-new autodiff
+    /// LEAF with no edge back to `inputs` — the term's scalar VALUE will still look correct in
+    /// console logging / SAW-BRDR bookkeeping (which only reads the value), but it supplies
+    /// ZERO gradient to `.backward()`, silently making the term inert to gradient descent (see
+    /// the pin-lug Signorini-term autodiff-detachment bug, Issue #9, this note exists to
+    /// prevent a repeat of). Converting to a plain `Vec`/scalar is fine ONLY for host-side data
+    /// that never re-enters the returned tensor's graph (e.g. fixed non-learned constants like
+    /// `thetas`, or values used purely for diagnostic printing).
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1>;
 
     /// True if this term is only active once Phase 2 begins (e.g. Kirsch's stress-probe
