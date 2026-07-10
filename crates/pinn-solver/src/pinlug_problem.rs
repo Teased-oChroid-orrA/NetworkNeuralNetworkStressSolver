@@ -65,7 +65,6 @@ use pinn_core::{
 use crate::{
     energy::{dem_energy_loss, hole_traction_loss_direct, neumann_loss},
     problem::{BoundaryValueProblem, DomainForwardOutputs, DomainState, LossTerm, B},
-    signorini::{decompose_radial, non_tension_penalty, penetration_penalty},
 };
 
 pub const PIN_DOMAIN: DomainId = DomainId(0);
@@ -375,24 +374,26 @@ impl LossTerm for InterfacePenetrationTerm {
         let pin = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("interface_penetration: pin missing");
         let lug = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("interface_penetration: lug missing");
         let n = self.thetas.len();
-        let pin_u: Vec<f32> = pin.raw_out.clone().slice([0..n, 0..1]).reshape([n]).into_data().to_vec().unwrap_or_default();
-        let pin_v: Vec<f32> = pin.raw_out.clone().slice([0..n, 1..2]).reshape([n]).into_data().to_vec().unwrap_or_default();
-        let lug_u: Vec<f32> = lug.raw_out.clone().slice([0..n, 0..1]).reshape([n]).into_data().to_vec().unwrap_or_default();
-        let lug_v: Vec<f32> = lug.raw_out.clone().slice([0..n, 1..2]).reshape([n]).into_data().to_vec().unwrap_or_default();
-
-        let mut total = 0.0_f64;
-        for i in 0..n {
-            let theta = self.thetas[i];
-            let c = theta.cos();
-            let s = theta.sin();
-            let u_r_pin = pin_u[i] as f64 * c + pin_v[i] as f64 * s;
-            let u_r_lug = lug_u[i] as f64 * c + lug_v[i] as f64 * s;
-            let gap = (self.r_lug + u_r_lug) - (self.r_pin + u_r_pin);
-            total += penetration_penalty(gap);
-        }
-        let mean = total / n.max(1) as f64 / self.ref_gap2 as f64;
         let device = pin.raw_out.device();
-        Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(vec![mean as f32], vec![1]), &device)
+
+        let pin_u = pin.raw_out.clone().slice([0..n, 0..1]).reshape([n]);
+        let pin_v = pin.raw_out.clone().slice([0..n, 1..2]).reshape([n]);
+        let lug_u = lug.raw_out.clone().slice([0..n, 0..1]).reshape([n]);
+        let lug_v = lug.raw_out.clone().slice([0..n, 1..2]).reshape([n]);
+
+        let cos_v: Vec<f32> = self.thetas.iter().map(|t| t.cos() as f32).collect();
+        let sin_v: Vec<f32> = self.thetas.iter().map(|t| t.sin() as f32).collect();
+        let cos_theta = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(cos_v, vec![n]), &device);
+        let sin_theta = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(sin_v, vec![n]), &device);
+
+        let u_r_pin = pin_u * cos_theta.clone() + pin_v * sin_theta.clone();
+        let u_r_lug = lug_u * cos_theta + lug_v * sin_theta;
+
+        // gap = (r_lug + u_r_lug) - (r_pin + u_r_pin) == (u_r_lug - u_r_pin) + (r_lug - r_pin)
+        let gap = (u_r_lug - u_r_pin).add_scalar(self.r_lug - self.r_pin);
+
+        let penalty = gap.neg().clamp_min(0.0_f64).powf_scalar(2.0_f64);
+        penalty.mean().mul_scalar(1.0 / self.ref_gap2 as f64)
     }
 }
 
@@ -421,17 +422,25 @@ impl LossTerm for InterfaceNonTensionTerm {
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let pin = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("interface_non_tension: pin missing");
         let n = self.thetas.len();
-        let sxx: Vec<f32> = pin.raw_out.clone().slice([0..n, 2..3]).reshape([n]).into_data().to_vec().unwrap_or_default();
-        let syy: Vec<f32> = pin.raw_out.clone().slice([0..n, 3..4]).reshape([n]).into_data().to_vec().unwrap_or_default();
-        let sxy: Vec<f32> = pin.raw_out.clone().slice([0..n, 4..5]).reshape([n]).into_data().to_vec().unwrap_or_default();
-        let mut total = 0.0_f64;
-        for i in 0..n {
-            let (s_rr, _s_tt, _s_rt) = decompose_radial(sxx[i] as f64, syy[i] as f64, sxy[i] as f64, self.thetas[i]);
-            total += non_tension_penalty(s_rr);
-        }
-        let mean = total / n.max(1) as f64 / self.ref_stress2 as f64;
         let device = pin.raw_out.device();
-        Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(vec![mean as f32], vec![1]), &device)
+
+        let sxx = pin.raw_out.clone().slice([0..n, 2..3]).reshape([n]);
+        let syy = pin.raw_out.clone().slice([0..n, 3..4]).reshape([n]);
+        let sxy = pin.raw_out.clone().slice([0..n, 4..5]).reshape([n]);
+
+        let cos_v: Vec<f32> = self.thetas.iter().map(|t| t.cos() as f32).collect();
+        let sin_v: Vec<f32> = self.thetas.iter().map(|t| t.sin() as f32).collect();
+        let cos_theta = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(cos_v, vec![n]), &device);
+        let sin_theta = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(sin_v, vec![n]), &device);
+
+        let cos2 = cos_theta.clone() * cos_theta.clone();
+        let sin2 = sin_theta.clone() * sin_theta.clone();
+        let sin_cos_2 = (sin_theta * cos_theta).mul_scalar(2.0);
+
+        let s_rr = sxx * cos2 + syy * sin2 + sxy * sin_cos_2;
+
+        let penalty = s_rr.clamp_min(0.0_f64).powf_scalar(2.0_f64);
+        penalty.mean().mul_scalar(1.0 / self.ref_stress2 as f64)
     }
 }
 
@@ -829,6 +838,213 @@ mod tests {
         let loss = term.compute(&[pin_fwd, lug_fwd]);
         let v: f32 = loss.into_data().to_vec::<f32>().unwrap()[0];
         assert_eq!(v, 0.0, "zero displacement + equal radii must give exactly zero gap everywhere -> zero penalty");
+    }
+
+    #[test]
+    fn interface_penetration_term_new_impl_matches_old_cpu_math_mixed_active_inactive() {
+        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let n = 4;
+        let thetas: Vec<f64> = (0..n).map(|i| 2.0 * std::f64::consts::PI * i as f64 / n as f64).collect();
+        let (r_pin, r_lug) = (0.5_f64, 0.52_f64);
+
+        let pin_u = [0.05_f32, 0.0, -0.05, 0.0];
+        let pin_v = [0.0_f32, 0.0, 0.0, 0.08];
+        let lug_u = [0.0_f32, 0.0, 0.0, 0.0];
+        let lug_v = [0.0_f32, 0.1, 0.0, 0.0];
+
+        let mut pin_flat = vec![0.0_f32; n * 5];
+        let mut lug_flat = vec![0.0_f32; n * 5];
+        for i in 0..n {
+            pin_flat[i * 5] = pin_u[i];
+            pin_flat[i * 5 + 1] = pin_v[i];
+            lug_flat[i * 5] = lug_u[i];
+            lug_flat[i * 5 + 1] = lug_v[i];
+        }
+        let pin_raw = Tensor::<B, 2>::from_data(burn::tensor::TensorData::new(pin_flat, vec![n, 5]), &device);
+        let lug_raw = Tensor::<B, 2>::from_data(burn::tensor::TensorData::new(lug_flat, vec![n, 5]), &device);
+
+        let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
+        let lug_fwd = DomainForwardOutputs { domain: LUG_DOMAIN, raw_out: &lug_raw, strains: None, normals: None };
+
+        let term = InterfacePenetrationTerm { thetas: thetas.clone(), r_pin, r_lug, ref_gap2: 1.0 };
+        let actual: f32 = term.compute(&[pin_fwd, lug_fwd]).into_data().to_vec::<f32>().unwrap()[0];
+
+        let mut total = 0.0_f64;
+        for i in 0..n {
+            let c = thetas[i].cos();
+            let s = thetas[i].sin();
+            let u_r_pin = pin_u[i] as f64 * c + pin_v[i] as f64 * s;
+            let u_r_lug = lug_u[i] as f64 * c + lug_v[i] as f64 * s;
+            let gap = (r_lug + u_r_lug) - (r_pin + u_r_pin);
+            total += crate::signorini::penetration_penalty(gap);
+        }
+        let expected = (total / n as f64) as f32;
+
+        assert!((expected - 0.00045).abs() < 1e-6, "fixture sanity: expected ~0.00045, got {expected}");
+        let scale = actual.abs().max(expected.abs()).max(1e-8);
+        assert!((actual - expected).abs() / scale < 1e-4,
+            "new Tensor impl diverges from old CPU-f64 oracle: actual={actual} expected={expected}");
+    }
+
+    #[test]
+    fn interface_non_tension_term_new_impl_matches_old_cpu_math_mixed_active_inactive() {
+        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let n = 4;
+        let thetas: Vec<f64> = (0..n).map(|i| 2.0 * std::f64::consts::PI * i as f64 / n as f64).collect();
+
+        let sxx = [50.0_f32, 0.0, -20.0, 0.0];
+        let syy = [0.0_f32, -30.0, 0.0, 10.0];
+        let sxy = [0.0_f32; 4];
+
+        let mut pin_flat = vec![0.0_f32; n * 5];
+        for i in 0..n {
+            pin_flat[i * 5 + 2] = sxx[i];
+            pin_flat[i * 5 + 3] = syy[i];
+            pin_flat[i * 5 + 4] = sxy[i];
+        }
+        let pin_raw = Tensor::<B, 2>::from_data(burn::tensor::TensorData::new(pin_flat, vec![n, 5]), &device);
+        let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
+
+        let term = InterfaceNonTensionTerm { thetas: thetas.clone(), ref_stress2: 1.0 };
+        let actual: f32 = term.compute(&[pin_fwd]).into_data().to_vec::<f32>().unwrap()[0];
+
+        let mut total = 0.0_f64;
+        for i in 0..n {
+            let (s_rr, _, _) = crate::signorini::decompose_radial(sxx[i] as f64, syy[i] as f64, sxy[i] as f64, thetas[i]);
+            total += crate::signorini::non_tension_penalty(s_rr);
+        }
+        let expected = (total / n as f64) as f32;
+
+        assert!((expected - 650.0).abs() < 1e-3, "fixture sanity: expected 650.0, got {expected}");
+        let scale = actual.abs().max(expected.abs()).max(1e-8);
+        assert!((actual - expected).abs() / scale < 1e-4,
+            "new Tensor impl diverges from old CPU-f64 oracle: actual={actual} expected={expected}");
+    }
+
+    #[test]
+    fn interface_penetration_term_gradient_nonzero_when_penetrating() {
+        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let thetas = vec![0.0_f64];
+        let (r_pin, r_lug) = (0.5_f64, 0.5_f64);
+
+        let pin_raw = Tensor::<B, 2>::from_data(
+            burn::tensor::TensorData::new(vec![0.1_f32, 0.0, 0.0, 0.0, 0.0], vec![1, 5]), &device,
+        ).require_grad();
+        let lug_raw = Tensor::<B, 2>::from_data(
+            burn::tensor::TensorData::new(vec![0.0_f32; 5], vec![1, 5]), &device,
+        ).require_grad();
+
+        let term = InterfacePenetrationTerm { thetas, r_pin, r_lug, ref_gap2: 1.0 };
+        let loss = {
+            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
+            let lug_fwd = DomainForwardOutputs { domain: LUG_DOMAIN, raw_out: &lug_raw, strains: None, normals: None };
+            term.compute(&[pin_fwd, lug_fwd])
+        };
+
+        let loss_v: f32 = loss.clone().into_data().to_vec::<f32>().unwrap()[0];
+        assert!((loss_v - 0.01).abs() < 1e-5, "expected loss=0.01 (gap=-0.1), got {loss_v}");
+
+        let grads = loss.backward();
+        let pin_grad = pin_raw.grad(&grads)
+            .expect("pin_raw must receive a gradient — compute() must not detach from the autodiff graph");
+        let lug_grad = lug_raw.grad(&grads)
+            .expect("lug_raw must receive a gradient — compute() must not detach from the autodiff graph");
+
+        let pin_grad_v: Vec<f32> = pin_grad.into_data().to_vec().unwrap();
+        let lug_grad_v: Vec<f32> = lug_grad.into_data().to_vec().unwrap();
+
+        assert!((pin_grad_v[0] - 0.2).abs() < 1e-4, "d(loss)/d(pin_u) expected 0.2, got {}", pin_grad_v[0]);
+        assert!((lug_grad_v[0] - (-0.2)).abs() < 1e-4, "d(loss)/d(lug_u) expected -0.2, got {}", lug_grad_v[0]);
+        for &g in &pin_grad_v[1..] { assert!(g.abs() < 1e-6, "unrelated pin column must have ~0 gradient, got {g}"); }
+        for &g in &lug_grad_v[1..] { assert!(g.abs() < 1e-6, "unrelated lug column must have ~0 gradient, got {g}"); }
+    }
+
+    #[test]
+    fn interface_penetration_term_gradient_zero_when_non_penetrating() {
+        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let thetas = vec![0.0_f64];
+        let (r_pin, r_lug) = (0.5_f64, 0.5_f64);
+
+        let pin_raw = Tensor::<B, 2>::from_data(
+            burn::tensor::TensorData::new(vec![-0.1_f32, 0.0, 0.0, 0.0, 0.0], vec![1, 5]), &device,
+        ).require_grad();
+        let lug_raw = Tensor::<B, 2>::from_data(
+            burn::tensor::TensorData::new(vec![0.0_f32; 5], vec![1, 5]), &device,
+        ).require_grad();
+
+        let term = InterfacePenetrationTerm { thetas, r_pin, r_lug, ref_gap2: 1.0 };
+        let loss = {
+            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
+            let lug_fwd = DomainForwardOutputs { domain: LUG_DOMAIN, raw_out: &lug_raw, strains: None, normals: None };
+            term.compute(&[pin_fwd, lug_fwd])
+        };
+
+        let loss_v: f32 = loss.clone().into_data().to_vec::<f32>().unwrap()[0];
+        assert_eq!(loss_v, 0.0, "non-penetrating gap must give exactly zero penalty");
+
+        let grads = loss.backward();
+        let pin_grad_v: Vec<f32> = pin_raw.grad(&grads)
+            .expect("tensor is still part of the graph even with zero local gradient")
+            .into_data().to_vec().unwrap();
+        let lug_grad_v: Vec<f32> = lug_raw.grad(&grads).unwrap().into_data().to_vec().unwrap();
+
+        for &g in &pin_grad_v { assert!(g.abs() < 1e-6, "inactive region must have ~0 gradient, got {g}"); }
+        for &g in &lug_grad_v { assert!(g.abs() < 1e-6, "inactive region must have ~0 gradient, got {g}"); }
+    }
+
+    #[test]
+    fn interface_non_tension_term_gradient_nonzero_when_tensile() {
+        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let thetas = vec![0.0_f64];
+
+        let pin_raw = Tensor::<B, 2>::from_data(
+            burn::tensor::TensorData::new(vec![0.0_f32, 0.0, 2.0, 0.0, 0.0], vec![1, 5]), &device,
+        ).require_grad();
+
+        let term = InterfaceNonTensionTerm { thetas, ref_stress2: 1.0 };
+        let loss = {
+            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
+            term.compute(&[pin_fwd])
+        };
+
+        let loss_v: f32 = loss.clone().into_data().to_vec::<f32>().unwrap()[0];
+        assert!((loss_v - 4.0).abs() < 1e-4, "expected loss=4.0 (s_rr=2.0), got {loss_v}");
+
+        let grads = loss.backward();
+        let pin_grad_v: Vec<f32> = pin_raw.grad(&grads)
+            .expect("pin_raw must receive a gradient — compute() must not detach from the autodiff graph")
+            .into_data().to_vec().unwrap();
+
+        assert!((pin_grad_v[2] - 4.0).abs() < 1e-4, "d(loss)/d(sxx) expected 4.0, got {}", pin_grad_v[2]);
+        assert!(pin_grad_v[0].abs() < 1e-6, "u column unrelated, expected ~0");
+        assert!(pin_grad_v[1].abs() < 1e-6, "v column unrelated, expected ~0");
+        assert!(pin_grad_v[3].abs() < 1e-6, "d(loss)/d(syy) expected ~0 at theta=0 (sin²=0)");
+        assert!(pin_grad_v[4].abs() < 1e-6, "d(loss)/d(sxy) expected ~0 at theta=0 (2 sin cos=0)");
+    }
+
+    #[test]
+    fn interface_non_tension_term_gradient_zero_when_compressive() {
+        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let thetas = vec![0.0_f64];
+
+        let pin_raw = Tensor::<B, 2>::from_data(
+            burn::tensor::TensorData::new(vec![0.0_f32, 0.0, -2.0, 0.0, 0.0], vec![1, 5]), &device,
+        ).require_grad();
+
+        let term = InterfaceNonTensionTerm { thetas, ref_stress2: 1.0 };
+        let loss = {
+            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
+            term.compute(&[pin_fwd])
+        };
+
+        let loss_v: f32 = loss.clone().into_data().to_vec::<f32>().unwrap()[0];
+        assert_eq!(loss_v, 0.0, "compressive s_rr must give exactly zero penalty");
+
+        let grads = loss.backward();
+        let pin_grad_v: Vec<f32> = pin_raw.grad(&grads)
+            .expect("tensor is still part of the graph even with zero local gradient")
+            .into_data().to_vec().unwrap();
+        for &g in &pin_grad_v { assert!(g.abs() < 1e-6, "inactive region must have ~0 gradient, got {g}"); }
     }
 
     #[test]
