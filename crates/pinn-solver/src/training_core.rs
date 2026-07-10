@@ -122,6 +122,20 @@ pub fn compute_reference_scales(config: &SolverConfig) -> (f32, f32, f32) {
     (u_ref, ref_energy, ref_stress2)
 }
 
+/// Floors the MAGNITUDE of a divisor at 1.0 while preserving sign — the linear-divisor
+/// analogue of `ref_div2`'s `.max(1.0)` guard, which is safe to apply directly only because
+/// that divisor is pre-squared (always >= 0). `px * half_w` here is not squared, so a naive
+/// `.max(1.0)` would silently flip the sign of a legitimate negative (compression) divisor
+/// into a positive floor. Exact zero defaults to +1.0 (this codebase's tension-positive
+/// `LoadConfig` convention).
+fn floor_signed_divisor(d: f64) -> f64 {
+    if d.abs() < 1.0 {
+        if d < 0.0 { -1.0 } else { 1.0 }
+    } else {
+        d
+    }
+}
+
 /// Partition sampled boundary points into the traction-load, hole-free, and
 /// right-edge-traction index sets `StepCtx` uses to slice into the `bnd_*` arrays.
 pub fn extract_boundary_indices(bnd_pts: &[BoundaryPoint], bnd_nx: &[f32]) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
@@ -353,7 +367,7 @@ pub fn step_physics(
         let u_vals = out_r.slice([0..nr, 0..1]).reshape([nr]);
         let w_val = u_vals.mean()
             .mul_scalar(2.0 * ctx.config.material.e
-                / (ctx.config.load.px * ctx.config.geometry.half_w));
+                / floor_signed_divisor(ctx.config.load.px * ctx.config.geometry.half_w));
         (d_val, w_val)
     } else {
         (Tensor::<B, 1>::zeros([1], device), Tensor::<B, 1>::zeros([1], device))
@@ -1293,7 +1307,7 @@ pub fn compute_gradient_conflict(
                 .mul_scalar(1.0 / denom);
             let w_val = u_vals.mean()
                 .mul_scalar(2.0 * ctx.config.material.e
-                    / (ctx.config.load.px * ctx.config.geometry.half_w));
+                    / floor_signed_divisor(ctx.config.load.px * ctx.config.geometry.half_w));
             (d_val, w_val)
         } else {
             (Tensor::<B, 1>::zeros([1], device), Tensor::<B, 1>::zeros([1], device))
@@ -1534,7 +1548,7 @@ fn compute_loss_for_lbfgs(
             .mul_scalar(1.0 / denom);
         let w_val = u_vals.mean()
             .mul_scalar(2.0 * ctx.config.material.e
-                / (ctx.config.load.px * ctx.config.geometry.half_w));
+                / floor_signed_divisor(ctx.config.load.px * ctx.config.geometry.half_w));
         (d_val, w_val)
     } else {
         (Tensor::<B, 1>::zeros([1], device), Tensor::<B, 1>::zeros([1], device))
@@ -2068,6 +2082,233 @@ mod tests {
             (actual_ratio - expected_ratio).abs() / expected_ratio < 1e-5,
             "expected u_ref ratio {expected_ratio}, got {actual_ratio}"
         );
+    }
+
+    #[test]
+    fn floor_signed_divisor_boundary_cases() {
+        assert_eq!(floor_signed_divisor(0.0), 1.0, "exact zero must default to +1.0 (tension-positive convention)");
+        assert_eq!(floor_signed_divisor(1.0), 1.0, "exactly at the floor: unchanged");
+        assert_eq!(floor_signed_divisor(-1.0), -1.0, "exactly at the floor, negative: unchanged, sign preserved");
+        assert_eq!(floor_signed_divisor(0.5), 1.0, "inside the floor, positive: clamped up to +1.0");
+        assert_eq!(floor_signed_divisor(-0.5), -1.0, "inside the floor, negative: clamped to -1.0, NOT flipped to +1.0");
+        assert_eq!(floor_signed_divisor(1e-10), 1.0, "near-zero positive: floored");
+        assert_eq!(floor_signed_divisor(-1e-10), -1.0, "near-zero negative: floored, sign preserved");
+        assert_eq!(floor_signed_divisor(3502.4), 3502.4, "well outside the floor: passthrough, unchanged");
+        assert_eq!(floor_signed_divisor(-3502.4), -3502.4, "well outside the floor, negative: passthrough, unchanged");
+    }
+
+    /// Shared scaffolding for the 3 `floor_signed_divisor` production-site regression tests
+    /// below — builds a Kirsch `StepCtx` with `use_ultimate_strength_scaling = true` so
+    /// `ref_energy`/`ref_stress2` (and thus every OTHER loss term's normalization) stay
+    /// derived from the material's ultimate strength, not from `config.load.px` — isolating
+    /// the specific `w_val`-divisor bug under test from the separate, out-of-scope fact that
+    /// the DEFAULT (`px`-based) reference-scale path also degrades at `px = 0` (a distinct,
+    /// unguarded divide-by-zero in `compute_reference_scales`, not part of this fix).
+    ///
+    /// `px`: the value to install into `config.load.px` (the divisor under test). Callers that
+    /// exercise `compute_loss_for_lbfgs`/`step_lbfgs` must pass a small-but-NONZERO value (not
+    /// exactly `0.0`) — that function has its own separate, pre-existing, out-of-scope bug
+    /// (an inline `ref_energy = 0.5*px*px/E` recompute that ignores `use_ultimate_strength_
+    /// scaling` entirely) which independently divides by zero at literal `px = 0.0`; using a
+    /// tiny nonzero `px` still exercises `floor_signed_divisor`'s floor (product magnitude < 1)
+    /// and its sign-preservation (negative `px`) without tripping that unrelated bug.
+    fn zero_px_test_fixture(px: f64) -> (
+        pinn_core::messages::SolverConfig, crate::engine::EngineParams, FdConfig, f32, f32, f32, f64, f64, f64,
+        Vec<[f32; 2]>, Vec<[f32; 2]>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>,
+        Vec<usize>, Vec<usize>, Vec<usize>, Vec<[f32; 2]>,
+    ) {
+        use pinn_core::messages::SolverConfig;
+        use crate::engine::EngineParams;
+
+        let mut config = SolverConfig::default_kirsch();
+        config.n_interior = 64;
+        config.n_boundary = 32;
+        config.max_steps = 2;
+        config.use_ultimate_strength_scaling = true;
+        config.load.px = px;
+        let engine = EngineParams::analyze(&config);
+        engine.apply_to(&mut config);
+
+        let (x0, x1) = config.geometry.x_range();
+        let (y0, y1) = config.geometry.y_range();
+        let fd = FdConfig::new(config.fd_h, x1 - x0, y1 - y0);
+        let cx = fd.sx / (2.0 * fd.hx as f64);
+        let cy = fd.sy / (2.0 * fd.hy as f64);
+        let ref_div2 = (config.load.px * cx).powi(2).max(1.0);
+        let (u_ref, ref_energy, ref_stress2) = compute_reference_scales(&config);
+
+        let int_pts = pinn_core::sampling::sample_interior(&config.geometry, engine.phase1_n_interior);
+        let bnd_pts = pinn_core::sampling::sample_boundary(&config.geometry, &config.load, config.n_boundary);
+        let eq_ring = pinn_core::sampling::sample_eq_ring(&config.geometry, engine.n_eq_ring);
+
+        let int_norm: Vec<[f32; 2]> = int_pts.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
+        let bnd_norm: Vec<[f32; 2]> = bnd_pts.iter().map(|b| normalize_point(b.x, b.y, &config)).collect();
+        let bnd_nx: Vec<f32> = bnd_pts.iter().map(|b| b.nx as f32).collect();
+        let bnd_ny: Vec<f32> = bnd_pts.iter().map(|b| b.ny as f32).collect();
+        let bnd_tx: Vec<f32> = bnd_pts.iter().map(|b| b.tx as f32).collect();
+        let bnd_ty: Vec<f32> = bnd_pts.iter().map(|b| b.ty as f32).collect();
+        let (trac_idx, hole_idx, right_idx) = extract_boundary_indices(&bnd_pts, &bnd_nx);
+        let eq_ring_norm: Vec<[f32; 2]> = eq_ring.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
+
+        (
+            config, engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        )
+    }
+
+    #[test]
+    fn step_physics_finite_at_zero_px_load() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::{
+            kirsch_problem::KirschProblem,
+            network::ElasticityNetConfig,
+            optim::{make_bias_optim, make_gate_optim, WeightOptim},
+        };
+
+        let (
+            config, engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(0.0);
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+
+        let problem = KirschProblem::new(
+            config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
+        );
+
+        let mut optim_w = WeightOptim::new(config.use_soap_muon);
+        let mut optim_b = make_bias_optim();
+        let mut optim_gate = make_gate_optim();
+        let mut saw = SawBrdr::with_base(engine.init_weights(), 0.95);
+        let mut lr_sched = LrSchedule::new(engine.peak_lr, 200, 1000);
+
+        let ctx = StepCtx {
+            config: &config, engine: &engine, problem: &problem, fd: &fd,
+            k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm: &int_norm, bnd_norm: &bnd_norm,
+            bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            eq_ring_norm: &eq_ring_norm,
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            phase2_active: false, step: 0,
+        };
+
+        let (_m, out) = step_physics(
+            model, &mut optim_w, &mut optim_b, &mut optim_gate,
+            &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+        assert!(out.w_scalar.is_finite(), "w_scalar must be finite at px=0.0, got {}", out.w_scalar);
+        assert!(out.total_scalar.is_finite(), "total_scalar must be finite at px=0.0, got {}", out.total_scalar);
+    }
+
+    #[test]
+    fn compute_gradient_conflict_finite_at_zero_px_load() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::network::ElasticityNetConfig;
+
+        let (
+            config, engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(0.0);
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+
+        use crate::kirsch_problem::KirschProblem;
+        let problem = KirschProblem::new(
+            config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
+        );
+
+        let ctx = StepCtx {
+            config: &config, engine: &engine, problem: &problem, fd: &fd,
+            k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm: &int_norm, bnd_norm: &bnd_norm,
+            bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            eq_ring_norm: &eq_ring_norm,
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            phase2_active: false, step: 0,
+        };
+
+        let conflict = compute_gradient_conflict(&model, &ctx, 0, &device);
+        assert!(conflict.cosine_sim.is_finite(), "cosine_sim must be finite at px=0.0, got {}", conflict.cosine_sim);
+        assert!(conflict.g_bc_norm.is_finite(), "g_bc_norm must be finite at px=0.0, got {}", conflict.g_bc_norm);
+    }
+
+    /// Uses a tiny NEGATIVE (not exactly zero) `px` — see `zero_px_test_fixture`'s doc comment:
+    /// `compute_loss_for_lbfgs` has its own separate, pre-existing, out-of-scope bug (an inline
+    /// `ref_energy` recompute from raw `px` that ignores `use_ultimate_strength_scaling` and
+    /// divides by exactly zero at `px = 0.0`) that this test must not trip in order to cleanly
+    /// exercise ONLY the in-scope `w_val`-divisor fix (`floor_signed_divisor`) at this call site,
+    /// including its sign-preservation for a legitimate compression (`px < 0`) load.
+    #[test]
+    fn step_lbfgs_finite_at_near_zero_negative_px_load() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::network::ElasticityNetConfig;
+
+        let (
+            config, engine, fd, u_ref, _ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(-0.5);
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+
+        let lbfgs_ctx = LbfgsCtxScalars {
+            config: config.clone(),
+            engine: engine.clone(),
+            fd,
+            k: engine.ansatz_k,
+            u_ref,
+            ref_stress2,
+            cx, cy, ref_div2,
+            int_norm: int_norm.clone(),
+            bnd_norm: bnd_norm.clone(),
+            bnd_nx: bnd_nx.clone(),
+            bnd_ny: bnd_ny.clone(),
+            bnd_tx: bnd_tx.clone(),
+            bnd_ty: bnd_ty.clone(),
+            trac_idx: trac_idx.clone(),
+            hole_idx: hole_idx.clone(),
+            right_idx: right_idx.clone(),
+            eq_ring_norm: eq_ring_norm.clone(),
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+        };
+        let lams = LbfgsLams {
+            lam_e: 1.0, lam_n: 1.0, lam_h: 1.0, lam_d: 1.0, lam_eq: 1.0, lam_kirsch: 1.0, lam_const: 1.0,
+        };
+
+        let (_total, total_scalar) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &lams, &device);
+        assert!(total_scalar.is_finite(), "compute_loss_for_lbfgs's total loss must be finite at px=0.0, got {total_scalar}");
+
+        let mut lbfgs = make_lbfgs(3);
+        let (_model_out, loss_out) = step_lbfgs(model, &mut lbfgs, 1e-3, &lbfgs_ctx, &lams, &device);
+        assert!(loss_out.is_finite(), "step_lbfgs's returned loss must be finite at px=0.0, got {loss_out}");
     }
 
     /// Numerical-equivalence proof for the `step_physics` trait-driven cutover.

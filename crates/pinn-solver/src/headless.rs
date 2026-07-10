@@ -24,7 +24,7 @@ use pinn_core::{
 
 use crate::{
     bc::apply_dirichlet_ansatz,
-    controllers::ConvergenceTracker,
+    controllers::{ConvergenceTracker, STUCK_NONE_THRESHOLD},
     decision_maker::{OptimizerTier, PinnDecisionMaker},
     engine::EngineParams,
     energy::dem_energy_per_point,
@@ -363,6 +363,7 @@ pub fn run_headless(config: SolverConfig) -> bool {
 
                 if phase2_started {
                     if let Some(kt) = kt_opt {
+                        tracker.note_reading_received();
                         tracker.push(kt as f64);
 
                         // Crash recovery: K_t collapsed ≥50% from recent peak → fresh restart.
@@ -402,6 +403,24 @@ pub fn run_headless(config: SolverConfig) -> bool {
                             converged = true;
                             break 'training;
                         }
+                    } else if let Some(new_cap) = tracker.note_missed_reading() {
+                        // The network has been fully NaN-diverged (probe_kt_shared returning
+                        // None) for STUCK_NONE_THRESHOLD consecutive probes with zero recovery
+                        // signal reaching the cascade above — mirror check_kt_crash's restart
+                        // body exactly so the same cap-tighten/reset machinery applies.
+                        dynamic_lam_h_cap = new_cap;
+                        dynamic_lam_d_cap = new_cap;
+                        tracker.clear_history();
+                        saw.reset();
+                        lr_sched.reset_for_phase2();
+                        decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
+                        optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
+                        optim_b = make_bias_optim();
+                        optim_gate = make_gate_optim();
+                        stiffness_controller = StiffnessController::new(stiff_config.clone());
+                        lbfgs_opt = None; frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None;
+                        println!("\n  [STUCK-NAN RECOVERY #{}] {} consecutive missed K_t readings → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
+                            tracker.total_restarts(), STUCK_NONE_THRESHOLD);
                     }
                 }
 
@@ -846,6 +865,7 @@ pub(crate) fn run_headless_pinlug_inner(
             ];
             if let Some(rms) = problem.convergence_metric(&state) {
                 metric_probes += 1;
+                tracker.note_reading_received();
                 tracker.push(rms);
 
                 // Crash recovery: gap RMS spiked >=2x its recent best → fresh restart.
@@ -880,6 +900,23 @@ pub(crate) fn run_headless_pinlug_inner(
                     println!("\n  [WARM RESTART #{}] gap_rms plateau → reset: lr+adam+SAW, lam_caps→{new_cap:.0}",
                         tracker.total_restarts());
                 }
+            } else if let Some(new_cap) = tracker.note_missed_reading() {
+                // Both domains have been fully NaN-diverged (convergence_metric returning None)
+                // for STUCK_NONE_THRESHOLD consecutive probes with zero recovery signal
+                // reaching the cascade above — mirror the crash-recovery restart body exactly.
+                dynamic_lam_h_cap = new_cap;
+                dynamic_lam_d_cap = new_cap;
+                tracker.clear_history();
+                saw.reset();
+                lr_sched.reset_for_phase2();
+                decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, true);
+                optims = vec![
+                    DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
+                    DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
+                ];
+                lbfgs_opt = None; frozen_ctx = None; frozen_lams = None;
+                println!("\n  [STUCK-NAN RECOVERY #{}] {} consecutive missed gap_rms readings → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
+                    tracker.total_restarts(), STUCK_NONE_THRESHOLD);
             }
         }
 

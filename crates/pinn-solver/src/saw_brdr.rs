@@ -61,6 +61,16 @@ impl SawBrdr {
 
         for i in 0..n {
             let curr = losses[i].abs();
+            // A non-finite reading (NaN/Inf) is skipped entirely, leaving `prev_losses[i]`/
+            // `decay_ema[i]` at their last-known-finite values — self-healing: once the
+            // reading returns to finite, adaptation resumes exactly as if the bad step never
+            // happened. Storing a NaN unconditionally here (the old behavior) would poison
+            // `decay_ema[i]` on the NEXT call via the `prev/curr` ratio, which poisons
+            // `total_ema`, permanently freezing the ENTIRE multiplier-update block below
+            // (not just this one term) since `total_ema > 1e-12` becomes false forever.
+            if !curr.is_finite() {
+                continue;
+            }
             if let Some(prev) = self.prev_losses[i] {
                 // Inverse decay rate: slow convergence → high irdr → high weight
                 let rate = if curr > 1e-12 { (prev / curr).clamp(0.05, 20.0) } else { 1.0 };
@@ -101,5 +111,66 @@ impl SawBrdr {
     pub fn set_base_weights(&mut self, base: Vec<f32>) {
         assert_eq!(base.len(), self.base_weights.len());
         self.base_weights = base;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_with_nan_reading_on_first_call_does_not_panic_and_stays_uninitialized() {
+        let mut saw = SawBrdr::with_base(vec![1.0, 1.0], 0.5);
+        let out = saw.update(&[f32::NAN, 1.0]);
+        assert!(out[0].is_finite() && out[1].is_finite(), "first-ever call being NaN must not corrupt effective_weights: {out:?}");
+        let out2 = saw.update(&[2.0, 1.0]);
+        assert!(out2.iter().all(|w| w.is_finite()));
+    }
+
+    #[test]
+    fn update_all_terms_nan_simultaneously_does_not_panic_or_poison_state() {
+        let mut saw = SawBrdr::with_base(vec![1.0, 1.0], 0.5);
+        saw.update(&[8.0, 8.0]);
+        let out = saw.update(&[f32::NAN, f32::NAN]);
+        assert!(out.iter().all(|w| w.is_finite()), "all-NaN reading must not poison effective_weights: {out:?}");
+        let out2 = saw.update(&[4.0, 4.0]);
+        assert!(out2.iter().all(|w| w.is_finite()));
+    }
+
+    #[test]
+    fn update_treats_infinite_reading_as_non_finite_and_skips_it_like_nan() {
+        let mut saw = SawBrdr::with_base(vec![1.0, 1.0], 0.5);
+        saw.update(&[8.0, 8.0]);
+        let out = saw.update(&[f32::INFINITY, 8.0]);
+        assert!(out.iter().all(|w| w.is_finite()), "+Infinity is non-finite and must be skipped exactly like NaN: {out:?}");
+    }
+
+    /// Mutation-testing-grade: hand-computed exact values (beta_w=0.5 for exact fractions)
+    /// proving (1) a transient NaN doesn't freeze the OTHER term's adaptation, and (2) SawBrdr
+    /// resumes adapting against its LAST FINITE reading, not a poisoned/reset one.
+    #[test]
+    fn update_resumes_adapting_against_last_finite_state_after_transient_nan() {
+        let mut saw = SawBrdr::with_base(vec![1.0, 1.0], 0.5);
+
+        saw.update(&[8.0, 8.0]);
+        let w2 = saw.update(&[4.0, 8.0]);
+        let expect2 = [0.9285714_f32, 1.0714286_f32];
+        for (a, b) in w2.iter().zip(expect2) { assert!((a - b).abs() < 1e-4, "step2: {w2:?} vs {expect2:?}"); }
+
+        let w3 = saw.update(&[f32::NAN, 8.0]);
+        assert!(w3.iter().all(|w| w.is_finite()), "step3 (NaN injected): must stay finite: {w3:?}");
+        let expect3 = [0.8928571_f32, 1.1071429_f32];
+        for (a, b) in w3.iter().zip(expect3) { assert!((a - b).abs() < 1e-4, "step3: {w3:?} vs {expect3:?}"); }
+
+        let w4 = saw.update(&[2.0, 8.0]);
+        assert!(w4.iter().all(|w| w.is_finite()), "step4 (post-NaN recovery): must stay finite: {w4:?}");
+        let expect4 = [0.831044_f32, 1.168956_f32];
+        for (a, b) in w4.iter().zip(expect4) { assert!((a - b).abs() < 1e-4, "step4: {w4:?} vs {expect4:?}"); }
+
+        // The assertion that actually distinguishes fixed-vs-buggy code: under the bug, decay_ema[0]
+        // goes NaN at step 4 (poisoned by Some(NaN) stored at step 3), freezing the ENTIRE multiplier
+        // update — so w4 would equal w3 EXACTLY. Assert genuine continued movement, not just finiteness.
+        assert!((w4[0] - w3[0]).abs() > 1e-4, "weights must keep adapting after the NaN clears, not freeze: w3={w3:?} w4={w4:?}");
+        assert!((w4[1] - w3[1]).abs() > 1e-4, "the OTHER (never-NaN) term must also keep adapting, not get dragged into a freeze: w3={w3:?} w4={w4:?}");
     }
 }
