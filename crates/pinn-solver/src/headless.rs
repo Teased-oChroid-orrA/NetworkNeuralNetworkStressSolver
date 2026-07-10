@@ -24,7 +24,7 @@ use pinn_core::{
 
 use crate::{
     bc::apply_dirichlet_ansatz,
-    controllers::ConvergenceTracker,
+    controllers::{ConvergenceTracker, STUCK_NONE_THRESHOLD},
     decision_maker::{OptimizerTier, PinnDecisionMaker},
     engine::EngineParams,
     energy::dem_energy_per_point,
@@ -363,6 +363,7 @@ pub fn run_headless(config: SolverConfig) -> bool {
 
                 if phase2_started {
                     if let Some(kt) = kt_opt {
+                        tracker.note_reading_received();
                         tracker.push(kt as f64);
 
                         // Crash recovery: K_t collapsed ≥50% from recent peak → fresh restart.
@@ -402,6 +403,24 @@ pub fn run_headless(config: SolverConfig) -> bool {
                             converged = true;
                             break 'training;
                         }
+                    } else if let Some(new_cap) = tracker.note_missed_reading() {
+                        // The network has been fully NaN-diverged (probe_kt_shared returning
+                        // None) for STUCK_NONE_THRESHOLD consecutive probes with zero recovery
+                        // signal reaching the cascade above — mirror check_kt_crash's restart
+                        // body exactly so the same cap-tighten/reset machinery applies.
+                        dynamic_lam_h_cap = new_cap;
+                        dynamic_lam_d_cap = new_cap;
+                        tracker.clear_history();
+                        saw.reset();
+                        lr_sched.reset_for_phase2();
+                        decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
+                        optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
+                        optim_b = make_bias_optim();
+                        optim_gate = make_gate_optim();
+                        stiffness_controller = StiffnessController::new(stiff_config.clone());
+                        lbfgs_opt = None; frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None;
+                        println!("\n  [STUCK-NAN RECOVERY #{}] {} consecutive missed K_t readings → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
+                            tracker.total_restarts(), STUCK_NONE_THRESHOLD);
                     }
                 }
 
@@ -846,6 +865,7 @@ pub(crate) fn run_headless_pinlug_inner(
             ];
             if let Some(rms) = problem.convergence_metric(&state) {
                 metric_probes += 1;
+                tracker.note_reading_received();
                 tracker.push(rms);
 
                 // Crash recovery: gap RMS spiked >=2x its recent best → fresh restart.
@@ -880,6 +900,23 @@ pub(crate) fn run_headless_pinlug_inner(
                     println!("\n  [WARM RESTART #{}] gap_rms plateau → reset: lr+adam+SAW, lam_caps→{new_cap:.0}",
                         tracker.total_restarts());
                 }
+            } else if let Some(new_cap) = tracker.note_missed_reading() {
+                // Both domains have been fully NaN-diverged (convergence_metric returning None)
+                // for STUCK_NONE_THRESHOLD consecutive probes with zero recovery signal
+                // reaching the cascade above — mirror the crash-recovery restart body exactly.
+                dynamic_lam_h_cap = new_cap;
+                dynamic_lam_d_cap = new_cap;
+                tracker.clear_history();
+                saw.reset();
+                lr_sched.reset_for_phase2();
+                decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, true);
+                optims = vec![
+                    DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
+                    DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
+                ];
+                lbfgs_opt = None; frozen_ctx = None; frozen_lams = None;
+                println!("\n  [STUCK-NAN RECOVERY #{}] {} consecutive missed gap_rms readings → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
+                    tracker.total_restarts(), STUCK_NONE_THRESHOLD);
             }
         }
 
@@ -1053,6 +1090,87 @@ mod tests {
         let result = run_headless_pinlug_inner(config, None);
         assert!(result.metric_probes >= 2);
         assert!(result.converged);
+    }
+
+    /// Builds a pair of pin/lug `ElasticityNet`s whose every float parameter is NaN — the
+    /// same `NanMapper` pattern `pinlug_problem.rs`'s
+    /// `convergence_metric_pinlug_returns_none_when_forward_pass_is_all_nan` uses to prove
+    /// `PinLugProblem::convergence_metric` returns `None` on total divergence. Reused here
+    /// (rather than that unit-level proof alone) to close the actual integration gap: does
+    /// `run_headless_pinlug_inner`'s `else if let Some(new_cap) = tracker.note_missed_reading()`
+    /// branch actually fire and run the SAME restart machinery as the crash/plateau arms
+    /// (cap tighten, `saw.reset()`, `lr_sched.reset_for_phase2()`, fresh decision maker,
+    /// fresh optimizers, L-BFGS state cleared) — not just that `ConvergenceTracker::
+    /// note_missed_reading` works correctly in isolation (already covered in
+    /// `controllers.rs`'s test module).
+    fn nan_pinlug_models(config: &pinn_core::messages::SolverConfig, device: &WgpuDevice) -> (ElasticityNet<B>, ElasticityNet<B>) {
+        use burn::module::{Module, ModuleMapper, Param};
+        use burn::tensor::Tensor;
+        use crate::network::ElasticityNetConfig;
+
+        struct NanMapper;
+        impl<Bk: burn::tensor::backend::Backend> ModuleMapper<Bk> for NanMapper {
+            fn map_float<const D: usize>(&mut self, param: Param<Tensor<Bk, D>>) -> Param<Tensor<Bk, D>> {
+                param.map(|t| t.zeros_like().add_scalar(f32::NAN))
+            }
+        }
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(3)
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(5)
+            .with_use_piratenet(false);
+        let model_pin: ElasticityNet<B> = net_cfg.init(device).map(&mut NanMapper);
+        let model_lug: ElasticityNet<B> = net_cfg.init(device).map(&mut NanMapper);
+        (model_pin, model_lug)
+    }
+
+    /// Negative control for the integration test below: with only 2 consecutive missed
+    /// probes (steps 0, 200 — cadence is `step % 200 == 0`), `STUCK_NONE_THRESHOLD` (4) has
+    /// not yet been reached, so `note_missed_reading` must still be returning `None` and the
+    /// restart machinery must never fire. Without this control, the firing test below could
+    /// pass vacuously if `note_missed_reading` (or its wiring) fired unconditionally on any
+    /// miss rather than gating on the threshold.
+    #[test]
+    fn run_headless_pinlug_stuck_nan_below_threshold_does_not_restart() {
+        let device = WgpuDevice::default();
+        let mut config = small_pinlug_config();
+        config.max_steps = 201; // probes at step 0 and step 200 only: 2 misses < threshold 4
+        let (model_pin, model_lug) = nan_pinlug_models(&config, &device);
+
+        let result = run_headless_pinlug_inner(config, Some((model_pin, model_lug)));
+
+        assert_eq!(result.metric_probes, 0, "an all-NaN network must never yield a Some(rms) reading");
+        assert_eq!(result.total_restarts, 0, "2 consecutive misses must not reach STUCK_NONE_THRESHOLD=4");
+    }
+
+    /// THE integration proof: an all-NaN pin/lug network run long enough to accumulate
+    /// `STUCK_NONE_THRESHOLD` (4) consecutive missed probes (steps 0, 200, 400, 600 at the
+    /// existing 200-step cadence) must trip `run_headless_pinlug_inner`'s
+    /// `note_missed_reading` branch and increment `total_restarts` via the SAME
+    /// `crash_restarts` budget the crash-recovery arm uses — proving the wiring in
+    /// `headless.rs`, not just the `ConvergenceTracker` method in isolation.
+    #[test]
+    fn run_headless_pinlug_stuck_nan_integration_fires_restart_at_threshold() {
+        let device = WgpuDevice::default();
+        let mut config = small_pinlug_config();
+        config.max_steps = 601; // probes at steps 0, 200, 400, 600: exactly 4 consecutive misses
+        let (model_pin, model_lug) = nan_pinlug_models(&config, &device);
+
+        let result = run_headless_pinlug_inner(config, Some((model_pin, model_lug)));
+
+        assert_eq!(result.metric_probes, 0, "an all-NaN network must never yield a Some(rms) reading");
+        assert!(
+            result.total_restarts >= 1,
+            "4 consecutive missed probes must trip the STUCK-NAN RECOVERY branch and increment total_restarts, got {}",
+            result.total_restarts
+        );
+        // The restart body tightens dynamic_lam_h_cap/dynamic_lam_d_cap via the same
+        // step_down_cap cascade check_kt_crash uses (50.0 unchanged on the FIRST restart
+        // overall) — assert both were actually threaded through to the result, not just the
+        // tracker's internal counter.
+        assert_eq!(result.final_lam_h_cap, 50.0, "first-ever restart must leave lam_h_cap at LAM_CAP_INITIAL (no decay until the 2nd restart)");
+        assert_eq!(result.final_lam_d_cap, 50.0, "first-ever restart must leave lam_d_cap at LAM_CAP_INITIAL (no decay until the 2nd restart)");
     }
 
     /// Extends the existing zero-regression test's pattern past max_steps=220 (past the

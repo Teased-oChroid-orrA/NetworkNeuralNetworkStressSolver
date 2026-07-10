@@ -517,9 +517,13 @@ impl PinLugProblem {
         };
 
         // Same formula as `training_core::compute_reference_scales`, with `stress_ref`
-        // standing in for Kirsch's far-field `config.load.px`.
-        let ref_energy = (0.5 * stress_ref * stress_ref / material_e) as f32;
-        let ref_stress2 = (stress_ref * stress_ref) as f32;
+        // standing in for Kirsch's far-field `config.load.px` — including its `.max(1.0)`
+        // floor (both are squared, always >= 0), for the same reason: these are used
+        // downstream as `1.0 / ref_energy`/`1.0 / ref_stress2` divisors, and a degenerate
+        // geometry (e.g. r_pin/thickness driving equivalent_traction_pa toward 0) would
+        // otherwise silently divide by zero.
+        let ref_energy = (0.5 * stress_ref * stress_ref / material_e).max(1.0) as f32;
+        let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
         let u_ref = (stress_ref / material_e) * r_pin;
         let ref_gap2 = (u_ref * u_ref) as f32;
 
@@ -679,6 +683,7 @@ impl BoundaryValueProblem for PinLugProblem {
         let lug_u_ref = lug_state.u_ref as f64;
 
         let mut sum_sq = 0.0_f64;
+        let mut finite_n = 0usize;
         for i in 0..n {
             let theta = thetas[i];
             let c = theta.cos();
@@ -686,9 +691,20 @@ impl BoundaryValueProblem for PinLugProblem {
             let u_r_pin = (pin_u[i] as f64 * pin_u_ref) * c + (pin_v[i] as f64 * pin_u_ref) * s;
             let u_r_lug = (lug_u[i] as f64 * lug_u_ref) * c + (lug_v[i] as f64 * lug_u_ref) * s;
             let gap = (r_lug + u_r_lug) - (r_pin + u_r_pin);
-            sum_sq += gap * gap;
+            // A NaN-diverged network poisons every combined gap (both domains contribute to
+            // each theta), so filter non-finite contributions rather than let a single NaN
+            // silently poison the whole RMS (which would then poison `ConvergenceTracker`'s
+            // internal max/min folds, breaking the crash/plateau cascade the same way an
+            // unfiltered NaN reading does — see `SawBrdr::update`'s analogous fix).
+            if gap.is_finite() {
+                sum_sq += gap * gap;
+                finite_n += 1;
+            }
         }
-        let rms = (sum_sq / n.max(1) as f64).sqrt();
+        if finite_n == 0 {
+            return None;
+        }
+        let rms = (sum_sq / finite_n as f64).sqrt();
         Some(rms)
     }
 
@@ -819,6 +835,80 @@ mod tests {
         assert!(
             (rms - expected).abs() < 1e-9,
             "expected RMS gap {expected} (= |r_lug - r_pin| at zero displacement), got {rms}"
+        );
+    }
+
+    #[test]
+    fn convergence_metric_pinlug_returns_none_when_forward_pass_is_all_nan() {
+        use burn::module::{Module, ModuleMapper, Param};
+        use crate::network::ElasticityNetConfig;
+        use crate::problem::DomainState;
+
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
+        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(3)
+            .with_hidden_dim(8)
+            .with_n_hidden(2)
+            .with_output_dim(5)
+            .with_use_piratenet(false);
+
+        struct NanMapper;
+        impl<B: burn::tensor::backend::Backend> ModuleMapper<B> for NanMapper {
+            fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+                param.map(|t| t.zeros_like().add_scalar(f32::NAN))
+            }
+        }
+        let model_pin: crate::network::ElasticityNet<B> = net_cfg.init(&device).map(&mut NanMapper);
+        let model_lug: crate::network::ElasticityNet<B> = net_cfg.init(&device).map(&mut NanMapper);
+
+        let state = vec![
+            DomainState { id: PIN_DOMAIN, model: model_pin, u_ref: 1e-4, ref_energy: 1.0, ref_stress2: 1.0 },
+            DomainState { id: LUG_DOMAIN, model: model_lug, u_ref: 1e-4, ref_energy: 1.0, ref_stress2: 1.0 },
+        ];
+
+        assert_eq!(
+            problem.convergence_metric(&state), None,
+            "an all-NaN forward pass must yield None (every gap non-finite), not Some(NaN)"
+        );
+    }
+
+    #[test]
+    fn convergence_metric_pinlug_returns_none_when_only_one_domain_is_nan() {
+        use burn::module::{Module, ModuleMapper, Param};
+        use crate::network::ElasticityNetConfig;
+        use crate::problem::DomainState;
+
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
+        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(3)
+            .with_hidden_dim(8)
+            .with_n_hidden(2)
+            .with_output_dim(5)
+            .with_use_piratenet(false);
+
+        struct NanMapper;
+        impl<B: burn::tensor::backend::Backend> ModuleMapper<B> for NanMapper {
+            fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+                param.map(|t| t.zeros_like().add_scalar(f32::NAN))
+            }
+        }
+        // Only the PIN domain diverges to NaN; the LUG domain stays well-formed.
+        let model_pin: crate::network::ElasticityNet<B> = net_cfg.init(&device).map(&mut NanMapper);
+        let model_lug: crate::network::ElasticityNet<B> = net_cfg.init(&device);
+
+        let state = vec![
+            DomainState { id: PIN_DOMAIN, model: model_pin, u_ref: 1e-4, ref_energy: 1.0, ref_stress2: 1.0 },
+            DomainState { id: LUG_DOMAIN, model: model_lug, u_ref: 1e-4, ref_energy: 1.0, ref_stress2: 1.0 },
+        ];
+
+        // Since gap(theta) combines BOTH domains' displacement, a single diverged domain must
+        // still poison every combined point -> None (not silently averaged away by the
+        // healthy domain).
+        assert_eq!(
+            problem.convergence_metric(&state), None,
+            "one NaN'd domain must poison every combined gap -> None, not a partial/averaged result"
         );
     }
 

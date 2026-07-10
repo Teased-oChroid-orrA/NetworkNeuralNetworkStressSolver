@@ -19,6 +19,11 @@ const MAX_CRASH_RESTARTS: usize = 4;
 const LAM_CAP_DECAY_FACTOR: f64 = 0.6;
 const LAM_CAP_FLOOR: f64 = 15.0;
 const LAM_CAP_INITIAL: f64 = 50.0;
+/// Consecutive missed-reading threshold. At the existing 200-step probe cadence, 4 misses in
+/// a row means the network has been fully NaN-diverged for ~800 steps with zero recovery
+/// signal reaching the cascade — presumed stuck. `pub(crate)` so callers (`headless.rs`) can
+/// reference it in restart log messages rather than re-hardcoding the number.
+pub(crate) const STUCK_NONE_THRESHOLD: usize = 4;
 /// K_t crash detection: fires when current K_t drops below this fraction of the recent
 /// peak, provided that peak exceeds `CRASH_MIN_PEAK_KT` (so noise near zero doesn't trigger).
 const CRASH_DROP_FRACTION: f64 = 0.5;
@@ -72,6 +77,9 @@ pub struct ConvergenceTracker {
     pub crash_restarts: usize,
     lam_h_cap: f64,
     mode: MetricMode,
+    /// Consecutive `note_missed_reading()` calls since the last `note_reading_received()`
+    /// (or since construction). Reset to 0 on any real reading or once a stuck-restart fires.
+    consecutive_none: usize,
 }
 
 impl ConvergenceTracker {
@@ -86,6 +94,7 @@ impl ConvergenceTracker {
                 crash_min_peak: CRASH_MIN_PEAK_KT,
                 crash_drop_fraction: CRASH_DROP_FRACTION,
             },
+            consecutive_none: 0,
         }
     }
 
@@ -118,6 +127,7 @@ impl ConvergenceTracker {
                 crash_spike_factor,
                 significant_floor,
             },
+            consecutive_none: 0,
         }
     }
 
@@ -247,6 +257,26 @@ impl ConvergenceTracker {
     pub fn clear_history(&mut self) {
         self.kt_history.clear();
     }
+
+    /// Call when the per-step metric probe returns `None`. Returns `Some(new_lam_h_cap)` —
+    /// treated identically to `check_kt_crash`'s effect (same cap cascade, same
+    /// `crash_restarts` budget) — once `STUCK_NONE_THRESHOLD` consecutive misses have been
+    /// observed. Without this, a fully NaN-diverged network (whose metric probe returns `None`
+    /// forever) would silently stop the crash/plateau cascade from ever firing again.
+    pub fn note_missed_reading(&mut self) -> Option<f64> {
+        self.consecutive_none += 1;
+        if self.consecutive_none < STUCK_NONE_THRESHOLD { return None; }
+        self.consecutive_none = 0;
+        if self.crash_restarts >= MAX_CRASH_RESTARTS { return None; }
+        let new_cap = self.step_down_cap();
+        self.crash_restarts += 1;
+        Some(new_cap)
+    }
+
+    /// Call whenever a real (non-`None`) reading is obtained — resets the missed-reading streak.
+    pub fn note_reading_received(&mut self) {
+        self.consecutive_none = 0;
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +331,47 @@ mod tests {
         fill_plateau(&mut t, 1.0, PLATEAU_WINDOW * 2);
         assert!(t.check_plateau().is_some());
         assert_eq!(t.plateau_restarts, 1);
+    }
+
+    // ─── Stuck-NaN missed-reading recovery ─────────────────────────────────────────────
+
+    #[test]
+    fn note_missed_reading_does_not_fire_below_threshold() {
+        let mut t = ConvergenceTracker::new();
+        for i in 0..3 {
+            assert_eq!(t.note_missed_reading(), None, "miss #{} (below threshold) must not fire", i + 1);
+        }
+    }
+
+    #[test]
+    fn note_missed_reading_fires_on_reaching_threshold_with_initial_uncapped_lam() {
+        let mut t = ConvergenceTracker::new();
+        for _ in 0..3 { assert_eq!(t.note_missed_reading(), None); }
+        let fired = t.note_missed_reading();
+        assert_eq!(fired, Some(50.0), "first-ever restart (any kind) must return LAM_CAP_INITIAL=50.0 unchanged, got {fired:?}");
+        assert_eq!(t.crash_restarts, 1, "note_missed_reading must increment the SAME crash_restarts budget check_kt_crash uses");
+    }
+
+    #[test]
+    fn note_reading_received_resets_the_missed_streak() {
+        let mut t = ConvergenceTracker::new();
+        for _ in 0..3 { assert_eq!(t.note_missed_reading(), None); }
+        t.note_reading_received();
+        for _ in 0..3 { assert_eq!(t.note_missed_reading(), None, "streak must have been reset to 0, not resumed from 3"); }
+        assert!(t.note_missed_reading().is_some(), "4th miss of the FRESH streak fires");
+    }
+
+    #[test]
+    fn note_missed_reading_shares_crash_restart_budget_and_stops_at_max() {
+        let mut t = ConvergenceTracker::new();
+        // Exhaust MAX_CRASH_RESTARTS purely via note_missed_reading (4 misses per restart):
+        for _ in 0..4 {
+            for _ in 0..3 { assert_eq!(t.note_missed_reading(), None); }
+            assert!(t.note_missed_reading().is_some());
+        }
+        assert_eq!(t.crash_restarts, 4);
+        for _ in 0..3 { assert_eq!(t.note_missed_reading(), None); }
+        assert_eq!(t.note_missed_reading(), None, "budget exhausted: must not fire even at a fresh 4th miss");
     }
 
     #[test]
