@@ -224,6 +224,15 @@ pub struct MultiStepCtx<'a> {
     pub domains: Vec<DomainStepCtx<'a>>,
     pub dynamic_lam_h_cap: f64,
     pub dynamic_lam_d_cap: f64,
+    /// Cap on `interface_penetration`'s SAW-BRDR effective weight, mirroring
+    /// `dynamic_lam_h_cap`'s role for `hole_traction`/`lug_free_edge_traction` — see
+    /// `step_physics_multi`'s dispatch match. Only binds once SAW-BRDR pushes the term's
+    /// live weight above whatever this is currently set to; the caller (`headless.rs`)
+    /// seeds it at the term's own `base_weight` (500.0), not the shared 50.0 h/d convention.
+    pub dynamic_lam_penetration_cap: f64,
+    /// Cap on `interface_non_tension`'s SAW-BRDR effective weight — see
+    /// `dynamic_lam_penetration_cap`'s doc comment (same convention, seeded at 100.0).
+    pub dynamic_lam_non_tension_cap: f64,
     pub phase2_active: bool,
     pub step: usize,
 }
@@ -250,6 +259,8 @@ pub struct FrozenMultiStepCtx {
     pub domains: Vec<FrozenDomainStepCtx>,
     pub dynamic_lam_h_cap: f64,
     pub dynamic_lam_d_cap: f64,
+    pub dynamic_lam_penetration_cap: f64,
+    pub dynamic_lam_non_tension_cap: f64,
     pub phase2_active: bool,
 }
 
@@ -268,6 +279,8 @@ impl FrozenMultiStepCtx {
             }).collect(),
             dynamic_lam_h_cap: ctx.dynamic_lam_h_cap,
             dynamic_lam_d_cap: ctx.dynamic_lam_d_cap,
+            dynamic_lam_penetration_cap: ctx.dynamic_lam_penetration_cap,
+            dynamic_lam_non_tension_cap: ctx.dynamic_lam_non_tension_cap,
             phase2_active: ctx.phase2_active,
         }
     }
@@ -291,6 +304,8 @@ impl FrozenMultiStepCtx {
             }).collect(),
             dynamic_lam_h_cap: self.dynamic_lam_h_cap,
             dynamic_lam_d_cap: self.dynamic_lam_d_cap,
+            dynamic_lam_penetration_cap: self.dynamic_lam_penetration_cap,
+            dynamic_lam_non_tension_cap: self.dynamic_lam_non_tension_cap,
             phase2_active: self.phase2_active,
             step: 0,
         }
@@ -400,5 +415,51 @@ mod tests {
     fn loss_term_conflict_group_defaults_to_bc_when_not_overridden() {
         let term = DefaultConflictGroupTerm;
         assert_eq!(term.conflict_group(), ConflictGroup::Bc);
+    }
+
+    /// `dynamic_lam_penetration_cap`/`dynamic_lam_non_tension_cap` must round-trip through
+    /// `FrozenMultiStepCtx::from_ctx` -> `as_multi_step_ctx` bit-exact (plain f64 field
+    /// copies, no arithmetic) — proves the two new cap fields are threaded through the
+    /// freeze/thaw path alongside the pre-existing `dynamic_lam_h_cap`/`dynamic_lam_d_cap`.
+    /// Uses arbitrary distinct-from-h/d-cap values so a copy-paste field-swap bug (e.g.
+    /// `dynamic_lam_penetration_cap` accidentally reading `dynamic_lam_h_cap`) is detectable.
+    #[test]
+    fn frozen_multi_step_ctx_round_trips_the_two_new_interface_caps() {
+        let problem = MismatchedDomainProblem {
+            domains: vec![dummy_domain_spec(0)],
+            sampling: DummySampling,
+            ansatz: DummyAnsatz,
+            term_domains: vec![DomainId(0)],
+        };
+        let config = SolverConfig::default_pinlug();
+        let fd = FdConfig::new(1e-3, 2.0, 2.0);
+        let data = DomainStepData {
+            id: DomainId(0),
+            int_norm: Vec::new(),
+            extra_ring_norm: Vec::new(),
+            named: HashMap::new(),
+        };
+        let ctx = MultiStepCtx {
+            config: &config,
+            problem: &problem,
+            fd: &fd,
+            k: 1.0,
+            domains: vec![DomainStepCtx { data: &data, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 }],
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            dynamic_lam_penetration_cap: 500.0,
+            dynamic_lam_non_tension_cap: 100.0,
+            phase2_active: true,
+            step: 0,
+        };
+
+        let frozen = FrozenMultiStepCtx::from_ctx(&ctx);
+        let thawed = frozen.as_multi_step_ctx(&problem);
+
+        assert_eq!(thawed.dynamic_lam_penetration_cap, 500.0);
+        assert_eq!(thawed.dynamic_lam_non_tension_cap, 100.0);
+        // Adversarial: prove the two new fields aren't aliased to the pre-existing h/d caps.
+        assert_ne!(thawed.dynamic_lam_penetration_cap, thawed.dynamic_lam_h_cap);
+        assert_ne!(thawed.dynamic_lam_non_tension_cap, thawed.dynamic_lam_d_cap);
     }
 }
