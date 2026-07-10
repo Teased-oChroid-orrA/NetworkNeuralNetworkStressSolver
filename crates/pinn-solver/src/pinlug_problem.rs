@@ -1047,6 +1047,66 @@ mod tests {
         for &g in &pin_grad_v { assert!(g.abs() < 1e-6, "inactive region must have ~0 gradient, got {g}"); }
     }
 
+    // All 6 pre-existing gradient/equivalence tests for InterfaceNonTensionTerm use thetas in
+    // {0, pi/2, pi, 3pi/2} (sin*cos == 0 at every one) and/or sxy == 0, so none of them ever
+    // exercises the `2.0 * sxy * sin(theta) * cos(theta)` shear cross-term in the s_rr radial
+    // decomposition with a nonzero coefficient — a mutation dropping that factor of 2 (e.g.
+    // `mul_scalar(2.0)` -> `mul_scalar(1.0)`, or the multiplication by `sxy` silently omitted)
+    // would survive every one of them. theta = pi/4 makes sin*cos = 0.5 (its maximum
+    // magnitude), and a pure-shear stress state (sxx = syy = 0, sxy != 0) isolates the cross
+    // term from the cos^2/sin^2 terms entirely, so this test's expected values are sensitive
+    // to that factor of 2 specifically.
+    #[test]
+    fn interface_non_tension_term_shear_cross_term_matches_oracle_at_45_degrees() {
+        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let theta = std::f64::consts::FRAC_PI_4;
+        let thetas = vec![theta];
+        let sxy = 100.0_f32;
+
+        let pin_raw = Tensor::<B, 2>::from_data(
+            burn::tensor::TensorData::new(vec![0.0_f32, 0.0, 0.0, 0.0, sxy], vec![1, 5]), &device,
+        ).require_grad();
+
+        let term = InterfaceNonTensionTerm { thetas: thetas.clone(), ref_stress2: 1.0 };
+        let loss = {
+            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
+            term.compute(&[pin_fwd])
+        };
+
+        // Oracle: s_rr = sxx*cos^2 + syy*sin^2 + 2*sxy*sin*cos = 2*100*0.5 = 100 exactly
+        // (sin(pi/4)*cos(pi/4) = 0.5), matching signorini::decompose_radial's s_rr formula.
+        let (s_rr_oracle, _, _) = crate::signorini::decompose_radial(0.0, 0.0, sxy as f64, theta);
+        assert!((s_rr_oracle - 100.0).abs() < 1e-9, "fixture sanity: expected s_rr=100.0, got {s_rr_oracle}");
+        let expected_penalty = crate::signorini::non_tension_penalty(s_rr_oracle);
+        assert!((expected_penalty - 10_000.0).abs() < 1e-6, "fixture sanity: expected penalty=10000, got {expected_penalty}");
+
+        let loss_v: f32 = loss.clone().into_data().to_vec::<f32>().unwrap()[0];
+        assert!((loss_v - 10_000.0).abs() < 1e-2,
+            "expected loss=10000 (s_rr=100 via the shear cross-term alone), got {loss_v} \
+             — a missing factor of 2 in `2*sxy*sin*cos` would give s_rr=50, loss=2500");
+
+        let grads = loss.backward();
+        let pin_grad_v: Vec<f32> = pin_raw.grad(&grads)
+            .expect("pin_raw must receive a gradient — compute() must not detach from the autodiff graph")
+            .into_data().to_vec().unwrap();
+
+        // d(loss)/d(sxy) = 2*s_rr * d(s_rr)/d(sxy) = 2*100*(2*sin*cos) = 2*100*1.0 = 200.
+        // A missing factor of 2 would instead give 2*50*0.5 = 50 — clearly distinguishable.
+        assert!((pin_grad_v[4] - 200.0).abs() < 1e-1,
+            "d(loss)/d(sxy) expected 200.0, got {} — a missing factor of 2 in the shear \
+             cross-term would give 50.0 instead", pin_grad_v[4]);
+        assert!(pin_grad_v[0].abs() < 1e-6, "u column unrelated, expected ~0");
+        assert!(pin_grad_v[1].abs() < 1e-6, "v column unrelated, expected ~0");
+        // d(loss)/d(sxx) = 2*s_rr*cos^2 = 2*100*0.5 = 100, and symmetrically for syy via
+        // sin^2 — nonzero even though sxx=syy=0 here, since s_rr itself is nonzero (driven
+        // entirely by the cross term). These two are unaffected by the cross-term's factor of
+        // 2 (cos^2/sin^2 have no such coefficient), so they serve as a control confirming the
+        // 200.0 vs 50.0 distinction above is specific to the cross-term coefficient, not a
+        // general scale error in the whole gradient.
+        assert!((pin_grad_v[2] - 100.0).abs() < 1e-1, "d(loss)/d(sxx) expected 100.0, got {}", pin_grad_v[2]);
+        assert!((pin_grad_v[3] - 100.0).abs() < 1e-1, "d(loss)/d(syy) expected 100.0, got {}", pin_grad_v[3]);
+    }
+
     #[test]
     fn pinlug_scaling_mode_applied_load_matches_existing_traction_based_formula() {
         let material = MaterialProps::steel_4340();
