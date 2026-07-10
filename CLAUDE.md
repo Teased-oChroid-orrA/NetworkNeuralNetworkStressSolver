@@ -21,7 +21,13 @@ pin-lug returns interface-gap RMS — `ConvergenceTracker` neither knows nor car
 `LossTerm` declares which domain(s) and named point-set(s) it needs (`domains()`/
 `point_sets()`); cross-domain terms (e.g. pin-lug's Signorini penetration/non-tension
 penalties, `pinn_solver::signorini`) declare more than one domain and receive both domains'
-forward-pass outputs in `compute()`.
+forward-pass outputs in `compute()`. `compute()`'s returned tensor must stay connected to
+`inputs`'s live autodiff graph end-to-end — the Signorini terms once detached by reading
+`raw_out` to a host `Vec`, running the penalty math in plain `f64`, and rebuilding a fresh leaf
+via `Tensor::from_data`, which silently supplied zero gradient despite the term's scalar value
+looking correct in logging/SAW-BRDR bookkeeping (the bug `compute()`'s own doc comment now warns
+against). `pinn_solver::signorini`'s pure `f64` functions remain as a CPU-math oracle for tests,
+not production call sites.
 
 **Two step-driver functions, not one, by design.** `training_core::step_physics` is the frozen,
 byte-proven single-domain path Kirsch runs through — it predates the trait, is regression-tested

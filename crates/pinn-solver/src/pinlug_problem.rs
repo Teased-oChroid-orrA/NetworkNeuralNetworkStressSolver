@@ -364,6 +364,18 @@ pub struct InterfacePenetrationTerm {
     /// O(1)-normalized energy/stress terms it's summed against.
     pub ref_gap2: f32,
 }
+/// Uploads `thetas`' cos/sin as fixed (non-learned) host constants, shared by both Signorini
+/// terms below. Never carries gradient itself — only the sliced `raw_out` operands multiplied
+/// against these need to stay connected to the autodiff graph.
+fn theta_trig_tensors<B: burn::tensor::backend::Backend>(thetas: &[f64], device: &B::Device) -> (Tensor<B, 1>, Tensor<B, 1>) {
+    let n = thetas.len();
+    let cos_v: Vec<f32> = thetas.iter().map(|t| t.cos() as f32).collect();
+    let sin_v: Vec<f32> = thetas.iter().map(|t| t.sin() as f32).collect();
+    let cos_theta = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(cos_v, vec![n]), device);
+    let sin_theta = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(sin_v, vec![n]), device);
+    (cos_theta, sin_theta)
+}
+
 impl LossTerm for InterfacePenetrationTerm {
     fn name(&self) -> &'static str { "interface_penetration" }
     fn domains(&self) -> Vec<DomainId> { vec![PIN_DOMAIN, LUG_DOMAIN] }
@@ -381,10 +393,7 @@ impl LossTerm for InterfacePenetrationTerm {
         let lug_u = lug.raw_out.clone().slice([0..n, 0..1]).reshape([n]);
         let lug_v = lug.raw_out.clone().slice([0..n, 1..2]).reshape([n]);
 
-        let cos_v: Vec<f32> = self.thetas.iter().map(|t| t.cos() as f32).collect();
-        let sin_v: Vec<f32> = self.thetas.iter().map(|t| t.sin() as f32).collect();
-        let cos_theta = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(cos_v, vec![n]), &device);
-        let sin_theta = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(sin_v, vec![n]), &device);
+        let (cos_theta, sin_theta) = theta_trig_tensors::<B>(&self.thetas, &device);
 
         let u_r_pin = pin_u * cos_theta.clone() + pin_v * sin_theta.clone();
         let u_r_lug = lug_u * cos_theta + lug_v * sin_theta;
@@ -428,10 +437,7 @@ impl LossTerm for InterfaceNonTensionTerm {
         let syy = pin.raw_out.clone().slice([0..n, 3..4]).reshape([n]);
         let sxy = pin.raw_out.clone().slice([0..n, 4..5]).reshape([n]);
 
-        let cos_v: Vec<f32> = self.thetas.iter().map(|t| t.cos() as f32).collect();
-        let sin_v: Vec<f32> = self.thetas.iter().map(|t| t.sin() as f32).collect();
-        let cos_theta = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(cos_v, vec![n]), &device);
-        let sin_theta = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(sin_v, vec![n]), &device);
+        let (cos_theta, sin_theta) = theta_trig_tensors::<B>(&self.thetas, &device);
 
         let cos2 = cos_theta.clone() * cos_theta.clone();
         let sin2 = sin_theta.clone() * sin_theta.clone();
