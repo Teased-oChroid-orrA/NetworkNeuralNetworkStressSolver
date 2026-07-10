@@ -481,6 +481,13 @@ pub(crate) struct PinLugHeadlessResult {
     pub final_lam_h_cap: f64,
     #[allow(dead_code)]
     pub final_lam_d_cap: f64,
+    /// Final `dynamic_lam_penetration_cap`/`dynamic_lam_non_tension_cap` after all
+    /// plateau/crash restarts — same lockstep cascade as `final_lam_h_cap`/`final_lam_d_cap`
+    /// (see the cascade block inside the training loop below).
+    #[allow(dead_code)]
+    pub final_lam_penetration_cap: f64,
+    #[allow(dead_code)]
+    pub final_lam_non_tension_cap: f64,
     /// `tracker.plateau_restarts + tracker.crash_restarts` at the end of training.
     #[allow(dead_code)]
     pub total_restarts: usize,
@@ -666,6 +673,15 @@ pub(crate) fn run_headless_pinlug_inner(
     );
     let mut dynamic_lam_h_cap = 50.0_f64;
     let mut dynamic_lam_d_cap = 50.0_f64;
+    // Unlike dynamic_lam_h_cap/dynamic_lam_d_cap (seeded at the shared 50.0, already binding
+    // from step 0), these two seed at the term's OWN base_weight (500.0/100.0) via
+    // `problem.base_weight` rather than a hardcoded literal (avoids drift if
+    // LAM_PENETRATION/LAM_NON_TENSION are ever retuned) — non-binding at the moment these
+    // terms first carry real gradient (issue #9), since raw_lam == base_weight exactly at
+    // step 0 (SawBrdr's first-call decay-EMA skip). Only binds once SAW-BRDR's adaptive
+    // multiplier later pushes the term's effective weight ABOVE its base — see CLAUDE.md.
+    let mut dynamic_lam_penetration_cap = problem.base_weight("interface_penetration") as f64;
+    let mut dynamic_lam_non_tension_cap = problem.base_weight("interface_non_tension") as f64;
     let mut metric_probes: usize = 0;
     let mut last_lam_before_converge: Option<HashMap<&'static str, f64>> = None;
     let mut lbfgs_entry_lams: Option<HashMap<&'static str, f64>> = None;
@@ -714,6 +730,8 @@ pub(crate) fn run_headless_pinlug_inner(
             ],
             dynamic_lam_h_cap,
             dynamic_lam_d_cap,
+            dynamic_lam_penetration_cap,
+            dynamic_lam_non_tension_cap,
             // NOTE: `MultiStepCtx::phase2_active` and the `PHASE2_ACTIVE` const below are two
             // INDEPENDENT booleans that happen to share a value by coincidence, not
             // architectural coupling. This one gates `step_physics_multi`'s h/d SAW-BRDR cap
@@ -873,6 +891,8 @@ pub(crate) fn run_headless_pinlug_inner(
                 if let Some(new_cap) = tracker.check_kt_crash(rms) {
                     dynamic_lam_h_cap = new_cap;
                     dynamic_lam_d_cap = new_cap;
+                    dynamic_lam_penetration_cap = new_cap;
+                    dynamic_lam_non_tension_cap = new_cap;
                     tracker.clear_history();
                     saw.reset();
                     lr_sched.reset_for_phase2();
@@ -889,6 +909,8 @@ pub(crate) fn run_headless_pinlug_inner(
                 } else if let Some(new_cap) = tracker.check_plateau() {
                     dynamic_lam_h_cap = new_cap;
                     dynamic_lam_d_cap = new_cap;
+                    dynamic_lam_penetration_cap = new_cap;
+                    dynamic_lam_non_tension_cap = new_cap;
                     saw.reset();
                     lr_sched.reset_for_phase2();
                     decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, true);
@@ -959,6 +981,8 @@ pub(crate) fn run_headless_pinlug_inner(
         metric_probes,
         final_lam_h_cap: dynamic_lam_h_cap,
         final_lam_d_cap: dynamic_lam_d_cap,
+        final_lam_penetration_cap: dynamic_lam_penetration_cap,
+        final_lam_non_tension_cap: dynamic_lam_non_tension_cap,
         total_restarts: tracker.plateau_restarts + tracker.crash_restarts,
         last_lam_before_converge,
         lbfgs_entry_lams,
@@ -1081,6 +1105,31 @@ mod tests {
             "with a permissive conflict_threshold and enabled=true, the decision maker must \
              transition out of Explore within {} steps; final_tier={:?}",
             60, result.final_tier);
+    }
+
+    /// The key design decision under test: `dynamic_lam_penetration_cap`/
+    /// `dynamic_lam_non_tension_cap` seed at the term's OWN `base_weight` (500.0/100.0), NOT
+    /// the shared `dynamic_lam_h_cap`/`dynamic_lam_d_cap` convention's `50.0` — non-binding at
+    /// the moment these terms first carry gradient (see CLAUDE.md's design rationale).
+    #[test]
+    fn run_headless_pinlug_new_interface_caps_start_at_own_base_weight_not_shared_fifty() {
+        let mut config = small_pinlug_config();
+        config.max_steps = 1;
+        let result = run_headless_pinlug_inner(config.clone(), None);
+
+        use crate::pinlug_problem::{PinLugProblem, PinLugScalingMode};
+        use crate::problem::BoundaryValueProblem;
+        let problem = PinLugProblem::new(
+            config.material.clone(), 5, usize::MAX, 64, PinLugScalingMode::AppliedLoad,
+        );
+        let expected_penetration = problem.base_weight("interface_penetration") as f64;
+        let expected_non_tension = problem.base_weight("interface_non_tension") as f64;
+
+        assert_eq!(result.final_lam_penetration_cap, expected_penetration);
+        assert_eq!(result.final_lam_non_tension_cap, expected_non_tension);
+        // Adversarial: prove these are NOT the shared 50.0 h/d convention.
+        assert_ne!(result.final_lam_penetration_cap, result.final_lam_h_cap);
+        assert_ne!(result.final_lam_non_tension_cap, result.final_lam_d_cap);
     }
 
     #[test]
@@ -1215,6 +1264,8 @@ mod tests {
         assert_eq!(a.total_restarts, b.total_restarts);
         assert_eq!(a.final_lam_h_cap, b.final_lam_h_cap);
         assert_eq!(a.final_lam_d_cap, b.final_lam_d_cap);
+        assert_eq!(a.final_lam_penetration_cap, b.final_lam_penetration_cap);
+        assert_eq!(a.final_lam_non_tension_cap, b.final_lam_non_tension_cap);
         assert_eq!(a.trajectory.len(), b.trajectory.len());
         for (i, (x, y)) in a.trajectory.iter().zip(b.trajectory.iter()).enumerate() {
             let scale = x.abs().max(y.abs()).max(1e-8);

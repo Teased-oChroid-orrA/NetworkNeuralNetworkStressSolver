@@ -749,6 +749,12 @@ pub fn run_training_pinlug(
             ],
             dynamic_lam_h_cap: 50.0,
             dynamic_lam_d_cap: 50.0,
+            // `phase2_active: false` below makes these two caps fully inert (same as the
+            // pre-existing h/d caps on this GUI-driving path) — see `run_headless_pinlug_
+            // inner`'s equivalent construction for the wired-up cascade version. No cascade
+            // logic here; a deliberate, tracked scope cut (see CLAUDE.md's GUI section).
+            dynamic_lam_penetration_cap: 500.0,
+            dynamic_lam_non_tension_cap: 100.0,
             phase2_active: false,
             step,
         };

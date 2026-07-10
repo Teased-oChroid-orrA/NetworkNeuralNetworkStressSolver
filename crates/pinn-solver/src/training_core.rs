@@ -914,6 +914,14 @@ pub fn step_physics_multi(
                 let v = raw_lam as f64;
                 if ctx.phase2_active { v.min(ctx.dynamic_lam_d_cap) } else { v }
             }
+            "interface_penetration" => {
+                let v = raw_lam as f64 * physics_boost;
+                if ctx.phase2_active { v.min(ctx.dynamic_lam_penetration_cap) } else { v }
+            }
+            "interface_non_tension" => {
+                let v = raw_lam as f64 * physics_boost;
+                if ctx.phase2_active { v.min(ctx.dynamic_lam_non_tension_cap) } else { v }
+            }
             _ => raw_lam as f64 * physics_boost,
         };
         lam_by_name.insert(name, lam);
@@ -3047,6 +3055,8 @@ mod tests {
                 }],
                 dynamic_lam_h_cap: 50.0,
                 dynamic_lam_d_cap: 50.0,
+                dynamic_lam_penetration_cap: 500.0,
+                dynamic_lam_non_tension_cap: 100.0,
                 phase2_active: false,
                 step,
             };
@@ -3325,6 +3335,8 @@ mod tests {
             ],
             dynamic_lam_h_cap: 50.0,
             dynamic_lam_d_cap: 50.0,
+            dynamic_lam_penetration_cap: 500.0,
+            dynamic_lam_non_tension_cap: 100.0,
             phase2_active: false,
             step: 0,
         };
@@ -3397,6 +3409,8 @@ mod tests {
             ],
             dynamic_lam_h_cap: 50.0,
             dynamic_lam_d_cap: 50.0,
+            dynamic_lam_penetration_cap: 500.0,
+            dynamic_lam_non_tension_cap: 100.0,
             phase2_active: false,
             step: 0,
         };
@@ -3511,6 +3525,8 @@ mod tests {
             ],
             dynamic_lam_h_cap: 50.0,
             dynamic_lam_d_cap: 50.0,
+            dynamic_lam_penetration_cap: 500.0,
+            dynamic_lam_non_tension_cap: 100.0,
             phase2_active: false,
             step: 0,
         };
@@ -3647,6 +3663,8 @@ mod tests {
             ],
             dynamic_lam_h_cap: 50.0,
             dynamic_lam_d_cap: 50.0,
+            dynamic_lam_penetration_cap: 500.0,
+            dynamic_lam_non_tension_cap: 100.0,
             phase2_active: false,
             step: 0,
         };
@@ -3694,6 +3712,8 @@ mod tests {
             ],
             dynamic_lam_h_cap: 50.0,
             dynamic_lam_d_cap: 50.0,
+            dynamic_lam_penetration_cap: 500.0,
+            dynamic_lam_non_tension_cap: 100.0,
             phase2_active: false,
             step: 0,
         };
@@ -3827,6 +3847,8 @@ mod tests {
             ],
             dynamic_lam_h_cap: 50.0,
             dynamic_lam_d_cap: 50.0,
+            dynamic_lam_penetration_cap: 500.0,
+            dynamic_lam_non_tension_cap: 100.0,
             phase2_active: false,
             step: 0,
         };
@@ -3907,6 +3929,8 @@ mod tests {
             ],
             dynamic_lam_h_cap: 50.0,
             dynamic_lam_d_cap: 50.0,
+            dynamic_lam_penetration_cap: 500.0,
+            dynamic_lam_non_tension_cap: 100.0,
             phase2_active: false,
             step: 0,
         };
@@ -3939,6 +3963,370 @@ mod tests {
             "lam_by_name must reflect SAW-BRDR's adapted weight after several steps, not the \
              static base_weight seed both terms started from: last_lam_a={last_lam_a} \
              last_lam_b={last_lam_b} base_seed={base_seed}");
+    }
+
+    // ─── interface_penetration / interface_non_tension cap dispatch (issue #21) ───────────
+
+    /// Normalizes a physical coordinate to [-1,1]^2 for an arbitrary domain's own geometry
+    /// bounds — a local copy of `headless.rs`'s private `normalize_point_generic` (not `pub`,
+    /// so re-derived here rather than reached into across module boundaries).
+    fn normalize_point_generic_for_test(x: f64, y: f64, geom: &pinn_core::geometry::GeometryConfig) -> [f32; 2] {
+        let (x0, x1) = geom.x_range();
+        let (y0, y1) = geom.y_range();
+        let dw = x1 - x0;
+        let dh = y1 - y0;
+        [(2.0 * (x - x0) / dw - 1.0) as f32, (2.0 * (y - y0) / dh - 1.0) as f32]
+    }
+
+    /// Builds real (non-toy) pin/lug `DomainStepData` plus reference scales for a
+    /// `PinLugProblem`, mirroring `headless.rs::run_headless_pinlug_inner`'s per-step setup
+    /// (sample interior/boundary/named point-sets, wire the driving traction target) trimmed
+    /// to small point counts for test speed. Returns owned data so each test can build its
+    /// own `MultiStepCtx` with distinct cap values referencing it.
+    fn build_pinlug_test_domain_data(
+        problem: &crate::pinlug_problem::PinLugProblem,
+        n_interior: usize,
+        n_boundary: usize,
+    ) -> (crate::problem::DomainStepData, crate::problem::DomainStepData, f32, f32, f32) {
+        use crate::pinlug_problem::{PIN_DOMAIN, LUG_DOMAIN};
+        use crate::problem::{DomainStepData, PointSetData};
+
+        let pin_geom = problem.domains()[0].geometry.clone();
+        let lug_geom = problem.domains()[1].geometry.clone();
+        let pin_sampling = problem.sampling_strategy(0);
+        let lug_sampling = problem.sampling_strategy(1);
+
+        let equiv_traction = problem.equivalent_traction_pa();
+        let e = problem.domains()[0].material.e;
+        let u_ref = ((equiv_traction / e) * lug_geom.half_w) as f32;
+        let ref_energy = (0.5 * equiv_traction * equiv_traction / e) as f32;
+        let ref_stress2 = (equiv_traction * equiv_traction) as f32;
+
+        let pin_int = pin_sampling.sample_interior(&pin_geom, n_interior);
+        let lug_int = lug_sampling.sample_interior(&lug_geom, n_interior);
+        let lug_bnd = lug_sampling.sample_boundary(&lug_geom, &pinn_core::loading::LoadConfig::uniaxial_x(equiv_traction), n_boundary);
+
+        let pin_int_norm: Vec<[f32; 2]> = pin_int.iter().map(|&[x, y]| normalize_point_generic_for_test(x, y, &pin_geom)).collect();
+        let lug_int_norm: Vec<[f32; 2]> = lug_int.iter().map(|&[x, y]| normalize_point_generic_for_test(x, y, &lug_geom)).collect();
+
+        let build_pointset = |pts: &[pinn_core::loading::BoundaryPoint], geom: &pinn_core::geometry::GeometryConfig| -> PointSetData {
+            PointSetData {
+                norm: pts.iter().map(|p| normalize_point_generic_for_test(p.x, p.y, geom)).collect(),
+                nx: pts.iter().map(|p| p.nx as f32).collect(),
+                ny: pts.iter().map(|p| p.ny as f32).collect(),
+                tx: pts.iter().map(|p| p.tx as f32).collect(),
+                ty: pts.iter().map(|p| p.ty as f32).collect(),
+            }
+        };
+
+        let mut pin_named = HashMap::new();
+        let mut lug_named = HashMap::new();
+        for set in pin_sampling.named_point_sets(&[]) {
+            pin_named.insert(set.name, build_pointset(&set.points, &pin_geom));
+        }
+        for set in lug_sampling.named_point_sets(&[]) {
+            lug_named.insert(set.name, build_pointset(&set.points, &lug_geom));
+        }
+        lug_named.insert("boundary", build_pointset(&lug_bnd, &lug_geom));
+        if let Some(driving) = pin_named.get_mut("driving") {
+            for t in driving.tx.iter_mut() { *t = equiv_traction as f32; }
+        }
+
+        let pin_data = DomainStepData { id: PIN_DOMAIN, int_norm: pin_int_norm, extra_ring_norm: Vec::new(), named: pin_named };
+        let lug_data = DomainStepData { id: LUG_DOMAIN, int_norm: lug_int_norm, extra_ring_norm: Vec::new(), named: lug_named };
+        (pin_data, lug_data, u_ref, ref_energy, ref_stress2)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_pinlug_test_ctx<'a>(
+        config: &'a SolverConfig,
+        problem: &'a crate::pinlug_problem::PinLugProblem,
+        fd: &'a FdConfig,
+        pin_data: &'a crate::problem::DomainStepData,
+        lug_data: &'a crate::problem::DomainStepData,
+        u_ref: f32, ref_energy: f32, ref_stress2: f32,
+        dynamic_lam_h_cap: f64, dynamic_lam_d_cap: f64,
+        dynamic_lam_penetration_cap: f64, dynamic_lam_non_tension_cap: f64,
+        phase2_active: bool,
+    ) -> crate::problem::MultiStepCtx<'a> {
+        crate::problem::MultiStepCtx {
+            config,
+            problem,
+            fd,
+            k: 1.0,
+            domains: vec![
+                crate::problem::DomainStepCtx { data: pin_data, u_ref, ref_energy, ref_stress2 },
+                crate::problem::DomainStepCtx { data: lug_data, u_ref, ref_energy, ref_stress2 },
+            ],
+            dynamic_lam_h_cap,
+            dynamic_lam_d_cap,
+            dynamic_lam_penetration_cap,
+            dynamic_lam_non_tension_cap,
+            phase2_active,
+            step: 0,
+        }
+    }
+
+    fn pinlug_test_fixture() -> (crate::pinlug_problem::PinLugProblem, SolverConfig, FdConfig) {
+        use crate::pinlug_problem::{PinLugProblem, PinLugScalingMode};
+        let problem = PinLugProblem::new(
+            pinn_core::material::MaterialProps::steel_4340(), 5, usize::MAX, 8,
+            PinLugScalingMode::AppliedLoad,
+        );
+        let config = SolverConfig::default_pinlug();
+        let fd = FdConfig::new(config.fd_h, 1.0, 1.0);
+        (problem, config, fd)
+    }
+
+    fn tiny_pinlug_nets(device: &WgpuDevice) -> (ElasticityNet<B>, ElasticityNet<B>) {
+        let net_cfg = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3)
+            .with_hidden_dim(4)
+            .with_n_hidden(1)
+            .with_output_dim(5)
+            .with_use_piratenet(false);
+        (net_cfg.init(device), net_cfg.init(device))
+    }
+
+    /// Same as `tiny_pinlug_nets`, but forces every lazily-initialized `Param` to
+    /// materialize BEFORE returning (see the `TouchVisitor` doc comment on
+    /// `headless.rs`'s zero-regression test for why: burn's `Param` defers random-weight
+    /// materialization until first access, so an untouched `Param`'s `.clone()` clones its
+    /// lazy init state, not a value — each clone would then independently materialize
+    /// DIFFERENT random weights on first use). Tests that need two runs to start from the
+    /// EXACT same weights (not just the same distribution) must build ONE pair here, then
+    /// `.clone()` it into each run.
+    fn touched_tiny_pinlug_nets(device: &WgpuDevice) -> (ElasticityNet<B>, ElasticityNet<B>) {
+        let (model_pin, model_lug) = tiny_pinlug_nets(device);
+        struct TouchVisitor;
+        impl ModuleVisitor<B> for TouchVisitor {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+                let _ = param.val();
+            }
+        }
+        model_pin.visit(&mut TouchVisitor);
+        model_lug.visit(&mut TouchVisitor);
+        (model_pin, model_lug)
+    }
+
+    /// At step 0 with a fresh `SawBrdr`, `raw_lam == base_weight` for every term (the
+    /// first-call decay-EMA skip — see CLAUDE.md), so seeding
+    /// `dynamic_lam_penetration_cap`/`dynamic_lam_non_tension_cap` at the terms' own
+    /// `base_weight` must be a no-op (within float-rounding tolerance, NOT bit-exact — `n *
+    /// (1.0/n as f32)` is not bit-exact for all n).
+    #[test]
+    fn step_physics_multi_interface_penetration_cap_is_noop_at_step_zero_when_cap_equals_base_weight() {
+        let device = WgpuDevice::default();
+        let (problem, config, fd) = pinlug_test_fixture();
+        let (pin_data, lug_data, u_ref, ref_energy, ref_stress2) = build_pinlug_test_domain_data(&problem, 8, 6);
+        let (model_pin, model_lug) = tiny_pinlug_nets(&device);
+
+        let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+        let mut saw = SawBrdr::with_base(base_weights, 0.95);
+        let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
+        let mut optims = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+
+        let penetration_base = problem.base_weight("interface_penetration") as f64;
+        let non_tension_base = problem.base_weight("interface_non_tension") as f64;
+        let ctx = make_pinlug_test_ctx(
+            &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
+            50.0, 50.0, penetration_base, non_tension_base, true,
+        );
+
+        let (_new_models, out) = step_physics_multi(
+            vec![model_pin, model_lug], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+        let lam_by_name = out.lam_by_name.expect("must be populated");
+
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-8);
+        assert!(rel(lam_by_name["interface_penetration"], penetration_base) < 1e-4,
+            "interface_penetration lam={} expected~={penetration_base}", lam_by_name["interface_penetration"]);
+        assert!(rel(lam_by_name["interface_non_tension"], non_tension_base) < 1e-4,
+            "interface_non_tension lam={} expected~={non_tension_base}", lam_by_name["interface_non_tension"]);
+    }
+
+    /// A cap set far below the live/adapted weight must clamp the effective weight to
+    /// exactly that cap — and must NOT leak into the pre-existing h/d caps' own dispatch arms.
+    #[test]
+    fn step_physics_multi_interface_penetration_cap_binds_when_below_live_weight() {
+        let device = WgpuDevice::default();
+        let (problem, config, fd) = pinlug_test_fixture();
+        let (pin_data, lug_data, u_ref, ref_energy, ref_stress2) = build_pinlug_test_domain_data(&problem, 8, 6);
+
+        let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+        let (model_pin_seed, model_lug_seed) = touched_tiny_pinlug_nets(&device);
+
+        // Control run: h/d caps at 50.0 (their own established convention), new caps at
+        // f64::MAX (fully non-binding), to capture lug_free_edge_traction/lug_shank_anchor's
+        // "normal" lam values for comparison.
+        let (model_pin_ctrl, model_lug_ctrl) = (model_pin_seed.clone(), model_lug_seed.clone());
+        let mut saw_ctrl = SawBrdr::with_base(base_weights.clone(), 0.95);
+        let mut lr_sched_ctrl = LrSchedule::new(1e-3, 200, 1000);
+        let mut optims_ctrl = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+        let ctx_ctrl = make_pinlug_test_ctx(
+            &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
+            50.0, 50.0, f64::MAX, f64::MAX, true,
+        );
+        let (_new_models, out_ctrl) = step_physics_multi(
+            vec![model_pin_ctrl, model_lug_ctrl], &mut optims_ctrl, &ctx_ctrl, &mut saw_ctrl, &mut lr_sched_ctrl, &device, 0, 1.0, 1.0,
+        );
+        let lam_ctrl = out_ctrl.lam_by_name.expect("must be populated");
+
+        // Test run: SAME starting models/SAW seed, new caps clamped to 1.0.
+        let (model_pin, model_lug) = (model_pin_seed, model_lug_seed);
+        let mut saw = SawBrdr::with_base(base_weights, 0.95);
+        let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
+        let mut optims = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+        let ctx = make_pinlug_test_ctx(
+            &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
+            50.0, 50.0, 1.0, 1.0, true,
+        );
+        let (_new_models, out) = step_physics_multi(
+            vec![model_pin, model_lug], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+        let lam = out.lam_by_name.expect("must be populated");
+
+        assert_eq!(lam["interface_penetration"], 1.0);
+        assert_eq!(lam["interface_non_tension"], 1.0);
+        // The pre-existing h/d-capped terms must be BYTE-IDENTICAL between the two runs
+        // (same starting models/SAW seed/h-d caps) — proves the new caps don't leak into
+        // lug_free_edge_traction/lug_shank_anchor's own dispatch arms.
+        assert_eq!(lam["lug_free_edge_traction"], lam_ctrl["lug_free_edge_traction"]);
+        assert_eq!(lam["lug_shank_anchor"], lam_ctrl["lug_shank_anchor"]);
+    }
+
+    /// `phase2_active: false` must make the new caps fully inert — mirrors the pre-existing
+    /// h/d arms' documented gating (matches `runner.rs`'s GUI-path construction).
+    #[test]
+    fn step_physics_multi_interface_penetration_cap_inert_when_phase2_active_false() {
+        let device = WgpuDevice::default();
+        let (problem, config, fd) = pinlug_test_fixture();
+        let (pin_data, lug_data, u_ref, ref_energy, ref_stress2) = build_pinlug_test_domain_data(&problem, 8, 6);
+        let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+        let (model_pin_seed, model_lug_seed) = touched_tiny_pinlug_nets(&device);
+
+        let (model_pin_a, model_lug_a) = (model_pin_seed.clone(), model_lug_seed.clone());
+        let mut saw_a = SawBrdr::with_base(base_weights.clone(), 0.95);
+        let mut lr_sched_a = LrSchedule::new(1e-3, 200, 1000);
+        let mut optims_a = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+        let ctx_a = make_pinlug_test_ctx(
+            &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
+            50.0, 50.0, 1.0, 1.0, false,
+        );
+        let (_new_models, out_a) = step_physics_multi(
+            vec![model_pin_a, model_lug_a], &mut optims_a, &ctx_a, &mut saw_a, &mut lr_sched_a, &device, 0, 1.0, 1.0,
+        );
+        let lam_a = out_a.lam_by_name.expect("must be populated");
+
+        let (model_pin_b, model_lug_b) = (model_pin_seed, model_lug_seed);
+        let mut saw_b = SawBrdr::with_base(base_weights, 0.95);
+        let mut lr_sched_b = LrSchedule::new(1e-3, 200, 1000);
+        let mut optims_b = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+        let ctx_b = make_pinlug_test_ctx(
+            &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
+            50.0, 50.0, f64::MAX, f64::MAX, false,
+        );
+        let (_new_models, out_b) = step_physics_multi(
+            vec![model_pin_b, model_lug_b], &mut optims_b, &ctx_b, &mut saw_b, &mut lr_sched_b, &device, 0, 1.0, 1.0,
+        );
+        let lam_b = out_b.lam_by_name.expect("must be populated");
+
+        assert_eq!(lam_a["interface_penetration"], lam_b["interface_penetration"]);
+        assert_eq!(lam_a["interface_non_tension"], lam_b["interface_non_tension"]);
+    }
+
+    /// The two new caps must be read INDEPENDENTLY — clamping one must not affect the other
+    /// (proves they aren't accidentally aliased to the same local).
+    #[test]
+    fn step_physics_multi_interface_penetration_and_non_tension_caps_are_independent() {
+        let device = WgpuDevice::default();
+        let (problem, config, fd) = pinlug_test_fixture();
+        let (pin_data, lug_data, u_ref, ref_energy, ref_stress2) = build_pinlug_test_domain_data(&problem, 8, 6);
+        let (model_pin, model_lug) = tiny_pinlug_nets(&device);
+        let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+        let mut saw = SawBrdr::with_base(base_weights, 0.95);
+        let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
+        let mut optims = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+        let ctx = make_pinlug_test_ctx(
+            &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
+            50.0, 50.0, 1.0, f64::MAX, true,
+        );
+        let (_new_models, out) = step_physics_multi(
+            vec![model_pin, model_lug], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+        let lam = out.lam_by_name.expect("must be populated");
+
+        assert_eq!(lam["interface_penetration"], 1.0, "penetration must clamp to its own cap");
+        assert!(lam["interface_non_tension"] != 1.0,
+            "non_tension must NOT clamp to interface_penetration's cap (proves independence): got {}",
+            lam["interface_non_tension"]);
+    }
+
+    /// Boundary case: cap == raw_lam precisely — a `>` vs `>=` mutation in the `.min()` call
+    /// would still be correct here (`.min` ties are a no-op either way), but this pins the
+    /// exact-equality behavior explicitly so a future refactor away from `.min()` is caught.
+    #[test]
+    fn step_physics_multi_interface_penetration_cap_exactly_at_live_weight_is_noop() {
+        let device = WgpuDevice::default();
+        let (problem, config, fd) = pinlug_test_fixture();
+        let (pin_data, lug_data, u_ref, ref_energy, ref_stress2) = build_pinlug_test_domain_data(&problem, 8, 6);
+        let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+        let (model_pin_seed, model_lug_seed) = touched_tiny_pinlug_nets(&device);
+
+        // First, an uncapped run to discover the live raw_lam for interface_penetration.
+        let (model_pin_probe, model_lug_probe) = (model_pin_seed.clone(), model_lug_seed.clone());
+        let mut saw_probe = SawBrdr::with_base(base_weights.clone(), 0.95);
+        let mut lr_sched_probe = LrSchedule::new(1e-3, 200, 1000);
+        let mut optims_probe = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+        let ctx_probe = make_pinlug_test_ctx(
+            &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
+            50.0, 50.0, f64::MAX, f64::MAX, true,
+        );
+        let (_new_models, out_probe) = step_physics_multi(
+            vec![model_pin_probe, model_lug_probe], &mut optims_probe, &ctx_probe, &mut saw_probe, &mut lr_sched_probe, &device, 0, 1.0, 1.0,
+        );
+        let live_weight = out_probe.lam_by_name.expect("must be populated")["interface_penetration"];
+
+        // Second, an identical run with the cap set to EXACTLY that live weight.
+        let (model_pin, model_lug) = (model_pin_seed, model_lug_seed);
+        let mut saw = SawBrdr::with_base(base_weights, 0.95);
+        let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
+        let mut optims = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+        let ctx = make_pinlug_test_ctx(
+            &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
+            50.0, 50.0, live_weight, f64::MAX, true,
+        );
+        let (_new_models, out) = step_physics_multi(
+            vec![model_pin, model_lug], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+        let lam = out.lam_by_name.expect("must be populated");
+
+        let rel = (lam["interface_penetration"] - live_weight).abs() / live_weight.abs().max(1e-8);
+        assert!(rel < 1e-9, "cap exactly at live weight must be a no-op: got={} expected~={live_weight}", lam["interface_penetration"]);
     }
 }
 
