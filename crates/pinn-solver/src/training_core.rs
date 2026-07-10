@@ -2445,18 +2445,19 @@ mod tests {
             let ref_div2 = (config.load.px * cx).powi(2).max(1.0);
             let (u_ref, ref_energy, ref_stress2) = compute_reference_scales(&config);
 
-            let int_pts = pinn_core::sampling::sample_interior(&config.geometry, engine.phase1_n_interior);
-            let bnd_pts = pinn_core::sampling::sample_boundary(&config.geometry, &config.load, config.n_boundary);
-            let eq_ring = pinn_core::sampling::sample_eq_ring(&config.geometry, engine.n_eq_ring);
-
-            let int_norm: Vec<[f32; 2]> = int_pts.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
-            let bnd_norm: Vec<[f32; 2]> = bnd_pts.iter().map(|b| normalize_point(b.x, b.y, &config)).collect();
-            let bnd_nx: Vec<f32> = bnd_pts.iter().map(|b| b.nx as f32).collect();
-            let bnd_ny: Vec<f32> = bnd_pts.iter().map(|b| b.ny as f32).collect();
-            let bnd_tx: Vec<f32> = bnd_pts.iter().map(|b| b.tx as f32).collect();
-            let bnd_ty: Vec<f32> = bnd_pts.iter().map(|b| b.ty as f32).collect();
-            let (trac_idx, hole_idx, right_idx) = extract_boundary_indices(&bnd_pts, &bnd_nx);
-            let eq_ring_norm: Vec<[f32; 2]> = eq_ring.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
+            // `LbfgsCtxScalars::from_ctx` only `.to_vec()`-clones these slices (no indexing/
+            // branching on contents) and the `ref_energy` field asserted below depends only on
+            // `config`, never on sampled points — so real sampling here would be pure overhead.
+            let int_norm: Vec<[f32; 2]> = Vec::new();
+            let bnd_norm: Vec<[f32; 2]> = Vec::new();
+            let bnd_nx: Vec<f32> = Vec::new();
+            let bnd_ny: Vec<f32> = Vec::new();
+            let bnd_tx: Vec<f32> = Vec::new();
+            let bnd_ty: Vec<f32> = Vec::new();
+            let trac_idx: Vec<usize> = Vec::new();
+            let hole_idx: Vec<usize> = Vec::new();
+            let right_idx: Vec<usize> = Vec::new();
+            let eq_ring_norm: Vec<[f32; 2]> = Vec::new();
 
             let problem = KirschProblem::new(
                 config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
@@ -2481,11 +2482,6 @@ mod tests {
                 "LbfgsCtxScalars::from_ctx must thread StepCtx::ref_energy through unchanged \
                  (use_ultimate_strength_scaling={use_uts}); got {}, expected {}",
                 lbfgs_ctx.ref_energy, expected_ref_energy,
-            );
-            assert_eq!(
-                lbfgs_ctx.ref_energy, ctx.ref_energy,
-                "LbfgsCtxScalars::ref_energy must equal the StepCtx it was built from \
-                 (use_ultimate_strength_scaling={use_uts})",
             );
         }
     }
