@@ -2666,19 +2666,20 @@ mod tests {
         use burn::module::AutodiffModule;
         use pinn_core::messages::SolverConfig;
         use crate::{
-            engine::EngineParams,
             kirsch_problem::KirschProblem,
             network::ElasticityNetConfig,
             optim::{make_bias_optim, make_gate_optim, WeightOptim},
         };
 
-        let mut config = SolverConfig::default_kirsch();
-        config.n_interior = 64;
-        config.n_boundary = 32;
-        config.max_steps = 8;
-        config.use_ultimate_strength_scaling = true;
-        let engine = EngineParams::analyze(&config);
-        engine.apply_to(&mut config);
+        // `zero_px_test_fixture` already hardcodes `use_ultimate_strength_scaling = true` —
+        // reuse it with the real default px (not 0.0) instead of hand-rolling the same
+        // config/sampling setup a 4th time in this file.
+        let default_px = SolverConfig::default_kirsch().load.px;
+        let (
+            config, engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(default_px);
         assert_eq!(engine.output_dim(), 5,
             "default Kirsch config must be mDEM-capable (has_hole=true) for this test to \
              actually exercise the use_mdem + use_ultimate_strength_scaling combination");
@@ -2691,27 +2692,6 @@ mod tests {
             .with_output_dim(engine.output_dim())
             .with_use_piratenet(config.use_piratenet);
         let mut model: ElasticityNet<B> = net_cfg.init(&device);
-
-        let (x0, x1) = config.geometry.x_range();
-        let (y0, y1) = config.geometry.y_range();
-        let fd = FdConfig::new(config.fd_h, x1 - x0, y1 - y0);
-        let cx = fd.sx / (2.0 * fd.hx as f64);
-        let cy = fd.sy / (2.0 * fd.hy as f64);
-        let ref_div2 = (config.load.px * cx).powi(2).max(1.0);
-        let (u_ref, ref_energy, ref_stress2) = compute_reference_scales(&config);
-
-        let int_pts = pinn_core::sampling::sample_interior(&config.geometry, engine.phase1_n_interior);
-        let bnd_pts = pinn_core::sampling::sample_boundary(&config.geometry, &config.load, config.n_boundary);
-        let eq_ring = pinn_core::sampling::sample_eq_ring(&config.geometry, engine.n_eq_ring);
-
-        let int_norm: Vec<[f32; 2]> = int_pts.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
-        let bnd_norm: Vec<[f32; 2]> = bnd_pts.iter().map(|b| normalize_point(b.x, b.y, &config)).collect();
-        let bnd_nx: Vec<f32> = bnd_pts.iter().map(|b| b.nx as f32).collect();
-        let bnd_ny: Vec<f32> = bnd_pts.iter().map(|b| b.ny as f32).collect();
-        let bnd_tx: Vec<f32> = bnd_pts.iter().map(|b| b.tx as f32).collect();
-        let bnd_ty: Vec<f32> = bnd_pts.iter().map(|b| b.ty as f32).collect();
-        let (trac_idx, hole_idx, right_idx) = extract_boundary_indices(&bnd_pts, &bnd_nx);
-        let eq_ring_norm: Vec<[f32; 2]> = eq_ring.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
 
         let problem = KirschProblem::new(
             config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
