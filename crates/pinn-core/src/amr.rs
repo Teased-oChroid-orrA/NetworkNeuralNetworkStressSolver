@@ -506,7 +506,7 @@ mod tests {
     #[test]
     fn test_hole_zone_always_refined() {
         let geom = test_geom();
-        let cfg  = AmrtConfig { min_level_hole: 6, hole_zone_factor: 3.0, ..AmrtConfig::default() };
+        let cfg  = AmrtConfig { min_level_hole: 6, hole_zone_factor: DEFAULT_HOLE_ZONE_FACTOR, ..AmrtConfig::default() };
         let mut grid = AdaptiveGrid::new(&geom, cfg);
         // Force coarsen
         for _ in 0..5 {
@@ -517,7 +517,7 @@ mod tests {
         }
         // All points near hole should still be there
         let pts = grid.sample_points();
-        let r_zone = 0.003175 * 3.0;
+        let r_zone = 0.003175 * DEFAULT_HOLE_ZONE_FACTOR;
         let near_hole: Vec<_> = pts.iter().filter(|&&[x, y]| {
             (x*x + y*y).sqrt() < r_zone
         }).collect();
