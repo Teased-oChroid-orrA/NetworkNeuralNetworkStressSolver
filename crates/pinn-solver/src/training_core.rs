@@ -1408,6 +1408,7 @@ pub struct LbfgsCtxScalars {
     pub fd:              FdConfig,
     pub k:               f32,
     pub u_ref:           f32,
+    pub ref_energy:      f32,
     pub ref_stress2:     f32,
     pub cx:              f64,
     pub cy:              f64,
@@ -1436,6 +1437,7 @@ impl LbfgsCtxScalars {
             fd:               *ctx.fd,
             k:                ctx.k,
             u_ref:            ctx.u_ref,
+            ref_energy:       ctx.ref_energy,
             ref_stress2:      ctx.ref_stress2,
             cx:               ctx.cx,
             cy:               ctx.cy,
@@ -1511,9 +1513,13 @@ fn compute_loss_for_lbfgs(
         (Some(s.0), Some(s.1), Some(s.2))
     } else { (None, None, None) };
     let (exx, eyy, exy) = compute_strains::<B>(stencil_out, n_int, &ctx.fd);
-    // Floored: see compute_reference_scales' identical `.max(1.0)` guard on ref_energy — at
-    // px=0 this is exactly 0.0, and `1.0 / ref_energy` below would divide by zero.
-    let ref_energy = (0.5 * ctx.config.load.px * ctx.config.load.px / ctx.config.material.e).max(1.0) as f32;
+    // Threaded from `StepCtx::ref_energy` (via `LbfgsCtxScalars::from_ctx`), NOT recomputed
+    // here — `compute_reference_scales` (the single source of truth) is the only place that
+    // knows to branch on `config.use_ultimate_strength_scaling`; a local recompute from raw
+    // `config.load.px` would silently ignore that flag (issue #23). Already floored
+    // (`.max(1.0)`) upstream by `compute_reference_scales` against the px=0 divide-by-zero
+    // case, so no separate guard is needed here.
+    let ref_energy = ctx.ref_energy;
     let e_loss = dem_energy_loss(exx.clone(), eyy.clone(), exy.clone(), &ctx.config.material)
         .mul_scalar(1.0 / ref_energy as f64);
     let const_loss: Tensor<B, 1> = if let (Some(sxx_n), Some(syy_n), Some(sxy_n)) =
@@ -2286,15 +2292,15 @@ mod tests {
     /// sign-preservation for a legitimate compression (`px < 0`) load at this call site (the
     /// `w_val` divisor inside `compute_loss_for_lbfgs`). See
     /// `step_lbfgs_finite_at_literal_zero_px_load` below for the `px = 0.0` case, which is
-    /// now also safe: `compute_loss_for_lbfgs`'s own inline `ref_energy` recompute (a
-    /// separate divisor from `w_val`'s) is floored too.
+    /// now also safe: `ctx.ref_energy` (threaded from `StepCtx`/`compute_reference_scales`,
+    /// a separate divisor from `w_val`'s) is floored too.
     #[test]
     fn step_lbfgs_finite_at_near_zero_negative_px_load() {
         use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
-            config, engine, fd, u_ref, _ref_energy, ref_stress2, cx, cy, ref_div2,
+            config, engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
             trac_idx, hole_idx, right_idx, eq_ring_norm,
         ) = zero_px_test_fixture(-0.5);
@@ -2314,6 +2320,7 @@ mod tests {
             fd,
             k: engine.ansatz_k,
             u_ref,
+            ref_energy,
             ref_stress2,
             cx, cy, ref_div2,
             int_norm: int_norm.clone(),
@@ -2342,19 +2349,22 @@ mod tests {
         assert!(loss_out.is_finite(), "step_lbfgs's returned loss must be finite at px=0.0, got {loss_out}");
     }
 
-    /// Literal `px = 0.0` (not just near-zero) through `compute_loss_for_lbfgs`'s inline
-    /// `ref_energy` recompute — the second divide-by-zero site found in this same file
-    /// (distinct from `w_val`'s `floor_signed_divisor` fix): `ref_energy = 0.5*px*px/E` was
-    /// exactly `0.0` at `px=0.0` with no floor, and `e_loss.mul_scalar(1.0/ref_energy)` would
-    /// divide by zero. Now floored (`.max(1.0)`, mirroring `compute_reference_scales`'s own
-    /// identical guard).
+    /// Literal `px = 0.0` (not just near-zero) through `ctx.ref_energy` (threaded from
+    /// `StepCtx`/`compute_reference_scales` — the second divide-by-zero site found in this
+    /// same file (distinct from `w_val`'s `floor_signed_divisor` fix): `ref_energy =
+    /// 0.5*stress_ref*stress_ref/E` would be exactly `0.0` at `stress_ref=0.0` with no floor,
+    /// and `e_loss.mul_scalar(1.0/ref_energy)` would divide by zero. Floored (`.max(1.0)`) at
+    /// the single source (`compute_reference_scales`) and threaded through unchanged from
+    /// there — see `lbfgs_ctx_scalars_from_ctx_threads_ref_energy_for_both_scaling_modes`
+    /// (issue #23) for the regression this used to silently defeat by recomputing locally
+    /// from raw `config.load.px` instead of reusing this already-floored value.
     #[test]
     fn step_lbfgs_finite_at_literal_zero_px_load() {
         use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
-            config, engine, fd, u_ref, _ref_energy, ref_stress2, cx, cy, ref_div2,
+            config, engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
             trac_idx, hole_idx, right_idx, eq_ring_norm,
         ) = zero_px_test_fixture(0.0);
@@ -2374,6 +2384,7 @@ mod tests {
             fd,
             k: engine.ansatz_k,
             u_ref,
+            ref_energy,
             ref_stress2,
             cx, cy, ref_div2,
             int_norm: int_norm.clone(),
@@ -2400,6 +2411,79 @@ mod tests {
         let mut lbfgs = make_lbfgs(3);
         let (_model_out, loss_out) = step_lbfgs(model, &mut lbfgs, 1e-3, &lbfgs_ctx, &lams, &device);
         assert!(loss_out.is_finite(), "step_lbfgs's returned loss must be finite at literal px=0.0, got {loss_out}");
+    }
+
+    /// Regression for issue #23: `LbfgsCtxScalars::from_ctx` previously dropped
+    /// `StepCtx::ref_energy` entirely (only `u_ref`/`ref_stress2` were threaded through),
+    /// forcing `compute_loss_for_lbfgs` to hand-roll its own `ref_energy` from raw
+    /// `config.load.px` — silently ignoring `config.use_ultimate_strength_scaling` (unlike
+    /// `compute_reference_scales`, the single source of truth, which correctly branches on
+    /// the flag). Proves `LbfgsCtxScalars::from_ctx`'s `ref_energy` field matches
+    /// `compute_reference_scales`'s own `ref_energy` output for BOTH scaling-mode states —
+    /// the cheapest reliable way to exercise the dropped-field bug, since it needs no live
+    /// model / GPU forward pass through `compute_loss_for_lbfgs` itself.
+    #[test]
+    fn lbfgs_ctx_scalars_from_ctx_threads_ref_energy_for_both_scaling_modes() {
+        use crate::engine::EngineParams;
+        use crate::kirsch_problem::KirschProblem;
+        use pinn_core::messages::SolverConfig;
+
+        for use_uts in [false, true] {
+            let mut config = SolverConfig::default_kirsch();
+            config.n_interior = 64;
+            config.n_boundary = 32;
+            config.max_steps = 2;
+            config.use_ultimate_strength_scaling = use_uts;
+            let engine = EngineParams::analyze(&config);
+            engine.apply_to(&mut config);
+
+            let (x0, x1) = config.geometry.x_range();
+            let (y0, y1) = config.geometry.y_range();
+            let fd = FdConfig::new(config.fd_h, x1 - x0, y1 - y0);
+            let cx = fd.sx / (2.0 * fd.hx as f64);
+            let cy = fd.sy / (2.0 * fd.hy as f64);
+            let ref_div2 = (config.load.px * cx).powi(2).max(1.0);
+            let (u_ref, ref_energy, ref_stress2) = compute_reference_scales(&config);
+
+            // `LbfgsCtxScalars::from_ctx` only `.to_vec()`-clones these slices (no indexing/
+            // branching on contents) and the `ref_energy` field asserted below depends only on
+            // `config`, never on sampled points — so real sampling here would be pure overhead.
+            let int_norm: Vec<[f32; 2]> = Vec::new();
+            let bnd_norm: Vec<[f32; 2]> = Vec::new();
+            let bnd_nx: Vec<f32> = Vec::new();
+            let bnd_ny: Vec<f32> = Vec::new();
+            let bnd_tx: Vec<f32> = Vec::new();
+            let bnd_ty: Vec<f32> = Vec::new();
+            let trac_idx: Vec<usize> = Vec::new();
+            let hole_idx: Vec<usize> = Vec::new();
+            let right_idx: Vec<usize> = Vec::new();
+            let eq_ring_norm: Vec<[f32; 2]> = Vec::new();
+
+            let problem = KirschProblem::new(
+                config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
+            );
+
+            let ctx = StepCtx {
+                config: &config, engine: &engine, problem: &problem, fd: &fd,
+                k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+                int_norm: &int_norm, bnd_norm: &bnd_norm,
+                bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
+                trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+                eq_ring_norm: &eq_ring_norm,
+                dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+                phase2_active: false, step: 0,
+            };
+
+            let lbfgs_ctx = LbfgsCtxScalars::from_ctx(&ctx);
+
+            let expected_ref_energy = compute_reference_scales(&config).1;
+            assert_eq!(
+                lbfgs_ctx.ref_energy, expected_ref_energy,
+                "LbfgsCtxScalars::from_ctx must thread StepCtx::ref_energy through unchanged \
+                 (use_ultimate_strength_scaling={use_uts}); got {}, expected {}",
+                lbfgs_ctx.ref_energy, expected_ref_energy,
+            );
+        }
     }
 
     /// Numerical-equivalence proof for the `step_physics` trait-driven cutover.
