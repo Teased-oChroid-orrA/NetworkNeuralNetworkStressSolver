@@ -2648,6 +2648,118 @@ mod tests {
             "param_l2_sq: new={} old={} rel_err={rel}", vis_new.total, vis_old.total);
     }
 
+    /// Confirmatory test for `use_mdem` (auto-derived from `has_hole`, always true for a
+    /// default Kirsch config) combined with `use_ultimate_strength_scaling=true` — a
+    /// combination no other test in this file exercises. Investigated as a possible sibling
+    /// of issue #23 (`scale_out`'s mDEM stress channels are scaled by raw `config.load.px`,
+    /// not the flag-aware `stress_ref` used for the displacement channels via `ctx.u_ref`) and
+    /// concluded correct by design, not a bug: `constitutive_consistency_loss` trains the
+    /// stress channel toward the true physical Hooke's-law stress (derived from the always
+    /// flag-independent `E`/`nu`), so recovering it via raw `px` is consistent — exactly like
+    /// `u_target_val`/`w_val`'s verified-correct use of real `px`/`py` as physical BC targets
+    /// rather than a normalization scale. This test backs that reasoning empirically rather
+    /// than by proof alone: every `step_physics` component scalar must stay finite across
+    /// several real steps, and `probe_kt_shared` must still return a finite K_t afterward.
+    #[test]
+    fn step_physics_stays_finite_with_mdem_and_ultimate_strength_scaling_combined() {
+        use burn::backend::wgpu::WgpuDevice;
+        use burn::module::AutodiffModule;
+        use pinn_core::messages::SolverConfig;
+        use crate::{
+            engine::EngineParams,
+            kirsch_problem::KirschProblem,
+            network::ElasticityNetConfig,
+            optim::{make_bias_optim, make_gate_optim, WeightOptim},
+        };
+
+        let mut config = SolverConfig::default_kirsch();
+        config.n_interior = 64;
+        config.n_boundary = 32;
+        config.max_steps = 8;
+        config.use_ultimate_strength_scaling = true;
+        let engine = EngineParams::analyze(&config);
+        engine.apply_to(&mut config);
+        assert_eq!(engine.output_dim(), 5,
+            "default Kirsch config must be mDEM-capable (has_hole=true) for this test to \
+             actually exercise the use_mdem + use_ultimate_strength_scaling combination");
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let mut model: ElasticityNet<B> = net_cfg.init(&device);
+
+        let (x0, x1) = config.geometry.x_range();
+        let (y0, y1) = config.geometry.y_range();
+        let fd = FdConfig::new(config.fd_h, x1 - x0, y1 - y0);
+        let cx = fd.sx / (2.0 * fd.hx as f64);
+        let cy = fd.sy / (2.0 * fd.hy as f64);
+        let ref_div2 = (config.load.px * cx).powi(2).max(1.0);
+        let (u_ref, ref_energy, ref_stress2) = compute_reference_scales(&config);
+
+        let int_pts = pinn_core::sampling::sample_interior(&config.geometry, engine.phase1_n_interior);
+        let bnd_pts = pinn_core::sampling::sample_boundary(&config.geometry, &config.load, config.n_boundary);
+        let eq_ring = pinn_core::sampling::sample_eq_ring(&config.geometry, engine.n_eq_ring);
+
+        let int_norm: Vec<[f32; 2]> = int_pts.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
+        let bnd_norm: Vec<[f32; 2]> = bnd_pts.iter().map(|b| normalize_point(b.x, b.y, &config)).collect();
+        let bnd_nx: Vec<f32> = bnd_pts.iter().map(|b| b.nx as f32).collect();
+        let bnd_ny: Vec<f32> = bnd_pts.iter().map(|b| b.ny as f32).collect();
+        let bnd_tx: Vec<f32> = bnd_pts.iter().map(|b| b.tx as f32).collect();
+        let bnd_ty: Vec<f32> = bnd_pts.iter().map(|b| b.ty as f32).collect();
+        let (trac_idx, hole_idx, right_idx) = extract_boundary_indices(&bnd_pts, &bnd_nx);
+        let eq_ring_norm: Vec<[f32; 2]> = eq_ring.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
+
+        let problem = KirschProblem::new(
+            config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
+        );
+
+        let mut optim_w = WeightOptim::new(config.use_soap_muon);
+        let mut optim_b = make_bias_optim();
+        let mut optim_gate = make_gate_optim();
+        let mut saw = SawBrdr::with_base(engine.init_weights(), 0.95);
+        let mut lr_sched = LrSchedule::new(engine.peak_lr, 200, 1000);
+
+        for step in 0..8usize {
+            let ctx = StepCtx {
+                config: &config, engine: &engine, problem: &problem, fd: &fd,
+                k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+                int_norm: &int_norm, bnd_norm: &bnd_norm,
+                bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
+                trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+                eq_ring_norm: &eq_ring_norm,
+                dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+                phase2_active: false, step,
+            };
+
+            let (m, out) = step_physics(
+                model, &mut optim_w, &mut optim_b, &mut optim_gate,
+                &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+            );
+            model = m;
+
+            for (name, v) in [
+                ("e_scalar", out.e_scalar), ("n_scalar", out.n_scalar), ("h_scalar", out.h_scalar),
+                ("d_scalar", out.d_scalar), ("eq_scalar", out.eq_scalar), ("kirsch_scalar", out.kirsch_scalar),
+                ("const_scalar", out.const_scalar), ("total_scalar", out.total_scalar),
+            ] {
+                assert!(v.is_finite(),
+                    "step {step}: {name} went non-finite ({v}) under use_ultimate_strength_scaling=true \
+                     + mDEM — scale_out's raw-px stress-channel convention would be the first suspect \
+                     if this ever regresses");
+            }
+        }
+
+        let model_val: ElasticityNet<BInner> = model.valid();
+        let kt = probe_kt_shared(&model_val, &config, &engine, &fd, engine.ansatz_k, u_ref, &device);
+        assert!(kt.is_some_and(|v| v.is_finite()),
+            "probe_kt_shared must return a finite K_t after training with \
+             use_ultimate_strength_scaling=true + mDEM, got {kt:?}");
+    }
+
     /// Verbatim transcription of commit 05cd1bc's hardcoded `step_physics` body (the
     /// pre-cutover e/n/h/d/eq/kirsch sequence) — kept ONLY for
     /// `step_physics_trait_driven_matches_independently_reimplemented_old_formula`'s
