@@ -64,6 +64,18 @@ enum MetricMode {
     },
 }
 
+/// Which condition fired inside `ConvergenceTracker::check()` — crash always takes priority
+/// over plateau when a single reading independently satisfies both (see `check()`'s doc
+/// comment). Carries the same `new_lam_h_cap` value the corresponding individual method
+/// (`check_kt_crash`/`check_plateau`) would itself have returned, so callers that migrate to
+/// `check()` in the future get identical cap-cascade behavior, just disambiguated by variant
+/// instead of by which of two calls returned `Some`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RestartReason {
+    Crash(f64),
+    Plateau(f64),
+}
+
 /// Detects K_t plateau in Phase 2 and triggers warm restarts to escape local attractors.
 ///
 /// Plateau = max K_t in the recent window hasn't improved by `PLATEAU_EPSILON` over the
@@ -251,6 +263,32 @@ impl ConvergenceTracker {
         } else {
             None
         }
+    }
+
+    /// Single entry point that internally enforces crash-before-plateau priority, making the
+    /// ordering an invariant of `ConvergenceTracker` itself rather than a call-site
+    /// convention every future caller must independently get right (issue #15a: previously,
+    /// nothing stopped a careless call site from invoking `check_kt_crash`/`check_plateau`
+    /// unconditionally instead of chaining them with `else if`, double-firing both restart
+    /// budgets from one reading — see the `characterization_calling_both_checks_
+    /// unconditionally_double_fires_today` test for that failure mode reproduced against the
+    /// two-method API).
+    ///
+    /// Behaviorally identical to the pre-existing `if let Some(..) = check_kt_crash(current)
+    /// { .. } else if let Some(..) = check_plateau() { .. }` pattern `run_training` (runner.rs),
+    /// `run_headless`, and `run_headless_pinlug_inner` (headless.rs) all use today: checks
+    /// crash first, and only consults plateau (via `or_else`, which is lazy — `check_plateau`'s
+    /// side effects on `plateau_restarts` only run when this closure is actually invoked) when
+    /// crash did not fire, so a reading satisfying both conditions can only ever consume the
+    /// crash budget.
+    ///
+    /// Additive, not a replacement: `check_kt_crash`/`check_plateau` remain public and
+    /// unchanged, and are still what every existing call site (`runner.rs`, `headless.rs`)
+    /// uses — no call site is migrated onto `check()` in this change.
+    pub fn check(&mut self, current: f64) -> Option<RestartReason> {
+        self.check_kt_crash(current)
+            .map(RestartReason::Crash)
+            .or_else(|| self.check_plateau().map(RestartReason::Plateau))
     }
 
     /// Clears K_t history (call after crash recovery to avoid cascade detections).
@@ -600,5 +638,135 @@ mod tests {
         assert_eq!(t.crash_restarts, 1, "crash must have fired");
         assert_eq!(t.plateau_restarts, 0,
             "plateau budget must be untouched because crash fired first (else-if ordering)");
+    }
+
+    // ─── CHARACTERIZATION: today's ordering is a call-site convention only (issue #15a) ──
+    //
+    // The two tests above prove the *correctly written* `if check_kt_crash {..} else if
+    // check_plateau {..}` call-site pattern behaves as intended. They do NOT prove the
+    // ordering is enforced by `ConvergenceTracker` itself — nothing stops a future call site
+    // from invoking both checks unconditionally (e.g. two separate `if let Some(..) = ..`
+    // statements instead of an `else if` chain). This test demonstrates that exact failure
+    // mode against TODAY'S API: from a single reading that independently satisfies both the
+    // crash and plateau conditions, calling both checks unconditionally (no `else`) consumes
+    // BOTH restart budgets, even though only one restart should have been counted. This is
+    // the characterization/safety-net test for `ConvergenceTracker::check()`, which closes
+    // this gap by construction.
+
+    #[test]
+    fn characterization_calling_both_checks_unconditionally_double_fires_today() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
+        for _ in 0..PLATEAU_WINDOW * 2 { t.push(1e-4); }
+        let current = 3e-4; // >= crash_spike_factor(2.0) * min_prev5(1e-4) -> crash ALSO true
+
+        // NOT an else-if: both checks are invoked unconditionally, as a future careless call
+        // site might. `ConvergenceTracker`'s public API today provides nothing to prevent this.
+        let crash_fired = t.check_kt_crash(current).is_some();
+        let plateau_fired = t.check_plateau().is_some();
+
+        assert!(crash_fired, "test setup invariant broken: crash must independently fire");
+        assert!(plateau_fired, "test setup invariant broken: plateau must independently fire too \
+            (that's what makes double-firing possible from a single reading)");
+        assert_eq!(t.crash_restarts, 1, "crash budget consumed");
+        assert_eq!(t.plateau_restarts, 1,
+            "BUG (today's behavior): plateau budget was ALSO consumed from the same single \
+            reading that already triggered a crash restart — nothing in the API stops this");
+    }
+
+    // ─── `ConvergenceTracker::check()` — ordering enforced by construction (issue #15a fix) ──
+
+    #[test]
+    fn check_returns_none_and_consumes_no_budget_when_neither_condition_holds() {
+        let mut t = ConvergenceTracker::new();
+        // Too few readings for either check_plateau (needs 2*PLATEAU_WINDOW) or
+        // check_kt_crash (needs >= 6) to do anything but return None.
+        t.push(1.0);
+        assert_eq!(t.check(1.0), None);
+        assert_eq!(t.crash_restarts, 0);
+        assert_eq!(t.plateau_restarts, 0);
+    }
+
+    #[test]
+    fn check_returns_crash_variant_when_only_crash_condition_holds() {
+        let mut t = ConvergenceTracker::new();
+        for _ in 0..5 { t.push(2.0); } // 5 prior readings, peak > CRASH_MIN_PEAK_KT
+        let current = 0.5; // < CRASH_DROP_FRACTION * peak -> crash
+        // KtLegacy convention (mirrors crash_and_plateau_budgets_are_independent above):
+        // caller pushes the current reading, then checks with that same value — check_kt_crash
+        // needs >= 6 total readings (5 prior + the just-pushed current) to do anything.
+        t.push(current);
+        assert_eq!(t.check(current), Some(RestartReason::Crash(LAM_CAP_INITIAL)));
+        assert_eq!(t.crash_restarts, 1);
+        assert_eq!(t.plateau_restarts, 0);
+    }
+
+    #[test]
+    fn check_returns_plateau_variant_when_only_plateau_condition_holds() {
+        let mut t = ConvergenceTracker::new();
+        fill_plateau(&mut t, 1.0, PLATEAU_WINDOW * 2); // constant 1.0 never crashes (< CRASH_MIN_PEAK_KT)
+        assert_eq!(t.check(1.0), Some(RestartReason::Plateau(LAM_CAP_INITIAL)));
+        assert_eq!(t.crash_restarts, 0);
+        assert_eq!(t.plateau_restarts, 1);
+    }
+
+    #[test]
+    fn check_cascades_the_cap_identically_to_check_plateau_across_repeated_calls() {
+        // Proves check() reuses the exact same step_down_cap cascade as the two-method API —
+        // byte-identical cap sequence (50 -> 30 -> 18 -> 15), just reached through one call.
+        let mut t = ConvergenceTracker::new();
+        fill_plateau(&mut t, 1.0, PLATEAU_WINDOW * 2);
+        assert_eq!(t.check(1.0), Some(RestartReason::Plateau(LAM_CAP_INITIAL)));
+        assert_eq!(t.check(1.0), Some(RestartReason::Plateau(30.0)));
+        assert_eq!(t.check(1.0), Some(RestartReason::Plateau(18.0)));
+        assert_eq!(t.check(1.0), Some(RestartReason::Plateau(LAM_CAP_FLOOR)));
+        assert_eq!(t.plateau_restarts, MAX_PLATEAU_RESTARTS);
+        assert_eq!(t.check(1.0), None, "plateau budget exhausted");
+    }
+
+    /// The test the acceptance criteria calls for by name: construct a state where BOTH a
+    /// crash condition and a plateau condition would independently fire, call `check()`, and
+    /// assert the returned `RestartReason` is the crash variant regardless of what order a
+    /// hypothetical caller might otherwise have tried the two checks in — proving the
+    /// ordering is now a property of `ConvergenceTracker` itself, not callable-order-dependent.
+    #[test]
+    fn check_prioritizes_crash_over_plateau_when_both_conditions_true_relative_mode() {
+        let mk = || ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
+
+        // Adversarial pre-check: prove check_plateau() would ALSO independently fire from this
+        // exact push history (mirrors the pre-existing call-site-pattern test's precondition).
+        let mut t_plateau_only = mk();
+        for _ in 0..PLATEAU_WINDOW * 2 { t_plateau_only.push(1e-4); }
+        assert!(t_plateau_only.check_plateau().is_some(),
+            "test setup invariant broken: plateau must independently be true for this to be a real priority test");
+
+        let mut t = mk();
+        for _ in 0..PLATEAU_WINDOW * 2 { t.push(1e-4); }
+        let current = 3e-4; // >= crash_spike_factor(2.0) * min_prev5(1e-4) -> crash ALSO true
+
+        let reason = t.check(current);
+        assert_eq!(reason, Some(RestartReason::Crash(LAM_CAP_INITIAL)),
+            "crash must win when both conditions are true, regardless of hypothetical call order, got {reason:?}");
+        assert_eq!(t.crash_restarts, 1, "crash must have fired");
+        assert_eq!(t.plateau_restarts, 0, "check() must not double-fire — plateau budget must stay untouched");
+    }
+
+    #[test]
+    fn check_prioritizes_crash_over_plateau_when_both_conditions_true_kt_legacy_mode() {
+        const PEAK: f64 = 1.6;
+        const CURRENT: f64 = 0.5; // < CRASH_DROP_FRACTION(0.5) * PEAK(1.6) = 0.8 -> crash fires
+
+        let mut t_plateau_only = ConvergenceTracker::new();
+        fill_plateau(&mut t_plateau_only, PEAK, PLATEAU_WINDOW * 2);
+        assert!(t_plateau_only.check_plateau().is_some(),
+            "test setup invariant broken: plateau must independently be true for this to be a real priority test");
+
+        let mut t = ConvergenceTracker::new();
+        fill_plateau(&mut t, PEAK, PLATEAU_WINDOW * 2);
+
+        let reason = t.check(CURRENT);
+        assert_eq!(reason, Some(RestartReason::Crash(LAM_CAP_INITIAL)),
+            "crash must win when both conditions are true, regardless of hypothetical call order, got {reason:?}");
+        assert_eq!(t.crash_restarts, 1, "crash must have fired");
+        assert_eq!(t.plateau_restarts, 0, "check() must not double-fire — plateau budget must stay untouched");
     }
 }

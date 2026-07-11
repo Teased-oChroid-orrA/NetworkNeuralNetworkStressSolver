@@ -198,11 +198,7 @@ impl PinnDecisionMaker {
             }
             // Phase 2: Converge → Align on conflict re-emergence or gradient spike.
             (OptimizerTier::Converge, true) => {
-                let conflict_reemerged = effective_cosine < 0.50;
-                let grad_spike = g_total_norm.map_or(false, |gnorm| {
-                    gnorm > 3.0 * self.config.converge_grad_threshold
-                });
-                if conflict_reemerged || grad_spike {
+                if self.converge_exit_condition(effective_cosine, g_total_norm) {
                     Some(TierTransition {
                         new_tier:    OptimizerTier::Align,
                         reset_optim: false,
@@ -220,11 +216,7 @@ impl PinnDecisionMaker {
             // exactly as before.
             (OptimizerTier::Converge, false) => {
                 if self.allow_converge {
-                    let conflict_reemerged = effective_cosine < 0.50;
-                    let grad_spike = g_total_norm.is_some_and(|gnorm| {
-                        gnorm > 3.0 * self.config.converge_grad_threshold
-                    });
-                    if conflict_reemerged || grad_spike {
+                    if self.converge_exit_condition(effective_cosine, g_total_norm) {
                         Some(TierTransition {
                             new_tier:    OptimizerTier::Align,
                             reset_optim: false,
@@ -249,6 +241,21 @@ impl PinnDecisionMaker {
         }
 
         transition
+    }
+
+    /// Shared Converge-exit condition: true when the gradient conflict has re-emerged
+    /// (`effective_cosine` dropped below the re-emergence threshold) OR the gradient norm has
+    /// spiked to more than 3x the Converge-entry threshold. Both reachable Converge-exit
+    /// arms — `(Converge, true)` (Kirsch's Phase-2 curriculum) and `(Converge, false)` gated
+    /// on `self.allow_converge` (pin-in-lug, which has no Phase-2 curriculum split) — call
+    /// this instead of each hardcoding the same two thresholds, so retuning either one only
+    /// has a single call site to update.
+    fn converge_exit_condition(&self, effective_cosine: f32, g_total_norm: Option<f32>) -> bool {
+        let conflict_reemerged = effective_cosine < 0.50;
+        let grad_spike = g_total_norm.is_some_and(|gnorm| {
+            gnorm > 3.0 * self.config.converge_grad_threshold
+        });
+        conflict_reemerged || grad_spike
     }
 }
 
@@ -347,6 +354,39 @@ mod tests {
             dm.current_tier = tier;
             let got = dm.evaluate(Some(conflict), 1.0, phase2).map(|t| t.new_tier);
             assert_eq!(got, expected, "arm (tier={tier:?}, phase2_active={phase2}) diverged from pre-existing behavior");
+        }
+    }
+
+    // ─── CHARACTERIZATION: the two Converge-exit arms are copy-pasted, not shared (issue #15b) ─
+    //
+    // `(Converge, true)` (Kirsch's real Phase-2 exit arm) and `(Converge, false)` gated on
+    // `self.allow_converge` (pin-in-lug's only reachable Converge-exit arm, since it never
+    // sets `phase2_active`) each hardcode `effective_cosine < 0.50` and
+    // `gnorm > 3.0 * converge_grad_threshold` verbatim today. This test proves that claim by
+    // running identical `GradientConflict` inputs through both arms and asserting identical
+    // outcomes — the baseline this refactor (extracting one shared private helper) must
+    // reproduce exactly.
+    #[test]
+    fn characterization_converge_true_and_converge_false_allow_converge_arms_agree_on_identical_inputs() {
+        let cases: &[GradientConflict] = &[
+            GradientConflict { cosine_sim: 0.30, g_pde_norm: 0.1, g_bc_norm: 0.1 },   // conflict reemerged (cosine < 0.50)
+            GradientConflict { cosine_sim: 0.90, g_pde_norm: 10.0, g_bc_norm: 10.0 }, // grad spike (gnorm=20 > 3*5=15)
+            GradientConflict { cosine_sim: 0.95, g_pde_norm: 0.5, g_bc_norm: 0.5 },   // stable: neither condition holds
+            GradientConflict { cosine_sim: 0.50, g_pde_norm: 0.0, g_bc_norm: 0.0 },   // boundary: cosine == 0.50 (strict <, must NOT count as reemerged)
+            GradientConflict { cosine_sim: 0.90, g_pde_norm: 7.5, g_bc_norm: 7.5 },   // boundary: gnorm == 3*5=15 exactly (strict >, must NOT count as spike)
+        ];
+        for &conflict in cases {
+            let mut dm_phase2_true = PinnDecisionMaker::new(permissive_config(), false, false);
+            dm_phase2_true.current_tier = OptimizerTier::Converge;
+            let got_phase2_true = dm_phase2_true.evaluate(Some(conflict), 1.0, true).map(|t| t.new_tier);
+
+            let mut dm_allow_converge = PinnDecisionMaker::new(permissive_config(), false, true);
+            dm_allow_converge.current_tier = OptimizerTier::Converge;
+            let got_allow_converge = dm_allow_converge.evaluate(Some(conflict), 1.0, false).map(|t| t.new_tier);
+
+            assert_eq!(got_phase2_true, got_allow_converge,
+                "conflict={conflict:?}: (Converge,phase2_active=true) and (Converge,phase2_active=false)-with-\
+                allow_converge=true arms disagreed — they are supposed to share identical exit logic");
         }
     }
 }
