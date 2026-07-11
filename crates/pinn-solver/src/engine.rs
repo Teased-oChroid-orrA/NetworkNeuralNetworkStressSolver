@@ -188,10 +188,11 @@ impl EngineParams {
         // SAW-BRDR base weights (also what `KirschProblem::base_weight` returns) — read here
         // rather than re-typed, so this seed and that lookup can't silently drift apart.
         // `KirschProblem` always has a hole (`GeometryConfig::kirsch_plate_inches()`), so in
-        // practice every `KirschProblem` instance takes the `has_hole` branch below; the
-        // `else` branch only matters for a hole-less geometry driven directly through this
-        // generic engine outside a `KirschProblem` (no equivalent Kirsch-loss/eq-ring terms
-        // to weight in that case).
+        // practice `lam_h`/`lam_eq`/`lam_kirsch` below always take their non-zero branch;
+        // `lam_e`/`lam_n`/`lam_d` are unconditional regardless of `has_hole` and always were.
+        // Those three `else` branches only matter for a hole-less geometry driven directly
+        // through this generic engine outside a `KirschProblem` (no equivalent Kirsch-loss/
+        // eq-ring terms to weight in that case).
         let lam_e  = LAM_E;
         let lam_n  = LAM_N;
         let lam_h  = if has_hole { LAM_H } else { 0.0 };
