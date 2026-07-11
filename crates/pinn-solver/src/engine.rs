@@ -5,12 +5,14 @@
 /// loop is computed from geometry, material, and loading.
 
 use pinn_core::{
-    amr::AmrtConfig,
+    amr::{AmrtConfig, DEFAULT_HOLE_ZONE_FACTOR},
     geometry::{GeometryConfig, HoleType, SymmetryMode},
     kirsch::kirsch_stress,
     loading::LoadConfig,
     messages::SolverConfig,
 };
+
+use crate::kirsch_problem::{LAM_D, LAM_E, LAM_EQ, LAM_H, LAM_KIRSCH, LAM_N};
 
 /// All parameters derived automatically from the physical problem.
 #[derive(Debug, Clone)]
@@ -182,16 +184,25 @@ impl EngineParams {
         let (n_interior, n_boundary) = compute_collocation_sizes(geom);
 
         let has_hole = matches!(geom.hole, HoleType::Circular { .. });
-        let lam_e  = 1.0_f32;
-        let lam_n  = 10.0_f32;
-        let lam_h  = if has_hole { 200.0_f32 } else { 0.0 };
-        let lam_d  = 50.0_f32;
+        // LAM_E/LAM_N/LAM_H/LAM_D/LAM_EQ/LAM_KIRSCH are `kirsch_problem.rs`'s canonical
+        // SAW-BRDR base weights (also what `KirschProblem::base_weight` returns) — read here
+        // rather than re-typed, so this seed and that lookup can't silently drift apart.
+        // `KirschProblem` always has a hole (`GeometryConfig::kirsch_plate_inches()`), so in
+        // practice `lam_h`/`lam_eq`/`lam_kirsch` below always take their non-zero branch;
+        // `lam_e`/`lam_n`/`lam_d` are unconditional regardless of `has_hole` and always were.
+        // Those three `else` branches only matter for a hole-less geometry driven directly
+        // through this generic engine outside a `KirschProblem` (no equivalent Kirsch-loss/
+        // eq-ring terms to weight in that case).
+        let lam_e  = LAM_E;
+        let lam_n  = LAM_N;
+        let lam_h  = if has_hole { LAM_H } else { 0.0 };
+        let lam_d  = LAM_D;
         // Equilibrium residual: enforces ∇·σ=0 at near-hole ring.
-        let lam_eq    = if has_hole { 5.0_f32 } else { 0.0 };
+        let lam_eq    = if has_hole { LAM_EQ } else { 0.0 };
         let n_eq_ring = if has_hole { 100 } else { 0 };
         // Kirsch stress loss: directly targets (σ_xx, σ_yy, σ_xy) at 4 radii × 7 angles = 28 pts.
         // SAW-BRDR 6th component in Phase 2 — replaces AdaptiveLamKirsch controller.
-        let lam_kirsch = if has_hole { 2.0_f32 } else { 0.0 };
+        let lam_kirsch = if has_hole { LAM_KIRSCH } else { 0.0 };
 
         // mDEM + Fourier Feature Embedding: enabled when a circular hole is present.
         // n_fourier=8 → 32 features covering freq [π, 128π] — corrects spectral bias near hole.
@@ -234,7 +245,7 @@ impl EngineParams {
             initial_level:      4,
             max_level:          amr_max_level,
             min_level_hole:     amr_max_level - 1,
-            hole_zone_factor:   3.0,
+            hole_zone_factor:   DEFAULT_HOLE_ZONE_FACTOR,
             refine_percentile:  0.80,
             coarsen_percentile: 0.15,
             ema_alpha:          0.30,
@@ -304,5 +315,42 @@ impl EngineParams {
     /// SAW replaced entirely at phase2 transition (not mutated in-place).
     pub fn init_weights_phase2(&self) -> Vec<f32> {
         vec![self.lam_e, self.lam_n, self.lam_h, self.lam_d, self.lam_eq, self.lam_kirsch]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pinn_core::messages::SolverConfig;
+
+    /// LAM_E/LAM_N/LAM_H/LAM_D/LAM_EQ/LAM_KIRSCH must be hand-typed in exactly one place.
+    /// `kirsch_problem.rs`'s `LAM_*` constants are that canonical source (they're also what
+    /// `KirschProblem::base_weight` returns — see `base_weights_match_engine_params_literals`
+    /// there); `analyze` reads them here rather than carrying its own independently-typed
+    /// copies that could silently drift out of sync with the values actually seeded into
+    /// live Kirsch training (`engine.init_weights()` / `init_weights_phase2()`).
+    /// `SolverConfig::default_kirsch()` always has a hole, so every term below is on its
+    /// non-zero (`has_hole`) branch.
+    #[test]
+    fn lam_weights_match_kirsch_problem_canonical_constants() {
+        let config = SolverConfig::default_kirsch();
+        let engine = EngineParams::analyze(&config);
+        assert_eq!(engine.lam_e, crate::kirsch_problem::LAM_E);
+        assert_eq!(engine.lam_n, crate::kirsch_problem::LAM_N);
+        assert_eq!(engine.lam_h, crate::kirsch_problem::LAM_H);
+        assert_eq!(engine.lam_d, crate::kirsch_problem::LAM_D);
+        assert_eq!(engine.lam_eq, crate::kirsch_problem::LAM_EQ);
+        assert_eq!(engine.lam_kirsch, crate::kirsch_problem::LAM_KIRSCH);
+    }
+
+    /// `hole_zone_factor` (3.0) must likewise be a single shared constant: this AMR config
+    /// and `KirschSamplingStrategy::amr_lock_zone`'s geometry-only mirror (see that method's
+    /// own test in `kirsch_problem.rs`) both read `pinn_core::amr::DEFAULT_HOLE_ZONE_FACTOR`
+    /// instead of each hand-typing `3.0`.
+    #[test]
+    fn hole_zone_factor_matches_shared_default_constant() {
+        let config = SolverConfig::default_kirsch();
+        let engine = EngineParams::analyze(&config);
+        assert_eq!(engine.amr.hole_zone_factor, pinn_core::amr::DEFAULT_HOLE_ZONE_FACTOR);
     }
 }

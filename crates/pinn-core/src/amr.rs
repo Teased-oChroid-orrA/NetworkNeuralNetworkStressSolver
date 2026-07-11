@@ -35,6 +35,14 @@ const REFINE_PERCENTILE_MAX: f64 = 0.92;
 /// convergence" branch can fire — avoids easing off on a single lucky low-residual read.
 const SELF_TUNE_EASE_OFF_ADAPTS: usize = 10;
 
+/// Default zone-lock radius factor: cells within `hole_zone_factor × r_hole` of the hole
+/// center are locked at `min_level_hole` (see `AdaptiveGrid::enforce_hole_zone`). `pub` so
+/// `pinn_solver::engine::EngineParams::analyze` (which builds its own `AmrtConfig` from
+/// derived, per-problem values) and `pinn_solver::kirsch_problem::KirschSamplingStrategy::
+/// amr_lock_zone` (which mirrors this zone in geometry-only terms, without an `AmrtConfig`
+/// of its own) both read this single value instead of each hand-typing `3.0` independently.
+pub const DEFAULT_HOLE_ZONE_FACTOR: f64 = 3.0;
+
 /// Configuration — derived from problem geometry in engine.rs, not hardcoded.
 #[derive(Debug, Clone)]
 pub struct AmrtConfig {
@@ -45,6 +53,7 @@ pub struct AmrtConfig {
     /// Minimum refinement level near hole (always maintained regardless of residual).
     pub min_level_hole:     usize,
     /// Cells within `hole_zone_factor × r_hole` of origin are locked at min_level_hole.
+    /// Defaults to `DEFAULT_HOLE_ZONE_FACTOR`.
     pub hole_zone_factor:   f64,
     /// Refine leaf cells above this residual percentile (self-tuning based on convergence trend).
     pub refine_percentile:  f64,
@@ -66,7 +75,7 @@ impl Default for AmrtConfig {
             initial_level:      4,
             max_level:          7,
             min_level_hole:     6,
-            hole_zone_factor:   3.0,
+            hole_zone_factor:   DEFAULT_HOLE_ZONE_FACTOR,
             refine_percentile:  0.80,
             coarsen_percentile: 0.15,
             ema_alpha:          0.30,
@@ -497,7 +506,7 @@ mod tests {
     #[test]
     fn test_hole_zone_always_refined() {
         let geom = test_geom();
-        let cfg  = AmrtConfig { min_level_hole: 6, hole_zone_factor: 3.0, ..AmrtConfig::default() };
+        let cfg  = AmrtConfig { min_level_hole: 6, hole_zone_factor: DEFAULT_HOLE_ZONE_FACTOR, ..AmrtConfig::default() };
         let mut grid = AdaptiveGrid::new(&geom, cfg);
         // Force coarsen
         for _ in 0..5 {
@@ -508,10 +517,20 @@ mod tests {
         }
         // All points near hole should still be there
         let pts = grid.sample_points();
-        let r_zone = 0.003175 * 3.0;
+        let r_zone = 0.003175 * DEFAULT_HOLE_ZONE_FACTOR;
         let near_hole: Vec<_> = pts.iter().filter(|&&[x, y]| {
             (x*x + y*y).sqrt() < r_zone
         }).collect();
         assert!(!near_hole.is_empty(), "hole zone was coarsened away — no near-hole points remain");
+    }
+
+    /// `hole_zone_factor`'s value (3.0) must live in exactly one place. `AmrtConfig::default()`
+    /// reads `DEFAULT_HOLE_ZONE_FACTOR` instead of hand-typing its own `3.0`, and
+    /// `pinn_solver::engine::EngineParams::analyze` / `KirschSamplingStrategy::amr_lock_zone`
+    /// (pinn-solver, see their own tests) read the same constant rather than each carrying an
+    /// independent copy that could silently drift from this one.
+    #[test]
+    fn default_hole_zone_factor_is_shared_constant() {
+        assert_eq!(AmrtConfig::default().hole_zone_factor, DEFAULT_HOLE_ZONE_FACTOR);
     }
 }

@@ -18,6 +18,7 @@
 use burn::tensor::Tensor;
 
 use pinn_core::{
+    amr::DEFAULT_HOLE_ZONE_FACTOR,
     geometry::{GeometryConfig, HoleType, SymmetryMode},
     loading::{BoundaryKind, BoundaryPoint, LoadConfig},
     material::MaterialProps,
@@ -214,13 +215,15 @@ impl DomainSamplingStrategy for KirschSamplingStrategy {
     }
 
     fn amr_lock_zone(&self, geom: &GeometryConfig, cell_center: [f64; 2]) -> bool {
-        // Mirrors `AdaptiveGrid::enforce_hole_zone`'s `hole_zone_factor` lock (default 3.0,
-        // set by `EngineParams::analyze`'s `amr.hole_zone_factor`). Expressed here in terms
-        // of geometry alone (no AmrtConfig dependency) since this trait is problem-facing.
-        const HOLE_ZONE_FACTOR: f64 = 3.0;
+        // Reads the same `pinn_core::amr::DEFAULT_HOLE_ZONE_FACTOR` that seeds
+        // `AdaptiveGrid::enforce_hole_zone` (via `EngineParams::analyze`'s
+        // `amr.hole_zone_factor`) — a single shared constant, not an independently
+        // hand-typed mirror, so the two can no longer drift apart. Imported directly
+        // (rather than via `AmrtConfig`) since this trait is problem-facing and has no
+        // `AmrtConfig` of its own.
         match geom.hole {
             HoleType::Circular { radius } => {
-                let zone_r = radius * HOLE_ZONE_FACTOR;
+                let zone_r = radius * DEFAULT_HOLE_ZONE_FACTOR;
                 let [cx, cy] = cell_center;
                 cx * cx + cy * cy < zone_r * zone_r
             }
@@ -264,12 +267,19 @@ impl DirichletAnsatz for QuarterSymmAnsatz {
 
 // ─── Loss terms — thin descriptive wrappers around `energy.rs`, same formulas/weights ────
 
-const LAM_E: f32 = 1.0;
-const LAM_N: f32 = 10.0;
-const LAM_H: f32 = 200.0;
-const LAM_D: f32 = 50.0;
-const LAM_EQ: f32 = 5.0;
-const LAM_KIRSCH: f32 = 2.0;
+// Canonical SAW-BRDR base weights for Kirsch's 6 loss-term components. `base_weight` below
+// returns these; `pub(crate)` so `engine::EngineParams::analyze` reads them too (wrapping
+// LAM_H/LAM_EQ/LAM_KIRSCH in its own `has_hole` conditional — see `analyze`'s doc comment)
+// instead of each carrying an independently hand-typed copy that could silently drift out
+// of sync with what `SawBrdr::with_base(engine.init_weights(), ..)` actually seeds live
+// Kirsch training with. See `lam_weights_match_kirsch_problem_canonical_constants` in
+// `engine.rs` and `base_weights_match_engine_params_literals` below.
+pub(crate) const LAM_E: f32 = 1.0;
+pub(crate) const LAM_N: f32 = 10.0;
+pub(crate) const LAM_H: f32 = 200.0;
+pub(crate) const LAM_D: f32 = 50.0;
+pub(crate) const LAM_EQ: f32 = 5.0;
+pub(crate) const LAM_KIRSCH: f32 = 2.0;
 
 pub struct InteriorEnergyTerm {
     pub domain: DomainId,
@@ -628,6 +638,26 @@ mod tests {
         assert_eq!(dx0, 0.0);
         let (_, dy0) = QuarterSymmAnsatz.eval(0.5, -1.0, k);
         assert_eq!(dy0, 0.0);
+    }
+
+    /// `KirschSamplingStrategy::amr_lock_zone`'s zone radius must move in lockstep with
+    /// `pinn_core::amr::DEFAULT_HOLE_ZONE_FACTOR` — the same constant `AmrtConfig::default()`
+    /// and `EngineParams::analyze`'s `amr.hole_zone_factor` read (see their own tests in
+    /// `pinn-core/src/amr.rs` and `pinn-solver/src/engine.rs`), not an independently
+    /// hand-typed `3.0` that could silently drift from theirs.
+    #[test]
+    fn amr_lock_zone_boundary_matches_shared_hole_zone_factor() {
+        let geom = GeometryConfig::kirsch_plate_inches();
+        let radius = match geom.hole {
+            HoleType::Circular { radius } => radius,
+            HoleType::None => panic!("kirsch_plate_inches() must have a circular hole"),
+        };
+        let zone_r = radius * pinn_core::amr::DEFAULT_HOLE_ZONE_FACTOR;
+        let strategy = KirschSamplingStrategy;
+        assert!(strategy.amr_lock_zone(&geom, [zone_r * 0.99, 0.0]),
+            "point just inside the shared-constant zone radius should be locked");
+        assert!(!strategy.amr_lock_zone(&geom, [zone_r * 1.01, 0.0]),
+            "point just outside the shared-constant zone radius should not be locked");
     }
 
     #[test]
