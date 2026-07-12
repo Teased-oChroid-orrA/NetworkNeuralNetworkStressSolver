@@ -252,6 +252,7 @@ impl EngineParams {
             trend_weight:       0.40,
             interval_steps:     1000,
             pts_per_cell:       1,
+            max_active_cells:   None,
         };
 
         // Kirsch stress loss probe points.
