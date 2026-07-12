@@ -1170,22 +1170,6 @@ pub fn compute_gradient_conflict(
     let n_int = ctx.int_norm.len();
     let n_sub = (n_int / 4).max(1);
 
-    // Deterministic index selection: LCG-based Fisher-Yates shuffle seeded by step.
-    let sub_int_norm: Vec<[f32; 2]> = {
-        let mut idx: Vec<usize> = (0..n_int).collect();
-        let mut rng = (step as u64)
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        for i in (1..n_int).rev() {
-            rng = rng
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let j = (rng >> 33) as usize % (i + 1);
-            idx.swap(i, j);
-        }
-        idx[..n_sub].iter().map(|&i| ctx.int_norm[i]).collect()
-    };
-
     let n_fourier = ctx.engine.n_fourier;
     let use_mdem  = ctx.engine.use_mdem;
     let px        = ctx.config.load.px;
@@ -1209,34 +1193,65 @@ pub fn compute_gradient_conflict(
     };
 
     // === Interior forward pass (25% subsample) — drives interior_energy + constitutive_consistency ===
-    let n_sub_int = sub_int_norm.len();
-    let pts_t = norm_pts_to_tensor::<B>(&sub_int_norm, device);
-    let stencil_coords = assemble_stencil::<B>(&pts_t, ctx.fd, device);
-    let stencil_out = scale_out(apply_dirichlet_ansatz::<B>(
-        fwd(model, stencil_coords.clone(), n_fourier, device),
-        &stencil_coords, ctx.config.geometry.symmetry, ctx.k,
-    ));
-    let int_raw_out = stencil_out.clone().slice([0..n_sub_int, 0..stencil_out.dims()[1]]);
-    let (eps_xx, eps_yy, eps_xy) = compute_strains::<B>(stencil_out, n_sub_int, ctx.fd);
-    let int_forward = DomainForwardOutputs {
-        domain: KIRSCH_DOMAIN,
-        raw_out: &int_raw_out,
-        strains: Some((eps_xx, eps_yy, eps_xy)),
-        normals: None,
-    };
-    let e_loss = {
-        let term = crate::kirsch_problem::InteriorEnergyTerm {
-            domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), ref_energy: ctx.ref_energy,
+    // Skipped entirely when `n_int==0` (degenerate geometry with zero interior collocation
+    // points — see Issue #13): running the forward pass on an empty point-set would reduce
+    // `interior_energy`'s `.mean()` to a silent 0/0 NaN reduction. `interior_energy` and (when
+    // mDEM is active) `constitutive_consistency` — which reads this same interior forward
+    // pass — are both excluded from the Physics group below (`active_terms` filter for the
+    // former, the `use_mdem && n_int > 0` gate on `const_loss`'s fold for the latter) rather
+    // than folded in as a graphless zero-tensor literal, which would panic `.backward()` with
+    // "Node should have a step registered" the moment they end up as the *only* contributor to
+    // a group (see `compute_gradient_conflict_zero_interior_and_zero_eq_ring_yields_zero_pde_
+    // norm_and_epsilon_guarded_cosine`).
+    let (e_loss, const_loss): (Tensor<B, 1>, Tensor<B, 1>) = if n_int > 0 {
+        // Deterministic index selection: LCG-based Fisher-Yates shuffle seeded by step.
+        let sub_int_norm: Vec<[f32; 2]> = {
+            let mut idx: Vec<usize> = (0..n_int).collect();
+            let mut rng = (step as u64)
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            for i in (1..n_int).rev() {
+                rng = rng
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let j = (rng >> 33) as usize % (i + 1);
+                idx.swap(i, j);
+            }
+            idx[..n_sub].iter().map(|&i| ctx.int_norm[i]).collect()
         };
-        term.compute(std::slice::from_ref(&int_forward))
-    };
-    let const_loss: Tensor<B, 1> = if use_mdem {
-        let term = crate::kirsch_problem::ConstitutiveConsistencyTerm {
-            domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), ref_stress2: ctx.ref_stress2,
+
+        let n_sub_int = sub_int_norm.len();
+        let pts_t = norm_pts_to_tensor::<B>(&sub_int_norm, device);
+        let stencil_coords = assemble_stencil::<B>(&pts_t, ctx.fd, device);
+        let stencil_out = scale_out(apply_dirichlet_ansatz::<B>(
+            fwd(model, stencil_coords.clone(), n_fourier, device),
+            &stencil_coords, ctx.config.geometry.symmetry, ctx.k,
+        ));
+        let int_raw_out = stencil_out.clone().slice([0..n_sub_int, 0..stencil_out.dims()[1]]);
+        let (eps_xx, eps_yy, eps_xy) = compute_strains::<B>(stencil_out, n_sub_int, ctx.fd);
+        let int_forward = DomainForwardOutputs {
+            domain: KIRSCH_DOMAIN,
+            raw_out: &int_raw_out,
+            strains: Some((eps_xx, eps_yy, eps_xy)),
+            normals: None,
         };
-        term.compute(std::slice::from_ref(&int_forward))
+        let e_loss = {
+            let term = crate::kirsch_problem::InteriorEnergyTerm {
+                domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), ref_energy: ctx.ref_energy,
+            };
+            term.compute(std::slice::from_ref(&int_forward))
+        };
+        let const_loss: Tensor<B, 1> = if use_mdem {
+            let term = crate::kirsch_problem::ConstitutiveConsistencyTerm {
+                domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), ref_stress2: ctx.ref_stress2,
+            };
+            term.compute(std::slice::from_ref(&int_forward))
+        } else {
+            Tensor::<B, 1>::zeros([1], device)
+        };
+        (e_loss, const_loss)
     } else {
-        Tensor::<B, 1>::zeros([1], device)
+        (Tensor::<B, 1>::zeros([1], device), Tensor::<B, 1>::zeros([1], device))
     };
 
     // === Neumann traction forward pass ===
@@ -1464,9 +1479,15 @@ pub fn compute_gradient_conflict(
         }
     };
 
+    // `interior_energy` is excluded when `n_int==0` (no interior collocation points — degenerate
+    // geometry, Issue #13) and `equilibrium_ring` is excluded whenever `ctx.eq_ring_norm` is
+    // empty (same `contains()`-gated sampling degenerates both together in practice, but the two
+    // checks are independent since a geometry could in principle degenerate only one).
     let active_terms: Vec<Box<dyn LossTerm>> = ctx.problem.loss_terms().into_iter()
         .filter(|t| t.name() != "constitutive_consistency")
         .filter(|t| ctx.phase2_active || !t.phase2_only())
+        .filter(|t| n_int > 0 || t.name() != "interior_energy")
+        .filter(|t| !ctx.eq_ring_norm.is_empty() || t.name() != "equilibrium_ring")
         .collect();
 
     type TermVec = Vec<Box<dyn LossTerm>>;
@@ -1491,8 +1512,12 @@ pub fn compute_gradient_conflict(
     // computed/mDEM-gated treatment, folded additively into the Physics group here exactly as
     // `step_physics`'s total does — dropping it would reintroduce a narrower version of this
     // exact issue's bug (gradient-conflict silently diverging from `step_physics`'s ground
-    // truth the instant mDEM is active; see `pinn-solver`'s `CLAUDE.md`).
-    if use_mdem {
+    // truth the instant mDEM is active; see `pinn-solver`'s `CLAUDE.md`). Additionally gated on
+    // `n_int > 0`: `const_loss` reads the same (skipped-when-degenerate) interior forward pass
+    // as `e_loss` (see above) — folding in its graphless `zeros([1])` placeholder unconditionally
+    // would, when it's the *only* Physics contributor this step (e.g. `eq_ring_norm` also
+    // empty), leave `physics_sum` entirely graphless and panic `.backward()`.
+    if use_mdem && n_int > 0 {
         physics_sum = Some(match physics_sum {
             Some(acc) => acc + const_loss,
             None => const_loss,
@@ -2653,6 +2678,89 @@ mod tests {
         assert_eq!(conflict.cosine_sim, 0.0, "cosine_sim must be exactly 0.0 with zero active loss terms");
         assert_eq!(conflict.g_pde_norm, 0.0, "g_pde_norm must be exactly 0.0 with zero active loss terms");
         assert_eq!(conflict.g_bc_norm, 0.0, "g_bc_norm must be exactly 0.0 with zero active loss terms");
+    }
+
+    #[test]
+    fn compute_gradient_conflict_zero_interior_points_does_not_panic() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::network::ElasticityNetConfig;
+
+        let (
+            config, engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            _int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(6.0e7);
+        assert!(!eq_ring_norm.is_empty(), "fixture sanity: eq_ring_norm must be non-empty to isolate n_int==0 alone");
+
+        let empty_int_norm: Vec<[f32; 2]> = Vec::new();
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+        let problem = kirsch_problem_from_fixture(&config, &engine);
+
+        let ctx = StepCtx {
+            config: &config, engine: &engine, problem: &problem, fd: &fd,
+            k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm: &empty_int_norm, bnd_norm: &bnd_norm,
+            bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            eq_ring_norm: &eq_ring_norm,
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            phase2_active: false, step: 0,
+        };
+
+        let conflict = compute_gradient_conflict(&model, &ctx, 0, &device);
+
+        assert!(conflict.g_pde_norm.is_finite(), "g_pde_norm must be finite with n_int==0, got {}", conflict.g_pde_norm);
+        assert!(conflict.g_pde_norm > 0.0, "equilibrium_ring is still active so g_pde_norm must be > 0, got {}", conflict.g_pde_norm);
+        assert!(conflict.g_bc_norm.is_finite() && conflict.g_bc_norm > 0.0);
+        assert!(conflict.cosine_sim.is_finite());
+    }
+
+    #[test]
+    fn compute_gradient_conflict_zero_interior_and_zero_eq_ring_yields_zero_pde_norm_and_epsilon_guarded_cosine() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::network::ElasticityNetConfig;
+
+        let (
+            config, engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            _int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, _eq_ring_norm,
+        ) = zero_px_test_fixture(6.0e7);
+
+        let empty_int_norm: Vec<[f32; 2]> = Vec::new();
+        let empty_eq_ring_norm: Vec<[f32; 2]> = Vec::new();
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+        let problem = kirsch_problem_from_fixture(&config, &engine);
+
+        let ctx = StepCtx {
+            config: &config, engine: &engine, problem: &problem, fd: &fd,
+            k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm: &empty_int_norm, bnd_norm: &bnd_norm,
+            bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            eq_ring_norm: &empty_eq_ring_norm,
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            phase2_active: false, step: 0,
+        };
+
+        let conflict = compute_gradient_conflict(&model, &ctx, 0, &device);
+
+        assert_eq!(conflict.g_pde_norm, 0.0, "Physics group entirely empty when both n_int==0 and eq_ring_norm empty, got {}", conflict.g_pde_norm);
+        assert_eq!(conflict.cosine_sim, 0.0, "cosine_sim must be exactly 0.0 when the Physics group is empty");
+        assert!(conflict.g_bc_norm.is_finite() && conflict.g_bc_norm > 0.0, "Bc-group terms are untouched by interior/eq-ring degeneracy, got g_bc_norm={}", conflict.g_bc_norm);
     }
 
     #[test]
