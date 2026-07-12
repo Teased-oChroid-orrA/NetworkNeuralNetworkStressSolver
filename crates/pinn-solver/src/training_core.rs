@@ -1194,8 +1194,9 @@ pub fn compute_gradient_conflict(
 
     // === Interior forward pass (25% subsample) — drives interior_energy + constitutive_consistency ===
     // Skipped entirely when `n_int==0` (degenerate geometry with zero interior collocation
-    // points — see Issue #13): running the forward pass on an empty point-set would reduce
-    // `interior_energy`'s `.mean()` to a silent 0/0 NaN reduction. `interior_energy` and (when
+    // points — see Issue #13): the deterministic subsample below floors `n_sub` to at least 1
+    // regardless of `n_int`, so with `n_int==0` (an empty `idx`), running it unguarded would
+    // panic on an out-of-bounds `idx[..n_sub]` slice, not produce a NaN. `interior_energy` and (when
     // mDEM is active) `constitutive_consistency` — which reads this same interior forward
     // pass — are both excluded from the Physics group below (`active_terms` filter for the
     // former, the `use_mdem && n_int > 0` gate on `const_loss`'s fold for the latter) rather
