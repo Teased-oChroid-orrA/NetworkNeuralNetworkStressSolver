@@ -170,6 +170,10 @@ impl EngineParams {
         let geom = &config.geometry;
         let load = &config.load;
 
+        if let Err(msg) = geom.validate() {
+            panic!("EngineParams::analyze: invalid geometry — {msg}");
+        }
+
         let symmetry         = detect_symmetry(geom, load);
         // Safe probe: inward FD stencil must not cross hole.
         // fd_h=1e-3 (normalised coords) → physical step ≈ 0.127mm; empirically r_factor ≥ 1.2 is safe.
@@ -353,5 +357,19 @@ mod tests {
         let config = SolverConfig::default_kirsch();
         let engine = EngineParams::analyze(&config);
         assert_eq!(engine.amr.hole_zone_factor, pinn_core::amr::DEFAULT_HOLE_ZONE_FACTOR);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid geometry")]
+    fn analyze_panics_on_degenerate_hole_radius() {
+        let mut config = SolverConfig::default_kirsch();
+        config.geometry.hole = HoleType::Circular { radius: config.geometry.half_w };
+        let _ = EngineParams::analyze(&config);
+    }
+
+    #[test]
+    fn analyze_does_not_panic_on_valid_default_kirsch_geometry() {
+        let config = SolverConfig::default_kirsch();
+        let _ = EngineParams::analyze(&config);
     }
 }
