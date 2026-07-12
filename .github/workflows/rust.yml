@@ -20,23 +20,20 @@ jobs:
     - name: Install Mesa software Vulkan driver (lavapipe)
       run: |
         sudo apt-get update
-        sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
-
-    - name: Diagnose Vulkan availability
-      run: |
-        echo "--- libvulkan present? ---"
-        ldconfig -p | grep -i vulkan || echo "NOT FOUND in ldconfig"
-        echo "--- ICD registry dir ---"
-        ls -la /usr/share/vulkan/icd.d/ || echo "DIR MISSING"
-        cat /usr/share/vulkan/icd.d/*.json 2>&1 || true
-        echo "--- vulkaninfo summary ---"
-        vulkaninfo --summary 2>&1 || echo "vulkaninfo FAILED (exit $?)"
+        sudo apt-get install -y mesa-vulkan-drivers
 
     - name: Build
       run: cargo build --features eframe/x11,eframe/wayland --verbose
 
+    # --test-threads=1: this workspace's wgpu/burn/cubecl tests each open their own GPU
+    # compute context. Against a real GPU that's cheap; against lavapipe (llvmpipe, a
+    # CPU-emulated software Vulkan renderer - confirmed the only device available on
+    # GitHub-hosted runners) dozens of tests opening concurrent contexts overwhelms it and
+    # produces spurious RecvError panics deep in cubecl's device channel. Serial execution
+    # is slower but matches the behavior already relied on locally (the same class of
+    # failure was repeatedly seen and resolved by re-running single-threaded throughout this
+    # project's history - see any PR mentioning "GPU-contention-sensitive" test flakiness).
     - name: Run tests
-      run: cargo test --features eframe/x11,eframe/wayland --verbose
+      run: cargo test --features eframe/x11,eframe/wayland --verbose -- --test-threads=1
       env:
-        VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         RUST_BACKTRACE: 1
