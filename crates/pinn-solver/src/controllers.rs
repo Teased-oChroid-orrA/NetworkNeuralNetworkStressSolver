@@ -315,6 +315,16 @@ impl ConvergenceTracker {
     pub fn note_reading_received(&mut self) {
         self.consecutive_none = 0;
     }
+
+    /// Force-consumes one crash-budget restart unconditionally (no data-driven condition to
+    /// check — the caller already has direct proof of Param-level corruption). Identical cap
+    /// cascade / budget to `check_kt_crash`, just skipping its data-threshold test.
+    pub fn force_crash_restart(&mut self) -> Option<f64> {
+        if self.crash_restarts >= MAX_CRASH_RESTARTS { return None; }
+        let new_cap = self.step_down_cap();
+        self.crash_restarts += 1;
+        Some(new_cap)
+    }
 }
 
 #[cfg(test)]
@@ -768,5 +778,41 @@ mod tests {
             "crash must win when both conditions are true, regardless of hypothetical call order, got {reason:?}");
         assert_eq!(t.crash_restarts, 1, "crash must have fired");
         assert_eq!(t.plateau_restarts, 0, "check() must not double-fire — plateau budget must stay untouched");
+    }
+
+    #[test]
+    fn force_crash_restart_fires_unconditionally_and_returns_lam_cap_initial_first_time() {
+        let mut t = ConvergenceTracker::new();
+        assert_eq!(t.force_crash_restart(), Some(LAM_CAP_INITIAL));
+        assert_eq!(t.crash_restarts, 1);
+        assert_eq!(t.plateau_restarts, 0, "must not touch the plateau budget");
+    }
+
+    #[test]
+    fn force_crash_restart_cascades_the_cap_across_repeated_calls() {
+        let mut t = ConvergenceTracker::new();
+        assert_eq!(t.force_crash_restart(), Some(50.0));
+        assert_eq!(t.force_crash_restart(), Some(30.0));
+        assert_eq!(t.force_crash_restart(), Some(18.0));
+        assert_eq!(t.force_crash_restart(), Some(LAM_CAP_FLOOR));
+        assert_eq!(t.crash_restarts, MAX_CRASH_RESTARTS);
+    }
+
+    #[test]
+    fn force_crash_restart_returns_none_once_crash_budget_exhausted() {
+        let mut t = ConvergenceTracker::new();
+        for _ in 0..MAX_CRASH_RESTARTS { assert!(t.force_crash_restart().is_some()); }
+        assert_eq!(t.force_crash_restart(), None);
+        assert_eq!(t.crash_restarts, MAX_CRASH_RESTARTS);
+    }
+
+    #[test]
+    fn force_crash_restart_shares_the_same_budget_as_check_kt_crash() {
+        let mut t = ConvergenceTracker::new();
+        assert!(t.force_crash_restart().is_some());
+        for _ in 0..5 { t.push(2.0); }
+        t.push(0.5);
+        assert!(t.check_kt_crash(0.5).is_some());
+        assert_eq!(t.crash_restarts, 2, "both call paths must increment the SAME counter");
     }
 }
