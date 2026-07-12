@@ -290,6 +290,7 @@ pub struct InteriorEnergyTerm {
 impl LossTerm for InteriorEnergyTerm {
     fn name(&self) -> &'static str { "interior_energy" }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("interior_energy: domain not present in inputs");
@@ -311,6 +312,7 @@ impl LossTerm for NeumannTractionTerm {
     fn name(&self) -> &'static str { "neumann_traction" }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["traction"] }
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("neumann_traction: domain not present in inputs");
@@ -340,6 +342,7 @@ impl LossTerm for HoleTractionTerm {
     fn name(&self) -> &'static str { "hole_traction" }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["hole"] }
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("hole_traction: domain not present in inputs");
@@ -370,6 +373,7 @@ impl LossTerm for DisplacementAnchorTerm {
     fn name(&self) -> &'static str { "displacement_anchor" }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["right_edge"] }
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("displacement_anchor: domain not present in inputs");
@@ -401,6 +405,7 @@ impl LossTerm for EquilibriumRingTerm {
     // `compute` ignores `inputs` entirely (reads pre-populated `components` instead — see
     // its doc comment), so the point-set name here is purely documentary.
     fn point_sets(&self) -> Vec<&'static str> { vec!["eq_ring"] }
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
     fn compute(&self, _inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let [sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym] =
             self.components.clone().expect(
@@ -431,6 +436,7 @@ impl LossTerm for KirschStressTerm {
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn phase2_only(&self) -> bool { true }
     fn point_sets(&self) -> Vec<&'static str> { vec!["kirsch_probes"] }
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("kirsch_stress: domain not present in inputs");
@@ -465,6 +471,11 @@ pub struct ConstitutiveConsistencyTerm {
 impl LossTerm for ConstitutiveConsistencyTerm {
     fn name(&self) -> &'static str { "constitutive_consistency" }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
+    // Never included in `loss_terms()`'s Vec (see that method's doc comment) — overridden
+    // anyway for documentation consistency (see the design note in CLAUDE.md/#12): it's an
+    // interior-energy-family term (constitutive-law residual on the SAME collocation points
+    // as `InteriorEnergyTerm`/`EquilibriumRingTerm`), not a boundary/interface condition.
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("constitutive_consistency: domain not present in inputs");
@@ -677,6 +688,42 @@ mod tests {
         let material = MaterialProps::al7075_t6();
         let problem = KirschProblem::new(material, 5, 4000, 3.0);
         crate::problem::validate_loss_terms(&problem); // must not panic
+    }
+
+    /// Mirrors `pinlug_problem.rs`'s `pinlug_loss_terms_have_expected_conflict_group_
+    /// classification` — pins each of Kirsch's 6 `loss_terms()` to its expected
+    /// `ConflictGroup` (interior-energy-family = Physics; everything boundary/interface/
+    /// probe = Bc, same convention pin-lug already established). RED before the
+    /// `conflict_group()` overrides above land (every term silently defaults to `Bc`).
+    #[test]
+    fn kirsch_loss_terms_have_expected_conflict_group_classification() {
+        use crate::problem::ConflictGroup;
+
+        let material = MaterialProps::al7075_t6();
+        let problem = KirschProblem::new(material, 5, 4000, 3.0);
+        let terms = problem.loss_terms();
+        assert_eq!(terms.len(), 6, "expected exactly 6 loss terms (2 Physics + 4 Bc)");
+
+        let expected: &[(&str, ConflictGroup)] = &[
+            ("interior_energy", ConflictGroup::Physics),
+            ("neumann_traction", ConflictGroup::Bc),
+            ("hole_traction", ConflictGroup::Bc),
+            ("displacement_anchor", ConflictGroup::Bc),
+            ("equilibrium_ring", ConflictGroup::Physics),
+            ("kirsch_stress", ConflictGroup::Bc),
+        ];
+
+        for term in &terms {
+            let (_, expected_group) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.conflict_group(), *expected_group,
+                "term '{}' has conflict_group {:?}, expected {:?}", term.name(), term.conflict_group(), expected_group);
+        }
+
+        let n_physics = terms.iter().filter(|t| t.conflict_group() == ConflictGroup::Physics).count();
+        let n_bc = terms.iter().filter(|t| t.conflict_group() == ConflictGroup::Bc).count();
+        assert_eq!(n_physics, 2, "expected exactly 2 Physics-group terms (interior_energy + equilibrium_ring)");
+        assert_eq!(n_bc, 4, "expected exactly 4 Bc-group terms");
     }
 
     /// Regression bar: run the OLD hardcoded `step_physics` path and compare its per-step
