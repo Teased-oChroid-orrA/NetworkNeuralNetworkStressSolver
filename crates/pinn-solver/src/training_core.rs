@@ -27,9 +27,16 @@ use crate::{
     bc::apply_dirichlet_ansatz,
     decision_maker::GradientConflict,
     engine::EngineParams,
-    energy::{compute_stress, constitutive_consistency_loss, dem_energy_loss,
-             equilibrium_residual_loss, hole_traction_loss, hole_traction_loss_direct,
-             neumann_loss},
+    // `compute_stress` (strain -> stress via Hooke's law) is the only raw `energy` helper
+    // still called directly in production code (the equilibrium-ring non-mDEM branch's
+    // strain->stress conversion feeding `EquilibriumRingTerm`) — every loss-term FORMULA
+    // (`dem_energy_loss`/`neumann_loss`/`hole_traction_loss[_direct]`/
+    // `constitutive_consistency_loss`/`equilibrium_residual_loss`) is now reached exclusively
+    // through `kirsch_problem`'s `LossTerm` impls (see `compute_gradient_conflict`/
+    // `compute_loss_for_lbfgs` below), not called by name here. The independent
+    // `old_hardcoded_step_physics` regression oracle (tests module) imports the raw formulas
+    // itself, separately, since it deliberately does NOT go through the trait.
+    energy::compute_stress,
     fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig},
     kirsch_problem::KIRSCH_DOMAIN,
     lr_schedule::LrSchedule,
@@ -1137,12 +1144,23 @@ pub fn flatten_grads(model: &ElasticityNet<B>, grads: &GradientsParams) -> Tenso
     Tensor::cat(vis.tensors, 0)
 }
 
-/// Compute gradient conflict between the physics group and BC group using dual backward passes.
+/// Compute gradient conflict between the Physics group and Bc group using dual backward
+/// passes, partitioned via `ctx.problem.loss_terms()`'s `LossTerm::conflict_group()` — the
+/// same trait-driven partition `compute_gradient_conflict_multi` already uses (see its doc
+/// comment), migrated onto Kirsch's single-domain path. Previously hardcoded (Physics group:
+/// e_loss + eq_loss + const_loss; Bc group: n_loss + h_loss + d_loss + w_neumann), which
+/// silently diverged from whatever `ctx.problem.loss_terms()` actually declared the moment a
+/// term's presence/`conflict_group()` classification changed — this is the bug Issue #12
+/// fixes. `w_neumann` (the DEM external-work term, not itself a named `LossTerm`) plays no
+/// role in either group here, unlike `step_physics`'s actual training total — this function
+/// is a diagnostic (gradient DIRECTION, feeding `PinnDecisionMaker`'s tier heuristics), not a
+/// second loss total, so it partitions strictly over the six real named terms.
 ///
-/// Uses a 25% random subset of interior collocation points (seeded deterministically by `step`).
-/// Physics group: e_loss + eq_loss + const_loss.
-/// BC group:      n_loss + h_loss + d_loss + w_neumann.
-/// Gradients are computed unweighted (no SAW scaling) — we care about direction, not magnitude.
+/// Uses a 25% random subset of interior collocation points (seeded deterministically by
+/// `step`) for the interior/constitutive forward pass; every other named forward pass
+/// (neumann/right/hole/eq-ring, plus the phase2-gated kirsch-probe pass — previously entirely
+/// missing from this function) uses its full point-set, exactly as `step_physics` does.
+/// Gradients are computed UNWEIGHTED (no SAW scaling) — direction, not magnitude, matters.
 pub fn compute_gradient_conflict(
     model: &ElasticityNet<B>,
     ctx: &StepCtx,
@@ -1190,188 +1208,334 @@ pub fn compute_gradient_conflict(
         }
     };
 
-    // Helper: extract σ from a scaled mDEM output for rows [rs,re).
-    let mdem_stress = |out: &Tensor<B, 2>, rs: usize, re: usize| -> (Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) {
-        let n = re - rs;
-        let sxx = out.clone().slice([rs..re, 2..3]).reshape([n]);
-        let syy = out.clone().slice([rs..re, 3..4]).reshape([n]);
-        let sxy = out.clone().slice([rs..re, 4..5]).reshape([n]);
-        (sxx, syy, sxy)
+    // === Interior forward pass (25% subsample) — drives interior_energy + constitutive_consistency ===
+    let n_sub_int = sub_int_norm.len();
+    let pts_t = norm_pts_to_tensor::<B>(&sub_int_norm, device);
+    let stencil_coords = assemble_stencil::<B>(&pts_t, ctx.fd, device);
+    let stencil_out = scale_out(apply_dirichlet_ansatz::<B>(
+        fwd(model, stencil_coords.clone(), n_fourier, device),
+        &stencil_coords, ctx.config.geometry.symmetry, ctx.k,
+    ));
+    let int_raw_out = stencil_out.clone().slice([0..n_sub_int, 0..stencil_out.dims()[1]]);
+    let (eps_xx, eps_yy, eps_xy) = compute_strains::<B>(stencil_out, n_sub_int, ctx.fd);
+    let int_forward = DomainForwardOutputs {
+        domain: KIRSCH_DOMAIN,
+        raw_out: &int_raw_out,
+        strains: Some((eps_xx, eps_yy, eps_xy)),
+        normals: None,
+    };
+    let e_loss = {
+        let term = crate::kirsch_problem::InteriorEnergyTerm {
+            domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), ref_energy: ctx.ref_energy,
+        };
+        term.compute(std::slice::from_ref(&int_forward))
+    };
+    let const_loss: Tensor<B, 1> = if use_mdem {
+        let term = crate::kirsch_problem::ConstitutiveConsistencyTerm {
+            domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), ref_stress2: ctx.ref_stress2,
+        };
+        term.compute(std::slice::from_ref(&int_forward))
+    } else {
+        Tensor::<B, 1>::zeros([1], device)
     };
 
-    // ── Pass 1: physics group ────────────────────────────────────────────────
-    let g_pde_flat: Tensor<BInner, 1> = {
-        let pts_t = norm_pts_to_tensor::<B>(&sub_int_norm, device);
-        let stencil = assemble_stencil::<B>(&pts_t, ctx.fd, device);
-        let out = scale_out(apply_dirichlet_ansatz::<B>(
-            fwd(model, stencil.clone(), n_fourier, device),
-            &stencil, ctx.config.geometry.symmetry, ctx.k,
+    // === Neumann traction forward pass ===
+    let n_loss = if !ctx.trac_idx.is_empty() {
+        let trac_norm: Vec<[f32; 2]> = ctx.trac_idx.iter().map(|&i| ctx.bnd_norm[i]).collect();
+        let nt = trac_norm.len();
+        let bnd_t = norm_pts_to_tensor::<B>(&trac_norm, device);
+        let stencil_bnd = assemble_stencil::<B>(&bnd_t, ctx.fd, device);
+        let out_bnd = scale_out(apply_dirichlet_ansatz::<B>(
+            fwd(model, stencil_bnd.clone(), n_fourier, device),
+            &stencil_bnd, ctx.config.geometry.symmetry, ctx.k,
         ));
-        let n_sub_int = sub_int_norm.len();
-        let (sxx_n, syy_n, sxy_n) = if use_mdem { mdem_stress(&out, 0, n_sub_int) } else { (
-            Tensor::<B, 1>::zeros([1], device),
-            Tensor::<B, 1>::zeros([1], device),
-            Tensor::<B, 1>::zeros([1], device),
-        )};
-        let (exx, eyy, exy) = compute_strains::<B>(out, n_sub_int, ctx.fd);
-        let e_loss = dem_energy_loss(exx.clone(), eyy.clone(), exy.clone(), &ctx.config.material)
-            .mul_scalar(1.0 / ctx.ref_energy as f64);
-        let const_loss: Tensor<B, 1> = if use_mdem {
-            constitutive_consistency_loss(
-                sxx_n, syy_n, sxy_n, exx, eyy, exy, &ctx.config.material,
-            ).mul_scalar(1.0 / ctx.ref_stress2 as f64)
-        } else {
-            Tensor::<B, 1>::zeros([1], device)
+        let (ex, ey, exy) = compute_strains::<B>(out_bnd.clone(), nt, ctx.fd);
+        let neumann_forward = DomainForwardOutputs {
+            domain: KIRSCH_DOMAIN,
+            raw_out: &out_bnd,
+            strains: Some((ex, ey, exy)),
+            normals: Some((v_to_t(ctx.trac_idx, ctx.bnd_nx), v_to_t(ctx.trac_idx, ctx.bnd_ny))),
         };
+        let term = crate::kirsch_problem::NeumannTractionTerm {
+            domain: KIRSCH_DOMAIN,
+            material: ctx.config.material.clone(),
+            ref_stress2: ctx.ref_stress2,
+            tx_target: v_to_t(ctx.trac_idx, ctx.bnd_tx),
+            ty_target: v_to_t(ctx.trac_idx, ctx.bnd_ty),
+        };
+        term.compute(std::slice::from_ref(&neumann_forward))
+    } else {
+        Tensor::<B, 1>::zeros([1], device)
+    };
 
-        // Equilibrium ring: use full set (fixed, cheap, always included in physics group).
-        let n_eq = ctx.eq_ring_norm.len();
-        let eq_loss: Tensor<B, 1> = if n_eq > 0 {
-            if use_mdem {
-                let shifts: [(f32, f32); 4] = [
-                    ( ctx.fd.hx, 0.0), (-ctx.fd.hx, 0.0),
-                    (0.0,  ctx.fd.hy), (0.0, -ctx.fd.hy),
-                ];
-                let all_shifted: Vec<[f32; 2]> = shifts.iter().flat_map(|&(dx, dy)| {
-                    ctx.eq_ring_norm.iter().map(move |&[x, y]| [x + dx, y + dy])
-                }).collect();
-                let pts_all = norm_pts_to_tensor::<B>(&all_shifted, device);
-                let out_all = scale_out(apply_dirichlet_ansatz::<B>(
-                    fwd(model, pts_all.clone(), n_fourier, device),
-                    &pts_all, ctx.config.geometry.symmetry, ctx.k,
+    // === Right-edge forward pass — drives displacement_anchor. `w_neumann` is deliberately
+    // NOT computed here (see this function's doc comment: it isn't one of
+    // `ctx.problem.loss_terms()`'s named terms, so it has no group to join). ===
+    let u_target_val = ((ctx.config.load.px
+        - ctx.config.material.nu * ctx.config.load.py)
+        / ctx.config.material.e * ctx.config.geometry.half_w) as f32;
+    let d_loss = if !ctx.right_idx.is_empty() {
+        let right_norm: Vec<[f32; 2]> = ctx.right_idx.iter().map(|&i| ctx.bnd_norm[i]).collect();
+        let right_t = norm_pts_to_tensor::<B>(&right_norm, device);
+        let out_r = scale_out(apply_dirichlet_ansatz::<B>(
+            fwd(model, right_t.clone(), n_fourier, device),
+            &right_t, ctx.config.geometry.symmetry, ctx.k,
+        ));
+        let right_forward = DomainForwardOutputs {
+            domain: KIRSCH_DOMAIN,
+            raw_out: &out_r,
+            strains: None,
+            normals: None,
+        };
+        let term = crate::kirsch_problem::DisplacementAnchorTerm {
+            domain: KIRSCH_DOMAIN,
+            u_target: u_target_val,
+        };
+        term.compute(std::slice::from_ref(&right_forward))
+    } else {
+        Tensor::<B, 1>::zeros([1], device)
+    };
+
+    // === Hole traction-free forward pass ===
+    let h_loss = if !ctx.hole_idx.is_empty() {
+        let hole_norm: Vec<[f32; 2]> = ctx.hole_idx.iter().map(|&i| ctx.bnd_norm[i]).collect();
+        let nh = hole_norm.len();
+        let bnd_h = norm_pts_to_tensor::<B>(&hole_norm, device);
+        if use_mdem {
+            let out_h = scale_out(apply_dirichlet_ansatz::<B>(
+                fwd(model, bnd_h.clone(), n_fourier, device),
+                &bnd_h, ctx.config.geometry.symmetry, ctx.k,
+            ));
+            let hole_forward = DomainForwardOutputs {
+                domain: KIRSCH_DOMAIN,
+                raw_out: &out_h,
+                strains: None,
+                normals: Some((v_to_t(ctx.hole_idx, ctx.bnd_nx), v_to_t(ctx.hole_idx, ctx.bnd_ny))),
+            };
+            let term = crate::kirsch_problem::HoleTractionTerm {
+                domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
+                ref_stress2: ctx.ref_stress2, direct: true,
+            };
+            term.compute(std::slice::from_ref(&hole_forward))
+        } else {
+            let stencil_h = assemble_stencil::<B>(&bnd_h, ctx.fd, device);
+            let out_h = scale_out(apply_dirichlet_ansatz::<B>(
+                fwd(model, stencil_h.clone(), n_fourier, device),
+                &stencil_h, ctx.config.geometry.symmetry, ctx.k,
+            ));
+            let (ex, ey, exy) = compute_strains::<B>(out_h.clone(), nh, ctx.fd);
+            let hole_forward = DomainForwardOutputs {
+                domain: KIRSCH_DOMAIN,
+                raw_out: &out_h,
+                strains: Some((ex, ey, exy)),
+                normals: Some((v_to_t(ctx.hole_idx, ctx.bnd_nx), v_to_t(ctx.hole_idx, ctx.bnd_ny))),
+            };
+            let term = crate::kirsch_problem::HoleTractionTerm {
+                domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
+                ref_stress2: ctx.ref_stress2, direct: false,
+            };
+            term.compute(std::slice::from_ref(&hole_forward))
+        }
+    } else {
+        Tensor::<B, 1>::zeros([1], device)
+    };
+
+    // === Equilibrium residual — full set (fixed, cheap, always included in Physics group) ===
+    let n_eq = ctx.eq_ring_norm.len();
+    let eq_loss: Tensor<B, 1> = if n_eq > 0 {
+        let components: [Tensor<B, 1>; 8] = if use_mdem {
+            let shifts: [(f32, f32); 4] = [
+                ( ctx.fd.hx, 0.0), (-ctx.fd.hx, 0.0),
+                (0.0,  ctx.fd.hy), (0.0, -ctx.fd.hy),
+            ];
+            let all_shifted: Vec<[f32; 2]> = shifts.iter().flat_map(|&(dx, dy)| {
+                ctx.eq_ring_norm.iter().map(move |&[x, y]| [x + dx, y + dy])
+            }).collect();
+            let pts_all = norm_pts_to_tensor::<B>(&all_shifted, device);
+            let out_all = scale_out(apply_dirichlet_ansatz::<B>(
+                fwd(model, pts_all.clone(), n_fourier, device),
+                &pts_all, ctx.config.geometry.symmetry, ctx.k,
+            ));
+            let seg = |i: usize| -> (Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) {
+                extract_mdem_stress(&out_all, i * n_eq, (i + 1) * n_eq)
+            };
+            let (sxx_xp, _, sxy_xp) = seg(0);
+            let (sxx_xm, _, sxy_xm) = seg(1);
+            let (_, syy_yp, sxy_yp) = seg(2);
+            let (_, syy_ym, sxy_ym) = seg(3);
+            [sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym]
+        } else {
+            let fwd_shift = |dx: f32, dy: f32| {
+                let shifted: Vec<[f32; 2]> = ctx.eq_ring_norm.iter()
+                    .map(|&[xn, yn]| [xn + dx, yn + dy]).collect();
+                let pts = norm_pts_to_tensor::<B>(&shifted, device);
+                let stencil = assemble_stencil::<B>(&pts, ctx.fd, device);
+                let out = scale_out(apply_dirichlet_ansatz::<B>(
+                    fwd(model, stencil.clone(), n_fourier, device),
+                    &stencil, ctx.config.geometry.symmetry, ctx.k,
                 ));
-                let seg = |i: usize| mdem_stress(&out_all, i * n_eq, (i + 1) * n_eq);
-                let (sxx_xp, _, sxy_xp) = seg(0);
-                let (sxx_xm, _, sxy_xm) = seg(1);
-                let (_, syy_yp, sxy_yp) = seg(2);
-                let (_, syy_ym, sxy_ym) = seg(3);
-                equilibrium_residual_loss(
-                    sxx_xp, sxy_xp, sxx_xm, sxy_xm,
-                    sxy_yp, syy_yp, sxy_ym, syy_ym,
-                    ctx.cx, ctx.cy, ctx.ref_div2,
-                )
-            } else {
-                let fwd_shift = |dx: f32, dy: f32| {
-                    let shifted: Vec<[f32; 2]> = ctx.eq_ring_norm.iter()
-                        .map(|&[xn, yn]| [xn + dx, yn + dy]).collect();
-                    let pts = norm_pts_to_tensor::<B>(&shifted, device);
-                    let stencil = assemble_stencil::<B>(&pts, ctx.fd, device);
-                    let out = scale_out(apply_dirichlet_ansatz::<B>(
-                        fwd(model, stencil.clone(), n_fourier, device),
-                        &stencil, ctx.config.geometry.symmetry, ctx.k,
-                    ));
-                    let (exx_, eyy_, exy_) = compute_strains::<B>(out, n_eq, ctx.fd);
-                    compute_stress(exx_, eyy_, exy_, &ctx.config.material)
+                let (exx, eyy, exy) = compute_strains::<B>(out, n_eq, ctx.fd);
+                compute_stress(exx, eyy, exy, &ctx.config.material)
+            };
+            let (sxx_xp, _, sxy_xp) = fwd_shift( ctx.fd.hx,  0.0);
+            let (sxx_xm, _, sxy_xm) = fwd_shift(-ctx.fd.hx,  0.0);
+            let (_, syy_yp, sxy_yp) = fwd_shift( 0.0,  ctx.fd.hy);
+            let (_, syy_ym, sxy_ym) = fwd_shift( 0.0, -ctx.fd.hy);
+            [sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym]
+        };
+        let term = crate::kirsch_problem::EquilibriumRingTerm {
+            domain: KIRSCH_DOMAIN, cx: ctx.cx, cy: ctx.cy, ref_div2: ctx.ref_div2,
+            components: Some(components),
+        };
+        term.compute(&[])
+    } else {
+        Tensor::<B, 1>::zeros([1], device)
+    };
+
+    // === Kirsch stress probe forward pass — Phase 2 only. Previously entirely missing from
+    // this function (a Phase-2 gradient-conflict check never accounted for kirsch_stress's
+    // contribution to the Bc group at all); added here to mirror step_physics. ===
+    let kirsch_loss: Tensor<B, 1> = if ctx.phase2_active {
+        if let HoleType::Circular { radius } = ctx.config.geometry.hole {
+            let probes = compute_kirsch_probes(ctx, radius);
+            let n_pr = probes.points.len();
+            let pts_pr = norm_pts_to_tensor::<B>(&probes.points, device);
+            // `px` is already `f64` (ctx.config.load.px) — no cast needed here, unlike the
+            // `f32` probe coordinate arithmetic elsewhere in this function.
+            let px2 = px * px;
+            let to_t1 = |v: &[f32]| -> Tensor<B, 1> {
+                Tensor::from_data(TensorData::new(v.to_vec(), vec![v.len()]), device)
+            };
+            if use_mdem {
+                let out_pr = scale_out(apply_dirichlet_ansatz::<B>(
+                    fwd(model, pts_pr.clone(), n_fourier, device),
+                    &pts_pr, ctx.config.geometry.symmetry, ctx.k,
+                ));
+                let kirsch_forward = DomainForwardOutputs {
+                    domain: KIRSCH_DOMAIN, raw_out: &out_pr, strains: None, normals: None,
                 };
-                let (sxx_xp, _, sxy_xp) = fwd_shift( ctx.fd.hx,  0.0);
-                let (sxx_xm, _, sxy_xm) = fwd_shift(-ctx.fd.hx,  0.0);
-                let (_, syy_yp, sxy_yp) = fwd_shift( 0.0,  ctx.fd.hy);
-                let (_, syy_ym, sxy_ym) = fwd_shift( 0.0, -ctx.fd.hy);
-                equilibrium_residual_loss(
-                    sxx_xp, sxy_xp, sxx_xm, sxy_xm,
-                    sxy_yp, syy_yp, sxy_ym, syy_ym,
-                    ctx.cx, ctx.cy, ctx.ref_div2,
-                )
-            }
-        } else {
-            Tensor::<B, 1>::zeros([1], device)
-        };
-
-        let physics_loss = e_loss + eq_loss + const_loss;
-        let grads_raw = physics_loss.backward();
-        let grads_p = GradientsParams::from_grads(grads_raw, model);
-        flatten_grads(model, &grads_p)
-    };
-
-    // ── Pass 2: BC group ─────────────────────────────────────────────────────
-    let g_bc_flat: Tensor<BInner, 1> = {
-        let n_loss = if !ctx.trac_idx.is_empty() {
-            let trac_norm: Vec<[f32; 2]> = ctx.trac_idx.iter().map(|&i| ctx.bnd_norm[i]).collect();
-            let nt = trac_norm.len();
-            let bnd_t = norm_pts_to_tensor::<B>(&trac_norm, device);
-            let stencil_bnd = assemble_stencil::<B>(&bnd_t, ctx.fd, device);
-            let out_bnd = scale_out(apply_dirichlet_ansatz::<B>(
-                fwd(model, stencil_bnd.clone(), n_fourier, device),
-                &stencil_bnd, ctx.config.geometry.symmetry, ctx.k,
-            ));
-            let (ex, ey, exy) = compute_strains::<B>(out_bnd, nt, ctx.fd);
-            neumann_loss(
-                ex, ey, exy,
-                v_to_t(ctx.trac_idx, ctx.bnd_nx), v_to_t(ctx.trac_idx, ctx.bnd_ny),
-                v_to_t(ctx.trac_idx, ctx.bnd_tx), v_to_t(ctx.trac_idx, ctx.bnd_ty),
-                &ctx.config.material,
-            ).mul_scalar(1.0 / ctx.ref_stress2 as f64)
-        } else {
-            Tensor::<B, 1>::zeros([1], device)
-        };
-
-        let u_target_val = ((ctx.config.load.px
-            - ctx.config.material.nu * ctx.config.load.py)
-            / ctx.config.material.e * ctx.config.geometry.half_w) as f32;
-        let (d_loss, w_neumann) = if !ctx.right_idx.is_empty() {
-            let right_norm: Vec<[f32; 2]> = ctx.right_idx.iter().map(|&i| ctx.bnd_norm[i]).collect();
-            let nr = right_norm.len();
-            let right_t = norm_pts_to_tensor::<B>(&right_norm, device);
-            let out_r = scale_out(apply_dirichlet_ansatz::<B>(
-                fwd(model, right_t.clone(), n_fourier, device),
-                &right_t, ctx.config.geometry.symmetry, ctx.k,
-            ));
-            let u_vals = out_r.slice([0..nr, 0..1]).reshape([nr]);
-            let u_tgt: Tensor<B, 1> = Tensor::full([nr], u_target_val as f64, device);
-            let denom = ((u_target_val * u_target_val) as f64).max(1e-20);
-            let d_val = (u_vals.clone() - u_tgt).powf_scalar(2.0_f64).mean()
-                .mul_scalar(1.0 / denom);
-            let w_val = u_vals.mean()
-                .mul_scalar(2.0 * ctx.config.material.e
-                    / floor_signed_divisor(ctx.config.load.px * ctx.config.geometry.half_w));
-            (d_val, w_val)
-        } else {
-            (Tensor::<B, 1>::zeros([1], device), Tensor::<B, 1>::zeros([1], device))
-        };
-
-        let h_loss = if !ctx.hole_idx.is_empty() {
-            let hole_norm: Vec<[f32; 2]> = ctx.hole_idx.iter().map(|&i| ctx.bnd_norm[i]).collect();
-            let nh = hole_norm.len();
-            let bnd_h = norm_pts_to_tensor::<B>(&hole_norm, device);
-            if use_mdem {
-                let out_h = scale_out(apply_dirichlet_ansatz::<B>(
-                    fwd(model, bnd_h.clone(), n_fourier, device),
-                    &bnd_h, ctx.config.geometry.symmetry, ctx.k,
-                ));
-                let (sxx_h, syy_h, sxy_h) = mdem_stress(&out_h, 0, nh);
-                hole_traction_loss_direct(
-                    sxx_h, syy_h, sxy_h,
-                    v_to_t(ctx.hole_idx, ctx.bnd_nx),
-                    v_to_t(ctx.hole_idx, ctx.bnd_ny),
-                ).mul_scalar(1.0 / ctx.ref_stress2 as f64)
+                let term = crate::kirsch_problem::KirschStressTerm {
+                    domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: true,
+                    px2,
+                    sxx_targets: to_t1(&probes.sxx_targets),
+                    syy_targets: to_t1(&probes.syy_targets),
+                    sxy_targets: to_t1(&probes.sxy_targets),
+                    weights: to_t1(&probes.weights),
+                };
+                term.compute(std::slice::from_ref(&kirsch_forward))
             } else {
-                let stencil_h = assemble_stencil::<B>(&bnd_h, ctx.fd, device);
-                let out_h = scale_out(apply_dirichlet_ansatz::<B>(
-                    fwd(model, stencil_h.clone(), n_fourier, device),
-                    &stencil_h, ctx.config.geometry.symmetry, ctx.k,
+                let stencil_pr = assemble_stencil::<B>(&pts_pr, ctx.fd, device);
+                let out_pr = scale_out(apply_dirichlet_ansatz::<B>(
+                    fwd(model, stencil_pr.clone(), n_fourier, device),
+                    &stencil_pr, ctx.config.geometry.symmetry, ctx.k,
                 ));
-                let (ex, ey, exy) = compute_strains::<B>(out_h, nh, ctx.fd);
-                hole_traction_loss(
-                    ex, ey, exy,
-                    v_to_t(ctx.hole_idx, ctx.bnd_nx),
-                    v_to_t(ctx.hole_idx, ctx.bnd_ny),
-                    &ctx.config.material,
-                ).mul_scalar(1.0 / ctx.ref_stress2 as f64)
+                let (exx_pr, eyy_pr, exy_pr) = compute_strains::<B>(out_pr.clone(), n_pr, ctx.fd);
+                let kirsch_forward = DomainForwardOutputs {
+                    domain: KIRSCH_DOMAIN, raw_out: &out_pr,
+                    strains: Some((exx_pr, eyy_pr, exy_pr)), normals: None,
+                };
+                let term = crate::kirsch_problem::KirschStressTerm {
+                    domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: false,
+                    px2,
+                    sxx_targets: to_t1(&probes.sxx_targets),
+                    syy_targets: to_t1(&probes.syy_targets),
+                    sxy_targets: to_t1(&probes.sxy_targets),
+                    weights: to_t1(&probes.weights),
+                };
+                term.compute(std::slice::from_ref(&kirsch_forward))
             }
         } else {
             Tensor::<B, 1>::zeros([1], device)
-        };
-
-        let bc_loss = n_loss + h_loss + d_loss + w_neumann;
-        let grads_raw = bc_loss.backward();
-        let grads_p = GradientsParams::from_grads(grads_raw, model);
-        flatten_grads(model, &grads_p)
+        }
+    } else {
+        Tensor::<B, 1>::zeros([1], device)
     };
+
+    // === Trait-driven partition into Physics / Bc groups ===
+    let term_tensor = |name: &str| -> &Tensor<B, 1> {
+        match name {
+            "interior_energy" => &e_loss,
+            "neumann_traction" => &n_loss,
+            "hole_traction" => &h_loss,
+            "displacement_anchor" => &d_loss,
+            "equilibrium_ring" => &eq_loss,
+            "kirsch_stress" => &kirsch_loss,
+            other => panic!("compute_gradient_conflict: unhandled loss term '{other}'"),
+        }
+    };
+
+    let active_terms: Vec<Box<dyn LossTerm>> = ctx.problem.loss_terms().into_iter()
+        .filter(|t| t.name() != "constitutive_consistency")
+        .filter(|t| ctx.phase2_active || !t.phase2_only())
+        .collect();
+
+    type TermVec = Vec<Box<dyn LossTerm>>;
+    let (physics_terms, bc_terms): (TermVec, TermVec) = active_terms
+        .into_iter()
+        .partition(|t| t.conflict_group() == crate::problem::ConflictGroup::Physics);
+
+    // `None` iff `terms` is empty — a group with zero active loss terms has no autodiff graph
+    // to call `.backward()` on (see `to_flat` below).
+    let sum_group = |terms: &[Box<dyn LossTerm>]| -> Option<Tensor<B, 1>> {
+        terms.iter().fold(None, |acc, t| {
+            let tt = term_tensor(t.name()).clone();
+            Some(match acc { Some(a) => a + tt, None => tt })
+        })
+    };
+
+    let mut physics_sum = sum_group(&physics_terms);
+    let bc_sum = sum_group(&bc_terms);
+
+    // `constitutive_consistency` is deliberately excluded from `active_terms` above (same
+    // filter `step_physics`/`step_physics_multi` use) but keeps its pre-existing always-
+    // computed/mDEM-gated treatment, folded additively into the Physics group here exactly as
+    // `step_physics`'s total does — dropping it would reintroduce a narrower version of this
+    // exact issue's bug (gradient-conflict silently diverging from `step_physics`'s ground
+    // truth the instant mDEM is active; see `pinn-solver`'s `CLAUDE.md`).
+    if use_mdem {
+        physics_sum = Some(match physics_sum {
+            Some(acc) => acc + const_loss,
+            None => const_loss,
+        });
+    }
+
+    // Convert each group's Option<Tensor> to a flattened gradient. `None` means no active
+    // loss term contributed to that group this step — there is no autodiff graph to call
+    // `.backward()` on (a bare `zeros()` literal has no recorded op and panics with "Node
+    // should have a step registered"), so fall back directly to an empty `GradientsParams`
+    // instead (yields a genuine length-0 tensor, not a same-length zero vector).
+    let empty_grads = GradientsParams::new();
+    let to_flat = |loss: Option<Tensor<B, 1>>| -> Tensor<BInner, 1> {
+        match loss {
+            Some(l) => {
+                let grads_raw = l.backward();
+                let grads_p = GradientsParams::from_grads(grads_raw, model);
+                flatten_grads(model, &grads_p)
+            }
+            None => flatten_grads(model, &empty_grads),
+        }
+    };
+
+    let g_pde_flat = to_flat(physics_sum);
+    let g_bc_flat = to_flat(bc_sum);
 
     // ── Cosine similarity ────────────────────────────────────────────────────
+    // A group with no active loss term (see above) yields a genuinely zero-LENGTH flattened
+    // gradient, not a same-length zero vector — burn's elementwise `mul` requires equal (or
+    // broadcastable, i.e. size-1) shapes, so a length-0 vs length-N multiply panics
+    // (`TensorCheck::binary_ops_ew`). The two flattened vectors' lengths are only ever
+    // equal-and-nonzero (both groups' `.backward()` touch the same single model) or 0-vs-0
+    // (both groups empty) — never mismatched-and-nonzero — so the cross term is well-defined
+    // as exactly 0.0 whenever the lengths differ (an empty gradient trivially contributes
+    // nothing to the dot product), without masking any genuine same-length comparison.
+    let same_len = g_pde_flat.dims()[0] == g_bc_flat.dims()[0];
     let pde_norm_sq = g_pde_flat.clone().powf_scalar(2.0_f64).sum();
     let bc_norm_sq  = g_bc_flat.clone().powf_scalar(2.0_f64).sum();
-    let dot         = g_pde_flat.mul(g_bc_flat).sum();
+    let dot = if same_len {
+        g_pde_flat.mul(g_bc_flat).sum()
+    } else {
+        Tensor::<BInner, 1>::zeros([1], device)
+    };
 
     let g_pde_norm_v = pde_norm_sq.clone().sqrt().into_scalar() as f32;
     let g_bc_norm_v  = bc_norm_sq.clone().sqrt().into_scalar() as f32;
@@ -1386,19 +1550,6 @@ pub fn compute_gradient_conflict(
 }
 
 // ─── L-BFGS support ──────────────────────────────────────────────────────────
-
-/// Snapshot of SAW-BRDR lambda values captured at the moment of Converge tier entry.
-/// Used as fixed loss weights inside the L-BFGS closure to avoid GPU syncs per inner iteration.
-#[derive(Clone)]
-pub struct LbfgsLams {
-    pub lam_e:      f64,
-    pub lam_n:      f64,
-    pub lam_h:      f64,
-    pub lam_d:      f64,
-    pub lam_eq:     f64,
-    pub lam_kirsch: f64,
-    pub lam_const:  f64,
-}
 
 /// Owned copy of the training-step context needed by the L-BFGS closure.
 /// Replaces borrowed references from `StepCtx` so the closure can outlive the loop body.
@@ -1459,14 +1610,22 @@ impl LbfgsCtxScalars {
     }
 }
 
-/// Compute total loss on the frozen collocation points using fixed lambda values.
+/// Compute total loss on the frozen collocation points using fixed lambda values, weighted
+/// and summed via `problem.loss_terms()` — the same trait-driven approach `compute_loss_for_
+/// lbfgs_multi` already uses (see its doc comment), migrated onto Kirsch's single-domain
+/// path. Previously hardcoded (all six named terms always included, weighted by a fixed
+/// `LbfgsLams` struct's dedicated fields), which silently diverged from whatever
+/// `ctx.problem.loss_terms()` actually declared the moment a term was added/removed — this is
+/// the bug Issue #12 fixes.
 ///
 /// Called by the L-BFGS closure at each inner line-search iteration.
-/// SAW is NOT updated here — `lams` is the snapshot from Converge tier entry.
+/// SAW is NOT updated here — `lams` is the snapshot from Converge tier entry, keyed by each
+/// term's own `LossTerm::name()`.
 fn compute_loss_for_lbfgs(
     model: &ElasticityNet<B>,
     ctx: &LbfgsCtxScalars,
-    lams: &LbfgsLams,
+    problem: &dyn BoundaryValueProblem,
+    lams: &HashMap<&'static str, f64>,
     device: &WgpuDevice,
 ) -> (Tensor<B, 1>, f32) {
     let n_int     = ctx.int_norm.len();
@@ -1492,47 +1651,41 @@ fn compute_loss_for_lbfgs(
         }
     };
 
-    let mdem_stress_lbfgs = |out: &Tensor<B, 2>, rs: usize, re: usize| -> (Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) {
-        let n = re - rs;
-        (
-            out.clone().slice([rs..re, 2..3]).reshape([n]),
-            out.clone().slice([rs..re, 3..4]).reshape([n]),
-            out.clone().slice([rs..re, 4..5]).reshape([n]),
-        )
-    };
-
-    // Interior energy loss.
+    // === Interior forward pass (full, non-subsampled set) — drives interior_energy + constitutive_consistency ===
     let pts_t = norm_pts_to_tensor::<B>(&ctx.int_norm, device);
     let stencil_coords = assemble_stencil::<B>(&pts_t, &ctx.fd, device);
     let stencil_out = scale_out(apply_dirichlet_ansatz::<B>(
         fwd(model, stencil_coords.clone(), n_fourier, device),
         &stencil_coords, ctx.config.geometry.symmetry, ctx.k,
     ));
-    let (sxx_n_int, syy_n_int, sxy_n_int) = if use_mdem {
-        let s = mdem_stress_lbfgs(&stencil_out, 0, n_int);
-        (Some(s.0), Some(s.1), Some(s.2))
-    } else { (None, None, None) };
+    let int_raw_out = stencil_out.clone().slice([0..n_int, 0..stencil_out.dims()[1]]);
     let (exx, eyy, exy) = compute_strains::<B>(stencil_out, n_int, &ctx.fd);
-    // Threaded from `StepCtx::ref_energy` (via `LbfgsCtxScalars::from_ctx`), NOT recomputed
-    // here — `compute_reference_scales` (the single source of truth) is the only place that
-    // knows to branch on `config.use_ultimate_strength_scaling`; a local recompute from raw
-    // `config.load.px` would silently ignore that flag (issue #23). Already floored
-    // (`.max(1.0)`) upstream by `compute_reference_scales` against the px=0 divide-by-zero
-    // case, so no separate guard is needed here.
-    let ref_energy = ctx.ref_energy;
-    let e_loss = dem_energy_loss(exx.clone(), eyy.clone(), exy.clone(), &ctx.config.material)
-        .mul_scalar(1.0 / ref_energy as f64);
-    let const_loss: Tensor<B, 1> = if let (Some(sxx_n), Some(syy_n), Some(sxy_n)) =
-        (sxx_n_int, syy_n_int, sxy_n_int)
-    {
-        constitutive_consistency_loss(
-            sxx_n, syy_n, sxy_n, exx, eyy, exy, &ctx.config.material,
-        ).mul_scalar(1.0 / ctx.ref_stress2 as f64)
+    let int_forward = DomainForwardOutputs {
+        domain: KIRSCH_DOMAIN,
+        raw_out: &int_raw_out,
+        strains: Some((exx, eyy, exy)),
+        normals: None,
+    };
+    // `ctx.ref_energy` is threaded from `StepCtx::ref_energy` (via `LbfgsCtxScalars::from_ctx`),
+    // NOT recomputed here — `compute_reference_scales` (the single source of truth) is the
+    // only place that knows to branch on `config.use_ultimate_strength_scaling`; a local
+    // recompute from raw `config.load.px` would silently ignore that flag (issue #23).
+    let e_loss = {
+        let term = crate::kirsch_problem::InteriorEnergyTerm {
+            domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), ref_energy: ctx.ref_energy,
+        };
+        term.compute(std::slice::from_ref(&int_forward))
+    };
+    let const_loss: Tensor<B, 1> = if use_mdem {
+        let term = crate::kirsch_problem::ConstitutiveConsistencyTerm {
+            domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), ref_stress2: ctx.ref_stress2,
+        };
+        term.compute(std::slice::from_ref(&int_forward))
     } else {
         Tensor::<B, 1>::zeros([1], device)
     };
 
-    // Neumann traction loss.
+    // === Neumann traction forward pass ===
     let n_loss = if !ctx.trac_idx.is_empty() {
         let trac_norm: Vec<[f32; 2]> = ctx.trac_idx.iter().map(|&i| ctx.bnd_norm[i]).collect();
         let nt = trac_norm.len();
@@ -1542,18 +1695,30 @@ fn compute_loss_for_lbfgs(
             fwd(model, stencil_bnd.clone(), n_fourier, device),
             &stencil_bnd, ctx.config.geometry.symmetry, ctx.k,
         ));
-        let (ex, ey, exy_b) = compute_strains::<B>(out_bnd, nt, &ctx.fd);
-        neumann_loss(
-            ex, ey, exy_b,
-            v_to_t_lbfgs(&ctx.trac_idx, &ctx.bnd_nx), v_to_t_lbfgs(&ctx.trac_idx, &ctx.bnd_ny),
-            v_to_t_lbfgs(&ctx.trac_idx, &ctx.bnd_tx), v_to_t_lbfgs(&ctx.trac_idx, &ctx.bnd_ty),
-            &ctx.config.material,
-        ).mul_scalar(1.0 / ctx.ref_stress2 as f64)
+        let (ex, ey, exy_b) = compute_strains::<B>(out_bnd.clone(), nt, &ctx.fd);
+        let neumann_forward = DomainForwardOutputs {
+            domain: KIRSCH_DOMAIN,
+            raw_out: &out_bnd,
+            strains: Some((ex, ey, exy_b)),
+            normals: Some((v_to_t_lbfgs(&ctx.trac_idx, &ctx.bnd_nx), v_to_t_lbfgs(&ctx.trac_idx, &ctx.bnd_ny))),
+        };
+        let term = crate::kirsch_problem::NeumannTractionTerm {
+            domain: KIRSCH_DOMAIN,
+            material: ctx.config.material.clone(),
+            ref_stress2: ctx.ref_stress2,
+            tx_target: v_to_t_lbfgs(&ctx.trac_idx, &ctx.bnd_tx),
+            ty_target: v_to_t_lbfgs(&ctx.trac_idx, &ctx.bnd_ty),
+        };
+        term.compute(std::slice::from_ref(&neumann_forward))
     } else {
         Tensor::<B, 1>::zeros([1], device)
     };
 
-    // Displacement anchor + Neumann work.
+    // === Right-edge forward pass — drives displacement_anchor + the Neumann work term
+    // `w_neumann`, folded into `interior_energy`'s EFFECTIVE tensor (`e_loss_eff` below)
+    // exactly as `step_physics`'s `(e_loss - w_neumann) * lam_e` does, so Converge-tier
+    // L-BFGS keeps optimizing the SAME total-potential-energy objective Explore/Align did
+    // (dropping it would silently change what's being minimized, not just how it's grouped).
     let u_target_val = ((ctx.config.load.px
         - ctx.config.material.nu * ctx.config.load.py)
         / ctx.config.material.e * ctx.config.geometry.half_w) as f32;
@@ -1565,11 +1730,18 @@ fn compute_loss_for_lbfgs(
             fwd(model, right_t.clone(), n_fourier, device),
             &right_t, ctx.config.geometry.symmetry, ctx.k,
         ));
+        let right_forward = DomainForwardOutputs {
+            domain: KIRSCH_DOMAIN,
+            raw_out: &out_r,
+            strains: None,
+            normals: None,
+        };
+        let term = crate::kirsch_problem::DisplacementAnchorTerm {
+            domain: KIRSCH_DOMAIN,
+            u_target: u_target_val,
+        };
+        let d_val = term.compute(std::slice::from_ref(&right_forward));
         let u_vals = out_r.slice([0..nr, 0..1]).reshape([nr]);
-        let u_tgt: Tensor<B, 1> = Tensor::full([nr], u_target_val as f64, device);
-        let denom = ((u_target_val * u_target_val) as f64).max(1e-20);
-        let d_val = (u_vals.clone() - u_tgt).powf_scalar(2.0_f64).mean()
-            .mul_scalar(1.0 / denom);
         let w_val = u_vals.mean()
             .mul_scalar(2.0 * ctx.config.material.e
                 / floor_signed_divisor(ctx.config.load.px * ctx.config.geometry.half_w));
@@ -1578,7 +1750,7 @@ fn compute_loss_for_lbfgs(
         (Tensor::<B, 1>::zeros([1], device), Tensor::<B, 1>::zeros([1], device))
     };
 
-    // Hole traction-free loss.
+    // === Hole traction-free forward pass ===
     let h_loss = if !ctx.hole_idx.is_empty() {
         let hole_norm: Vec<[f32; 2]> = ctx.hole_idx.iter().map(|&i| ctx.bnd_norm[i]).collect();
         let nh = hole_norm.len();
@@ -1588,34 +1760,44 @@ fn compute_loss_for_lbfgs(
                 fwd(model, bnd_h.clone(), n_fourier, device),
                 &bnd_h, ctx.config.geometry.symmetry, ctx.k,
             ));
-            let (sxx_h, syy_h, sxy_h) = mdem_stress_lbfgs(&out_h, 0, nh);
-            hole_traction_loss_direct(
-                sxx_h, syy_h, sxy_h,
-                v_to_t_lbfgs(&ctx.hole_idx, &ctx.bnd_nx),
-                v_to_t_lbfgs(&ctx.hole_idx, &ctx.bnd_ny),
-            ).mul_scalar(1.0 / ctx.ref_stress2 as f64)
+            let hole_forward = DomainForwardOutputs {
+                domain: KIRSCH_DOMAIN,
+                raw_out: &out_h,
+                strains: None,
+                normals: Some((v_to_t_lbfgs(&ctx.hole_idx, &ctx.bnd_nx), v_to_t_lbfgs(&ctx.hole_idx, &ctx.bnd_ny))),
+            };
+            let term = crate::kirsch_problem::HoleTractionTerm {
+                domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
+                ref_stress2: ctx.ref_stress2, direct: true,
+            };
+            term.compute(std::slice::from_ref(&hole_forward))
         } else {
             let stencil_h = assemble_stencil::<B>(&bnd_h, &ctx.fd, device);
             let out_h = scale_out(apply_dirichlet_ansatz::<B>(
                 fwd(model, stencil_h.clone(), n_fourier, device),
                 &stencil_h, ctx.config.geometry.symmetry, ctx.k,
             ));
-            let (ex, ey, exy_h) = compute_strains::<B>(out_h, nh, &ctx.fd);
-            hole_traction_loss(
-                ex, ey, exy_h,
-                v_to_t_lbfgs(&ctx.hole_idx, &ctx.bnd_nx),
-                v_to_t_lbfgs(&ctx.hole_idx, &ctx.bnd_ny),
-                &ctx.config.material,
-            ).mul_scalar(1.0 / ctx.ref_stress2 as f64)
+            let (ex, ey, exy_h) = compute_strains::<B>(out_h.clone(), nh, &ctx.fd);
+            let hole_forward = DomainForwardOutputs {
+                domain: KIRSCH_DOMAIN,
+                raw_out: &out_h,
+                strains: Some((ex, ey, exy_h)),
+                normals: Some((v_to_t_lbfgs(&ctx.hole_idx, &ctx.bnd_nx), v_to_t_lbfgs(&ctx.hole_idx, &ctx.bnd_ny))),
+            };
+            let term = crate::kirsch_problem::HoleTractionTerm {
+                domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
+                ref_stress2: ctx.ref_stress2, direct: false,
+            };
+            term.compute(std::slice::from_ref(&hole_forward))
         }
     } else {
         Tensor::<B, 1>::zeros([1], device)
     };
 
-    // Equilibrium residual.
+    // === Equilibrium residual (full set) ===
     let n_eq = ctx.eq_ring_norm.len();
     let eq_loss: Tensor<B, 1> = if n_eq > 0 {
-        if use_mdem {
+        let components: [Tensor<B, 1>; 8] = if use_mdem {
             let shifts: [(f32, f32); 4] = [
                 ( ctx.fd.hx, 0.0), (-ctx.fd.hx, 0.0),
                 (0.0,  ctx.fd.hy), (0.0, -ctx.fd.hy),
@@ -1628,16 +1810,14 @@ fn compute_loss_for_lbfgs(
                 fwd(model, pts_all.clone(), n_fourier, device),
                 &pts_all, ctx.config.geometry.symmetry, ctx.k,
             ));
-            let seg = |i: usize| mdem_stress_lbfgs(&out_all, i * n_eq, (i + 1) * n_eq);
+            let seg = |i: usize| -> (Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) {
+                extract_mdem_stress(&out_all, i * n_eq, (i + 1) * n_eq)
+            };
             let (sxx_xp, _, sxy_xp) = seg(0);
             let (sxx_xm, _, sxy_xm) = seg(1);
             let (_, syy_yp, sxy_yp) = seg(2);
             let (_, syy_ym, sxy_ym) = seg(3);
-            equilibrium_residual_loss(
-                sxx_xp, sxy_xp, sxx_xm, sxy_xm,
-                sxy_yp, syy_yp, sxy_ym, syy_ym,
-                ctx.cx, ctx.cy, ctx.ref_div2,
-            )
+            [sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym]
         } else {
             let fwd_shift = |dx: f32, dy: f32| {
                 let shifted: Vec<[f32; 2]> = ctx.eq_ring_norm.iter()
@@ -1655,20 +1835,21 @@ fn compute_loss_for_lbfgs(
             let (sxx_xm, _, sxy_xm) = fwd_shift(-ctx.fd.hx,  0.0);
             let (_, syy_yp, sxy_yp) = fwd_shift( 0.0,  ctx.fd.hy);
             let (_, syy_ym, sxy_ym) = fwd_shift( 0.0, -ctx.fd.hy);
-            equilibrium_residual_loss(
-                sxx_xp, sxy_xp, sxx_xm, sxy_xm,
-                sxy_yp, syy_yp, sxy_ym, syy_ym,
-                ctx.cx, ctx.cy, ctx.ref_div2,
-            )
-        }
+            [sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym]
+        };
+        let term = crate::kirsch_problem::EquilibriumRingTerm {
+            domain: KIRSCH_DOMAIN, cx: ctx.cx, cy: ctx.cy, ref_div2: ctx.ref_div2,
+            components: Some(components),
+        };
+        term.compute(&[])
     } else {
         Tensor::<B, 1>::zeros([1], device)
     };
 
-    // Kirsch stress loss (Phase 2 only).
+    // === Kirsch stress probe forward pass — Phase 2 only ===
     use pinn_core::geometry::HoleType;
     use pinn_core::kirsch::kirsch_stress;
-    let (kirsch_loss, _kirsch_scalar_f): (Tensor<B, 1>, f32) = if ctx.phase2_active {
+    let kirsch_loss: Tensor<B, 1> = if ctx.phase2_active {
         if let HoleType::Circular { radius } = ctx.config.geometry.hole {
             let n_pr = ctx.engine.kirsch_r_factors.len() * ctx.engine.kirsch_thetas_deg.len();
             let mut points      = Vec::with_capacity(n_pr);
@@ -1696,71 +1877,142 @@ fn compute_loss_for_lbfgs(
             };
             let px2 = (px * px) as f64;
             let pts_pr = norm_pts_to_tensor::<B>(&points, device);
-            let kl = if use_mdem {
+            if use_mdem {
                 let out_pr = scale_out(apply_dirichlet_ansatz::<B>(
                     fwd(model, pts_pr.clone(), n_fourier, device),
                     &pts_pr, ctx.config.geometry.symmetry, ctx.k,
                 ));
-                let (sxx_pr, syy_pr, sxy_pr) = mdem_stress_lbfgs(&out_pr, 0, n_pr);
-                let loss_per_pt =
-                    (sxx_pr - to_t1(&sxx_targets)).powf_scalar(2.0_f64)
-                    + (syy_pr - to_t1(&syy_targets)).powf_scalar(2.0_f64)
-                    + (sxy_pr - to_t1(&sxy_targets)).powf_scalar(2.0_f64).mul_scalar(2.0_f64);
-                (loss_per_pt * to_t1(&weights)).sum().mul_scalar(1.0 / px2)
+                let kirsch_forward = DomainForwardOutputs {
+                    domain: KIRSCH_DOMAIN, raw_out: &out_pr, strains: None, normals: None,
+                };
+                let term = crate::kirsch_problem::KirschStressTerm {
+                    domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: true,
+                    px2,
+                    sxx_targets: to_t1(&sxx_targets),
+                    syy_targets: to_t1(&syy_targets),
+                    sxy_targets: to_t1(&sxy_targets),
+                    weights: to_t1(&weights),
+                };
+                term.compute(std::slice::from_ref(&kirsch_forward))
             } else {
                 let stencil_pr = assemble_stencil::<B>(&pts_pr, &ctx.fd, device);
                 let out_pr = scale_out(apply_dirichlet_ansatz::<B>(
                     fwd(model, stencil_pr.clone(), n_fourier, device),
                     &stencil_pr, ctx.config.geometry.symmetry, ctx.k,
                 ));
-                let (exx_pr, eyy_pr, exy_pr) = compute_strains::<B>(out_pr, n_pr, &ctx.fd);
-                let (sxx_pr, syy_pr, sxy_pr) = compute_stress(exx_pr, eyy_pr, exy_pr, &ctx.config.material);
-                let loss_per_pt =
-                    (sxx_pr - to_t1(&sxx_targets)).powf_scalar(2.0_f64)
-                    + (syy_pr - to_t1(&syy_targets)).powf_scalar(2.0_f64)
-                    + (sxy_pr - to_t1(&sxy_targets)).powf_scalar(2.0_f64).mul_scalar(2.0_f64);
-                (loss_per_pt * to_t1(&weights)).sum().mul_scalar(1.0 / px2)
-            };
-            let ks = t_scalar(&kl);
-            (kl, ks)
+                let (exx_pr, eyy_pr, exy_pr) = compute_strains::<B>(out_pr.clone(), n_pr, &ctx.fd);
+                let kirsch_forward = DomainForwardOutputs {
+                    domain: KIRSCH_DOMAIN, raw_out: &out_pr,
+                    strains: Some((exx_pr, eyy_pr, exy_pr)), normals: None,
+                };
+                let term = crate::kirsch_problem::KirschStressTerm {
+                    domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: false,
+                    px2,
+                    sxx_targets: to_t1(&sxx_targets),
+                    syy_targets: to_t1(&syy_targets),
+                    sxy_targets: to_t1(&sxy_targets),
+                    weights: to_t1(&weights),
+                };
+                term.compute(std::slice::from_ref(&kirsch_forward))
+            }
         } else {
-            (Tensor::<B, 1>::zeros([1], device), 0.0)
+            Tensor::<B, 1>::zeros([1], device)
         }
     } else {
-        (Tensor::<B, 1>::zeros([1], device), 0.0)
+        Tensor::<B, 1>::zeros([1], device)
     };
 
-    // Assemble total with fixed lams.
-    let lam_h_capped = lams.lam_h.min(ctx.dynamic_lam_h_cap);
-    let lam_d_capped = lams.lam_d.min(ctx.dynamic_lam_d_cap);
+    // === Trait-driven weighted combination ===
+    // `interior_energy`'s dispatched tensor bakes in the `- w_neumann` work-term subtraction
+    // (see the doc comment on the right-edge forward pass above) so the generic per-term loop
+    // below reproduces `step_physics`'s `(e_loss - w_neumann) * lam_e` exactly, just weighted
+    // through `lams` instead of a live SAW-BRDR update.
+    let e_loss_eff = e_loss - w_neumann;
+    let term_tensor = |name: &str| -> Tensor<B, 1> {
+        match name {
+            "interior_energy" => e_loss_eff.clone(),
+            "neumann_traction" => n_loss.clone(),
+            "hole_traction" => h_loss.clone(),
+            "displacement_anchor" => d_loss.clone(),
+            "equilibrium_ring" => eq_loss.clone(),
+            "kirsch_stress" => kirsch_loss.clone(),
+            other => panic!("compute_loss_for_lbfgs: unhandled loss term '{other}'"),
+        }
+    };
 
-    let total = (e_loss - w_neumann).mul_scalar(lams.lam_e)
-        + n_loss.mul_scalar(lams.lam_n)
-        + h_loss.mul_scalar(lam_h_capped)
-        + d_loss.mul_scalar(lam_d_capped)
-        + eq_loss.mul_scalar(lams.lam_eq)
-        + kirsch_loss.mul_scalar(lams.lam_kirsch)
-        + const_loss.mul_scalar(lams.lam_const);
+    let active_terms: Vec<Box<dyn LossTerm>> = problem.loss_terms().into_iter()
+        .filter(|t| t.name() != "constitutive_consistency")
+        .filter(|t| ctx.phase2_active || !t.phase2_only())
+        .collect();
 
-    let total_scalar = t_scalar(&total);
+    let mut total: Option<Tensor<B, 1>> = None;
+    let mut total_scalar = 0.0_f32;
+    for term in &active_terms {
+        let name = term.name();
+        let raw_lam = *lams.get(name).unwrap_or(&0.0);
+        // `dynamic_lam_h_cap`/`dynamic_lam_d_cap` still clamp inside the L-BFGS objective,
+        // exactly as before — only the lookup mechanism (HashMap vs. dedicated struct field)
+        // changed.
+        let lam = match name {
+            "hole_traction" => raw_lam.min(ctx.dynamic_lam_h_cap),
+            "displacement_anchor" => raw_lam.min(ctx.dynamic_lam_d_cap),
+            _ => raw_lam,
+        };
+        let t = term_tensor(name);
+        let s = t_scalar(&t);
+        let weighted = t.mul_scalar(lam);
+        total_scalar += s * lam as f32;
+        total = Some(match total {
+            Some(acc) => acc + weighted,
+            None => weighted,
+        });
+    }
+
+    // `constitutive_consistency` is deliberately excluded from `active_terms` above (same
+    // filter `step_physics`/`step_physics_multi` use) but keeps its pre-existing always-
+    // computed/fixed-weight (`ctx.engine.lam_const`, outside SAW-BRDR — `lam_const` is why it
+    // drops out of the `lams` HashMap entirely)/mDEM-gated treatment, folded in additively —
+    // dropping it would reintroduce a narrower version of this exact issue's bug (L-BFGS
+    // silently optimizing a different loss than Adam/SOAP-Muon did in Explore/Align).
+    if use_mdem {
+        let lam_const = ctx.engine.lam_const as f64;
+        let s = t_scalar(&const_loss);
+        let weighted_const = const_loss.mul_scalar(lam_const);
+        total_scalar += s * lam_const as f32;
+        total = Some(match total {
+            Some(acc) => acc + weighted_const,
+            None => weighted_const,
+        });
+    }
+
+    let total = total.unwrap_or_else(|| Tensor::<B, 1>::zeros([1], device));
     (total, total_scalar)
 }
 
 /// Run a single L-BFGS outer step on frozen collocation points.
 ///
-/// The closure captures `ctx` and `lams` by reference; LBFGS calls it 5–20 times
+/// The closure captures `ctx`/`problem`/`lams` by reference; LBFGS calls it 5–20 times
 /// internally during its Strong-Wolfe line search, each time on a clone of `model`.
 /// SAW-BRDR is NOT updated inside the closure — `lams` is the snapshot from Converge entry.
+///
+/// A `problem` whose (filtered, phase-gated) `loss_terms()` is entirely empty — and mDEM
+/// disabled, so `constitutive_consistency` doesn't fold in either — makes `compute_loss_for_
+/// lbfgs` return a bare, disconnected `Tensor::zeros([1], device)` (see its `unwrap_or_else`
+/// fallback); calling `.backward()` on that below panics with "Node should have a step
+/// registered" (no recorded autodiff op to walk). This mirrors an already-accepted gap in
+/// `step_lbfgs_multi` (pin-lug's analogous driver) — see `step_lbfgs_zero_terms_panics_on_
+/// disconnected_backward` — rather than a new regression introduced by this migration.
 pub fn step_lbfgs(
     model: ElasticityNet<B>,
     lbfgs: &mut burn::optim::LBFGS<B>,
     lr: f64,
     ctx: &LbfgsCtxScalars,
-    lams: &LbfgsLams,
+    problem: &dyn BoundaryValueProblem,
+    lams: &HashMap<&'static str, f64>,
     device: &WgpuDevice,
 ) -> (ElasticityNet<B>, f64) {
     let closure = |m: ElasticityNet<B>| -> (f64, GradientsParams) {
-        let (total_loss, total_scalar) = compute_loss_for_lbfgs(&m, ctx, lams, device);
+        let (total_loss, total_scalar) = compute_loss_for_lbfgs(&m, ctx, problem, lams, device);
         let loss_f64 = total_scalar as f64;
         let grads_raw = total_loss.backward();
         let grads_p = GradientsParams::from_grads(grads_raw, &m);
@@ -2011,9 +2263,19 @@ pub fn step_lbfgs_multi(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kirsch_problem::KirschProblem;
     use crate::optim::{make_bias_optim, make_gate_optim};
     use crate::problem::DomainState;
-    use pinn_core::problem::DomainSamplingStrategy;
+    use pinn_core::problem::{DirichletAnsatz, DomainSamplingStrategy, DomainSpec};
+    // Only `old_hardcoded_step_physics` (this module's independent regression oracle) still
+    // calls these raw `energy` formulas directly by their bare names — production code
+    // (`compute_gradient_conflict`/`compute_loss_for_lbfgs`/`step_physics`) now reaches every
+    // one of them exclusively through `kirsch_problem`'s `LossTerm` impls, so these are
+    // deliberately NOT re-exported from the top-level `use` block above.
+    use crate::energy::{
+        constitutive_consistency_loss, dem_energy_loss, equilibrium_residual_loss,
+        hole_traction_loss, hole_traction_loss_direct, neumann_loss,
+    };
 
     #[test]
     fn compute_reference_scales_relationships_hold() {
@@ -2194,6 +2456,467 @@ mod tests {
         )
     }
 
+    /// Wraps a real `KirschProblem` but drops any named term in `drop_names` from
+    /// `loss_terms()` — lets `compute_gradient_conflict`/`compute_loss_for_lbfgs` tests
+    /// observe behavior when `ctx.problem.loss_terms()` declares fewer than the full 6 terms,
+    /// without hand-rolling a second full `BoundaryValueProblem` impl per scenario.
+    struct KirschProblemFilterTerms {
+        inner: KirschProblem,
+        drop_names: Vec<&'static str>,
+    }
+    impl BoundaryValueProblem for KirschProblemFilterTerms {
+        fn domains(&self) -> &[DomainSpec] { self.inner.domains() }
+        fn sampling_strategy(&self, i: usize) -> &dyn DomainSamplingStrategy { self.inner.sampling_strategy(i) }
+        fn ansatz(&self, i: usize) -> &dyn DirichletAnsatz { self.inner.ansatz(i) }
+        fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
+            self.inner.loss_terms().into_iter().filter(|t| !self.drop_names.contains(&t.name())).collect()
+        }
+        fn base_weight(&self, n: &str) -> f32 { self.inner.base_weight(n) }
+        fn phase1_steps(&self) -> usize { self.inner.phase1_steps() }
+        fn convergence_metric(&self, s: &[DomainState<B>]) -> Option<f64> { self.inner.convergence_metric(s) }
+        fn convergence_target(&self) -> f64 { self.inner.convergence_target() }
+    }
+
+    /// Builds a `KirschProblem` matching `zero_px_test_fixture`'s config/engine, for tests
+    /// that need a real (non-placeholder) problem instance.
+    fn kirsch_problem_from_fixture(config: &SolverConfig, engine: &EngineParams) -> KirschProblem {
+        KirschProblem::new(config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt)
+    }
+
+    #[test]
+    fn compute_gradient_conflict_reflects_loss_term_removed_from_bc_group() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::network::ElasticityNetConfig;
+
+        let (
+            config, engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(6.0e7);
+        // Arrange-time sanity: a silently-empty point-set would make this test vacuously
+        // pass regardless of whether hole_traction is actually included.
+        assert!(!eq_ring_norm.is_empty(), "fixture sanity: eq_ring_norm must be non-empty");
+        assert!(!trac_idx.is_empty(), "fixture sanity: trac_idx must be non-empty");
+        assert!(!hole_idx.is_empty(), "fixture sanity: hole_idx must be non-empty");
+        assert!(!right_idx.is_empty(), "fixture sanity: right_idx must be non-empty");
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+
+        // Isolate hole_traction's OWN contribution rather than comparing "all 4 Bc terms" vs
+        // "3 of 4" — for this fixture's randomly-initialized (untrained) network,
+        // hole_traction's raw scalar is ~4-5 orders of magnitude smaller than
+        // neumann_traction's/displacement_anchor's (a freshly-initialized network's raw hole-
+        // boundary stress prediction happens to nearly satisfy the traction-free condition by
+        // chance), so a "drop hole_traction alone from the full 4-term Bc group" comparison
+        // would have neumann_traction/displacement_anchor swamp any change hole_traction's
+        // removal makes — not because the migration is broken, but because those OTHER
+        // terms' magnitudes dominate the sum regardless. Dropping every OTHER Bc-group term
+        // isolates hole_traction's own (still real, still nonzero) contribution against an
+        // empty-Bc-group baseline, which is robust to per-run initialization magnitude.
+        let problem_with_hole = KirschProblemFilterTerms {
+            inner: kirsch_problem_from_fixture(&config, &engine),
+            drop_names: vec!["neumann_traction", "displacement_anchor", "kirsch_stress"],
+        };
+        let problem_without_hole = KirschProblemFilterTerms {
+            inner: kirsch_problem_from_fixture(&config, &engine),
+            drop_names: vec!["neumann_traction", "displacement_anchor", "kirsch_stress", "hole_traction"],
+        };
+
+        let run = |problem: &dyn BoundaryValueProblem| -> GradientConflict {
+            let ctx = StepCtx {
+                config: &config, engine: &engine, problem, fd: &fd,
+                k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+                int_norm: &int_norm, bnd_norm: &bnd_norm,
+                bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
+                trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+                eq_ring_norm: &eq_ring_norm,
+                dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+                phase2_active: false, step: 3,
+            };
+            compute_gradient_conflict(&model, &ctx, 3, &device)
+        };
+
+        let conflict_full = run(&problem_with_hole);
+        let conflict_dropped = run(&problem_without_hole);
+
+        let rel = |a: f32, b: f32| ((a - b).abs() / a.abs().max(b.abs()).max(1e-8)) as f64;
+        assert!(
+            rel(conflict_full.g_bc_norm, conflict_dropped.g_bc_norm) > 0.01,
+            "g_bc_norm should differ by >1% relative when hole_traction is dropped from the \
+             Bc group: full={} dropped={}", conflict_full.g_bc_norm, conflict_dropped.g_bc_norm,
+        );
+        assert!(
+            rel(conflict_full.g_pde_norm, conflict_dropped.g_pde_norm) < 1e-4,
+            "g_pde_norm should be unchanged (hole_traction is a Bc-group term, not Physics): \
+             full={} dropped={}", conflict_full.g_pde_norm, conflict_dropped.g_pde_norm,
+        );
+    }
+
+    #[test]
+    fn compute_gradient_conflict_all_physics_terms_yields_zero_bc_norm_and_epsilon_guarded_cosine() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::network::ElasticityNetConfig;
+
+        let (
+            config, engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(6.0e7);
+        assert!(!eq_ring_norm.is_empty(), "fixture sanity: eq_ring_norm must be non-empty");
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+
+        // Keep only the 2 Physics-group terms (interior_energy, equilibrium_ring) — every
+        // Bc-group term (all 4) is dropped.
+        let problem = KirschProblemFilterTerms {
+            inner: kirsch_problem_from_fixture(&config, &engine),
+            drop_names: vec!["neumann_traction", "hole_traction", "displacement_anchor", "kirsch_stress"],
+        };
+
+        let ctx = StepCtx {
+            config: &config, engine: &engine, problem: &problem, fd: &fd,
+            k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm: &int_norm, bnd_norm: &bnd_norm,
+            bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            eq_ring_norm: &eq_ring_norm,
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            phase2_active: false, step: 0,
+        };
+
+        let conflict = compute_gradient_conflict(&model, &ctx, 0, &device);
+        assert_eq!(conflict.cosine_sim, 0.0, "cosine_sim must be exactly 0.0 when the Bc group is empty");
+        assert_eq!(conflict.g_bc_norm, 0.0, "g_bc_norm must be exactly 0.0 when the Bc group is empty");
+        assert!(
+            conflict.g_pde_norm.is_finite() && conflict.g_pde_norm > 0.0,
+            "g_pde_norm must be finite and positive (interior_energy + equilibrium_ring still \
+             active), got {}", conflict.g_pde_norm,
+        );
+    }
+
+    #[test]
+    fn compute_gradient_conflict_zero_loss_terms_yields_all_zero_finite_conflict() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::network::ElasticityNetConfig;
+
+        let (
+            config, mut engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(6.0e7);
+        // Prevent constitutive_consistency from sneaking into the Physics group unconditionally.
+        engine.use_mdem = false;
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+
+        let problem = KirschProblemFilterTerms {
+            inner: kirsch_problem_from_fixture(&config, &engine),
+            drop_names: vec![
+                "interior_energy", "neumann_traction", "hole_traction",
+                "displacement_anchor", "equilibrium_ring", "kirsch_stress",
+            ],
+        };
+
+        let ctx = StepCtx {
+            config: &config, engine: &engine, problem: &problem, fd: &fd,
+            k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm: &int_norm, bnd_norm: &bnd_norm,
+            bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            eq_ring_norm: &eq_ring_norm,
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            phase2_active: false, step: 0,
+        };
+
+        let conflict = compute_gradient_conflict(&model, &ctx, 0, &device);
+        assert_eq!(conflict.cosine_sim, 0.0, "cosine_sim must be exactly 0.0 with zero active loss terms");
+        assert_eq!(conflict.g_pde_norm, 0.0, "g_pde_norm must be exactly 0.0 with zero active loss terms");
+        assert_eq!(conflict.g_bc_norm, 0.0, "g_bc_norm must be exactly 0.0 with zero active loss terms");
+    }
+
+    #[test]
+    fn compute_loss_for_lbfgs_zero_terms_and_no_constitutive_contribution_returns_zero_without_panicking() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::network::ElasticityNetConfig;
+
+        let (
+            config, mut engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(6.0e7);
+        engine.use_mdem = false;
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+
+        let problem = KirschProblemFilterTerms {
+            inner: kirsch_problem_from_fixture(&config, &engine),
+            drop_names: vec![
+                "interior_energy", "neumann_traction", "hole_traction",
+                "displacement_anchor", "equilibrium_ring", "kirsch_stress",
+            ],
+        };
+
+        let lbfgs_ctx = LbfgsCtxScalars {
+            config: config.clone(), engine: engine.clone(), fd,
+            k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm: int_norm.clone(), bnd_norm: bnd_norm.clone(),
+            bnd_nx: bnd_nx.clone(), bnd_ny: bnd_ny.clone(), bnd_tx: bnd_tx.clone(), bnd_ty: bnd_ty.clone(),
+            trac_idx: trac_idx.clone(), hole_idx: hole_idx.clone(), right_idx: right_idx.clone(),
+            eq_ring_norm: eq_ring_norm.clone(),
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+        };
+        let lams: HashMap<&'static str, f64> = HashMap::new();
+
+        let (_total, total_scalar) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &problem, &lams, &device);
+        assert_eq!(
+            total_scalar, 0.0,
+            "expected exactly 0.0 with zero active terms and no constitutive contribution, got {total_scalar}",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Node should have a step registered")]
+    fn step_lbfgs_zero_terms_panics_on_disconnected_backward() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::network::ElasticityNetConfig;
+
+        let (
+            config, mut engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(6.0e7);
+        engine.use_mdem = false;
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+
+        let problem = KirschProblemFilterTerms {
+            inner: kirsch_problem_from_fixture(&config, &engine),
+            drop_names: vec![
+                "interior_energy", "neumann_traction", "hole_traction",
+                "displacement_anchor", "equilibrium_ring", "kirsch_stress",
+            ],
+        };
+
+        let lbfgs_ctx = LbfgsCtxScalars {
+            config: config.clone(), engine: engine.clone(), fd,
+            k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm: int_norm.clone(), bnd_norm: bnd_norm.clone(),
+            bnd_nx: bnd_nx.clone(), bnd_ny: bnd_ny.clone(), bnd_tx: bnd_tx.clone(), bnd_ty: bnd_ty.clone(),
+            trac_idx: trac_idx.clone(), hole_idx: hole_idx.clone(), right_idx: right_idx.clone(),
+            eq_ring_norm: eq_ring_norm.clone(),
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+        };
+        let lams: HashMap<&'static str, f64> = HashMap::new();
+
+        let mut lbfgs = make_lbfgs(3);
+        // Deliberate, pre-existing-shape risk (mirrors the analogous, already-accepted gap in
+        // `step_lbfgs_multi`): with nothing connected to the autodiff graph,
+        // `compute_loss_for_lbfgs` returns a bare, disconnected `Tensor::zeros`, and
+        // `.backward()` on that panics rather than silently no-op'ing.
+        let _ = step_lbfgs(model, &mut lbfgs, 1e-3, &lbfgs_ctx, &problem, &lams, &device);
+    }
+
+    /// Trivial extra `LossTerm` whose name neither `compute_gradient_conflict` nor
+    /// `compute_loss_for_lbfgs`'s `term_tensor` dispatch recognizes — proves both fail fast
+    /// (panic) rather than silently contributing zero for an unhandled term name.
+    struct MysteryTerm;
+    impl LossTerm for MysteryTerm {
+        fn name(&self) -> &'static str { "mystery_term" }
+        fn domains(&self) -> Vec<pinn_core::problem::DomainId> { vec![KIRSCH_DOMAIN] }
+        fn compute(&self, _inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+            Tensor::<B, 1>::zeros([1], &Default::default())
+        }
+    }
+
+    /// Wraps a real `KirschProblem`, appending `MysteryTerm` to `loss_terms()`'s Vec.
+    struct KirschProblemWithMysteryTerm {
+        inner: KirschProblem,
+    }
+    impl BoundaryValueProblem for KirschProblemWithMysteryTerm {
+        fn domains(&self) -> &[DomainSpec] { self.inner.domains() }
+        fn sampling_strategy(&self, i: usize) -> &dyn DomainSamplingStrategy { self.inner.sampling_strategy(i) }
+        fn ansatz(&self, i: usize) -> &dyn DirichletAnsatz { self.inner.ansatz(i) }
+        fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
+            let mut terms = self.inner.loss_terms();
+            terms.push(Box::new(MysteryTerm));
+            terms
+        }
+        fn base_weight(&self, n: &str) -> f32 { self.inner.base_weight(n) }
+        fn phase1_steps(&self) -> usize { self.inner.phase1_steps() }
+        fn convergence_metric(&self, s: &[DomainState<B>]) -> Option<f64> { self.inner.convergence_metric(s) }
+        fn convergence_target(&self) -> f64 { self.inner.convergence_target() }
+    }
+
+    #[test]
+    #[should_panic(expected = "unhandled loss term")]
+    fn compute_gradient_conflict_panics_on_unrecognized_loss_term_name() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::network::ElasticityNetConfig;
+
+        let (
+            config, engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(6.0e7);
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+
+        let problem = KirschProblemWithMysteryTerm { inner: kirsch_problem_from_fixture(&config, &engine) };
+
+        let ctx = StepCtx {
+            config: &config, engine: &engine, problem: &problem, fd: &fd,
+            k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm: &int_norm, bnd_norm: &bnd_norm,
+            bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            eq_ring_norm: &eq_ring_norm,
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            phase2_active: false, step: 0,
+        };
+
+        let _ = compute_gradient_conflict(&model, &ctx, 0, &device);
+    }
+
+    #[test]
+    #[should_panic(expected = "unhandled loss term")]
+    fn compute_loss_for_lbfgs_panics_on_unrecognized_loss_term_name() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::network::ElasticityNetConfig;
+
+        let (
+            config, engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(6.0e7);
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+
+        let problem = KirschProblemWithMysteryTerm { inner: kirsch_problem_from_fixture(&config, &engine) };
+
+        let lbfgs_ctx = LbfgsCtxScalars {
+            config: config.clone(), engine: engine.clone(), fd,
+            k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm: int_norm.clone(), bnd_norm: bnd_norm.clone(),
+            bnd_nx: bnd_nx.clone(), bnd_ny: bnd_ny.clone(), bnd_tx: bnd_tx.clone(), bnd_ty: bnd_ty.clone(),
+            trac_idx: trac_idx.clone(), hole_idx: hole_idx.clone(), right_idx: right_idx.clone(),
+            eq_ring_norm: eq_ring_norm.clone(),
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            phase2_active: false,
+        };
+        let lams: HashMap<&'static str, f64> = HashMap::new();
+
+        let _ = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &problem, &lams, &device);
+    }
+
+    #[test]
+    fn compute_loss_for_lbfgs_still_applies_dynamic_hole_traction_cap_via_hashmap_lams() {
+        use burn::backend::wgpu::WgpuDevice;
+        use crate::network::ElasticityNetConfig;
+
+        let (
+            config, engine, fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        ) = zero_px_test_fixture(6.0e7);
+
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+
+        let problem = kirsch_problem_from_fixture(&config, &engine);
+
+        let lbfgs_ctx = LbfgsCtxScalars {
+            config: config.clone(), engine: engine.clone(), fd,
+            k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm: int_norm.clone(), bnd_norm: bnd_norm.clone(),
+            bnd_nx: bnd_nx.clone(), bnd_ny: bnd_ny.clone(), bnd_tx: bnd_tx.clone(), bnd_ty: bnd_ty.clone(),
+            trac_idx: trac_idx.clone(), hole_idx: hole_idx.clone(), right_idx: right_idx.clone(),
+            eq_ring_norm: eq_ring_norm.clone(),
+            dynamic_lam_h_cap: 10.0, dynamic_lam_d_cap: 50.0,
+            phase2_active: true,
+        };
+
+        let base: Vec<(&'static str, f64)> = vec![
+            ("interior_energy", 1.0), ("neumann_traction", 1.0),
+            ("displacement_anchor", 1.0), ("equilibrium_ring", 1.0), ("kirsch_stress", 1.0),
+        ];
+        let mut at_cap_pairs = base.clone();
+        at_cap_pairs.push(("hole_traction", 10.0));
+        let mut over_cap_pairs = base;
+        over_cap_pairs.push(("hole_traction", 999.0));
+
+        let lams_at_cap: HashMap<&'static str, f64> = at_cap_pairs.into_iter().collect();
+        let lams_over_cap: HashMap<&'static str, f64> = over_cap_pairs.into_iter().collect();
+
+        let (_total_a, total_scalar_a) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &problem, &lams_at_cap, &device);
+        let (_total_b, total_scalar_b) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &problem, &lams_over_cap, &device);
+
+        let scale = total_scalar_a.abs().max(total_scalar_b.abs()).max(1e-8);
+        let rel = (total_scalar_a - total_scalar_b).abs() / scale;
+        assert!(
+            rel < 1e-4,
+            "hole_traction's dynamic cap (10.0) should make both lams maps produce the same \
+             total regardless of hole_traction's raw value (10.0 vs 999.0): at_cap={total_scalar_a} \
+             over_cap={total_scalar_b} rel_err={rel}",
+        );
+    }
+
     #[test]
     fn step_physics_finite_at_zero_px_load() {
         use burn::backend::wgpu::WgpuDevice;
@@ -2297,6 +3020,7 @@ mod tests {
     #[test]
     fn step_lbfgs_finite_at_near_zero_negative_px_load() {
         use burn::backend::wgpu::WgpuDevice;
+        use crate::kirsch_problem::KirschProblem;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -2314,6 +3038,10 @@ mod tests {
             .with_use_piratenet(config.use_piratenet);
         let model: ElasticityNet<B> = net_cfg.init(&device);
 
+        let problem = KirschProblem::new(
+            config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
+        );
+
         let lbfgs_ctx = LbfgsCtxScalars {
             config: config.clone(),
             engine: engine.clone(),
@@ -2337,15 +3065,16 @@ mod tests {
             dynamic_lam_d_cap: 50.0,
             phase2_active: false,
         };
-        let lams = LbfgsLams {
-            lam_e: 1.0, lam_n: 1.0, lam_h: 1.0, lam_d: 1.0, lam_eq: 1.0, lam_kirsch: 1.0, lam_const: 1.0,
-        };
+        let lams: HashMap<&'static str, f64> = HashMap::from([
+            ("interior_energy", 1.0), ("neumann_traction", 1.0), ("hole_traction", 1.0),
+            ("displacement_anchor", 1.0), ("equilibrium_ring", 1.0), ("kirsch_stress", 1.0),
+        ]);
 
-        let (_total, total_scalar) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &lams, &device);
+        let (_total, total_scalar) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &problem, &lams, &device);
         assert!(total_scalar.is_finite(), "compute_loss_for_lbfgs's total loss must be finite at px=0.0, got {total_scalar}");
 
         let mut lbfgs = make_lbfgs(3);
-        let (_model_out, loss_out) = step_lbfgs(model, &mut lbfgs, 1e-3, &lbfgs_ctx, &lams, &device);
+        let (_model_out, loss_out) = step_lbfgs(model, &mut lbfgs, 1e-3, &lbfgs_ctx, &problem, &lams, &device);
         assert!(loss_out.is_finite(), "step_lbfgs's returned loss must be finite at px=0.0, got {loss_out}");
     }
 
@@ -2361,6 +3090,7 @@ mod tests {
     #[test]
     fn step_lbfgs_finite_at_literal_zero_px_load() {
         use burn::backend::wgpu::WgpuDevice;
+        use crate::kirsch_problem::KirschProblem;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -2378,6 +3108,10 @@ mod tests {
             .with_use_piratenet(config.use_piratenet);
         let model: ElasticityNet<B> = net_cfg.init(&device);
 
+        let problem = KirschProblem::new(
+            config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
+        );
+
         let lbfgs_ctx = LbfgsCtxScalars {
             config: config.clone(),
             engine: engine.clone(),
@@ -2401,15 +3135,16 @@ mod tests {
             dynamic_lam_d_cap: 50.0,
             phase2_active: false,
         };
-        let lams = LbfgsLams {
-            lam_e: 1.0, lam_n: 1.0, lam_h: 1.0, lam_d: 1.0, lam_eq: 1.0, lam_kirsch: 1.0, lam_const: 1.0,
-        };
+        let lams: HashMap<&'static str, f64> = HashMap::from([
+            ("interior_energy", 1.0), ("neumann_traction", 1.0), ("hole_traction", 1.0),
+            ("displacement_anchor", 1.0), ("equilibrium_ring", 1.0), ("kirsch_stress", 1.0),
+        ]);
 
-        let (_total, total_scalar) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &lams, &device);
+        let (_total, total_scalar) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &problem, &lams, &device);
         assert!(total_scalar.is_finite(), "compute_loss_for_lbfgs's total loss must be finite at literal px=0.0, got {total_scalar}");
 
         let mut lbfgs = make_lbfgs(3);
-        let (_model_out, loss_out) = step_lbfgs(model, &mut lbfgs, 1e-3, &lbfgs_ctx, &lams, &device);
+        let (_model_out, loss_out) = step_lbfgs(model, &mut lbfgs, 1e-3, &lbfgs_ctx, &problem, &lams, &device);
         assert!(loss_out.is_finite(), "step_lbfgs's returned loss must be finite at literal px=0.0, got {loss_out}");
     }
 

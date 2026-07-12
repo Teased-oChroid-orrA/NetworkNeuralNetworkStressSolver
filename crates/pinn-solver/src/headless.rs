@@ -39,7 +39,7 @@ use crate::{
     training_core::{
         compute_gradient_conflict, compute_reference_scales, extract_boundary_indices,
         make_lbfgs, normalize_point, probe_kt_shared, step_lbfgs, step_physics,
-        BInner, LbfgsCtxScalars, LbfgsLams, StepCtx, StepOutput,
+        BInner, LbfgsCtxScalars, StepCtx, StepOutput,
     },
 };
 
@@ -107,7 +107,7 @@ pub fn run_headless(config: SolverConfig) -> bool {
     let mut stiffness_controller = StiffnessController::new(stiff_config.clone());
     let mut lbfgs_opt: Option<burn::optim::LBFGS<B>> = None;
     let mut frozen_lbfgs_ctx: Option<LbfgsCtxScalars> = None;
-    let mut frozen_lbfgs_lams: Option<LbfgsLams> = None;
+    let mut frozen_lbfgs_lams: Option<HashMap<&'static str, f64>> = None;
 
     let (u_ref, ref_energy, ref_stress2) = compute_reference_scales(&config);
 
@@ -259,7 +259,7 @@ pub fn run_headless(config: SolverConfig) -> bool {
             let lams = frozen_lbfgs_lams.as_ref().expect("lams must be set when entering Converge");
             let fctx = frozen_lbfgs_ctx.as_ref().unwrap();
             let lr = lr_sched.current_lr();
-            let (new_m, loss_f64) = step_lbfgs(model, lbfgs, lr, fctx, lams, &device);
+            let (new_m, loss_f64) = step_lbfgs(model, lbfgs, lr, fctx, &problem, lams, &device);
             let synthetic_out = StepOutput {
                 e_scalar: 0.0, n_scalar: 0.0, h_scalar: 0.0, d_scalar: 0.0,
                 eq_scalar: 0.0, w_scalar: 0.0, kirsch_scalar: 0.0, const_scalar: 0.0,
@@ -317,16 +317,18 @@ pub fn run_headless(config: SolverConfig) -> bool {
                     match t.new_tier {
                         OptimizerTier::Converge => {
                             // Freeze current collocation points and SAW lambdas for L-BFGS.
+                            // Keyed by the exact `loss_terms()` names — `lam_const` drops out
+                            // of this map entirely: `compute_loss_for_lbfgs` now reads
+                            // `ctx.engine.lam_const` directly, same as `step_physics` does.
                             frozen_lbfgs_ctx  = Some(LbfgsCtxScalars::from_ctx(&ctx));
-                            frozen_lbfgs_lams = Some(LbfgsLams {
-                                lam_e:      out.lam_e,
-                                lam_n:      out.lam_n,
-                                lam_h:      out.lam_h,
-                                lam_d:      out.lam_d,
-                                lam_eq:     out.lam_eq,
-                                lam_kirsch: out.lam_kirsch,
-                                lam_const:  engine.lam_const as f64,
-                            });
+                            frozen_lbfgs_lams = Some(HashMap::from([
+                                ("interior_energy", out.lam_e),
+                                ("neumann_traction", out.lam_n),
+                                ("hole_traction", out.lam_h),
+                                ("displacement_anchor", out.lam_d),
+                                ("equilibrium_ring", out.lam_eq),
+                                ("kirsch_stress", out.lam_kirsch),
+                            ]));
                             lbfgs_opt = None;
                         }
                         _ => {
