@@ -16,8 +16,16 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Install Mesa software Vulkan driver (lavapipe)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y mesa-vulkan-drivers
+
     - name: Build
       run: cargo build --features eframe/x11,eframe/wayland --verbose
 
     - name: Run tests
       run: cargo test --features eframe/x11,eframe/wayland --verbose
+      env:
+        VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
