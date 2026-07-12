@@ -20,7 +20,17 @@ jobs:
     - name: Install Mesa software Vulkan driver (lavapipe)
       run: |
         sudo apt-get update
-        sudo apt-get install -y mesa-vulkan-drivers
+        sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
+
+    - name: Diagnose Vulkan availability
+      run: |
+        echo "--- libvulkan present? ---"
+        ldconfig -p | grep -i vulkan || echo "NOT FOUND in ldconfig"
+        echo "--- ICD registry dir ---"
+        ls -la /usr/share/vulkan/icd.d/ || echo "DIR MISSING"
+        cat /usr/share/vulkan/icd.d/*.json 2>&1 || true
+        echo "--- vulkaninfo summary ---"
+        vulkaninfo --summary 2>&1 || echo "vulkaninfo FAILED (exit $?)"
 
     - name: Build
       run: cargo build --features eframe/x11,eframe/wayland --verbose
@@ -29,3 +39,4 @@ jobs:
       run: cargo test --features eframe/x11,eframe/wayland --verbose
       env:
         VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        RUST_BACKTRACE: 1
