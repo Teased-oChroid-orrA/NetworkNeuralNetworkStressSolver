@@ -1265,15 +1265,46 @@ mod tests {
 
     /// Builds a pair of pin/lug `ElasticityNet`s whose every float parameter is NaN — the
     /// same `NanMapper` pattern `pinlug_problem.rs`'s
-    /// `convergence_metric_pinlug_returns_none_when_forward_pass_is_all_nan` uses to prove
-    /// `PinLugProblem::convergence_metric` returns `None` on total divergence. Reused here
-    /// (rather than that unit-level proof alone) to close the actual integration gap: does
-    /// `run_headless_pinlug_inner`'s `else if let Some(new_cap) = tracker.note_missed_reading()`
-    /// branch actually fire and run the SAME restart machinery as the crash/plateau arms
-    /// (cap tighten, `saw.reset()`, `lr_sched.reset_for_phase2()`, fresh decision maker,
-    /// fresh optimizers, L-BFGS state cleared) — not just that `ConvergenceTracker::
-    /// note_missed_reading` works correctly in isolation (already covered in
-    /// `controllers.rs`'s test module).
+    /// `convergence_metric_pinlug_returns_none_when_forward_pass_is_all_nan` uses.
+    ///
+    /// NOTE (issue #26, updated): this helper no longer closes the `note_missed_reading`
+    /// integration gap its doc comment used to claim. Since `model_is_finite` was added and
+    /// placed BEFORE the `convergence_metric` probe in `run_headless_pinlug_inner`, an
+    /// all-NaN model fed through this helper is now caught by the Param-level
+    /// `model_is_finite` check on its very first probe (see
+    /// `run_headless_pinlug_param_nan_reinit_fires_on_first_probe_not_after_threshold_misses`
+    /// below) — it never reaches `tracker.note_missed_reading()` at all. The two tests below
+    /// that DO use this helper
+    /// (`run_headless_pinlug_param_nan_reinit_fires_on_first_probe_not_after_threshold_misses`,
+    /// `run_headless_pinlug_param_nan_reinit_uses_the_shared_crash_budget_and_cap_cascade`)
+    /// exist to prove exactly that: `model_is_finite` intercepts BEFORE `note_missed_reading`
+    /// is ever reached, not the other way around.
+    ///
+    /// Known accepted coverage gap: the STUCK-NAN RECOVERY branch itself (`else if let
+    /// Some(new_cap) = tracker.note_missed_reading()` in `run_headless_pinlug_inner`) is
+    /// reachable only when `problem.convergence_metric()` returns `None` for a model whose
+    /// Params are ALL finite (`model_is_finite` true) — e.g. a transient `None` from the
+    /// forward pass without Param-level corruption. Investigation (issue #26 follow-up):
+    /// `PinLugProblem::convergence_metric` only returns `None` when (a) the domain-state
+    /// slice doesn't have one entry per domain — unreachable through
+    /// `run_headless_pinlug_inner`'s own state-vector construction, which always supplies
+    /// both domains — or (b) every interface-theta gap is non-finite, which in practice
+    /// requires a NaN (not just large/overflowing) raw network output for at least one whole
+    /// domain. Because every hidden layer is `.tanh()`-saturated, a finite-but-large weight
+    /// can only push a hidden activation to Infinity, and `tanh(Infinity)` is a finite `1.0`
+    /// (no propagation to NaN) — the only way to get a NaN with all-finite Params would be an
+    /// Infinity-Infinity cancellation inside the final (unactivated) output layer's matmul
+    /// reduction, whose accumulation order is backend/driver-dependent and not something this
+    /// codebase controls or should rely on for a deterministic test. No existing test-only
+    /// hook exposes `n_interface`/the domain-state vector for direct injection either (only
+    /// `initial_models: Option<(ElasticityNet<B>, ElasticityNet<B>)>` is injectable). Closing
+    /// this gap for real would need a small production-code test-only injection point (e.g.
+    /// a way to force `problem.convergence_metric()` to return `None` a bounded number of
+    /// times for an otherwise-finite model) — that is a `backend-expert` change, not a
+    /// test-only one, and has been flagged back to the orchestrator rather than worked around
+    /// here. Until then, this branch's wiring is verified at the unit level only (via
+    /// `ConvergenceTracker::note_missed_reading` directly, see the two tests above), not
+    /// integration-tested end-to-end through `run_headless_pinlug_inner`.
     fn nan_pinlug_models(config: &pinn_core::messages::SolverConfig, device: &WgpuDevice) -> (ElasticityNet<B>, ElasticityNet<B>) {
         use burn::module::{Module, ModuleMapper, Param};
         use burn::tensor::Tensor;
