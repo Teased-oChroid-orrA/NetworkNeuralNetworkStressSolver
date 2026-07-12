@@ -38,7 +38,7 @@ use crate::{
     stiffness::StiffnessController,
     training_core::{
         compute_gradient_conflict, compute_reference_scales, extract_boundary_indices,
-        make_lbfgs, normalize_point, probe_kt_shared, step_lbfgs, step_physics,
+        make_lbfgs, model_is_finite, normalize_point, probe_kt_shared, step_lbfgs, step_physics,
         BInner, LbfgsCtxScalars, StepCtx, StepOutput,
     },
 };
@@ -47,8 +47,35 @@ type B = Autodiff<Wgpu>;
 
 const BAR_WIDTH: usize = 40;
 
+/// Richer result of [`run_headless_inner`] — the public [`run_headless`] only exposes
+/// `converged` (via its `bool` return), but tests need visibility into `model_reinit_count`/
+/// `total_restarts` to assert the Param-level NaN/Inf reinit cascade (see `#[cfg(test)]`
+/// module below). Mirrors `PinLugHeadlessResult`'s shape.
+pub(crate) struct KirschHeadlessResult {
+    pub converged: bool,
+    #[allow(dead_code)]
+    pub best_loss: f64,
+    #[allow(dead_code)]
+    pub last_kt: f64,
+    /// `tracker.plateau_restarts + tracker.crash_restarts` at the end of training.
+    #[allow(dead_code)]
+    pub total_restarts: usize,
+    /// Number of times the Param-level NaN/Inf check (`model_is_finite`) fired and fully
+    /// reinitialized `model` from scratch (Option A — full reinit, not checkpoint rollback;
+    /// see CLAUDE.md / issue #26).
+    #[allow(dead_code)]
+    pub model_reinit_count: usize,
+}
+
 /// Run headless training. Returns `true` if converged, `false` if exhausted max_steps.
 pub fn run_headless(config: SolverConfig) -> bool {
+    run_headless_inner(config, None).converged
+}
+
+/// `initial_model`: test-only hook (always `None` from the public `run_headless`), mirroring
+/// `run_headless_pinlug_inner`'s `initial_models` parameter — lets tests inject a pre-built
+/// (e.g. deliberately corrupted) model instead of relying on process RNG determinism.
+pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<ElasticityNet<B>>) -> KirschHeadlessResult {
     let mut config = config;
     let engine = EngineParams::analyze(&config);
     engine.apply_to(&mut config);
@@ -96,7 +123,10 @@ pub fn run_headless(config: SolverConfig) -> bool {
         .with_n_hidden(config.n_hidden)
         .with_output_dim(engine.output_dim())
         .with_use_piratenet(config.use_piratenet);
-    let mut model: ElasticityNet<B> = net_cfg.init(&device);
+    let mut model: ElasticityNet<B> = match initial_model {
+        Some(m) => m,
+        None => net_cfg.init(&device),
+    };
     let use_soap_muon = config.use_soap_muon;
     let dm_config = config.decision_maker.clone();
     let mut decision_maker = PinnDecisionMaker::new(dm_config.clone(), false, false);
@@ -144,6 +174,7 @@ pub fn run_headless(config: SolverConfig) -> bool {
     let mut best_loss = f32::MAX;
     let mut last_kt: Option<f32> = None;
     let mut converged = false;
+    let mut model_reinit_count: usize = 0;
     let start = std::time::Instant::now();
 
     // Cache normalized interior points — recomputed only when int_pts_phys changes (Phase 2 start
@@ -359,6 +390,43 @@ pub fn run_headless(config: SolverConfig) -> bool {
             print!("\r[{bar}] {:.1}%  {elapsed:.0}s  ETA {eta:.0}s", pct * 100.0);
 
             if step % 200 == 0 || step == config.max_steps - 1 {
+                // === Param-level NaN/Inf detection (Option A: full reinit from scratch) ===
+                // Runs regardless of `phase2_started` — a true Param-level NaN can occur in
+                // Phase 1 too, unlike the K_t crash/plateau cascade below (which is gated on
+                // `phase2_started` because it needs an actual K_t reading, only meaningful
+                // once Phase 2 has started). Placed BEFORE the probe below so a freshly
+                // reinitialized model gets probed (and can produce a valid reading) in the
+                // SAME iteration.
+                if !model_is_finite(&model) {
+                    match tracker.force_crash_restart() {
+                        Some(new_cap) => {
+                            model = net_cfg.init(&device);
+                            dynamic_lam_h_cap = new_cap;
+                            dynamic_lam_d_cap = new_cap;
+                            tracker.clear_history();
+                            saw.reset();
+                            lr_sched.reset_for_phase2();
+                            // Live `phase2_started` (NOT hardcoded `true` the way the
+                            // phase2-only restart bodies below do — they can hardcode it
+                            // because they only ever fire once already in Phase 2; this check
+                            // fires in both phases).
+                            decision_maker = PinnDecisionMaker::new(dm_config.clone(), phase2_started, false);
+                            optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
+                            optim_b = make_bias_optim();
+                            optim_gate = make_gate_optim();
+                            stiffness_controller = StiffnessController::new(stiff_config.clone());
+                            lbfgs_opt = None; frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None;
+                            model_reinit_count += 1;
+                            println!("\n  [PARAM-NAN REINIT #{}] Param-level NaN/Inf in model weights (phase2_started={phase2_started}) → full reinit from scratch (Option A): lr+adam+SAW, lam_caps→{new_cap:.0}",
+                                tracker.total_restarts());
+                        }
+                        None => {
+                            println!("\n  [FATAL] Param-level NaN/Inf detected and crash-restart budget exhausted — aborting training on dead weights");
+                            break 'training;
+                        }
+                    }
+                }
+
                 let model_val: ElasticityNet<BInner> = model.valid();
                 let kt_opt = probe_kt_shared(&model_val, &config, &engine, &fd, k, u_ref, &device);
                 if kt_opt.is_some() { last_kt = kt_opt; }
@@ -459,7 +527,13 @@ pub fn run_headless(config: SolverConfig) -> bool {
     println!("  Expected K_t    : {:.4} at r={}·r_hole", engine.expected_kt, engine.probe_r_factor);
     println!("════════════════════════════════════════════════════════════════════════════════════════════════════════");
 
-    converged
+    KirschHeadlessResult {
+        converged,
+        best_loss: best_loss as f64,
+        last_kt: last_kt.unwrap_or(0.0) as f64,
+        total_restarts: tracker.total_restarts(),
+        model_reinit_count,
+    }
 }
 
 /// Richer result of [`run_headless_pinlug_inner`] — the public [`run_headless_pinlug`] only
@@ -502,6 +576,11 @@ pub(crate) struct PinLugHeadlessResult {
     /// The `frozen_lams` snapshot actually captured at Converge-tier entry.
     #[allow(dead_code)]
     pub lbfgs_entry_lams: Option<HashMap<&'static str, f64>>,
+    /// Number of times the Param-level NaN/Inf check (`model_is_finite`) fired and fully
+    /// reinitialized both `model_pin`/`model_lug` from scratch (Option A — full reinit, not
+    /// checkpoint rollback; see CLAUDE.md / issue #26).
+    #[allow(dead_code)]
+    pub model_reinit_count: usize,
 }
 
 /// Headless-only entry point for the pin-in-lug 2-domain contact problem — routes through
@@ -685,6 +764,13 @@ pub(crate) fn run_headless_pinlug_inner(
     let mut dynamic_lam_penetration_cap = problem.base_weight("interface_penetration") as f64;
     let mut dynamic_lam_non_tension_cap = problem.base_weight("interface_non_tension") as f64;
     let mut metric_probes: usize = 0;
+    // Number of times the Param-level NaN/Inf check (`model_is_finite`) fired and fully
+    // reinitialized both `model_pin`/`model_lug` from scratch (Option A — see CLAUDE.md /
+    // issue #26).
+    let mut model_reinit_count: usize = 0;
+    // Set when the crash-restart budget is exhausted while the model is STILL non-finite —
+    // training aborts rather than continuing on dead weights (see the cascade block below).
+    let mut fatal_abort = false;
     let mut last_lam_before_converge: Option<HashMap<&'static str, f64>> = None;
     let mut lbfgs_entry_lams: Option<HashMap<&'static str, f64>> = None;
     // Most recent step_physics_multi (real, non-synthetic) StepOutput's lam_by_name — see
@@ -879,6 +965,39 @@ pub(crate) fn run_headless_pinlug_inner(
         // on `dm_config.enabled` — same convention as Kirsch's own cascade, which is gated
         // only on having started its curriculum, not on the decision maker being on. ===
         if step % 200 == 0 {
+            // === Param-level NaN/Inf detection (Option A: full reinit from scratch) ===
+            // Placed BEFORE the metric probe below so a freshly reinitialized pair of models
+            // gets probed (and can produce a valid reading) in the SAME iteration.
+            if !model_is_finite(&model_pin) || !model_is_finite(&model_lug) {
+                match tracker.force_crash_restart() {
+                    Some(new_cap) => {
+                        model_pin = net_cfg(pin_geom.half_w, pin_geom.half_h).init(&device);
+                        model_lug = net_cfg(lug_geom.half_w, lug_geom.half_h).init(&device);
+                        dynamic_lam_h_cap = new_cap;
+                        dynamic_lam_d_cap = new_cap;
+                        dynamic_lam_penetration_cap = new_cap;
+                        dynamic_lam_non_tension_cap = new_cap;
+                        tracker.clear_history();
+                        saw.reset();
+                        lr_sched.reset_for_phase2();
+                        decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, true);
+                        optims = vec![
+                            DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
+                            DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
+                        ];
+                        lbfgs_opt = None; frozen_ctx = None; frozen_lams = None;
+                        model_reinit_count += 1;
+                        println!("\n  [PARAM-NAN REINIT #{}] Param-level NaN/Inf in pin/lug model weights → full reinit from scratch (Option A): lr+adam+SAW, lam_caps→{new_cap:.0}",
+                            tracker.total_restarts());
+                    }
+                    None => {
+                        println!("\n  [FATAL] Param-level NaN/Inf detected and crash-restart budget exhausted — aborting training on dead weights");
+                        fatal_abort = true;
+                        break;
+                    }
+                }
+            }
+
             let state = vec![
                 DomainState { id: PIN_DOMAIN, model: model_pin.clone(), u_ref, ref_energy, ref_stress2 },
                 DomainState { id: LUG_DOMAIN, model: model_lug.clone(), u_ref, ref_energy, ref_stress2 },
@@ -977,7 +1096,7 @@ pub(crate) fn run_headless_pinlug_inner(
 
     println!("════════════════════════════════════════════════════════════════════════════════════════════════════════");
     PinLugHeadlessResult {
-        converged: last_total.is_finite(),
+        converged: !fatal_abort && last_total.is_finite(),
         final_tier: decision_maker.current_tier,
         trajectory,
         metric_probes,
@@ -988,6 +1107,7 @@ pub(crate) fn run_headless_pinlug_inner(
         total_restarts: tracker.plateau_restarts + tracker.crash_restarts,
         last_lam_before_converge,
         lbfgs_entry_lams,
+        model_reinit_count,
     }
 }
 
@@ -1176,52 +1296,73 @@ mod tests {
         (model_pin, model_lug)
     }
 
-    /// Negative control for the integration test below: with only 2 consecutive missed
-    /// probes (steps 0, 200 — cadence is `step % 200 == 0`), `STUCK_NONE_THRESHOLD` (4) has
-    /// not yet been reached, so `note_missed_reading` must still be returning `None` and the
-    /// restart machinery must never fire. Without this control, the firing test below could
-    /// pass vacuously if `note_missed_reading` (or its wiring) fired unconditionally on any
-    /// miss rather than gating on the threshold.
+    /// Retargeted (issue #26) at `ConvergenceTracker::note_missed_reading` directly
+    /// (unit-level) rather than via `run_headless_pinlug_inner` fed an all-NaN model: the new
+    /// Param-level `model_is_finite` check now catches an all-NaN model on its FIRST probe and
+    /// reinitializes immediately (see `run_headless_pinlug_param_nan_reinit_fires_on_first_
+    /// probe_not_after_threshold_misses` below), so an all-NaN model run through the full
+    /// integration path can no longer reach `note_missed_reading`'s STUCK_NONE_THRESHOLD
+    /// gating at all — that integration scenario is simply gone. The below-threshold behavior
+    /// itself remains real and load-bearing (a model whose forward pass transiently returns
+    /// `None` a few times WITHOUT Param-level corruption must not restart prematurely), so it
+    /// is preserved here directly against the tracker (also covered in isolation by
+    /// `controllers.rs`'s `note_missed_reading_does_not_fire_below_threshold`).
     #[test]
     fn run_headless_pinlug_stuck_nan_below_threshold_does_not_restart() {
-        let device = WgpuDevice::default();
-        let mut config = small_pinlug_config();
-        config.max_steps = 201; // probes at step 0 and step 200 only: 2 misses < threshold 4
-        let (model_pin, model_lug) = nan_pinlug_models(&config, &device);
-
-        let result = run_headless_pinlug_inner(config, Some((model_pin, model_lug)));
-
-        assert_eq!(result.metric_probes, 0, "an all-NaN network must never yield a Some(rms) reading");
-        assert_eq!(result.total_restarts, 0, "2 consecutive misses must not reach STUCK_NONE_THRESHOLD=4");
+        use crate::controllers::MetricDirection;
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 0.0);
+        for i in 0..3 {
+            assert_eq!(t.note_missed_reading(), None, "miss #{} (below STUCK_NONE_THRESHOLD) must not restart", i + 1);
+        }
+        assert_eq!(t.crash_restarts, 0);
     }
 
-    /// THE integration proof: an all-NaN pin/lug network run long enough to accumulate
-    /// `STUCK_NONE_THRESHOLD` (4) consecutive missed probes (steps 0, 200, 400, 600 at the
-    /// existing 200-step cadence) must trip `run_headless_pinlug_inner`'s
-    /// `note_missed_reading` branch and increment `total_restarts` via the SAME
-    /// `crash_restarts` budget the crash-recovery arm uses — proving the wiring in
-    /// `headless.rs`, not just the `ConvergenceTracker` method in isolation.
+    /// Retargeted (issue #26) at `ConvergenceTracker::note_missed_reading` directly for the
+    /// same reason as the test above — see its doc comment.
     #[test]
     fn run_headless_pinlug_stuck_nan_integration_fires_restart_at_threshold() {
-        let device = WgpuDevice::default();
+        use crate::controllers::MetricDirection;
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 0.0);
+        for _ in 0..3 { assert_eq!(t.note_missed_reading(), None); }
+        assert!(t.note_missed_reading().is_some(), "4th consecutive missed reading must trip the restart");
+        assert_eq!(t.crash_restarts, 1);
+    }
+
+    /// THE integration proof for issue #26's Param-level NaN/Inf reinit: an all-NaN pin/lug
+    /// network must be caught on the FIRST probe (step 0), not after accumulating
+    /// `STUCK_NONE_THRESHOLD` consecutive misses via `note_missed_reading` — Param-level
+    /// corruption is direct proof, unlike a merely transient bad reading.
+    #[test]
+    fn run_headless_pinlug_param_nan_reinit_fires_on_first_probe_not_after_threshold_misses() {
         let mut config = small_pinlug_config();
-        config.max_steps = 601; // probes at steps 0, 200, 400, 600: exactly 4 consecutive misses
+        config.max_steps = 1;
+        let device = WgpuDevice::default();
         let (model_pin, model_lug) = nan_pinlug_models(&config, &device);
-
         let result = run_headless_pinlug_inner(config, Some((model_pin, model_lug)));
+        assert_eq!(result.model_reinit_count, 1,
+            "a Param-level NaN observed on the FIRST probe must reinitialize immediately, not \
+             wait for STUCK_NONE_THRESHOLD consecutive misses");
+        assert_eq!(result.metric_probes, 1,
+            "the freshly-reinitialized model must be probed (and read Some) in the SAME iteration");
+    }
 
-        assert_eq!(result.metric_probes, 0, "an all-NaN network must never yield a Some(rms) reading");
-        assert!(
-            result.total_restarts >= 1,
-            "4 consecutive missed probes must trip the STUCK-NAN RECOVERY branch and increment total_restarts, got {}",
-            result.total_restarts
-        );
-        // The restart body tightens dynamic_lam_h_cap/dynamic_lam_d_cap via the same
-        // step_down_cap cascade check_kt_crash uses (50.0 unchanged on the FIRST restart
-        // overall) — assert both were actually threaded through to the result, not just the
-        // tracker's internal counter.
-        assert_eq!(result.final_lam_h_cap, 50.0, "first-ever restart must leave lam_h_cap at LAM_CAP_INITIAL (no decay until the 2nd restart)");
-        assert_eq!(result.final_lam_d_cap, 50.0, "first-ever restart must leave lam_d_cap at LAM_CAP_INITIAL (no decay until the 2nd restart)");
+    #[test]
+    fn run_headless_pinlug_param_nan_reinit_uses_the_shared_crash_budget_and_cap_cascade() {
+        let mut config = small_pinlug_config();
+        config.max_steps = 1;
+        let device = WgpuDevice::default();
+        let (model_pin, model_lug) = nan_pinlug_models(&config, &device);
+        let result = run_headless_pinlug_inner(config, Some((model_pin, model_lug)));
+        assert_eq!(result.total_restarts, 1);
+        assert_eq!(result.final_lam_h_cap, 50.0);
+    }
+
+    #[test]
+    fn run_headless_pinlug_finite_model_never_triggers_reinit() {
+        let mut config = small_pinlug_config();
+        config.max_steps = 220;
+        let result = run_headless_pinlug_inner(config, None);
+        assert_eq!(result.model_reinit_count, 0);
     }
 
     /// Extends the existing zero-regression test's pattern past max_steps=220 (past the
@@ -1341,5 +1482,66 @@ mod tests {
             "expected at least one term's SAW-adapted weight to have moved from its static \
              base_weight by Converge entry"
         );
+    }
+
+    // ─── Kirsch Param-level NaN/Inf reinit (issue #26) ──────────────────────────────────────
+
+    fn small_kirsch_config() -> SolverConfig {
+        let mut config = SolverConfig::default_kirsch();
+        config.n_interior = 32;
+        config.n_boundary = 24;
+        config.hidden_dim = 8;
+        config.n_hidden = 2;
+        config.max_steps = 10;
+        config
+    }
+
+    /// Builds a Kirsch `ElasticityNet` whose every float parameter is NaN — mirrors
+    /// `nan_pinlug_models`'s pattern exactly, but must replicate `run_headless_inner`'s own
+    /// `EngineParams::analyze` + `apply_to` + net-dim derivation (hidden_dim/n_hidden/
+    /// input_dim/output_dim are NOT simply the caller's raw `SolverConfig` fields — the engine
+    /// derives/overrides them from geometry) so the injected model's shape matches what
+    /// `run_headless_inner` will actually feed it.
+    fn nan_kirsch_model(config: &SolverConfig, device: &WgpuDevice) -> ElasticityNet<B> {
+        use burn::module::{Module, ModuleMapper, Param};
+        use burn::tensor::Tensor;
+
+        struct NanMapper;
+        impl<Bk: burn::tensor::backend::Backend> ModuleMapper<Bk> for NanMapper {
+            fn map_float<const D: usize>(&mut self, param: Param<Tensor<Bk, D>>) -> Param<Tensor<Bk, D>> {
+                param.map(|t| t.zeros_like().add_scalar(f32::NAN))
+            }
+        }
+
+        let mut config = config.clone();
+        let engine = EngineParams::analyze(&config);
+        engine.apply_to(&mut config);
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        net_cfg.init(device).map(&mut NanMapper)
+    }
+
+    #[test]
+    fn run_headless_kirsch_param_nan_reinit_fires_immediately_in_phase1() {
+        let mut config = small_kirsch_config();
+        config.max_steps = 1;
+        let device = WgpuDevice::default();
+        let model = nan_kirsch_model(&config, &device);
+        let result = run_headless_inner(config, Some(model));
+        assert_eq!(result.model_reinit_count, 1,
+            "a Param-level NaN in Phase 1 must be caught even though the existing K_t cascade \
+             is entirely gated behind phase2_started");
+    }
+
+    #[test]
+    fn run_headless_kirsch_finite_model_never_triggers_reinit() {
+        let mut config = small_kirsch_config();
+        config.max_steps = 50;
+        let result = run_headless_inner(config, None);
+        assert_eq!(result.model_reinit_count, 0);
     }
 }

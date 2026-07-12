@@ -1114,6 +1114,35 @@ fn t_scalar(t: &Tensor<B, 1>) -> f32 {
     t.clone().into_data().to_vec::<f32>().unwrap_or(vec![0.0])[0]
 }
 
+// ─── Param-level finiteness check ────────────────────────────────────────────
+
+/// Visitor that ANDs finiteness across every float `Param` visited (weights AND biases,
+/// every dimensionality) — mirrors `GradFlattenVisitor`'s traversal shape below, but only
+/// needs a running boolean rather than collecting tensors.
+struct FiniteCheckVisitor {
+    all_finite: bool,
+}
+
+impl ModuleVisitor<B> for FiniteCheckVisitor {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        let finite = match param.val().into_data().to_vec::<f32>() {
+            Ok(v) => v.iter().all(|x| x.is_finite()),
+            Err(_) => false,
+        };
+        self.all_finite &= finite;
+    }
+}
+
+/// True iff every float `Param` in `model` (weights AND biases, 1-D and 2-D alike) is finite
+/// (neither NaN nor ±Infinity). Distinct from the transient-bad-reading case
+/// `ConvergenceTracker::note_missed_reading` already handles — this detects true Param-level
+/// corruption of the model's own weight tensors.
+pub fn model_is_finite(model: &ElasticityNet<B>) -> bool {
+    let mut vis = FiniteCheckVisitor { all_finite: true };
+    model.visit(&mut vis);
+    vis.all_finite
+}
+
 // ─── Gradient conflict detection ─────────────────────────────────────────────
 
 /// Visitor that flattens all gradient tensors in `GradientsParams` to a 1-D inner-backend tensor.
@@ -5238,6 +5267,84 @@ mod tests {
 
         let rel = (lam["interface_penetration"] - live_weight).abs() / live_weight.abs().max(1e-8);
         assert!(rel < 1e-9, "cap exactly at live weight must be a no-op: got={} expected~={live_weight}", lam["interface_penetration"]);
+    }
+
+    #[test]
+    fn model_is_finite_true_for_freshly_initialized_model() {
+        let device = WgpuDevice::default();
+        let net_cfg = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(3)
+            .with_use_piratenet(false);
+        let model: ElasticityNet<B> = net_cfg.init(&device);
+        assert!(model_is_finite(&model), "a freshly-initialized model must be finite");
+    }
+
+    #[test]
+    fn model_is_finite_false_when_every_param_is_nan() {
+        use burn::module::{Module, ModuleMapper, Param};
+        struct NanMapper;
+        impl<Bk: burn::tensor::backend::Backend> ModuleMapper<Bk> for NanMapper {
+            fn map_float<const D: usize>(&mut self, param: Param<Tensor<Bk, D>>) -> Param<Tensor<Bk, D>> {
+                param.map(|t| t.zeros_like().add_scalar(f32::NAN))
+            }
+        }
+        let device = WgpuDevice::default();
+        let net_cfg = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(3)
+            .with_use_piratenet(false);
+        let model: ElasticityNet<B> = net_cfg.init(&device).map(&mut NanMapper);
+        assert!(!model_is_finite(&model));
+    }
+
+    #[test]
+    fn model_is_finite_false_when_only_1d_params_are_nan_not_2d_weights() {
+        use burn::module::{Module, ModuleMapper, Param};
+        struct NanOneDOnlyMapper;
+        impl<Bk: burn::tensor::backend::Backend> ModuleMapper<Bk> for NanOneDOnlyMapper {
+            fn map_float<const D: usize>(&mut self, param: Param<Tensor<Bk, D>>) -> Param<Tensor<Bk, D>> {
+                if D == 1 { param.map(|t| t.zeros_like().add_scalar(f32::NAN)) } else { param }
+            }
+        }
+        let device = WgpuDevice::default();
+        let net_cfg = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(3)
+            .with_use_piratenet(false);
+        let model: ElasticityNet<B> = net_cfg.init(&device).map(&mut NanOneDOnlyMapper);
+        assert!(!model_is_finite(&model), "corruption confined to 1-D params (biases) must still be detected");
+    }
+
+    #[test]
+    fn model_is_finite_false_for_positive_infinity() {
+        use burn::module::{Module, ModuleMapper, Param};
+        struct InfMapper;
+        impl<Bk: burn::tensor::backend::Backend> ModuleMapper<Bk> for InfMapper {
+            fn map_float<const D: usize>(&mut self, param: Param<Tensor<Bk, D>>) -> Param<Tensor<Bk, D>> {
+                param.map(|t| t.zeros_like().add_scalar(f32::INFINITY))
+            }
+        }
+        let device = WgpuDevice::default();
+        let net_cfg = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(3)
+            .with_use_piratenet(false);
+        let model: ElasticityNet<B> = net_cfg.init(&device).map(&mut InfMapper);
+        assert!(!model_is_finite(&model), "+Infinity is non-finite, not just NaN");
+    }
+
+    #[test]
+    fn model_is_finite_false_for_negative_infinity() {
+        use burn::module::{Module, ModuleMapper, Param};
+        struct NegInfMapper;
+        impl<Bk: burn::tensor::backend::Backend> ModuleMapper<Bk> for NegInfMapper {
+            fn map_float<const D: usize>(&mut self, param: Param<Tensor<Bk, D>>) -> Param<Tensor<Bk, D>> {
+                param.map(|t| t.zeros_like().add_scalar(f32::NEG_INFINITY))
+            }
+        }
+        let device = WgpuDevice::default();
+        let net_cfg = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(3)
+            .with_use_piratenet(false);
+        let model: ElasticityNet<B> = net_cfg.init(&device).map(&mut NegInfMapper);
+        assert!(!model_is_finite(&model));
     }
 }
 
