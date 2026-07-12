@@ -28,8 +28,30 @@ pub struct ElasticityNet<B: Backend> {
 
 impl<B: Backend> ElasticityNet<B> {
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.forward_masked(x, None)
+    }
+
+    /// Identical to [`Self::forward`], except that when `mask` is `Some`, hidden block
+    /// `i` (i.e. `self.layers[i]` for `i in 1..self.layers.len()`, mask index `i-1`) is
+    /// *structurally* skipped when `mask[i-1] == false`: `self.layers[i].forward(...)` is
+    /// never called for that block, so its ops never enter the autodiff graph (a real
+    /// compute-skip, not a zeroed contribution to it). `h` passes through unchanged for a
+    /// skipped block, matching the mathematically-exact `alpha=0` residual identity that
+    /// makes this lossless (see `dormant_block_gradient_is_exactly_zero`).
+    ///
+    /// `mask` must have length `self.gates.len()` (`self.layers.len() - 1`) when `Some`.
+    /// `None` (or an empty mask when `self.gates` is empty, i.e. `use_piratenet=false`)
+    /// computes every block, byte-identical to the pre-mask `forward()` path.
+    pub fn forward_masked(&self, x: Tensor<B, 2>, mask: Option<&[bool]>) -> Tensor<B, 2> {
         let mut h = self.layers[0].forward(x).tanh();
         for i in 1..self.layers.len() {
+            let awake = match mask {
+                Some(m) => m.get(i - 1).copied().unwrap_or(true),
+                None => true,
+            };
+            if !awake {
+                continue;
+            }
             let f = self.layers[i].forward(h.clone()).tanh();
             h = match self.gates.get(i - 1) {
                 Some(alpha) => h.clone() + f.mul(alpha.val().reshape([1, 1])),
@@ -37,6 +59,21 @@ impl<B: Backend> ElasticityNet<B> {
             };
         }
         self.out.forward(h)
+    }
+
+    /// Per-block "awake" classification (length `self.gates.len()`, i.e. `n_hidden - 1`):
+    /// `true` iff `gate_values()[i].abs() > gate_epsilon`. Empty when `use_piratenet=false`
+    /// (gates empty) — the single source of classification logic reused by both
+    /// `awake_weight_ids` (optimizer parameter-set exclusion) and `forward_masked`'s
+    /// compute-skip mask, so both enforcement points always agree.
+    pub fn awake_mask(&self, gate_epsilon: f32) -> Vec<bool> {
+        if self.gates.is_empty() {
+            return Vec::new();
+        }
+        self.gate_values()
+            .into_iter()
+            .map(|g| g.abs() > gate_epsilon)
+            .collect()
     }
 
     /// Returns (weight_param_ids, bias_param_ids) across all `Linear` layers — used to
@@ -60,6 +97,18 @@ impl<B: Backend> ElasticityNet<B> {
         self.gates.iter().map(|g| g.id).collect()
     }
 
+    /// Test-only: force `gates[i]` to `value` — direct field assignment (`gates` has no
+    /// production setter; training mutates it via the optimizer, never by direct
+    /// assignment) so cross-module tests (e.g. `training_core`'s compute-skip tests) can
+    /// deterministically exercise a dormant/awake block without a full training loop.
+    #[cfg(test)]
+    pub(crate) fn force_gate_for_test(&mut self, i: usize, value: f32, device: &B::Device) {
+        self.gates[i] = Param::from_tensor(Tensor::<B, 1>::from_data(
+            burn::tensor::TensorData::new(vec![value], vec![1]),
+            device,
+        ));
+    }
+
     /// Current gate values (cheap CPU read — call only at an infrequent check cadence,
     /// not on every step, since `.into_scalar()`/`.to_data()` forces a GPU sync).
     pub fn gate_values(&self) -> Vec<f32> {
@@ -76,14 +125,22 @@ impl<B: Backend> ElasticityNet<B> {
     /// so excluding it from the optimizer's parameter set is a correctness-preserving
     /// compute-skip, not an approximation.
     pub fn awake_weight_ids(&self, gate_epsilon: f32) -> Vec<ParamId> {
-        if self.gates.is_empty() {
+        let mask = self.awake_mask(gate_epsilon);
+        self.awake_weight_ids_from_mask(&mask)
+    }
+
+    /// Same result as [`Self::awake_weight_ids`], but takes an already-computed
+    /// [`Self::awake_mask`] instead of reading `gate_values()` itself — lets a caller that
+    /// also needs the mask for [`Self::forward_masked`] (e.g. `training_core::step_physics`)
+    /// take a single gate-value GPU-sync snapshot per step and reuse it for both purposes.
+    pub fn awake_weight_ids_from_mask(&self, mask: &[bool]) -> Vec<ParamId> {
+        if mask.is_empty() {
             return self.param_ids().0;
         }
-        let gate_values = self.gate_values();
         let mut ids = Vec::with_capacity(self.layers.len() + 1);
         ids.push(self.layers[0].weight.id);
         for i in 1..self.layers.len() {
-            if gate_values[i - 1].abs() > gate_epsilon {
+            if mask[i - 1] {
                 ids.push(self.layers[i].weight.id);
             }
         }
@@ -195,6 +252,22 @@ pub fn fwd<Bk: Backend>(
     }
 }
 
+/// `fwd`'s masked analogue — applies the same optional Fourier embedding, then calls
+/// `ElasticityNet::forward_masked` instead of `forward`. `None` is byte-identical to `fwd`.
+pub fn fwd_masked<Bk: Backend>(
+    model: &ElasticityNet<Bk>,
+    input: Tensor<Bk, 2>,
+    n_fourier: usize,
+    device: &Bk::Device,
+    mask: Option<&[bool]>,
+) -> Tensor<Bk, 2> {
+    if n_fourier > 0 {
+        model.forward_masked(fourier_embed(input, n_fourier, device), mask)
+    } else {
+        model.forward_masked(input, mask)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +338,131 @@ mod tests {
             let max_abs: f32 = g.abs().max().into_scalar();
             assert_eq!(max_abs, 0.0, "layers[{i}] weight gradient should be exactly zero at alpha=0");
         }
+    }
+
+    /// Sets `model.gates[i]` to `value` — thin wrapper over `force_gate_for_test`.
+    fn set_gate<B: Backend>(model: &mut ElasticityNet<B>, i: usize, value: f32, device: &B::Device) {
+        model.force_gate_for_test(i, value, device);
+    }
+
+    fn fixed_input(device: &WgpuDevice) -> Tensor<TB, 2> {
+        Tensor::from_data(
+            burn::tensor::TensorData::new(vec![0.3_f32, -0.7, 0.1, 0.9], vec![2, 2]),
+            device,
+        )
+    }
+
+    #[test]
+    fn awake_mask_matches_awake_weight_ids_classification() {
+        let device = WgpuDevice::default();
+        let mut model: ElasticityNet<TB> = piratenet_config().init(&device);
+        set_gate(&mut model, 0, 0.0, &device);
+        set_gate(&mut model, 1, 5e-4, &device);
+
+        let mask = model.awake_mask(1e-4);
+        assert_eq!(mask, vec![false, true]);
+
+        let ids = model.awake_weight_ids(1e-4);
+        assert!(ids.contains(&model.layers[0].weight.id));
+        assert!(ids.contains(&model.layers[2].weight.id));
+        assert!(ids.contains(&model.out.weight.id));
+        assert!(!ids.contains(&model.layers[1].weight.id));
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn dormant_block_forward_is_structurally_skipped_not_computed() {
+        let device = WgpuDevice::default();
+        let mut model: ElasticityNet<TB> = piratenet_config().init(&device);
+        set_gate(&mut model, 0, 0.0, &device); // layers[1] dormant
+        set_gate(&mut model, 1, 1.0, &device); // layers[2] awake
+
+        let mask = model.awake_mask(1e-4);
+        assert_eq!(mask, vec![false, true]);
+
+        let x = fixed_input(&device);
+        let out = model.forward_masked(x, Some(&mask));
+        let loss = out.powf_scalar(2.0_f64).sum();
+        let mut grads = loss.backward();
+
+        let id = model.layers[1].weight.id;
+        let g = GradientsParams::from_params(&mut grads, &model, &[id]).get::<TBInner, 2>(id);
+        assert!(
+            g.is_none(),
+            "structurally-skipped block should receive no gradient entry at all, got {g:?}"
+        );
+    }
+
+    #[test]
+    fn awake_block_forward_masked_still_computed_and_gradient_flows() {
+        let device = WgpuDevice::default();
+        let mut model: ElasticityNet<TB> = piratenet_config().init(&device);
+        set_gate(&mut model, 0, 0.0, &device); // layers[1] dormant
+        set_gate(&mut model, 1, 1.0, &device); // layers[2] awake
+
+        let mask = model.awake_mask(1e-4);
+        let x = fixed_input(&device);
+        let out = model.forward_masked(x, Some(&mask));
+        let loss = out.powf_scalar(2.0_f64).sum();
+        let mut grads = loss.backward();
+
+        let id = model.layers[2].weight.id;
+        let g = GradientsParams::from_params(&mut grads, &model, &[id])
+            .get::<TBInner, 2>(id)
+            .expect("awake block should have a gradient");
+        let max_abs: f32 = g.abs().max().into_scalar();
+        assert!(max_abs > 0.0, "awake block gradient should be nonzero, got {max_abs}");
+    }
+
+    #[test]
+    fn forward_masked_none_is_byte_identical_to_forward() {
+        let device = WgpuDevice::default();
+        let mut model: ElasticityNet<TB> = piratenet_config().init(&device);
+        set_gate(&mut model, 0, 0.37, &device);
+        set_gate(&mut model, 1, -0.91, &device);
+
+        let x = fixed_input(&device);
+        let a = model.forward(x.clone());
+        let b = model.forward_masked(x, None);
+
+        let diff: f32 = (a - b).abs().sum().into_scalar();
+        assert_eq!(diff, 0.0, "forward_masked(x, None) must be byte-identical to forward(x)");
+    }
+
+    #[test]
+    fn forward_masked_all_true_matches_forward_all_gates_nonzero() {
+        let device = WgpuDevice::default();
+        let mut model: ElasticityNet<TB> = piratenet_config().init(&device);
+        set_gate(&mut model, 0, 0.37, &device);
+        set_gate(&mut model, 1, -0.91, &device);
+
+        let x = fixed_input(&device);
+        let a = model.forward(x.clone());
+        let b = model.forward_masked(x, Some(&[true, true]));
+
+        let diff: f32 = (a - b).abs().sum().into_scalar();
+        assert!(diff < 1e-6, "all-true mask should numerically match forward(), diff={diff}");
+    }
+
+    #[test]
+    fn use_piratenet_disabled_makes_awake_mask_empty_and_forward_masked_ignores_it() {
+        let device = WgpuDevice::default();
+        let config = ElasticityNetConfig::new()
+            .with_input_dim(2)
+            .with_hidden_dim(4)
+            .with_n_hidden(3)
+            .with_output_dim(2)
+            .with_use_piratenet(false);
+        let model: ElasticityNet<TB> = config.init(&device);
+
+        assert!(model.gates.is_empty());
+        assert_eq!(model.awake_mask(1e-4), Vec::<bool>::new());
+
+        let x = fixed_input(&device);
+        let a = model.forward(x.clone());
+        let b = model.forward_masked(x, Some(&[]));
+
+        let diff: f32 = (a - b).abs().sum().into_scalar();
+        assert_eq!(diff, 0.0);
     }
 }

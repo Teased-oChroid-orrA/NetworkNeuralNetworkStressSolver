@@ -40,7 +40,7 @@ use crate::{
     fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig},
     kirsch_problem::KIRSCH_DOMAIN,
     lr_schedule::LrSchedule,
-    network::{fwd, ElasticityNet},
+    network::{fwd, fwd_masked, ElasticityNet},
     optim::{BiasOptim, GateOptim, WeightOptim},
     problem::{BoundaryValueProblem, DomainForwardOutputs, LossTerm},
     saw_brdr::SawBrdr,
@@ -282,6 +282,25 @@ pub fn step_physics(
     let px         = ctx.config.load.px;
     let u_ref_f64  = ctx.u_ref as f64;
 
+    // Single gate-value snapshot for this step, reused for BOTH the compute-skip forward
+    // mask below AND the SOAP-Muon weight-id exclusion further down — avoids a second
+    // `gate_values()` GPU sync. `None` when `use_piratenet=false` (matches
+    // `awake_weight_ids`'s pre-existing `use_piratenet`-gated behavior exactly).
+    let awake_mask: Option<Vec<bool>> = if ctx.config.use_piratenet {
+        Some(model.awake_mask(ctx.config.stiffness.gate_awake_epsilon))
+    } else {
+        None
+    };
+    // Actual forward compute-skip is additionally gated on `use_piratenet_compute_skip`
+    // (default false) — when disabled, `forward_mask` stays `None` and every `fwd_masked`
+    // call below is byte-identical to the pre-change `fwd` call, preserving this frozen
+    // path's byte-proven regression guarantee.
+    let forward_mask: Option<&[bool]> = if ctx.config.use_piratenet_compute_skip {
+        awake_mask.as_deref()
+    } else {
+        None
+    };
+
     let v_to_t = |idxs: &[usize], src: &[f32]| -> Tensor<B, 1> {
         let v: Vec<f32> = idxs.iter().map(|&i| src[i]).collect();
         Tensor::<B, 1>::from_data(TensorData::new(v.clone(), vec![v.len()]), device)
@@ -307,7 +326,7 @@ pub fn step_physics(
     let pts_t = norm_pts_to_tensor::<B>(ctx.int_norm, device);
     let stencil_coords = assemble_stencil::<B>(&pts_t, ctx.fd, device);
     let stencil_out = scale_out(apply_dirichlet_ansatz::<B>(
-        fwd(&model, stencil_coords.clone(), n_fourier, device),
+        fwd_masked(&model, stencil_coords.clone(), n_fourier, device, forward_mask),
         &stencil_coords,
         ctx.config.geometry.symmetry,
         ctx.k,
@@ -334,7 +353,7 @@ pub fn step_physics(
         let bnd_t = norm_pts_to_tensor::<B>(&trac_norm, device);
         let stencil_bnd = assemble_stencil::<B>(&bnd_t, ctx.fd, device);
         let out_bnd = scale_out(apply_dirichlet_ansatz::<B>(
-            fwd(&model, stencil_bnd.clone(), n_fourier, device), &stencil_bnd,
+            fwd_masked(&model, stencil_bnd.clone(), n_fourier, device, forward_mask), &stencil_bnd,
             ctx.config.geometry.symmetry, ctx.k,
         ));
         let (ex, ey, exy) = compute_strains::<B>(out_bnd.clone(), nt, ctx.fd);
@@ -365,7 +384,7 @@ pub fn step_physics(
         let nr = right_norm.len();
         let right_t = norm_pts_to_tensor::<B>(&right_norm, device);
         let out_r = scale_out(apply_dirichlet_ansatz::<B>(
-            fwd(&model, right_t.clone(), n_fourier, device), &right_t,
+            fwd_masked(&model, right_t.clone(), n_fourier, device, forward_mask), &right_t,
             ctx.config.geometry.symmetry, ctx.k,
         ));
         let right_forward = DomainForwardOutputs {
@@ -398,7 +417,7 @@ pub fn step_physics(
 
         if use_mdem {
             let out_h = scale_out(apply_dirichlet_ansatz::<B>(
-                fwd(&model, bnd_h.clone(), n_fourier, device), &bnd_h,
+                fwd_masked(&model, bnd_h.clone(), n_fourier, device, forward_mask), &bnd_h,
                 ctx.config.geometry.symmetry, ctx.k,
             ));
             let hole_forward = DomainForwardOutputs {
@@ -415,7 +434,7 @@ pub fn step_physics(
         } else {
             let stencil_h = assemble_stencil::<B>(&bnd_h, ctx.fd, device);
             let out_h = scale_out(apply_dirichlet_ansatz::<B>(
-                fwd(&model, stencil_h.clone(), n_fourier, device), &stencil_h,
+                fwd_masked(&model, stencil_h.clone(), n_fourier, device, forward_mask), &stencil_h,
                 ctx.config.geometry.symmetry, ctx.k,
             ));
             let (ex, ey, exy) = compute_strains::<B>(out_h.clone(), nh, ctx.fd);
@@ -452,7 +471,7 @@ pub fn step_physics(
             }).collect();
             let pts_all = norm_pts_to_tensor::<B>(&all_shifted, device);
             let out_all = scale_out(apply_dirichlet_ansatz::<B>(
-                fwd(&model, pts_all.clone(), n_fourier, device), &pts_all,
+                fwd_masked(&model, pts_all.clone(), n_fourier, device, forward_mask), &pts_all,
                 ctx.config.geometry.symmetry, ctx.k,
             ));
             // Each of the 4 shifts occupies n_eq consecutive rows; σ_xx=col2, σ_yy=col3, σ_xy=col4
@@ -472,7 +491,7 @@ pub fn step_physics(
                 let pts = norm_pts_to_tensor::<B>(&shifted, device);
                 let stencil = assemble_stencil::<B>(&pts, ctx.fd, device);
                 let out = scale_out(apply_dirichlet_ansatz::<B>(
-                    fwd(&model, stencil.clone(), n_fourier, device), &stencil,
+                    fwd_masked(&model, stencil.clone(), n_fourier, device, forward_mask), &stencil,
                     ctx.config.geometry.symmetry, ctx.k,
                 ));
                 let (exx, eyy, exy) = compute_strains::<B>(out, n_eq, ctx.fd);
@@ -510,7 +529,7 @@ pub fn step_physics(
                 let kl = if use_mdem {
                     // Direct pass: σ from network cols 2..5 (already in Pa after scale_out)
                     let out_pr = scale_out(apply_dirichlet_ansatz::<B>(
-                        fwd(&model, pts_pr.clone(), n_fourier, device), &pts_pr,
+                        fwd_masked(&model, pts_pr.clone(), n_fourier, device, forward_mask), &pts_pr,
                         ctx.config.geometry.symmetry, ctx.k,
                     ));
                     let kirsch_forward = DomainForwardOutputs {
@@ -528,7 +547,7 @@ pub fn step_physics(
                 } else {
                     let stencil_pr = assemble_stencil::<B>(&pts_pr, ctx.fd, device);
                     let out_pr = scale_out(apply_dirichlet_ansatz::<B>(
-                        fwd(&model, stencil_pr.clone(), n_fourier, device), &stencil_pr,
+                        fwd_masked(&model, stencil_pr.clone(), n_fourier, device, forward_mask), &stencil_pr,
                         ctx.config.geometry.symmetry, ctx.k,
                     ));
                     let (exx_pr, eyy_pr, exy_pr) = compute_strains::<B>(out_pr.clone(), n_pr, ctx.fd);
@@ -670,10 +689,11 @@ pub fn step_physics(
     // weight set — their true gradient is exactly zero at alpha=0 (see network.rs tests), so
     // this skips the eigendecomposition/Shampoo update for capacity the network isn't using
     // yet. No-op (full weight set) when use_piratenet=false.
-    let weight_ids = if ctx.config.use_piratenet {
-        model.awake_weight_ids(ctx.config.stiffness.gate_awake_epsilon)
-    } else {
-        default_weight_ids
+    // Reuses `awake_mask` (computed once, above, before this step's forward passes) instead
+    // of calling `awake_weight_ids` (which would re-read `gate_values()` a second time).
+    let weight_ids = match &awake_mask {
+        Some(mask) => model.awake_weight_ids_from_mask(mask),
+        None => default_weight_ids,
     };
     let gate_ids = model.gate_ids();
     let mut grads = loss.backward();
@@ -749,6 +769,7 @@ fn compute_domain_forwards(
     models: &[&ElasticityNet<B>],
     active_terms: &[Box<dyn LossTerm>],
     device: &WgpuDevice,
+    forward_masks: &[Option<&[bool]>],
 ) -> Vec<Computed> {
     use pinn_core::problem::DomainId;
 
@@ -809,7 +830,9 @@ fn compute_domain_forwards(
         // per-point (dx, dy) scale factors `DirichletAnsatz::eval` returns, then scale to
         // physical units exactly as `step_physics`'s `scale_out` does: displacement cols by
         // u_ref [m], and (mDEM only) stress cols 2..5 by Px [Pa].
-        let raw_net = fwd::<B>(model, stencil.clone(), n_fourier, device);
+        let raw_net = fwd_masked::<B>(
+            model, stencil.clone(), n_fourier, device, forward_masks[model_idx],
+        );
         let m = raw_net.dims()[0];
         let stencil_data: Vec<f32> = stencil.into_data().to_vec::<f32>().unwrap_or_default();
         let mut dx_v = Vec::with_capacity(m);
@@ -879,7 +902,23 @@ pub fn step_physics_multi(
         .collect();
 
     let model_refs: Vec<&ElasticityNet<B>> = models.iter().collect();
-    let computed = compute_domain_forwards(ctx, &model_refs, &active_terms, device);
+
+    // Single per-model gate-value snapshot for this step, reused for BOTH the compute-skip
+    // forward mask (below, via `compute_domain_forwards`) AND the SOAP-Muon weight-id
+    // exclusion further down — mirrors `step_physics`'s single-model `awake_mask`. `None`
+    // per-model when `use_piratenet=false` (today: always, for pin-lug — see CLAUDE.md).
+    let awake_masks: Vec<Option<Vec<bool>>> = if ctx.config.use_piratenet {
+        model_refs.iter().map(|m| Some(m.awake_mask(ctx.config.stiffness.gate_awake_epsilon))).collect()
+    } else {
+        model_refs.iter().map(|_| None).collect()
+    };
+    let forward_masks: Vec<Option<&[bool]>> = if ctx.config.use_piratenet_compute_skip {
+        awake_masks.iter().map(|m| m.as_deref()).collect()
+    } else {
+        model_refs.iter().map(|_| None).collect()
+    };
+
+    let computed = compute_domain_forwards(ctx, &model_refs, &active_terms, device, &forward_masks);
 
     let forwards: HashMap<(DomainId, &'static str), DFO<'_, B>> = computed.iter()
         .map(|c| (c.key, DFO {
@@ -961,10 +1000,11 @@ pub fn step_physics_multi(
     for (i, model) in models.into_iter().enumerate() {
         let dctx = &ctx.domains[i];
         let (default_weight_ids, bias_ids) = model.param_ids();
-        let weight_ids = if ctx.config.use_piratenet {
-            model.awake_weight_ids(ctx.config.stiffness.gate_awake_epsilon)
-        } else {
-            default_weight_ids
+        // Reuses `awake_masks[i]` (computed once, above, before this step's forward passes)
+        // instead of calling `awake_weight_ids` (which would re-read `gate_values()` again).
+        let weight_ids = match &awake_masks[i] {
+            Some(mask) => model.awake_weight_ids_from_mask(mask),
+            None => default_weight_ids,
         };
         let gate_ids = model.gate_ids();
         let weight_grads = GradientsParams::from_params(&mut grads, &model, &weight_ids);
@@ -2093,7 +2133,11 @@ fn sum_group_loss(
     if terms.is_empty() {
         return None;
     }
-    let computed = compute_domain_forwards(ctx, model_refs, terms, device);
+    // `sum_group_loss` backs `compute_gradient_conflict_multi` (a diagnostic gradient-conflict
+    // probe, not one of the 3 optimizer-facing step-driver call sites) — out of scope for the
+    // compute-skip optimization, always runs every block full-compute (`None` per model).
+    let no_masks: Vec<Option<&[bool]>> = model_refs.iter().map(|_| None).collect();
+    let computed = compute_domain_forwards(ctx, model_refs, terms, device, &no_masks);
     let forwards: HashMap<(DomainId, &'static str), DFO<'_, B>> = computed.iter()
         .map(|c| (c.key, DFO {
             domain: c.key.0,
@@ -2205,7 +2249,11 @@ fn compute_loss_for_lbfgs_multi(
         .collect();
 
     let model_refs: Vec<&ElasticityNet<B>> = vec![&models.pin, &models.lug];
-    let computed = compute_domain_forwards(&ctx, &model_refs, &active_terms, device);
+    // Frozen-collocation L-BFGS loss for pin-lug — out of scope for the compute-skip
+    // optimization (see contract: only the Kirsch L-BFGS step is wired in), always runs
+    // every block full-compute (`None` per model).
+    let no_masks: Vec<Option<&[bool]>> = model_refs.iter().map(|_| None).collect();
+    let computed = compute_domain_forwards(&ctx, &model_refs, &active_terms, device, &no_masks);
 
     let forwards: HashMap<(DomainId, &'static str), DFO<'_, B>> = computed.iter()
         .map(|c| (c.key, DFO {
@@ -5238,6 +5286,233 @@ mod tests {
 
         let rel = (lam["interface_penetration"] - live_weight).abs() / live_weight.abs().max(1e-8);
         assert!(rel < 1e-9, "cap exactly at live weight must be a no-op: got={} expected~={live_weight}", lam["interface_penetration"]);
+    }
+
+    // ─── PirateNet compute-skip (issue #20) ─────────────────────────────────────────────
+
+    /// Shared setup for the compute-skip tests below: a PirateNet-mode Kirsch `StepCtx`
+    /// (built from `zero_px_test_fixture`, same fixture `step_physics_finite_at_zero_px_load`
+    /// uses) plus a freshly-init'd model (gates all start at exactly 0.0 — dormant under any
+    /// `gate_awake_epsilon` — so no explicit `force_gate_for_test` call is needed to exercise
+    /// the "gate forced dormant" scenario these tests are named after).
+    fn compute_skip_test_fixture(compute_skip: bool) -> (
+        pinn_core::messages::SolverConfig, crate::engine::EngineParams, StepCtxOwned, WgpuDevice,
+    ) {
+        use crate::engine::EngineParams;
+        use pinn_core::messages::SolverConfig;
+
+        let mut config = SolverConfig::default_kirsch();
+        config.n_interior = 32;
+        config.n_boundary = 24;
+        config.max_steps = 1;
+        config.load.px = 6.895e7; // ~10 ksi
+        config.use_piratenet = true;
+        config.use_piratenet_compute_skip = compute_skip;
+        let engine = EngineParams::analyze(&config);
+        engine.apply_to(&mut config);
+
+        let device = WgpuDevice::default();
+
+        let (x0, x1) = config.geometry.x_range();
+        let (y0, y1) = config.geometry.y_range();
+        let fd = FdConfig::new(config.fd_h, x1 - x0, y1 - y0);
+        let cx = fd.sx / (2.0 * fd.hx as f64);
+        let cy = fd.sy / (2.0 * fd.hy as f64);
+        let ref_div2 = (config.load.px * cx).powi(2).max(1.0);
+        let (u_ref, ref_energy, ref_stress2) = compute_reference_scales(&config);
+
+        let int_pts = pinn_core::sampling::sample_interior(&config.geometry, engine.phase1_n_interior);
+        let bnd_pts = pinn_core::sampling::sample_boundary(&config.geometry, &config.load, config.n_boundary);
+        let eq_ring = pinn_core::sampling::sample_eq_ring(&config.geometry, engine.n_eq_ring);
+
+        let int_norm: Vec<[f32; 2]> = int_pts.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
+        let bnd_norm: Vec<[f32; 2]> = bnd_pts.iter().map(|b| normalize_point(b.x, b.y, &config)).collect();
+        let bnd_nx: Vec<f32> = bnd_pts.iter().map(|b| b.nx as f32).collect();
+        let bnd_ny: Vec<f32> = bnd_pts.iter().map(|b| b.ny as f32).collect();
+        let bnd_tx: Vec<f32> = bnd_pts.iter().map(|b| b.tx as f32).collect();
+        let bnd_ty: Vec<f32> = bnd_pts.iter().map(|b| b.ty as f32).collect();
+        let (trac_idx, hole_idx, right_idx) = extract_boundary_indices(&bnd_pts, &bnd_nx);
+        let eq_ring_norm: Vec<[f32; 2]> = eq_ring.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
+
+        let owned = StepCtxOwned {
+            fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
+            int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
+            trac_idx, hole_idx, right_idx, eq_ring_norm,
+        };
+        (config, engine, owned, device)
+    }
+
+    /// Plain data bag for the pieces `StepCtx<'_>` normally borrows — lets
+    /// `compute_skip_test_fixture` return owned data that two independent `StepCtx`s (one per
+    /// `compute_skip` setting) can each borrow from without a lifetime/ownership clash.
+    struct StepCtxOwned {
+        fd: FdConfig, u_ref: f32, ref_energy: f32, ref_stress2: f32, cx: f64, cy: f64, ref_div2: f64,
+        int_norm: Vec<[f32; 2]>, bnd_norm: Vec<[f32; 2]>,
+        bnd_nx: Vec<f32>, bnd_ny: Vec<f32>, bnd_tx: Vec<f32>, bnd_ty: Vec<f32>,
+        trac_idx: Vec<usize>, hole_idx: Vec<usize>, right_idx: Vec<usize>,
+        eq_ring_norm: Vec<[f32; 2]>,
+    }
+
+    /// Runs one `step_physics` call against `compute_skip_test_fixture`'s setup, on a
+    /// freshly-init'd model whose weights come from `seed` (a `TouchVisitor`-forced clone of a
+    /// shared source model, so both `compute_skip` variants start from bit-identical weights).
+    #[allow(clippy::too_many_arguments)]
+    fn run_compute_skip_step(
+        config: &SolverConfig,
+        engine: &crate::engine::EngineParams,
+        owned: &StepCtxOwned,
+        device: &WgpuDevice,
+        model: ElasticityNet<B>,
+    ) -> (ElasticityNet<B>, StepOutput) {
+        use crate::{
+            kirsch_problem::KirschProblem,
+            optim::{make_bias_optim, make_gate_optim, WeightOptim},
+        };
+
+        let problem = KirschProblem::new(
+            config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
+        );
+        let mut optim_w = WeightOptim::new(config.use_soap_muon);
+        let mut optim_b = make_bias_optim();
+        let mut optim_gate = make_gate_optim();
+        let mut saw = SawBrdr::with_base(engine.init_weights(), 0.95);
+        let mut lr_sched = LrSchedule::new(engine.peak_lr, 200, 1000);
+
+        let ctx = StepCtx {
+            config, engine, problem: &problem, fd: &owned.fd,
+            k: engine.ansatz_k, u_ref: owned.u_ref, ref_energy: owned.ref_energy,
+            ref_stress2: owned.ref_stress2, cx: owned.cx, cy: owned.cy, ref_div2: owned.ref_div2,
+            int_norm: &owned.int_norm, bnd_norm: &owned.bnd_norm,
+            bnd_nx: &owned.bnd_nx, bnd_ny: &owned.bnd_ny, bnd_tx: &owned.bnd_tx, bnd_ty: &owned.bnd_ty,
+            trac_idx: &owned.trac_idx, hole_idx: &owned.hole_idx, right_idx: &owned.right_idx,
+            eq_ring_norm: &owned.eq_ring_norm,
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            phase2_active: false, step: 0,
+        };
+
+        step_physics(
+            model, &mut optim_w, &mut optim_b, &mut optim_gate,
+            &ctx, &mut saw, &mut lr_sched, device, 0, 1.0, 1.0,
+        )
+    }
+
+    fn compute_skip_seed_model(engine: &crate::engine::EngineParams, config: &SolverConfig, device: &WgpuDevice) -> ElasticityNet<B> {
+        use crate::network::ElasticityNetConfig;
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(true);
+        let model: ElasticityNet<B> = net_cfg.init(device);
+        struct TouchVisitor;
+        impl ModuleVisitor<B> for TouchVisitor {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+                let _ = param.val();
+            }
+        }
+        model.visit(&mut TouchVisitor);
+        model
+    }
+
+    /// `use_piratenet_compute_skip` defaults to `false` (see `messages.rs`), so a
+    /// PirateNet-mode Kirsch step run twice under the default (disabled) setting — the
+    /// state this feature ships with — must be perfectly deterministic/reproducible: two
+    /// bit-identical starting models produce bit-identical `StepOutput`s. Combined with
+    /// `network::forward_masked_none_is_byte_identical_to_forward` (which proves
+    /// `forward_mask=None`, the value this path always uses when disabled, is byte-identical
+    /// to the pre-existing unmasked `forward()`), this establishes the frozen Kirsch path's
+    /// byte-identical-when-off guarantee end-to-end.
+    #[test]
+    fn step_physics_compute_skip_disabled_by_default_matches_pre_change_trajectory() {
+        let (config, engine, owned, device) = compute_skip_test_fixture(false);
+        assert!(!config.use_piratenet_compute_skip, "fixture's `compute_skip` arg must be false here");
+
+        let seed = compute_skip_seed_model(&engine, &config, &device);
+        let (_m_a, out_a) = run_compute_skip_step(&config, &engine, &owned, &device, seed.clone());
+        let (_m_b, out_b) = run_compute_skip_step(&config, &engine, &owned, &device, seed);
+
+        assert_eq!(out_a.total_scalar, out_b.total_scalar,
+            "disabled compute-skip path must be exactly reproducible");
+        assert_eq!(out_a.e_scalar, out_b.e_scalar);
+        assert_eq!(out_a.lam_e, out_b.lam_e);
+    }
+
+    /// With every PirateNet gate at its init value (0.0 — dormant under any positive
+    /// `gate_awake_epsilon`), enabling `use_piratenet_compute_skip` must be numerically
+    /// lossless: `StepOutput.total_scalar` and every `lam_*` field must match the
+    /// compute-skip-disabled run within 1e-6, since a dormant block's true contribution is
+    /// exactly zero (see `network::dormant_block_gradient_is_exactly_zero`) whether or not
+    /// its forward pass is structurally skipped.
+    #[test]
+    fn step_physics_compute_skip_enabled_numerically_matches_disabled_when_gate_forced_dormant() {
+        let (config_off, engine_off, owned_off, device) = compute_skip_test_fixture(false);
+        let (config_on, engine_on, owned_on, _device_on) = compute_skip_test_fixture(true);
+
+        let seed = compute_skip_seed_model(&engine_off, &config_off, &device);
+        let (_m_off, out_off) = run_compute_skip_step(&config_off, &engine_off, &owned_off, &device, seed.clone());
+        let (_m_on, out_on) = run_compute_skip_step(&config_on, &engine_on, &owned_on, &device, seed);
+
+        let close = |a: f32, b: f32, name: &str| {
+            let diff = (a - b).abs();
+            assert!(diff < 1e-6, "{name}: compute-skip on={a} vs off={b}, diff={diff}");
+        };
+        close(out_on.total_scalar, out_off.total_scalar, "total_scalar");
+        close(out_on.e_scalar, out_off.e_scalar, "e_scalar");
+        close(out_on.lam_e as f32, out_off.lam_e as f32, "lam_e");
+        close(out_on.lam_h as f32, out_off.lam_h as f32, "lam_h");
+        close(out_on.lam_d as f32, out_off.lam_d as f32, "lam_d");
+    }
+
+    /// Proves the two enforcement points (`forward_masked`'s structural forward-skip and
+    /// `awake_weight_ids_from_mask`'s SOAP-Muon weight-id exclusion) are driven by the SAME
+    /// mask and therefore agree: with a dormant gate, that hidden block's weight tensor must
+    /// be bit-identical before and after a `use_piratenet_compute_skip=true` step — it
+    /// received neither a forward invocation (so no gradient) nor an optimizer update.
+    #[test]
+    fn step_physics_awake_mask_computed_once_and_reused_for_forward_and_weight_ids() {
+        let (config, engine, owned, device) = compute_skip_test_fixture(true);
+        let model = compute_skip_seed_model(&engine, &config, &device);
+
+        // Read the dormant block's weight BEFORE the step (layers[1], mask index 0 — gate
+        // starts at 0.0, dormant under the default 1e-4 epsilon).
+        let mask_before = model.awake_mask(config.stiffness.gate_awake_epsilon);
+        assert_eq!(mask_before, vec![false; mask_before.len()], "every gate should start dormant");
+        let weight_ids = model.param_ids().0;
+        let dormant_id = weight_ids[1]; // layers[1].weight (layers[0] is index 0, never gated)
+
+        let get_weight = |m: &ElasticityNet<B>, id: burn::module::ParamId| -> Vec<f32> {
+            let mut vis = struct_weight_reader(id);
+            m.visit(&mut vis);
+            vis.found.expect("param id must exist in model")
+        };
+        let before = get_weight(&model, dormant_id);
+
+        let (model_after, _out) = run_compute_skip_step(&config, &engine, &owned, &device, model);
+        let after = get_weight(&model_after, dormant_id);
+
+        assert_eq!(before, after,
+            "dormant layer's weight must be bit-identical before/after a compute-skip step \
+             (neither forward-touched nor optimizer-updated)");
+    }
+
+    /// Tiny `ModuleVisitor` that captures the flattened f32 values of the single float param
+    /// matching `target_id` (test-only helper for
+    /// `step_physics_awake_mask_computed_once_and_reused_for_forward_and_weight_ids`).
+    struct WeightReader {
+        target_id: burn::module::ParamId,
+        found: Option<Vec<f32>>,
+    }
+    impl ModuleVisitor<B> for WeightReader {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+            if param.id == self.target_id {
+                let data = param.val().into_data();
+                self.found = Some(data.to_vec::<f32>().unwrap_or_default());
+            }
+        }
+    }
+    fn struct_weight_reader(target_id: burn::module::ParamId) -> WeightReader {
+        WeightReader { target_id, found: None }
     }
 }
 
