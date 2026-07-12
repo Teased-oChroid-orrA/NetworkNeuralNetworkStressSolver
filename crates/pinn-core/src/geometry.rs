@@ -172,4 +172,104 @@ impl GeometryConfig {
         h = h.wrapping_mul(1099511628211);
         h
     }
+
+    /// Returns `Err` when the hole's radius is >= either half-dimension of the plate — the hole
+    /// would then reach or extend past the plate's own edge, which is not a physically meaningful
+    /// "plate with a hole" (and, per `sampling::sample_interior`'s `contains()`-gated rejection
+    /// sampling, yields zero interior collocation points — see Issue #13).
+    pub fn validate(&self) -> Result<(), String> {
+        if let HoleType::Circular { radius } = self.hole {
+            let min_half = self.half_w.min(self.half_h);
+            if radius >= min_half {
+                return Err(format!(
+                    "GeometryConfig: hole radius ({radius:.6e} m) must be strictly less than \
+                     min(half_w, half_h) ({min_half:.6e} m) — a hole radius at or beyond the \
+                     plate's own half-dimension extends past the plate edge and yields zero (or \
+                     degenerately few) interior collocation points."
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn square_plate(half: f64, radius: f64) -> GeometryConfig {
+        GeometryConfig {
+            half_w: half, half_h: half, thickness: 0.01,
+            hole: HoleType::Circular { radius },
+            symmetry: SymmetryMode::Full,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_radius_one_ulp_below_half_dim() {
+        let half = 1.0_f64;
+        let radius = f64::from_bits(half.to_bits() - 1);
+        assert!(square_plate(half, radius).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_radius_exactly_equal_to_half_dim() {
+        let half = 1.0_f64;
+        let result = square_plate(half, half).validate();
+        assert!(result.is_err(), "radius exactly == half_w/half_h must be rejected");
+        assert!(result.unwrap_err().contains("radius"));
+    }
+
+    #[test]
+    fn validate_rejects_radius_one_ulp_above_half_dim() {
+        let half = 1.0_f64;
+        let radius = f64::from_bits(half.to_bits() + 1);
+        assert!(square_plate(half, radius).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_when_only_the_smaller_half_dimension_is_violated() {
+        let geom = GeometryConfig {
+            half_w: 10.0, half_h: 1.0, thickness: 0.01,
+            hole: HoleType::Circular { radius: 1.0 },
+            symmetry: SymmetryMode::Full,
+        };
+        assert!(geom.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_hole_type_none_regardless_of_dimensions() {
+        let geom = GeometryConfig {
+            half_w: 0.001, half_h: 0.001, thickness: 0.01,
+            hole: HoleType::None,
+            symmetry: SymmetryMode::Full,
+        };
+        assert!(geom.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_kirsch_plate_inches_default() {
+        assert!(GeometryConfig::kirsch_plate_inches().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_pinlug_lug_inches_default() {
+        assert!(GeometryConfig::pinlug_lug_inches().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_pinlug_pin_inches_default() {
+        assert!(GeometryConfig::pinlug_pin_inches().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_issue_13_reachable_gui_slider_combination() {
+        use crate::units::IN_TO_M;
+        let geom = GeometryConfig {
+            half_w: 0.5 * IN_TO_M, half_h: 0.5 * IN_TO_M, thickness: 0.1 * IN_TO_M,
+            hole: HoleType::Circular { radius: 2.0 * IN_TO_M },
+            symmetry: SymmetryMode::Full,
+        };
+        assert!(geom.validate().is_err());
+    }
 }

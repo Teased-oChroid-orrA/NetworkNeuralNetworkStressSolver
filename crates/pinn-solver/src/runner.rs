@@ -944,8 +944,8 @@ fn build_vis_grid(config: &SolverConfig) -> (Vec<[f32; 2]>, Vec<bool>) {
     let mut pts = Vec::with_capacity(nx_vis * ny_vis);
     for iy in 0..ny_vis {
         for ix in 0..nx_vis {
-            let xn = -1.0 + 2.0 * ix as f64 / (nx_vis - 1) as f64;
-            let yn = -1.0 + 2.0 * iy as f64 / (ny_vis - 1) as f64;
+            let xn = -1.0 + 2.0 * ix as f64 / (nx_vis.max(2) - 1) as f64;
+            let yn = -1.0 + 2.0 * iy as f64 / (ny_vis.max(2) - 1) as f64;
             pts.push([xn as f32, yn as f32]);
         }
     }
@@ -1043,6 +1043,34 @@ mod tests {
         cfg.n_hidden = 2;
         cfg.vis_grid = [4, 4];
         cfg
+    }
+
+    #[test]
+    fn build_vis_grid_handles_single_column_grid_without_nan() {
+        let mut config = tiny_kirsch_config();
+        config.vis_grid = [1, 4];
+        let (pts, mask) = build_vis_grid(&config);
+        assert_eq!(pts.len(), 4);
+        assert_eq!(mask.len(), 4);
+        for &[xn, yn] in &pts {
+            assert!(xn.is_finite(), "xn must be finite when nx_vis==1, got {xn}");
+            assert!(yn.is_finite(), "yn must be finite when nx_vis==1, got {yn}");
+            assert_eq!(xn, -1.0, "single-column grid (nx_vis==1) must place every point at xn=-1.0, got {xn}");
+        }
+    }
+
+    #[test]
+    fn build_vis_grid_handles_single_row_grid_without_nan() {
+        let mut config = tiny_kirsch_config();
+        config.vis_grid = [4, 1];
+        let (pts, mask) = build_vis_grid(&config);
+        assert_eq!(pts.len(), 4);
+        assert_eq!(mask.len(), 4);
+        for &[xn, yn] in &pts {
+            assert!(xn.is_finite());
+            assert!(yn.is_finite());
+            assert_eq!(yn, -1.0, "single-row grid (ny_vis==1) must place every point at yn=-1.0, got {yn}");
+        }
     }
 
     fn tiny_pinlug_config() -> SolverConfig {
