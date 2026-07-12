@@ -34,6 +34,16 @@ const REFINE_PERCENTILE_MAX: f64 = 0.92;
 /// Extra `adapt()` calls (beyond the warmup) required before the "ease off near
 /// convergence" branch can fire — avoids easing off on a single lucky low-residual read.
 const SELF_TUNE_EASE_OFF_ADAPTS: usize = 10;
+const COARSEN_QUORUM: usize = 3; // out of 4 fixed siblings — tolerates one persistently-noisy
+                                   // outlier (issue #14); hole-zone/leaf-structural preconditions
+                                   // remain unanimous, not subject to this relaxation.
+/// Upper bound on `enforce_active_cell_cap()`'s bounded escalation loop — guarantees the
+/// cap-enforcement pass always terminates, even when `max_active_cells` can never be
+/// satisfied given the hole-zone/structural floor.
+const MAX_CAP_ENFORCEMENT_ROUNDS: usize = 8;
+/// Per-round increase to the coarsen-eligibility percentile `enforce_active_cell_cap()`
+/// escalates through while the mesh remains over its configured cap.
+const CAP_ENFORCEMENT_PERCENTILE_STEP: f64 = 0.10;
 
 /// Default zone-lock radius factor: cells within `hole_zone_factor × r_hole` of the hole
 /// center are locked at `min_level_hole` (see `AdaptiveGrid::enforce_hole_zone`). `pub` so
@@ -67,6 +77,15 @@ pub struct AmrtConfig {
     pub interval_steps:     usize,
     /// Collocation points per leaf cell (1 = cell center only).
     pub pts_per_cell:       usize,
+    /// Best-effort soft cap on total active leaf cells (`None` = unbounded — the historical
+    /// behavior, zero change). When `Some(cap)` and `active_count() > cap`, `adapt()` runs an
+    /// additional coarsen-only escalation pass (`enforce_active_cell_cap`) beyond its normal
+    /// refine/coarsen sweep. This is a *best-effort* cap, not a hard limit: a value at or
+    /// below the structural floor imposed by the hole zone (`min_level_hole`) can never be
+    /// met exactly, and the enforcement pass must never panic or violate the hole-zone/
+    /// `max_level` invariants trying to reach it — it simply coarsens as far as the
+    /// quorum/hole-zone preconditions structurally allow and then stops.
+    pub max_active_cells:   Option<usize>,
 }
 
 impl Default for AmrtConfig {
@@ -82,6 +101,7 @@ impl Default for AmrtConfig {
             trend_weight:       0.40,
             interval_steps:     1000,
             pts_per_cell:       1,
+            max_active_cells:   None,
         }
     }
 }
@@ -297,6 +317,7 @@ impl AdaptiveGrid {
 
         // Hole zone is non-negotiable — always enforce after adapt
         self.enforce_hole_zone();
+        self.enforce_active_cell_cap();
         self.adapt_count += 1;
     }
 
@@ -322,11 +343,17 @@ impl AdaptiveGrid {
     ) {
         match node.children {
             Some(ref mut ch) => {
-                // Check if all 4 siblings are leaves eligible for coarsening
-                let all_leaves_coarsen = ch.iter().all(|c| {
-                    c.is_leaf() && !c.in_hole_zone && Self::priority(c, tw) < coarsen_th
-                });
-                if all_leaves_coarsen {
+                // Structural preconditions for coarsening stay unanimous, non-negotiable:
+                // every sibling must be a leaf, and none may be hole-zone-locked.
+                let all_leaves        = ch.iter().all(|c| c.is_leaf());
+                let none_in_hole_zone = ch.iter().all(|c| !c.in_hole_zone);
+                // Residual eligibility is relaxed to a quorum (issue #14): tolerates one
+                // persistently-noisy outlier sibling instead of requiring all 4 to agree,
+                // which otherwise permanently blocks 3 well-behaved neighbors from coarsening.
+                let n_eligible = ch.iter().filter(|c| Self::priority(c, tw) < coarsen_th).count();
+                let should_coarsen = all_leaves && none_in_hole_zone && n_eligible >= COARSEN_QUORUM;
+
+                if should_coarsen {
                     // Merge siblings: parent inherits max residual of children
                     let ema  = ch.iter().map(|c| c.residual_ema).fold(0.0_f64, f64::max);
                     let prev = ch.iter().map(|c| c.residual_prev).fold(0.0_f64, f64::max);
@@ -385,6 +412,94 @@ impl AdaptiveGrid {
         if let Some(ref mut ch) = node.children {
             for c in ch.iter_mut() {
                 Self::enforce_zone_rec(c, zone_r, min_level, max_level);
+            }
+        }
+    }
+
+    /// Parallels `collect_leaf_residuals` but collects refinement *priority* (residual +
+    /// trend bonus, see `priority()`) rather than raw residual. `enforce_active_cell_cap`
+    /// must compare against this same quantity for its escalation threshold — sizing the
+    /// threshold from raw `residual_ema` while comparing leaves against `priority()` (as
+    /// happens elsewhere in this file, e.g. `adapt()`'s own refine/coarsen thresholds) would
+    /// let the trend bonus silently push cells to either side of a threshold sized from a
+    /// different quantity, stalling this loop against plateau residual patterns.
+    fn collect_leaf_priorities(node: &QuadNode, geom: &GeometryConfig, tw: f64, out: &mut Vec<f64>) {
+        match &node.children {
+            Some(ch) => { for c in ch.iter() { Self::collect_leaf_priorities(c, geom, tw, out); } }
+            None => { if geom.contains(node.cx(), node.cy()) { out.push(Self::priority(node, tw)); } }
+        }
+    }
+
+    /// Coarsen-only counterpart to `apply_adapt_rec`'s merge arm, used solely by
+    /// `enforce_active_cell_cap`. Shares the exact same structural gate — all 4 siblings
+    /// must be leaves, none hole-zone-locked, and at least `COARSEN_QUORUM` of them eligible
+    /// — but never splits a leaf (coarsen-only, no refine path): this pass runs strictly
+    /// after the normal refine/coarsen sweep and must never grow the tree further.
+    ///
+    /// Uses `<=` rather than the main pass's strict `<`: this pass only runs when the mesh
+    /// is already over budget, so it must be able to make progress against a tied/plateau
+    /// residual population, which strict `<` can never admit (an eligibility threshold drawn
+    /// from a population that's fully tied at that value has no member strictly less than
+    /// it, even though every member is, in effect, at the floor of that population).
+    fn apply_coarsen_only_rec(node: &mut QuadNode, coarsen_th: f64, tw: f64) {
+        // leaf: coarsen-only pass never splits, so there's nothing to do for a `None` node
+        if let Some(ref mut ch) = node.children {
+            let all_leaves        = ch.iter().all(|c| c.is_leaf());
+            let none_in_hole_zone = ch.iter().all(|c| !c.in_hole_zone);
+            let n_eligible = ch.iter().filter(|c| Self::priority(c, tw) <= coarsen_th).count();
+            let should_coarsen = all_leaves && none_in_hole_zone && n_eligible >= COARSEN_QUORUM;
+
+            if should_coarsen {
+                let ema  = ch.iter().map(|c| c.residual_ema).fold(0.0_f64, f64::max);
+                let prev = ch.iter().map(|c| c.residual_prev).fold(0.0_f64, f64::max);
+                node.children = None;
+                node.residual_ema  = ema;
+                node.residual_prev = prev;
+            } else {
+                // Recurse into children — need to re-borrow after potential merge above
+                if let Some(ref mut ch) = node.children {
+                    for c in ch.iter_mut() {
+                        Self::apply_coarsen_only_rec(c, coarsen_th, tw);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Best-effort enforcement of `AmrtConfig::max_active_cells` (issue #14). No-op when the
+    /// cap is unset (`None` — zero behavior change) or already satisfied. Otherwise runs a
+    /// bounded escalation loop, up to `MAX_CAP_ENFORCEMENT_ROUNDS` rounds: each round
+    /// recomputes the current leaf-priority distribution (the tree changed under the
+    /// previous round's merges), derives a threshold from an increasingly lenient percentile
+    /// of it, and applies one coarsen-only pass at that threshold. Stops as soon as the cap
+    /// is met or a round fails to merge anything — a cap at or below the hole-zone/
+    /// structural floor simply converges to that floor and stops, rather than looping
+    /// uselessly or violating the hole-zone/`max_level` invariants to try to satisfy it.
+    fn enforce_active_cell_cap(&mut self) {
+        let Some(cap) = self.cfg.max_active_cells else { return; };
+        if self.active_count() <= cap {
+            return;
+        }
+
+        let tw = self.cfg.trend_weight;
+        for round in 0..MAX_CAP_ENFORCEMENT_ROUNDS {
+            let mut priorities: Vec<f64> = Vec::new();
+            Self::collect_leaf_priorities(&self.root, &self.geom, tw, &mut priorities);
+            if priorities.is_empty() {
+                break;
+            }
+            priorities.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = priorities.len();
+            let percentile  = (CAP_ENFORCEMENT_PERCENTILE_STEP * (round as f64 + 1.0)).min(1.0);
+            let idx         = ((n as f64 * percentile) as usize).min(n - 1);
+            let coarsen_th  = priorities[idx];
+
+            let before = self.active_count();
+            Self::apply_coarsen_only_rec(&mut self.root, coarsen_th, tw);
+            let after = self.active_count();
+
+            if after <= cap || after == before {
+                break;
             }
         }
     }
@@ -532,5 +647,133 @@ mod tests {
     #[test]
     fn default_hole_zone_factor_is_shared_constant() {
         assert_eq!(AmrtConfig::default().hole_zone_factor, DEFAULT_HOLE_ZONE_FACTOR);
+    }
+
+    /// A simple no-hole, full-symmetry [-1,1]x[-1,1] domain — isolates the coarsening-quorum
+    /// fix from hole-zone interaction (covered separately).
+    fn no_hole_geom() -> GeometryConfig {
+        GeometryConfig {
+            half_w: 1.0,
+            half_h: 1.0,
+            thickness: 1.0,
+            hole: HoleType::None,
+            symmetry: SymmetryMode::Full,
+        }
+    }
+
+    #[test]
+    fn test_coarsen_never_merges_when_all_four_siblings_stay_above_threshold() {
+        const NOISY: f32 = 1.0;
+        const PADDING: f32 = 0.001;
+
+        let cfg = AmrtConfig {
+            initial_level: 3, max_level: 3, min_level_hole: 0, hole_zone_factor: 0.0,
+            ema_alpha: 1.0, ..AmrtConfig::default()
+        };
+        let mut grid = AdaptiveGrid::new(&no_hole_geom(), cfg);
+        assert_eq!(grid.active_count(), 64);
+
+        for _ in 0..10 {
+            let pts = grid.sample_points();
+            let res: Vec<f32> = pts.iter()
+                .map(|&[x, y]| if x < -0.5 && y < -0.5 { NOISY } else { PADDING })
+                .collect();
+            grid.update_residuals(&res);
+            grid.adapt();
+        }
+
+        assert_eq!(grid.active_count(), 64,
+            "a quad merged even though 0-of-4 siblings satisfied the coarsen threshold");
+    }
+
+    #[test]
+    fn test_coarsen_blocked_by_single_hole_zone_sibling_despite_full_residual_agreement() {
+        let geom = GeometryConfig {
+            half_w: 1.0, half_h: 1.0, thickness: 1.0,
+            hole: HoleType::Circular { radius: 0.01 }, // zone_r = radius * hole_zone_factor = 0.05
+            symmetry: SymmetryMode::QuarterSymm,
+        };
+        let cfg = AmrtConfig {
+            initial_level: 3,
+            max_level: 3,
+            min_level_hole: 3,
+            hole_zone_factor: 5.0,
+            ema_alpha: 1.0,
+            ..AmrtConfig::default()
+        };
+        let mut grid = AdaptiveGrid::new(&geom, cfg);
+        assert_eq!(grid.active_count(), 64);
+
+        for _ in 0..5 {
+            let pts = grid.sample_points();
+            let res: Vec<f32> = pts.iter()
+                .map(|&[x, y]| if x < 0.25 && y < 0.25 { 0.001_f32 } else { 0.10_f32 })
+                .collect();
+            grid.update_residuals(&res);
+            grid.adapt();
+        }
+
+        let pts = grid.sample_points();
+        let expected_centers = [[0.0625, 0.0625], [0.1875, 0.0625], [0.0625, 0.1875], [0.1875, 0.1875]];
+        for [ex, ey] in expected_centers {
+            assert!(
+                pts.iter().any(|&[x, y]| (x - ex).abs() < 1e-9 && (y - ey).abs() < 1e-9),
+                "quad (0,0) coarsened away point ({ex},{ey}) despite a hole-zone sibling — the \
+                 hole-zone lock must remain absolute/unanimous, not subject to the majority relaxation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_coarsen_requires_at_least_three_of_four_not_two() {
+        const QUIET: f32 = 0.001;
+        const NOISY: f32 = 1.0;
+        const PADDING: f32 = 0.10;
+
+        let cfg = AmrtConfig {
+            initial_level: 3, max_level: 3, min_level_hole: 0, hole_zone_factor: 0.0,
+            ema_alpha: 1.0, ..AmrtConfig::default()
+        };
+        let mut grid = AdaptiveGrid::new(&no_hole_geom(), cfg);
+        assert_eq!(grid.active_count(), 64);
+
+        for _ in 0..5 {
+            let pts = grid.sample_points();
+            let res: Vec<f32> = pts.iter().map(|&[x, y]| {
+                if !(x < -0.5 && y < -0.5) { return PADDING; }
+                if y < -0.75 { QUIET } else { NOISY }
+            }).collect();
+            grid.update_residuals(&res);
+            grid.adapt();
+        }
+
+        assert_eq!(grid.active_count(), 64,
+            "quad merged with only 2-of-4 siblings eligible — coarsen must require >= 3-of-4");
+    }
+
+    #[test]
+    fn test_coarsen_merges_when_all_four_of_four_eligible() {
+        const QUIET: f32 = 0.001;
+        const PADDING: f32 = 0.10;
+
+        let cfg = AmrtConfig {
+            initial_level: 3, max_level: 3, min_level_hole: 0, hole_zone_factor: 0.0,
+            ema_alpha: 1.0, ..AmrtConfig::default()
+        };
+        let mut grid = AdaptiveGrid::new(&no_hole_geom(), cfg);
+        assert_eq!(grid.active_count(), 64);
+
+        for _ in 0..5 {
+            let pts = grid.sample_points();
+            let res: Vec<f32> = pts.iter()
+                .map(|&[x, y]| if x < -0.5 && y < -0.5 { QUIET } else { PADDING })
+                .collect();
+            grid.update_residuals(&res);
+            grid.adapt();
+        }
+
+        assert_eq!(grid.active_count(), 61,
+            "quad with 4-of-4 eligible siblings failed to merge: expected 64-3=61, got {}",
+            grid.active_count());
     }
 }
