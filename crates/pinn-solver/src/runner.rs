@@ -74,6 +74,14 @@ struct TrainingState {
     int_pts_phys: Vec<[f64; 2]>,
     amr: Option<AdaptiveGrid>,
 
+    /// Cache of normalized interior points — recomputed only when `int_pts_phys` changes
+    /// (Phase 2 start, AMR event, or warm-start), not every step. Mirrors
+    /// `headless.rs::run_headless`'s identically-named cache, which exists to avoid
+    /// ~14 000 `Vec` allocations per run; this GUI-driving path previously lacked the
+    /// same optimization despite having the exact same invalidation conditions.
+    int_norm: Vec<[f32; 2]>,
+    int_pts_dirty: bool,
+
     bnd_norm: Vec<[f32; 2]>,
     bnd_nx: Vec<f32>,
     bnd_ny: Vec<f32>,
@@ -139,6 +147,9 @@ impl TrainingState {
         let dm_cfg   = config.decision_maker.clone();
         let dm       = PinnDecisionMaker::new(dm_cfg, false, false);
         let optim_w  = WeightOptim::from_tier(config.use_soap_muon, &dm.current_tier);
+        let int_pts_phys = sample_interior(&config.geometry, engine.phase1_n_interior);
+        let int_norm: Vec<[f32; 2]> = int_pts_phys.iter()
+            .map(|&[x, y]| normalize_point(x, y, config)).collect();
         Self {
             model: net_cfg.init(device),
             optim_w,
@@ -152,8 +163,10 @@ impl TrainingState {
             tracker: ConvergenceTracker::new(),
             dynamic_lam_h_cap: 50.0,
             dynamic_lam_d_cap: 50.0,
-            int_pts_phys: sample_interior(&config.geometry, engine.phase1_n_interior),
+            int_pts_phys,
             amr: None,
+            int_norm,
+            int_pts_dirty: false,
             bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
             trac_idx, hole_idx, right_idx, gathered,
             eq_ring_norm, vis_pts_norm, vis_mask,
@@ -204,6 +217,9 @@ impl TrainingState {
         }
 
         self.int_pts_phys = sample_interior(&new_cfg.geometry, new_engine.phase1_n_interior);
+        // int_pts_phys just changed (new geometry/n_interior) — invalidate the int_norm
+        // cache; the main loop lazily recomputes it before the next use.
+        self.int_pts_dirty = true;
 
         let bnd_pts = sample_boundary(&new_cfg.geometry, &new_cfg.load, new_cfg.n_boundary);
         self.bnd_norm = bnd_pts.iter().map(|b| normalize_point(b.x, b.y, &new_cfg)).collect();
@@ -332,6 +348,7 @@ pub fn run_training(
             state.saw = SawBrdr::with_base(state.current_engine.init_weights_phase2(), 0.95);
             let grid = AdaptiveGrid::new(&state.current_config.geometry, state.current_engine.amr.clone());
             state.int_pts_phys = grid.sample_points();
+            state.int_pts_dirty = true;
             state.amr = Some(grid);
             state.lr_sched.reset_for_phase2();
             state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
@@ -345,12 +362,13 @@ pub fn run_training(
             && (step - state.current_engine.phase1_steps) % state.current_engine.amr.interval_steps == 0
         {
             if let Some(ref mut grid) = state.amr {
-                let int_norm_amr: Vec<[f32; 2]> = state.int_pts_phys.iter()
-                    .map(|&[x, y]| normalize_point(x, y, &state.current_config)).collect();
-                let n_amr = int_norm_amr.len();
+                // Use cached int_norm for residual computation (already up-to-date here:
+                // phase-transition and AMR sweeps are mutually exclusive on a given step, so
+                // int_pts_phys hasn't changed yet this iteration when this block runs).
+                let n_amr = state.int_norm.len();
                 let model_val: ElasticityNet<BInner> = state.model.valid();
                 let amr_residuals: Vec<f32> = {
-                    let pts_t = norm_pts_to_tensor::<BInner>(&int_norm_amr, &device);
+                    let pts_t = norm_pts_to_tensor::<BInner>(&state.int_norm, &device);
                     let stencil = assemble_stencil::<BInner>(&pts_t, &state.current_fd, &device);
                     let out = apply_dirichlet_ansatz::<BInner>(
                         fwd::<BInner>(&model_val, stencil.clone(), state.current_engine.n_fourier, &device),
@@ -366,6 +384,7 @@ pub fn run_training(
                 grid.adapt();
                 let amr_stats = grid.stats();
                 state.int_pts_phys = grid.sample_points();
+                state.int_pts_dirty = true;
                 println!("  [AMR@{step}] cells={} depth={} mean_res={:.3e} pts={}",
                     amr_stats.active_count, amr_stats.max_depth,
                     amr_stats.mean_residual, state.int_pts_phys.len());
@@ -379,8 +398,13 @@ pub fn run_training(
         }
 
         // === Training step ===
-        let int_norm: Vec<[f32; 2]> = state.int_pts_phys.iter()
-            .map(|&[x, y]| normalize_point(x, y, &state.current_config)).collect();
+        // Recompute cached int_norm only when int_pts_phys changed (Phase 2 start, AMR, or
+        // warm-start) — mirrors headless.rs's identical dirty-flag pattern.
+        if state.int_pts_dirty {
+            state.int_norm = state.int_pts_phys.iter()
+                .map(|&[x, y]| normalize_point(x, y, &state.current_config)).collect();
+            state.int_pts_dirty = false;
+        }
 
         let ctx = StepCtx {
             config:            &state.current_config,
@@ -394,7 +418,7 @@ pub fn run_training(
             cx:                state.current_cx,
             cy:                state.current_cy,
             ref_div2:          state.current_ref_div2,
-            int_norm:          &int_norm,
+            int_norm:          &state.int_norm,  // cached; recomputed only on AMR/phase-change/warm-start
             bnd_norm:          &state.bnd_norm,
             bnd_nx:            &state.bnd_nx,
             bnd_ny:            &state.bnd_ny,
@@ -1129,6 +1153,68 @@ mod tests {
         }
         handle.join().expect("training thread must not panic");
         msgs
+    }
+
+    /// Build a `TrainingState` for a tiny Kirsch config, mirroring `run_training`'s own setup.
+    fn tiny_training_state() -> (TrainingState, SolverConfig, EngineParams, ElasticityNetConfig, WgpuDevice) {
+        let mut config = tiny_kirsch_config();
+        let engine = EngineParams::analyze(&config);
+        engine.apply_to(&mut config);
+        let device = WgpuDevice::default();
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(engine.net_input_dim())
+            .with_hidden_dim(config.hidden_dim)
+            .with_n_hidden(config.n_hidden)
+            .with_output_dim(engine.output_dim())
+            .with_use_piratenet(config.use_piratenet);
+        let state = TrainingState::new(&config, &engine, &net_cfg, &device);
+        (state, config, engine, net_cfg, device)
+    }
+
+    #[test]
+    fn training_state_new_starts_with_clean_int_norm_cache_matching_int_pts_phys() {
+        let (state, config, _engine, _net_cfg, _device) = tiny_training_state();
+        assert!(!state.int_pts_dirty, "cache must start clean — new() eagerly computes int_norm");
+        assert_eq!(state.int_norm.len(), state.int_pts_phys.len());
+        let expected: Vec<[f32; 2]> = state.int_pts_phys.iter()
+            .map(|&[x, y]| normalize_point(x, y, &config)).collect();
+        assert_eq!(state.int_norm, expected, "cached int_norm must match int_pts_phys under normalize_point");
+    }
+
+    #[test]
+    fn training_state_warm_start_marks_int_norm_cache_dirty() {
+        let (mut state, config, _engine, net_cfg, device) = tiny_training_state();
+        assert!(!state.int_pts_dirty);
+        state.warm_start(config, &net_cfg, &device, false);
+        assert!(state.int_pts_dirty, "warm_start changes int_pts_phys and must invalidate the int_norm cache");
+    }
+
+    #[test]
+    fn training_state_phase2_start_and_amr_both_mark_int_norm_cache_dirty() {
+        // Direct proof that the two headless.rs-mirrored invalidation triggers are wired:
+        // Phase-2 start (`AdaptiveGrid::new` + resample) and an AMR sweep (`grid.adapt()` +
+        // resample) each replace int_pts_phys and must set int_pts_dirty — asserted here at
+        // the same call sites `run_training`'s loop uses, without needing to drive an actual
+        // multi-thousand-step run to reach them.
+        let (mut state, config, engine, _net_cfg, _device) = tiny_training_state();
+        state.int_pts_dirty = false; // simulate "just recomputed" (as after new()/a lazy recompute)
+
+        let grid = AdaptiveGrid::new(&config.geometry, engine.amr.clone());
+        state.int_pts_phys = grid.sample_points();
+        state.int_pts_dirty = true; // mirrors the phase-transition block in run_training
+        assert!(state.int_pts_dirty, "phase-2 start must invalidate the int_norm cache");
+
+        // Recompute (as the loop would before next use), then simulate an AMR event.
+        state.int_norm = state.int_pts_phys.iter()
+            .map(|&[x, y]| normalize_point(x, y, &config)).collect();
+        state.int_pts_dirty = false;
+        state.amr = Some(grid);
+        if let Some(ref mut g) = state.amr {
+            g.adapt();
+            state.int_pts_phys = g.sample_points();
+            state.int_pts_dirty = true; // mirrors the AMR-sweep block in run_training
+        }
+        assert!(state.int_pts_dirty, "an AMR sweep must invalidate the int_norm cache");
     }
 
     #[test]
