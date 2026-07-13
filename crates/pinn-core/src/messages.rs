@@ -175,6 +175,30 @@ impl Default for StiffnessConfig {
     }
 }
 
+/// Configuration for one-shot, fixed-step-count, function-preserving network width growth
+/// (Net2WiderNet-style — see `pinn_solver::network::ElasticityNet::grow_width`), opt-in and
+/// disabled by default. Unlike `DecisionMakerConfig`/`StiffnessConfig`, growth is triggered by
+/// a plain step-count comparison (`step == trigger_step`), not a plateau/gradient-conflict
+/// signal — a deliberate v1 scope cut (see the issue #50 design doc), not an oversight.
+///
+/// v1 scope: only read by the Kirsch headless path (`pinn_solver::headless::run_headless`) —
+/// `run_headless_pinlug_inner`, `runner.rs`'s GUI-driving paths, and pin-lug entirely do not
+/// read this field yet, mirroring `use_piratenet_compute_skip`'s existing GUI-absence
+/// precedent. Present on both `default_kirsch()`/`default_pinlug()` regardless (matching this
+/// struct's existing flag-uniformity convention) so `SolverConfig` stays a single shared shape
+/// across both problems even though only one problem's training loop currently acts on it.
+#[derive(Clone, Default)]
+pub struct WidthGrowthConfig {
+    /// Enable the one-shot width-growth event (default: false — opt-in).
+    pub enabled: bool,
+    /// The training step at which growth fires (compared with plain integer equality against
+    /// the training loop's own step counter — zero GPU sync). Default: 0.
+    pub trigger_step: usize,
+    /// `hidden_dim` to grow to. Must be strictly greater than `SolverConfig::hidden_dim` when
+    /// `enabled = true` (`ElasticityNet::grow_width` panics otherwise). Default: 0.
+    pub target_hidden_dim: usize,
+}
+
 /// Complete solver configuration (passed when spawning the solver thread)
 #[derive(Clone)]
 pub struct SolverConfig {
@@ -216,6 +240,9 @@ pub struct SolverConfig {
     /// optimization (see network.rs's `dormant_block_gradient_is_exactly_zero`) that still
     /// ships behind a kill-switch because it changes autodiff-graph structure per step.
     pub use_piratenet_compute_skip: bool,
+    /// One-shot function-preserving network width growth (issue #50). Disabled by default —
+    /// see [`WidthGrowthConfig`]'s doc comment for scope (Kirsch headless only in v1).
+    pub width_growth: WidthGrowthConfig,
 }
 
 impl SolverConfig {
@@ -237,6 +264,7 @@ impl SolverConfig {
             stiffness:      StiffnessConfig::default(),
             use_ultimate_strength_scaling: false,
             use_piratenet_compute_skip: false,
+            width_growth: WidthGrowthConfig::default(),
         }
     }
 
@@ -283,6 +311,7 @@ impl SolverConfig {
             stiffness:      StiffnessConfig::default(),
             use_ultimate_strength_scaling: false,
             use_piratenet_compute_skip: false,
+            width_growth: WidthGrowthConfig::default(),
         }
     }
 }
