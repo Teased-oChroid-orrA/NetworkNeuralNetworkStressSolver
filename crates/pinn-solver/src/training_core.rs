@@ -13,7 +13,7 @@ use burn::{
     backend::{Autodiff, Wgpu},
     module::{Module, ModuleVisitor, Param},
     optim::{GradientsParams, LBFGSConfig, Optimizer},
-    tensor::{Tensor, TensorData},
+    tensor::{backend::Backend, Tensor, TensorData},
 };
 use burn::backend::wgpu::WgpuDevice;
 use pinn_core::{
@@ -604,13 +604,14 @@ pub fn step_physics(
     // this step's forward passes) is looked up by name; `equilibrium_ring` and
     // `constitutive_consistency` aren't part of the SAW-BRDR vector (equilibrium_ring IS;
     // constitutive_consistency uses a fixed weight, same as before) — see below.
-    let e_scalar      = t_scalar(&e_loss);
-    let n_scalar      = t_scalar(&n_loss);
-    let h_scalar      = t_scalar(&h_loss);
-    let d_scalar      = t_scalar(&d_loss);
-    let eq_scalar     = t_scalar(&eq_loss);
-    let w_scalar      = t_scalar(&w_neumann);
-    let const_scalar  = t_scalar(&const_loss);
+    let batched_scalars = t_scalars(&[&e_loss, &n_loss, &h_loss, &d_loss, &eq_loss, &w_neumann, &const_loss]);
+    let e_scalar      = batched_scalars[0];
+    let n_scalar      = batched_scalars[1];
+    let h_scalar      = batched_scalars[2];
+    let d_scalar      = batched_scalars[3];
+    let eq_scalar     = batched_scalars[4];
+    let w_scalar      = batched_scalars[5];
+    let const_scalar  = batched_scalars[6];
 
     let term_tensor = |name: &str| -> &Tensor<B, 1> {
         match name {
@@ -947,9 +948,10 @@ pub fn step_physics_multi(
         .collect();
 
     // (b) Walk terms in stable order, compute each active term's real tensor from the
-    // forward-pass map, SAW-BRDR-weight exactly as step_physics does.
+    // forward-pass map, SAW-BRDR-weight exactly as step_physics does. Each term's scalar is
+    // read back in a SINGLE batched GPU sync after the loop (via `t_scalars`) rather than one
+    // `.into_data()` call per term — 7-8 separate syncs per step for pin-lug otherwise.
     let mut term_tensors: Vec<Tensor<B, 1>> = Vec::with_capacity(active_terms.len());
-    let mut term_scalars: Vec<f32> = Vec::with_capacity(active_terms.len());
     let mut term_names: Vec<&'static str> = Vec::with_capacity(active_terms.len());
     for term in &active_terms {
         let inputs: Vec<DFO<'_, B>> = term.domains().iter().zip(term.point_sets().iter())
@@ -959,11 +961,10 @@ pub fn step_physics_multi(
             }))
             .collect();
         let t = term.compute(&inputs);
-        let s = t_scalar(&t);
         term_tensors.push(t);
-        term_scalars.push(s);
         term_names.push(term.name());
     }
+    let term_scalars: Vec<f32> = t_scalars(&term_tensors.iter().collect::<Vec<_>>());
 
     let lams = saw.update(&term_scalars);
     let mut lam_by_name: HashMap<&'static str, f64> = HashMap::new();
@@ -1169,6 +1170,17 @@ pub fn probe_kt_shared(
 
 fn t_scalar(t: &Tensor<B, 1>) -> f32 {
     t.clone().into_data().to_vec::<f32>().unwrap_or(vec![0.0])[0]
+}
+
+/// Batched analogue of `t_scalar` for reading back several length-1 scalar tensors at once:
+/// `Tensor::cat`s them into a single tensor and pays exactly ONE GPU sync
+/// (`.into_data()`/buffer-map) instead of one sync per tensor — each `.into_scalar()`/
+/// `.into_data()` call pays a fixed wgpu queue-flush overhead independent of payload size, so
+/// batching N scalar reads into one is a pure perf win with identical f32 values out.
+fn t_scalars<Bk: Backend>(ts: &[&Tensor<Bk, 1>]) -> Vec<f32> {
+    if ts.is_empty() { return Vec::new(); }
+    let cat = Tensor::cat(ts.iter().map(|t| (*t).clone()).collect(), 0);
+    cat.into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; ts.len()])
 }
 
 // ─── Param-level finiteness check ────────────────────────────────────────────
@@ -1677,10 +1689,20 @@ pub fn compute_gradient_conflict(
         Tensor::<BInner, 1>::zeros([1], device)
     };
 
-    let g_pde_norm_v = pde_norm_sq.clone().sqrt().into_scalar() as f32;
-    let g_bc_norm_v  = bc_norm_sq.clone().sqrt().into_scalar() as f32;
-    let denom_f64    = (pde_norm_sq.sqrt() * bc_norm_sq.sqrt()).into_scalar() + 1e-8;
-    let cosine_sim   = (dot.into_scalar() / denom_f64) as f32;
+    // Batch all 4 length-1 scalar reads (g_pde_norm, g_bc_norm, their product for the cosine
+    // denominator, and the dot product) into ONE `.into_data()` GPU sync instead of 4 separate
+    // `.into_scalar()` calls — the `pde_norm_sq.sqrt() * bc_norm_sq.sqrt()` product is still
+    // computed as a tensor op (same GPU-side multiply as before `denom_v`'s host read), so the
+    // resulting f32 values are unchanged.
+    let g_pde_norm_t = pde_norm_sq.clone().sqrt().reshape([1]);
+    let g_bc_norm_t  = bc_norm_sq.clone().sqrt().reshape([1]);
+    let denom_t      = (pde_norm_sq.sqrt() * bc_norm_sq.sqrt()).reshape([1]);
+    let dot_t        = dot.reshape([1]);
+    let batched = t_scalars(&[&g_pde_norm_t, &g_bc_norm_t, &denom_t, &dot_t]);
+    let g_pde_norm_v = batched[0];
+    let g_bc_norm_v  = batched[1];
+    let denom_v      = batched[2] + 1e-8;
+    let cosine_sim   = batched[3] / denom_v;
 
     GradientConflict {
         cosine_sim: cosine_sim.clamp(-1.0, 1.0),
@@ -2323,10 +2345,16 @@ pub fn compute_gradient_conflict_multi(
     let bc_norm_sq  = g_bc_flat.clone().powf_scalar(2.0_f64).sum();
     let dot         = g_pde_flat.mul(g_bc_flat).sum();
 
-    let g_pde_norm_v = pde_norm_sq.clone().sqrt().into_scalar() as f32;
-    let g_bc_norm_v  = bc_norm_sq.clone().sqrt().into_scalar() as f32;
-    let denom_f64    = (pde_norm_sq.sqrt() * bc_norm_sq.sqrt()).into_scalar() + 1e-8;
-    let cosine_sim   = (dot.into_scalar() / denom_f64) as f32;
+    // Batched single-sync read — see `compute_gradient_conflict`'s identical comment.
+    let g_pde_norm_t = pde_norm_sq.clone().sqrt().reshape([1]);
+    let g_bc_norm_t  = bc_norm_sq.clone().sqrt().reshape([1]);
+    let denom_t      = (pde_norm_sq.sqrt() * bc_norm_sq.sqrt()).reshape([1]);
+    let dot_t        = dot.reshape([1]);
+    let batched = t_scalars(&[&g_pde_norm_t, &g_bc_norm_t, &denom_t, &dot_t]);
+    let g_pde_norm_v = batched[0];
+    let g_bc_norm_v  = batched[1];
+    let denom_v      = batched[2] + 1e-8;
+    let cosine_sim   = batched[3] / denom_v;
 
     GradientConflict {
         cosine_sim: cosine_sim.clamp(-1.0, 1.0),
