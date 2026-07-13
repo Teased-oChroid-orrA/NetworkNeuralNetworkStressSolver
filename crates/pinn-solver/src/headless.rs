@@ -37,9 +37,9 @@ use crate::{
     saw_brdr::SawBrdr,
     stiffness::StiffnessController,
     training_core::{
-        compute_gradient_conflict, compute_reference_scales, extract_boundary_indices,
-        make_lbfgs, model_is_finite, normalize_point, probe_kt_shared, step_lbfgs, step_physics,
-        BInner, LbfgsCtxScalars, StepCtx, StepOutput,
+        build_gathered_boundary_tensors, compute_gradient_conflict, compute_reference_scales,
+        extract_boundary_indices, make_lbfgs, model_is_finite, normalize_point, probe_kt_shared,
+        step_lbfgs, step_physics, BInner, LbfgsCtxScalars, StepCtx, StepOutput,
     },
 };
 
@@ -221,6 +221,14 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
     // Precomputed once — geometry is fixed during headless training.
     let (trac_idx, hole_idx, right_idx) = extract_boundary_indices(&bnd_pts, &bnd_nx);
 
+    // The 6 trac_idx/hole_idx-gathered tensors `step_physics`/`compute_gradient_conflict` need
+    // every step — built ONCE here (not per-step, see `GatheredBoundaryTensors`'s doc comment)
+    // since `bnd_nx`/`bnd_ny`/`bnd_tx`/`bnd_ty`/`trac_idx`/`hole_idx` never change during a
+    // headless run (no warm-start on this path, unlike `runner.rs`).
+    let gathered = build_gathered_boundary_tensors(
+        &trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device,
+    );
+
     // Equilibrium ring points: precomputed outside loop (fixed seed 42424242, fixed geometry).
     let eq_ring_norm: Vec<[f32; 2]> = sample_eq_ring(&config.geometry, engine.n_eq_ring)
         .iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
@@ -329,6 +337,7 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
             trac_idx:          &trac_idx,
             hole_idx:          &hole_idx,
             right_idx:         &right_idx,
+            gathered:          &gathered,
             eq_ring_norm:      &eq_ring_norm,
             dynamic_lam_h_cap,
             dynamic_lam_d_cap,
@@ -944,8 +953,12 @@ pub(crate) fn run_headless_pinlug_inner(
         let pin_int_norm: Vec<[f32; 2]> = pin_int.iter().map(|&[x, y]| normalize_point_generic(x, y, &pin_geom)).collect();
         let lug_int_norm: Vec<[f32; 2]> = lug_int.iter().map(|&[x, y]| normalize_point_generic(x, y, &lug_geom)).collect();
 
-        let mut pin_named = std::collections::HashMap::new();
-        let mut lug_named = std::collections::HashMap::new();
+        // Sized to the known closed set of names each domain's `named_point_sets()` populates
+        // (pin: "interface" + optionally "driving"; lug: "interface" + "shank_anchor", plus
+        // "boundary" inserted below) — avoids the incremental resize/rehash `HashMap::new()`
+        // would otherwise pay as entries are inserted one at a time, every step.
+        let mut pin_named = std::collections::HashMap::with_capacity(2);
+        let mut lug_named = std::collections::HashMap::with_capacity(3);
         for set in pin_sampling.named_point_sets(&[]) {
             pin_named.insert(set.name, build_pointset(&set.points, &pin_geom));
         }

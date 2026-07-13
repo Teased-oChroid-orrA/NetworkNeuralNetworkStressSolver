@@ -149,15 +149,13 @@ impl<B: Backend> SoapMuonState<B> {
     }
 }
 
-/// Full eigendecomposition of a symmetric matrix via `nalgebra`, returning the orthonormal
-/// eigenvector matrix (eigenvalues sorted descending for run-to-run ordering stability).
-///
-/// `burn-tensor` has no eigendecomposition primitive, so this round-trips the (small,
-/// `hidden_dim`×`hidden_dim`) matrix through the CPU.
-fn eigh_eigenvectors<B: Backend>(m: &Tensor<B, 2>, device: &Device<B>) -> Tensor<B, 2> {
-    let [n, _] = m.dims();
-    let data = m.clone().into_data().to_vec::<f32>().unwrap();
-    let mat = nalgebra::DMatrix::<f32>::from_row_slice(n, n, &data);
+/// Full eigendecomposition of a symmetric matrix, given already-on-host row-major data —
+/// returns the orthonormal eigenvector matrix, ALSO row-major, flattened (eigenvalues sorted
+/// descending for run-to-run ordering stability). Pure-CPU/host-only: no GPU round trip is
+/// performed here, so this can be called any number of times per combined GPU sync (see
+/// [`eigh_eigenvectors_batched`]).
+fn eigh_from_host_data(data: &[f32], n: usize) -> Vec<f32> {
+    let mat = nalgebra::DMatrix::<f32>::from_row_slice(n, n, data);
     let eig = nalgebra::SymmetricEigen::new(mat);
 
     let mut order: Vec<usize> = (0..n).collect();
@@ -173,7 +171,73 @@ fn eigh_eigenvectors<B: Backend>(m: &Tensor<B, 2>, device: &Device<B>) -> Tensor
             out[row * n + new_col] = eig.eigenvectors[(row, old_col)];
         }
     }
+    out
+}
+
+/// Full eigendecomposition of a symmetric matrix via `nalgebra`, returning the orthonormal
+/// eigenvector matrix (eigenvalues sorted descending for run-to-run ordering stability).
+///
+/// `burn-tensor` has no eigendecomposition primitive, so this round-trips the (small,
+/// `hidden_dim`×`hidden_dim`) matrix through the CPU. Kept as the single-matrix entry point
+/// (used directly by `eigh_eigenvectors_orthonormal`'s test); `SoapMuon::step`'s hot path uses
+/// [`eigh_eigenvectors_batched`] instead — see its doc comment for why. `#[allow(dead_code)]`
+/// because this is now exercised only from `#[cfg(test)]` code, which a plain (non-test)
+/// build sees as unused.
+#[allow(dead_code)]
+fn eigh_eigenvectors<B: Backend>(m: &Tensor<B, 2>, device: &Device<B>) -> Tensor<B, 2> {
+    let [n, _] = m.dims();
+    let data = m.clone().into_data().to_vec::<f32>().unwrap();
+    let out = eigh_from_host_data(&data, n);
     Tensor::<B, 2>::from_data(TensorData::new(out, vec![n, n]), device)
+}
+
+/// Batched analogue of two separate `eigh_eigenvectors(&gg0, ..)` / `eigh_eigenvectors(&gg1,
+/// ..)` calls: pays exactly ONE combined GPU->CPU sync and ONE combined CPU->GPU upload
+/// instead of two of each, by flattening+concatenating `gg0`/`gg1` before the single
+/// `.into_data()` call and concatenating both results before the single `Tensor::from_data`
+/// upload. The two matrices' `nalgebra::SymmetricEigen` decompositions are still run
+/// INDEPENDENTLY on host (via [`eigh_from_host_data`]) and produce byte-identical eigenvectors
+/// to calling `eigh_eigenvectors` on `gg0`/`gg1` separately.
+///
+/// Deliberately NOT a joint block-diagonal eigendecomposition of `[[gg0, 0], [0, gg1]]`: while
+/// that would be mathematically equivalent whenever `gg0`/`gg1` have disjoint eigenvalue
+/// spectra, a degenerate eigenvalue SHARED across the two blocks (e.g. both matrices having a
+/// zero eigenvalue, which is common for a rank-deficient/early-training Shampoo accumulator)
+/// has a non-unique eigenbasis for that joint eigenspace — `nalgebra` could return eigenvectors
+/// that mix components from `gg0` and `gg1`, which would silently change SOAP's preconditioning
+/// vs. computing each block's eigenbasis independently. Batching only the DATA TRANSFER (this
+/// function), never the decomposition itself, is a pure round-trip-count win with zero
+/// numerical difference from the pre-batching two-call path.
+fn eigh_eigenvectors_batched<B: Backend>(
+    gg0: &Tensor<B, 2>,
+    gg1: &Tensor<B, 2>,
+    device: &Device<B>,
+) -> (Tensor<B, 2>, Tensor<B, 2>) {
+    let [n0, _] = gg0.dims();
+    let [n1, _] = gg1.dims();
+    let sz0 = n0 * n0;
+    let sz1 = n1 * n1;
+
+    // ONE combined GPU->CPU readback (instead of two): flatten both matrices to row vectors
+    // and `cat` along dim 1 before the single `.into_data()` call.
+    let combined_in = Tensor::cat(
+        vec![gg0.clone().reshape([1, sz0]), gg1.clone().reshape([1, sz1])],
+        1,
+    );
+    let data = combined_in.into_data().to_vec::<f32>().unwrap();
+    let (data0, data1) = data.split_at(sz0);
+
+    let out0 = eigh_from_host_data(data0, n0);
+    let out1 = eigh_from_host_data(data1, n1);
+
+    // ONE combined CPU->GPU upload (instead of two).
+    let mut combined_out = Vec::with_capacity(sz0 + sz1);
+    combined_out.extend_from_slice(&out0);
+    combined_out.extend_from_slice(&out1);
+    let combined_t = Tensor::<B, 1>::from_data(TensorData::new(combined_out, vec![sz0 + sz1]), device);
+    let q0 = combined_t.clone().narrow(0, 0, sz0).reshape([n0, n0]);
+    let q1 = combined_t.narrow(0, sz0, sz1).reshape([n1, n1]);
+    (q0, q1)
 }
 
 /// Newton-Schulz quintic orthogonalization (Keller Jordan's iteration, as used by Muon).
@@ -249,10 +313,14 @@ impl<B: Backend> SimpleOptimizer<B> for SoapMuon<B> {
         );
         st.step += 1;
 
-        // 2. Refresh the eigenbasis periodically (full eigh — see module docs).
+        // 2. Refresh the eigenbasis periodically (full eigh — see module docs). Batched via
+        // `eigh_eigenvectors_batched` (one combined GPU round trip for both gg0/gg1's
+        // eigenvectors, byte-identical to two separate `eigh_eigenvectors` calls — see its
+        // doc comment for why this is safe and block-diagonal joint eigh is not).
         if st.step % self.precondition_frequency == 0 {
-            st.q0 = eigh_eigenvectors(&st.gg0, &device);
-            st.q1 = eigh_eigenvectors(&st.gg1, &device);
+            let (q0, q1) = eigh_eigenvectors_batched(&st.gg0, &st.gg1, &device);
+            st.q0 = q0;
+            st.q1 = q1;
         }
 
         // 3. Project gradient into the eigenbasis: q0^T @ grad @ q1

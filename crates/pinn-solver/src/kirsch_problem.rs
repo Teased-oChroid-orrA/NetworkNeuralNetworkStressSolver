@@ -749,8 +749,8 @@ mod tests {
             saw_brdr::SawBrdr,
             lr_schedule::LrSchedule,
             training_core::{
-                compute_reference_scales, extract_boundary_indices, normalize_point,
-                step_physics, StepCtx,
+                build_gathered_boundary_tensors, compute_reference_scales,
+                extract_boundary_indices, normalize_point, step_physics, StepCtx,
             },
         };
 
@@ -810,12 +810,15 @@ mod tests {
         let problem_for_ctx = KirschProblem::new(
             config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
         );
+        let gathered = build_gathered_boundary_tensors(
+            &trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device,
+        );
         let ctx = StepCtx {
             config: &config, engine: &engine, problem: &problem_for_ctx, fd: &fd,
             k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm: &int_norm, bnd_norm: &bnd_norm,
             bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
             eq_ring_norm: &eq_ring_norm,
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false, step: 0,
