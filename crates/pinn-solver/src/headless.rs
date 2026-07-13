@@ -841,7 +841,7 @@ pub(crate) fn run_headless_pinlug_inner(
             .with_hidden_dim(config.hidden_dim)
             .with_n_hidden(config.n_hidden)
             .with_output_dim(OUTPUT_DIM)
-            .with_use_piratenet(false)
+            .with_use_piratenet(config.use_piratenet)
     };
     let (mut model_pin, mut model_lug): (ElasticityNet<B>, ElasticityNet<B>) = match initial_models {
         Some((pin, lug)) => (pin, lug),
@@ -1585,6 +1585,53 @@ mod tests {
         config.max_steps = 220;
         let result = run_headless_pinlug_inner(config, None);
         assert_eq!(result.model_reinit_count, 0);
+    }
+
+    /// Issue #51: pin-lug's `net_cfg` closure in `run_headless_pinlug_inner` now reads
+    /// `config.use_piratenet` (mirroring Kirsch's `run_headless_inner`) instead of hardcoding
+    /// `false`. This proves the two-domain `step_physics_multi` path — including the
+    /// cross-domain Signorini `interface_penetration`/`interface_non_tension` terms, which
+    /// read BOTH domains' forward outputs every step — stays numerically well-behaved with
+    /// PirateNet's gate-based depth curriculum active: a short run produces a fully finite
+    /// `total_scalar` trajectory, never trips the Param-level NaN/Inf reinit guard, and the
+    /// interface-gap RMS convergence metric (pin-lug's `convergence_metric()`, read via
+    /// `metric_probes > 0`) stays probeable rather than degenerating to `None`/NaN.
+    #[test]
+    fn run_headless_pinlug_with_piratenet_enabled_produces_finite_trajectory() {
+        let mut config = small_pinlug_config();
+        config.max_steps = 12;
+        config.use_piratenet = true;
+        let result = run_headless_pinlug_inner(config, None);
+
+        assert_eq!(result.model_reinit_count, 0,
+            "PirateNet gates must not destabilize pin-lug's Signorini-coupled training into NaN/Inf");
+        assert!(!result.trajectory.is_empty());
+        for (i, total) in result.trajectory.iter().enumerate() {
+            assert!(total.is_finite(), "step {i}: total_scalar not finite under PirateNet: {total}");
+        }
+        assert!(result.metric_probes > 0,
+            "interface-gap RMS convergence metric must remain probeable with PirateNet gates active");
+    }
+
+    /// Same scenario as above, but also with `use_piratenet_compute_skip=true` — the
+    /// forward-skip optimization from issue #20 must not change the qualitative finiteness
+    /// guarantee when layered on top of pin-lug's cross-domain Signorini terms (PR #44 already
+    /// proves `step_physics_multi`'s mask machinery is domain-count-agnostic at the unit
+    /// level in `training_core.rs`; this is the pin-lug integration-level check).
+    #[test]
+    fn run_headless_pinlug_with_piratenet_compute_skip_produces_finite_trajectory() {
+        let mut config = small_pinlug_config();
+        config.max_steps = 12;
+        config.use_piratenet = true;
+        config.use_piratenet_compute_skip = true;
+        let result = run_headless_pinlug_inner(config, None);
+
+        assert_eq!(result.model_reinit_count, 0,
+            "compute-skip must not destabilize pin-lug's Signorini-coupled training into NaN/Inf");
+        assert!(!result.trajectory.is_empty());
+        for (i, total) in result.trajectory.iter().enumerate() {
+            assert!(total.is_finite(), "step {i}: total_scalar not finite under compute-skip: {total}");
+        }
     }
 
     /// Extends the existing zero-regression test's pattern past max_steps=220 (past the

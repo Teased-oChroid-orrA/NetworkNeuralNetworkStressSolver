@@ -635,7 +635,7 @@ pub fn run_training_pinlug(
             .with_hidden_dim(hidden_dim)
             .with_n_hidden(n_hidden)
             .with_output_dim(OUTPUT_DIM)
-            .with_use_piratenet(false)
+            .with_use_piratenet(config.use_piratenet)
     };
     let mut model_pin: ElasticityNet<B> = net_cfg(config.hidden_dim, config.n_hidden).init(&device);
     let mut model_lug: ElasticityNet<B> = net_cfg(config.hidden_dim, config.n_hidden).init(&device);
@@ -1186,6 +1186,32 @@ mod tests {
                 // n_colloc == pin + lug interior point counts, summed (both sampled with the
                 // same config.n_interior in this tiny config).
                 assert_eq!(u.n_colloc, 2 * n_interior);
+            }
+        }
+        assert!(saw_pinlug_update, "expected at least one TrainingMsg::PinLugUpdate");
+    }
+
+    /// Issue #51: `run_training_pinlug`'s `net_cfg` closure now reads `config.use_piratenet`
+    /// (mirroring `run_training`'s Kirsch pattern and `headless.rs::run_headless_pinlug_inner`)
+    /// instead of hardcoding `false`. GUI-path parity check: a short two-domain run with
+    /// PirateNet enabled must still complete without panic and emit only finite `total_loss`
+    /// values in every `PinLugUpdate`, exercising the same cross-domain Signorini terms
+    /// (`interface_penetration`/`interface_non_tension`) the headless path's equivalent test
+    /// covers.
+    #[test]
+    fn run_training_pinlug_with_piratenet_enabled_completes_with_finite_updates() {
+        let mut config = tiny_pinlug_config();
+        config.use_piratenet = true;
+        let (_stop_tx, stop_rx) = crossbeam_channel::unbounded();
+        let msgs = run_and_drain(move |tx| run_training_pinlug(config, tx, stop_rx));
+
+        assert!(msgs.iter().any(|m| matches!(m, TrainingMsg::Done)), "must send Done");
+        let mut saw_pinlug_update = false;
+        for m in &msgs {
+            if let TrainingMsg::PinLugUpdate(u) = m {
+                saw_pinlug_update = true;
+                assert!(u.total_loss.is_finite(),
+                    "total_loss must be finite under PirateNet, got {}", u.total_loss);
             }
         }
         assert!(saw_pinlug_update, "expected at least one TrainingMsg::PinLugUpdate");
