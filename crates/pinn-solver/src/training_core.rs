@@ -1750,13 +1750,33 @@ impl LbfgsCtxScalars {
     }
 }
 
+/// `(name, phase2_only)` for every loss term `problem` declares, excluding
+/// `constitutive_consistency` (folded into `compute_loss_for_lbfgs`'s total separately, with
+/// its own fixed `lam_const` weight outside SAW-BRDR/`lams` — see that function's own doc
+/// comment). Computed ONCE by `step_lbfgs` before entering the L-BFGS closure and passed BY
+/// VALUE into `compute_loss_for_lbfgs`, rather than having that function call
+/// `problem.loss_terms()` itself: `LBFGS::step`'s Strong-Wolfe line search invokes the closure
+/// (and therefore `compute_loss_for_lbfgs`) 5-20 times per outer step on a name/phase2-gating
+/// set that's invariant across those inner iterations — re-deriving it from a fresh
+/// `problem.loss_terms()` call (which allocates a `Vec<Box<dyn LossTerm>>`, including several
+/// placeholder GPU tensors, purely to read `.name()`/`.phase2_only()`; `.compute()` is never
+/// called on these instances — real values come from `term_tensor`'s separately-built structs)
+/// on every inner iteration was wasted, repeated work (Issue #36).
+fn lbfgs_term_names(problem: &dyn BoundaryValueProblem) -> Vec<(&'static str, bool)> {
+    problem.loss_terms().into_iter()
+        .filter(|t| t.name() != "constitutive_consistency")
+        .map(|t| (t.name(), t.phase2_only()))
+        .collect()
+}
+
 /// Compute total loss on the frozen collocation points using fixed lambda values, weighted
-/// and summed via `problem.loss_terms()` — the same trait-driven approach `compute_loss_for_
-/// lbfgs_multi` already uses (see its doc comment), migrated onto Kirsch's single-domain
-/// path. Previously hardcoded (all six named terms always included, weighted by a fixed
-/// `LbfgsLams` struct's dedicated fields), which silently diverged from whatever
-/// `ctx.problem.loss_terms()` actually declared the moment a term was added/removed — this is
-/// the bug Issue #12 fixes.
+/// and summed via `term_names` (the caller's precomputed, phase-gate-invariant view of
+/// `problem.loss_terms()` — see `lbfgs_term_names`) — the same trait-driven filtering
+/// `compute_loss_for_lbfgs_multi` already uses (see its doc comment), migrated onto Kirsch's
+/// single-domain path. Previously hardcoded (all six named terms always included, weighted by
+/// a fixed `LbfgsLams` struct's dedicated fields), which silently diverged from whatever
+/// `problem.loss_terms()` actually declared the moment a term was added/removed — this is the
+/// bug Issue #12 fixes.
 ///
 /// Called by the L-BFGS closure at each inner line-search iteration.
 /// SAW is NOT updated here — `lams` is the snapshot from Converge tier entry, keyed by each
@@ -1766,7 +1786,7 @@ impl LbfgsCtxScalars {
 fn compute_loss_for_lbfgs(
     model: &ElasticityNet<B>,
     ctx: &LbfgsCtxScalars,
-    problem: &dyn BoundaryValueProblem,
+    term_names: &[(&'static str, bool)],
     lams: &HashMap<&'static str, f64>,
     device: &WgpuDevice,
 ) -> (Tensor<B, 1>, f32) {
@@ -1778,19 +1798,15 @@ fn compute_loss_for_lbfgs(
     // literals in `headless.rs`/`runner.rs`, with no compile-time link to `LossTerm::name()`'s
     // actual return values — `lams.get(name).unwrap_or(&0.0)` below would otherwise silently
     // zero-weight a renamed term for the entire Converge tier with no panic, warning, or
-    // failing test pointing at the cause.
+    // failing test pointing at the cause. Checked against `term_names` (ALL non-constitutive
+    // terms, not just the phase2-gated active subset) — same set the pre-hoist inline
+    // `problem.loss_terms()` filter checked.
     debug_assert!(
-        problem.loss_terms().iter()
-            .map(|t| t.name())
-            .filter(|&n| n != "constitutive_consistency")
-            .all(|n| lams.contains_key(n)),
+        term_names.iter().all(|&(n, _)| lams.contains_key(n)),
         "compute_loss_for_lbfgs: `lams` has no entry for active loss term '{}' — a \
          `LossTerm::name()` was likely renamed without updating the `HashMap` literal built at \
          Converge-tier entry (see headless.rs/runner.rs)",
-        problem.loss_terms().iter()
-            .map(|t| t.name())
-            .find(|&n| n != "constitutive_consistency" && !lams.contains_key(n))
-            .unwrap_or("<unknown>"),
+        term_names.iter().find(|&&(n, _)| !lams.contains_key(n)).map(|&(n, _)| n).unwrap_or("<unknown>"),
     );
 
     let n_int     = ctx.int_norm.len();
@@ -2088,15 +2104,14 @@ fn compute_loss_for_lbfgs(
         }
     };
 
-    let active_terms: Vec<Box<dyn LossTerm>> = problem.loss_terms().into_iter()
-        .filter(|t| t.name() != "constitutive_consistency")
-        .filter(|t| ctx.phase2_active || !t.phase2_only())
+    let active_names: Vec<&'static str> = term_names.iter()
+        .filter(|&&(_, phase2_only)| ctx.phase2_active || !phase2_only)
+        .map(|&(n, _)| n)
         .collect();
 
     let mut total: Option<Tensor<B, 1>> = None;
     let mut total_scalar = 0.0_f32;
-    for term in &active_terms {
-        let name = term.name();
+    for name in active_names {
         let raw_lam = *lams.get(name).unwrap_or(&0.0);
         // `dynamic_lam_h_cap`/`dynamic_lam_d_cap` still clamp inside the L-BFGS objective,
         // exactly as before — only the lookup mechanism (HashMap vs. dedicated struct field)
@@ -2159,8 +2174,11 @@ pub fn step_lbfgs(
     lams: &HashMap<&'static str, f64>,
     device: &WgpuDevice,
 ) -> (ElasticityNet<B>, f64) {
+    // Computed ONCE per outer step, before the closure LBFGS invokes 5-20 times internally —
+    // see `lbfgs_term_names`'s doc comment (Issue #36).
+    let term_names = lbfgs_term_names(problem);
     let closure = |m: ElasticityNet<B>| -> (f64, GradientsParams) {
-        let (total_loss, total_scalar) = compute_loss_for_lbfgs(&m, ctx, problem, lams, device);
+        let (total_loss, total_scalar) = compute_loss_for_lbfgs(&m, ctx, &term_names, lams, device);
         let loss_f64 = total_scalar as f64;
         let grads_raw = total_loss.backward();
         let grads_p = GradientsParams::from_grads(grads_raw, &m);
@@ -2339,10 +2357,22 @@ pub fn compute_gradient_conflict_multi(
 /// per-term base weights (`lams`) — the multi-domain analogue of `compute_loss_for_lbfgs`.
 /// Reuses `compute_domain_forwards` (the SAME term-summation logic `step_physics_multi` uses)
 /// via `frozen_ctx.as_multi_step_ctx(problem)` — no second loss-assembly implementation.
+///
+/// `active_terms` is the caller's (`step_lbfgs_multi`) precomputed, already phase-gated
+/// `Vec<Box<dyn LossTerm>>` — passed in BY REFERENCE rather than this function calling
+/// `ctx.problem.loss_terms()` itself, since `LBFGS::step`'s Strong-Wolfe line search invokes
+/// this function's closure 5-20 times per outer step on a term set that's invariant across
+/// those inner iterations (Issue #36). Unlike `compute_loss_for_lbfgs`'s Kirsch path, the
+/// actual boxed `LossTerm` trait objects ARE needed here (not just `.name()`/`.phase2_only()`)
+/// — `compute_domain_forwards` reads `term.domains()`/`term.point_sets()` and the per-term
+/// loop below calls `term.compute()` for real, so this can't be reduced to a `(name,
+/// phase2_only)` tuple the way the Kirsch path was; only the redundant `loss_terms()`
+/// reallocation is hoisted away, not the trait objects themselves.
 fn compute_loss_for_lbfgs_multi(
     models: &TwoDomainModels<B>,
     frozen_ctx: &crate::problem::FrozenMultiStepCtx,
     problem: &dyn BoundaryValueProblem,
+    active_terms: &[Box<dyn LossTerm>],
     lams: &HashMap<&'static str, f64>,
     device: &WgpuDevice,
 ) -> (Tensor<B, 1>, f32) {
@@ -2351,17 +2381,12 @@ fn compute_loss_for_lbfgs_multi(
 
     let ctx = frozen_ctx.as_multi_step_ctx(problem);
 
-    let active_terms: Vec<Box<dyn LossTerm>> = ctx.problem.loss_terms().into_iter()
-        .filter(|t| t.name() != "constitutive_consistency")
-        .filter(|t| ctx.phase2_active || !t.phase2_only())
-        .collect();
-
     let model_refs: Vec<&ElasticityNet<B>> = vec![&models.pin, &models.lug];
     // Frozen-collocation L-BFGS loss for pin-lug — out of scope for the compute-skip
     // optimization (see contract: only the Kirsch L-BFGS step is wired in), always runs
     // every block full-compute (`None` per model).
     let no_masks: Vec<Option<&[bool]>> = model_refs.iter().map(|_| None).collect();
-    let computed = compute_domain_forwards(&ctx, &model_refs, &active_terms, device, &no_masks);
+    let computed = compute_domain_forwards(&ctx, &model_refs, active_terms, device, &no_masks);
 
     let forwards: HashMap<(DomainId, &'static str), DFO<'_, B>> = computed.iter()
         .map(|c| (c.key, DFO {
@@ -2374,7 +2399,7 @@ fn compute_loss_for_lbfgs_multi(
 
     let mut total: Option<Tensor<B, 1>> = None;
     let mut total_scalar = 0.0_f32;
-    for term in &active_terms {
+    for term in active_terms {
         let lam = *lams.get(term.name()).unwrap_or(&0.0);
         let inputs: Vec<DFO<'_, B>> = term.domains().iter().zip(term.point_sets().iter())
             .filter_map(|(&id, &ps)| forwards.get(&(id, ps)).map(|f| DFO {
@@ -2406,8 +2431,17 @@ pub fn step_lbfgs_multi(
     lams: &HashMap<&'static str, f64>,
     device: &WgpuDevice,
 ) -> (TwoDomainModels<B>, f64) {
+    // Computed ONCE per outer step, before the closure LBFGS invokes 5-20 times internally —
+    // mirrors `step_lbfgs`'s `term_names` hoist (Issue #36). Unlike the Kirsch path this keeps
+    // the full boxed `LossTerm` trait objects (see `compute_loss_for_lbfgs_multi`'s doc
+    // comment for why), but still avoids the repeated `loss_terms()` allocation per inner
+    // line-search iteration.
+    let active_terms: Vec<Box<dyn LossTerm>> = problem.loss_terms().into_iter()
+        .filter(|t| t.name() != "constitutive_consistency")
+        .filter(|t| frozen_ctx.phase2_active || !t.phase2_only())
+        .collect();
     let closure = |m: TwoDomainModels<B>| -> (f64, GradientsParams) {
-        let (total_loss, total_scalar) = compute_loss_for_lbfgs_multi(&m, frozen_ctx, problem, lams, device);
+        let (total_loss, total_scalar) = compute_loss_for_lbfgs_multi(&m, frozen_ctx, problem, &active_terms, lams, device);
         let loss_f64 = total_scalar as f64;
         let grads_raw = total_loss.backward();
         let grads_p = GradientsParams::from_grads(grads_raw, &m);
@@ -3067,7 +3101,7 @@ mod tests {
         };
         let lams: HashMap<&'static str, f64> = HashMap::new();
 
-        let (_total, total_scalar) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &problem, &lams, &device);
+        let (_total, total_scalar) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &lbfgs_term_names(&problem), &lams, &device);
         assert_eq!(
             total_scalar, 0.0,
             "expected exactly 0.0 with zero active terms and no constitutive contribution, got {total_scalar}",
@@ -3237,7 +3271,7 @@ mod tests {
             ("mystery_term", 1.0),
         ]);
 
-        let _ = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &problem, &lams, &device);
+        let _ = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &lbfgs_term_names(&problem), &lams, &device);
     }
 
     /// Regression for Issue #12's follow-up review: `lams.get(name).unwrap_or(&0.0)` used to
@@ -3287,7 +3321,7 @@ mod tests {
             ("displacement_anchor", 1.0), ("equilibrium_ring", 1.0), ("kirsch_stress", 1.0),
         ]);
 
-        let _ = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &problem, &lams, &device);
+        let _ = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &lbfgs_term_names(&problem), &lams, &device);
     }
 
     #[test]
@@ -3335,8 +3369,8 @@ mod tests {
         let lams_at_cap: HashMap<&'static str, f64> = at_cap_pairs.into_iter().collect();
         let lams_over_cap: HashMap<&'static str, f64> = over_cap_pairs.into_iter().collect();
 
-        let (_total_a, total_scalar_a) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &problem, &lams_at_cap, &device);
-        let (_total_b, total_scalar_b) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &problem, &lams_over_cap, &device);
+        let (_total_a, total_scalar_a) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &lbfgs_term_names(&problem), &lams_at_cap, &device);
+        let (_total_b, total_scalar_b) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &lbfgs_term_names(&problem), &lams_over_cap, &device);
 
         let scale = total_scalar_a.abs().max(total_scalar_b.abs()).max(1e-8);
         let rel = (total_scalar_a - total_scalar_b).abs() / scale;
@@ -3501,7 +3535,7 @@ mod tests {
             ("displacement_anchor", 1.0), ("equilibrium_ring", 1.0), ("kirsch_stress", 1.0),
         ]);
 
-        let (_total, total_scalar) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &problem, &lams, &device);
+        let (_total, total_scalar) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &lbfgs_term_names(&problem), &lams, &device);
         assert!(total_scalar.is_finite(), "compute_loss_for_lbfgs's total loss must be finite at px=0.0, got {total_scalar}");
 
         let mut lbfgs = make_lbfgs(3);
@@ -3571,7 +3605,7 @@ mod tests {
             ("displacement_anchor", 1.0), ("equilibrium_ring", 1.0), ("kirsch_stress", 1.0),
         ]);
 
-        let (_total, total_scalar) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &problem, &lams, &device);
+        let (_total, total_scalar) = compute_loss_for_lbfgs(&model, &lbfgs_ctx, &lbfgs_term_names(&problem), &lams, &device);
         assert!(total_scalar.is_finite(), "compute_loss_for_lbfgs's total loss must be finite at literal px=0.0, got {total_scalar}");
 
         let mut lbfgs = make_lbfgs(3);
