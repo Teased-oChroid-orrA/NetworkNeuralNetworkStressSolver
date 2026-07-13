@@ -829,8 +829,28 @@ fn compute_domain_forwards(
             continue;
         }
 
-        let pts_t = norm_pts_to_tensor::<B>(norm_pts, device);
         let n_pts = norm_pts.len();
+
+        // Compute the per-stencil-row (dx, dy) Dirichlet-ansatz scale factors directly from
+        // `norm_pts` (already CPU-resident) + the 4 known FD shift offsets, in exactly the
+        // row order `assemble_stencil` lays the [5*n_pts, 3] stencil batch out in (centre,
+        // x+hx, x-hx, y+hy, y-hy) — this is 100% deterministic from inputs already on the
+        // CPU, so there is no need to round-trip the GPU stencil tensor back to host memory
+        // just to read its x/y columns back out (see issue #17).
+        let m = 5 * n_pts;
+        let mut dx_v = Vec::with_capacity(m);
+        let mut dy_v = Vec::with_capacity(m);
+        for &(sx, sy) in &[(0.0f32, 0.0f32), (ctx.fd.hx, 0.0), (-ctx.fd.hx, 0.0), (0.0, ctx.fd.hy), (0.0, -ctx.fd.hy)] {
+            for p in norm_pts {
+                let xn = p[0] + sx;
+                let yn = p[1] + sy;
+                let (dx, dy) = ansatz.eval(xn, yn, ctx.k);
+                dx_v.push(dx);
+                dy_v.push(dy);
+            }
+        }
+
+        let pts_t = norm_pts_to_tensor::<B>(norm_pts, device);
         let stencil = assemble_stencil::<B>(&pts_t, ctx.fd, device);
 
         // Apply this domain's Dirichlet ansatz pointwise (columns 0,1 = u,v) via the
@@ -838,19 +858,9 @@ fn compute_domain_forwards(
         // physical units exactly as `step_physics`'s `scale_out` does: displacement cols by
         // u_ref [m], and (mDEM only) stress cols 2..5 by Px [Pa].
         let raw_net = fwd_masked::<B>(
-            model, stencil.clone(), n_fourier, device, forward_masks[model_idx],
+            model, stencil, n_fourier, device, forward_masks[model_idx],
         );
-        let m = raw_net.dims()[0];
-        let stencil_data: Vec<f32> = stencil.into_data().to_vec::<f32>().unwrap_or_default();
-        let mut dx_v = Vec::with_capacity(m);
-        let mut dy_v = Vec::with_capacity(m);
-        for row in 0..m {
-            let xn = stencil_data[row * 3];
-            let yn = stencil_data[row * 3 + 1];
-            let (dx, dy) = ansatz.eval(xn, yn, ctx.k);
-            dx_v.push(dx);
-            dy_v.push(dy);
-        }
+        debug_assert_eq!(raw_net.dims()[0], m, "stencil row count must match 5*n_pts");
         let dx_t = Tensor::<B, 2>::from_data(TensorData::new(dx_v, vec![m, 1]), device);
         let dy_t = Tensor::<B, 2>::from_data(TensorData::new(dy_v, vec![m, 1]), device);
         let u_col = raw_net.clone().slice([0..m, 0..1]) * dx_t;
@@ -5659,6 +5669,57 @@ mod tests {
 
         let rel = (lam["interface_penetration"] - live_weight).abs() / live_weight.abs().max(1e-8);
         assert!(rel < 1e-9, "cap exactly at live weight must be a no-op: got={} expected~={live_weight}", lam["interface_penetration"]);
+    }
+
+    // ─── Issue #17: pin-lug ansatz dx/dy from norm_pts, no GPU readback ─────────────────
+
+    /// `compute_domain_forwards` now computes the per-stencil-row Dirichlet-ansatz (dx, dy)
+    /// scale factors directly from `norm_pts` (+ the 4 known FD shift offsets) instead of
+    /// reading the assembled GPU stencil tensor back to host memory. This test proves the
+    /// closed-form (xn, yn) recovered per stencil row is numerically identical to what the
+    /// old build-tensor-then-readback path produced, for every one of the 5 stencil-row
+    /// blocks (centre, x+hx, x-hx, y+hy, y-hy) `assemble_stencil` lays out — comparing raw
+    /// coordinates directly (not run through `ansatz.eval`) matters because pin-lug's own
+    /// `IdentityAnsatz` ignores (xn, yn) entirely ((1.0, 1.0) for any input), so an
+    /// ansatz-mediated comparison would pass even with a broken shift direction/row-block
+    /// ordering; this test would catch that off-by-one directly.
+    #[test]
+    fn pinlug_stencil_coords_closed_form_matches_old_gpu_readback_path() {
+        let device = WgpuDevice::default();
+        let (problem, _config, fd) = pinlug_test_fixture();
+        let (pin_data, lug_data, _u_ref, _ref_energy, _ref_stress2) =
+            build_pinlug_test_domain_data(&problem, 8, 6);
+
+        for norm_pts in [&pin_data.int_norm, &lug_data.int_norm] {
+            let n_pts = norm_pts.len();
+            let m = 5 * n_pts;
+
+            // OLD path: build the [N,3] tensor, assemble the [5N,3] GPU stencil, read it
+            // back to host to recover the per-row (xn, yn).
+            let pts_t = norm_pts_to_tensor::<B>(norm_pts, &device);
+            let stencil = assemble_stencil::<B>(&pts_t, &fd, &device);
+            let stencil_data: Vec<f32> = stencil.into_data().to_vec::<f32>().unwrap();
+            let mut old_xy = Vec::with_capacity(m);
+            for row in 0..m {
+                old_xy.push((stencil_data[row * 3], stencil_data[row * 3 + 1]));
+            }
+
+            // NEW path: closed-form from norm_pts + FD shift offsets, no tensor round-trip.
+            let mut new_xy = Vec::with_capacity(m);
+            for &(sx, sy) in &[(0.0f32, 0.0f32), (fd.hx, 0.0), (-fd.hx, 0.0), (0.0, fd.hy), (0.0, -fd.hy)] {
+                for p in norm_pts.iter() {
+                    new_xy.push((p[0] + sx, p[1] + sy));
+                }
+            }
+
+            assert_eq!(old_xy.len(), new_xy.len());
+            for row in 0..m {
+                let (ox, oy) = old_xy[row];
+                let (nx, ny) = new_xy[row];
+                assert!((ox - nx).abs() < 1e-6, "row {row}: xn diverges: old={ox} new={nx}");
+                assert!((oy - ny).abs() < 1e-6, "row {row}: yn diverges: old={oy} new={ny}");
+            }
+        }
     }
 
     // ─── PirateNet compute-skip (issue #20) ─────────────────────────────────────────────
