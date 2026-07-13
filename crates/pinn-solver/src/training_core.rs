@@ -170,6 +170,56 @@ pub fn extract_boundary_indices(bnd_pts: &[BoundaryPoint], bnd_nx: &[f32]) -> (V
     (trac_idx, hole_idx, right_idx)
 }
 
+/// The 6 small `Tensor<B, 1>`s that used to be rebuilt from scratch (via the `v_to_t`
+/// closure) on EVERY call to `step_physics`/`compute_gradient_conflict`/
+/// `compute_loss_for_lbfgs` — `trac_idx`/`hole_idx`/`bnd_nx`/`bnd_ny`/`bnd_tx`/`bnd_ty` are
+/// all precomputed once outside the training loop and never change during a run (Kirsch has
+/// no per-step boundary resampling, unlike pin-lug), so gathering+uploading these 6 tensors
+/// is pure repeated work. Built once by [`build_gathered_boundary_tensors`] and threaded
+/// through `StepCtx`/`LbfgsCtxScalars` (cloning a `Tensor` is an O(1) refcount bump, not a
+/// re-upload).
+#[derive(Clone)]
+pub struct GatheredBoundaryTensors {
+    pub trac_nx: Tensor<B, 1>,
+    pub trac_ny: Tensor<B, 1>,
+    pub trac_tx: Tensor<B, 1>,
+    pub trac_ty: Tensor<B, 1>,
+    pub hole_nx: Tensor<B, 1>,
+    pub hole_ny: Tensor<B, 1>,
+}
+
+/// Gather `idxs` out of `src` and upload as a single `Tensor<B, 1>` — the same gather+upload
+/// `v_to_t` used to do inline, per-step, per-call-site. Exposed only so
+/// [`build_gathered_boundary_tensors`] (called ONCE, outside the loop) can build it; no
+/// per-step call site should invoke this directly anymore.
+fn gather_to_tensor(idxs: &[usize], src: &[f32], device: &WgpuDevice) -> Tensor<B, 1> {
+    let v: Vec<f32> = idxs.iter().map(|&i| src[i]).collect();
+    Tensor::<B, 1>::from_data(TensorData::new(v, vec![idxs.len()]), device)
+}
+
+/// Build the 6 gathered boundary tensors ONCE from the fixed `trac_idx`/`hole_idx` index
+/// sets and `bnd_nx`/`bnd_ny`/`bnd_tx`/`bnd_ty` arrays. Callers (`headless.rs`/`runner.rs`)
+/// call this once before the training loop starts, and again only when the underlying
+/// boundary sampling actually changes (Kirsch warm-start in `runner.rs`).
+pub fn build_gathered_boundary_tensors(
+    trac_idx: &[usize],
+    hole_idx: &[usize],
+    bnd_nx: &[f32],
+    bnd_ny: &[f32],
+    bnd_tx: &[f32],
+    bnd_ty: &[f32],
+    device: &WgpuDevice,
+) -> GatheredBoundaryTensors {
+    GatheredBoundaryTensors {
+        trac_nx: gather_to_tensor(trac_idx, bnd_nx, device),
+        trac_ny: gather_to_tensor(trac_idx, bnd_ny, device),
+        trac_tx: gather_to_tensor(trac_idx, bnd_tx, device),
+        trac_ty: gather_to_tensor(trac_idx, bnd_ty, device),
+        hole_nx: gather_to_tensor(hole_idx, bnd_nx, device),
+        hole_ny: gather_to_tensor(hole_idx, bnd_ny, device),
+    }
+}
+
 /// All read-only data a single training step needs (passed by reference to `step_physics`).
 pub struct StepCtx<'a> {
     pub config:          &'a SolverConfig,
@@ -197,6 +247,9 @@ pub struct StepCtx<'a> {
     pub trac_idx:        &'a [usize],
     pub hole_idx:        &'a [usize],
     pub right_idx:       &'a [usize],
+    /// The 6 `trac_idx`/`hole_idx`-gathered boundary tensors, built once outside the
+    /// training loop by [`build_gathered_boundary_tensors`] — see its doc comment.
+    pub gathered:        &'a GatheredBoundaryTensors,
     /// Pre-normalized equilibrium ring points (r ∈ [2r_hole, 3r_hole]); computed once outside loop.
     pub eq_ring_norm:    &'a [[f32; 2]],
     pub dynamic_lam_h_cap: f64,
@@ -308,11 +361,6 @@ pub fn step_physics(
         None
     };
 
-    let v_to_t = |idxs: &[usize], src: &[f32]| -> Tensor<B, 1> {
-        let v: Vec<f32> = idxs.iter().map(|&i| src[i]).collect();
-        Tensor::<B, 1>::from_data(TensorData::new(v.clone(), vec![v.len()]), device)
-    };
-
     // Scale network output after ansatz:
     // - displacement cols (0,1): × u_ref  [meters]
     // - stress cols (2,3,4) in mDEM mode: × Px  [Pa — matches analytical Kirsch values]
@@ -368,14 +416,14 @@ pub fn step_physics(
             domain: KIRSCH_DOMAIN,
             raw_out: &out_bnd,
             strains: Some((ex, ey, exy)),
-            normals: Some((v_to_t(ctx.trac_idx, ctx.bnd_nx), v_to_t(ctx.trac_idx, ctx.bnd_ny))),
+            normals: Some((ctx.gathered.trac_nx.clone(), ctx.gathered.trac_ny.clone())),
         };
         let term = crate::kirsch_problem::NeumannTractionTerm {
             domain: KIRSCH_DOMAIN,
             material: ctx.config.material.clone(),
             ref_stress2: ctx.ref_stress2,
-            tx_target: v_to_t(ctx.trac_idx, ctx.bnd_tx),
-            ty_target: v_to_t(ctx.trac_idx, ctx.bnd_ty),
+            tx_target: ctx.gathered.trac_tx.clone(),
+            ty_target: ctx.gathered.trac_ty.clone(),
         };
         term.compute(std::slice::from_ref(&neumann_forward))
     } else {
@@ -431,7 +479,7 @@ pub fn step_physics(
                 domain: KIRSCH_DOMAIN,
                 raw_out: &out_h,
                 strains: None,
-                normals: Some((v_to_t(ctx.hole_idx, ctx.bnd_nx), v_to_t(ctx.hole_idx, ctx.bnd_ny))),
+                normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -449,7 +497,7 @@ pub fn step_physics(
                 domain: KIRSCH_DOMAIN,
                 raw_out: &out_h,
                 strains: Some((ex, ey, exy)),
-                normals: Some((v_to_t(ctx.hole_idx, ctx.bnd_nx), v_to_t(ctx.hole_idx, ctx.bnd_ny))),
+                normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -1278,11 +1326,6 @@ pub fn compute_gradient_conflict(
     let px        = ctx.config.load.px;
     let u_ref_f64 = ctx.u_ref as f64;
 
-    let v_to_t = |idxs: &[usize], src: &[f32]| -> Tensor<B, 1> {
-        let v: Vec<f32> = idxs.iter().map(|&i| src[i]).collect();
-        Tensor::<B, 1>::from_data(TensorData::new(v.clone(), vec![v.len()]), device)
-    };
-
     let scale_out = |ansatz: Tensor<B, 2>| -> Tensor<B, 2> {
         if use_mdem {
             let nr = ansatz.dims()[0];
@@ -1373,14 +1416,14 @@ pub fn compute_gradient_conflict(
             domain: KIRSCH_DOMAIN,
             raw_out: &out_bnd,
             strains: Some((ex, ey, exy)),
-            normals: Some((v_to_t(ctx.trac_idx, ctx.bnd_nx), v_to_t(ctx.trac_idx, ctx.bnd_ny))),
+            normals: Some((ctx.gathered.trac_nx.clone(), ctx.gathered.trac_ny.clone())),
         };
         let term = crate::kirsch_problem::NeumannTractionTerm {
             domain: KIRSCH_DOMAIN,
             material: ctx.config.material.clone(),
             ref_stress2: ctx.ref_stress2,
-            tx_target: v_to_t(ctx.trac_idx, ctx.bnd_tx),
-            ty_target: v_to_t(ctx.trac_idx, ctx.bnd_ty),
+            tx_target: ctx.gathered.trac_tx.clone(),
+            ty_target: ctx.gathered.trac_ty.clone(),
         };
         term.compute(std::slice::from_ref(&neumann_forward))
     } else {
@@ -1438,7 +1481,7 @@ pub fn compute_gradient_conflict(
                 domain: KIRSCH_DOMAIN,
                 raw_out: &out_h,
                 strains: None,
-                normals: Some((v_to_t(ctx.hole_idx, ctx.bnd_nx), v_to_t(ctx.hole_idx, ctx.bnd_ny))),
+                normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -1456,7 +1499,7 @@ pub fn compute_gradient_conflict(
                 domain: KIRSCH_DOMAIN,
                 raw_out: &out_h,
                 strains: Some((ex, ey, exy)),
-                normals: Some((v_to_t(ctx.hole_idx, ctx.bnd_nx), v_to_t(ctx.hole_idx, ctx.bnd_ny))),
+                normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -1735,6 +1778,10 @@ pub struct LbfgsCtxScalars {
     pub trac_idx:        Vec<usize>,
     pub hole_idx:        Vec<usize>,
     pub right_idx:       Vec<usize>,
+    /// Cloned from `StepCtx::gathered` — a `Tensor` clone is an O(1) refcount bump, not a
+    /// re-upload, so this is still built once per Converge-tier entry (`from_ctx` is called
+    /// only there), not once per L-BFGS line-search iteration.
+    pub gathered:        GatheredBoundaryTensors,
     pub eq_ring_norm:    Vec<[f32; 2]>,
     pub dynamic_lam_h_cap: f64,
     pub dynamic_lam_d_cap: f64,
@@ -1764,6 +1811,7 @@ impl LbfgsCtxScalars {
             trac_idx:         ctx.trac_idx.to_vec(),
             hole_idx:         ctx.hole_idx.to_vec(),
             right_idx:        ctx.right_idx.to_vec(),
+            gathered:         ctx.gathered.clone(),
             eq_ring_norm:     ctx.eq_ring_norm.to_vec(),
             dynamic_lam_h_cap: ctx.dynamic_lam_h_cap,
             dynamic_lam_d_cap: ctx.dynamic_lam_d_cap,
@@ -1837,11 +1885,6 @@ fn compute_loss_for_lbfgs(
     let px        = ctx.config.load.px;
     let u_ref_f64 = ctx.u_ref as f64;
 
-    let v_to_t_lbfgs = |idxs: &[usize], src: &[f32]| -> Tensor<B, 1> {
-        let v: Vec<f32> = idxs.iter().map(|&i| src[i]).collect();
-        Tensor::<B, 1>::from_data(TensorData::new(v.clone(), vec![v.len()]), device)
-    };
-
     let scale_out = |ansatz: Tensor<B, 2>| -> Tensor<B, 2> {
         if use_mdem {
             let nr = ansatz.dims()[0];
@@ -1903,14 +1946,14 @@ fn compute_loss_for_lbfgs(
             domain: KIRSCH_DOMAIN,
             raw_out: &out_bnd,
             strains: Some((ex, ey, exy_b)),
-            normals: Some((v_to_t_lbfgs(&ctx.trac_idx, &ctx.bnd_nx), v_to_t_lbfgs(&ctx.trac_idx, &ctx.bnd_ny))),
+            normals: Some((ctx.gathered.trac_nx.clone(), ctx.gathered.trac_ny.clone())),
         };
         let term = crate::kirsch_problem::NeumannTractionTerm {
             domain: KIRSCH_DOMAIN,
             material: ctx.config.material.clone(),
             ref_stress2: ctx.ref_stress2,
-            tx_target: v_to_t_lbfgs(&ctx.trac_idx, &ctx.bnd_tx),
-            ty_target: v_to_t_lbfgs(&ctx.trac_idx, &ctx.bnd_ty),
+            tx_target: ctx.gathered.trac_tx.clone(),
+            ty_target: ctx.gathered.trac_ty.clone(),
         };
         term.compute(std::slice::from_ref(&neumann_forward))
     } else {
@@ -1967,7 +2010,7 @@ fn compute_loss_for_lbfgs(
                 domain: KIRSCH_DOMAIN,
                 raw_out: &out_h,
                 strains: None,
-                normals: Some((v_to_t_lbfgs(&ctx.hole_idx, &ctx.bnd_nx), v_to_t_lbfgs(&ctx.hole_idx, &ctx.bnd_ny))),
+                normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -1985,7 +2028,7 @@ fn compute_loss_for_lbfgs(
                 domain: KIRSCH_DOMAIN,
                 raw_out: &out_h,
                 strains: Some((ex, ey, exy_h)),
-                normals: Some((v_to_t_lbfgs(&ctx.hole_idx, &ctx.bnd_nx), v_to_t_lbfgs(&ctx.hole_idx, &ctx.bnd_ny))),
+                normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -2748,12 +2791,13 @@ mod tests {
         };
 
         let run = |problem: &dyn BoundaryValueProblem| -> GradientConflict {
+            let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
             let ctx = StepCtx {
                 config: &config, engine: &engine, problem, fd: &fd,
                 k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
                 int_norm: &int_norm, bnd_norm: &bnd_norm,
                 bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-                trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+                trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
                 eq_ring_norm: &eq_ring_norm,
                 dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
                 phase2_active: false, step: 3,
@@ -2873,12 +2917,13 @@ mod tests {
             drop_names: vec!["neumann_traction", "hole_traction", "kirsch_stress"],
         };
 
+        let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
         let ctx = StepCtx {
             config: &config, engine: &engine, problem: &problem, fd: &fd,
             k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm: &int_norm, bnd_norm: &bnd_norm,
             bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
             eq_ring_norm: &eq_ring_norm,
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false, step: 7,
@@ -2937,12 +2982,13 @@ mod tests {
             drop_names: vec!["neumann_traction", "hole_traction", "displacement_anchor", "kirsch_stress"],
         };
 
+        let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
         let ctx = StepCtx {
             config: &config, engine: &engine, problem: &problem, fd: &fd,
             k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm: &int_norm, bnd_norm: &bnd_norm,
             bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
             eq_ring_norm: &eq_ring_norm,
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false, step: 0,
@@ -2988,12 +3034,13 @@ mod tests {
             ],
         };
 
+        let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
         let ctx = StepCtx {
             config: &config, engine: &engine, problem: &problem, fd: &fd,
             k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm: &int_norm, bnd_norm: &bnd_norm,
             bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
             eq_ring_norm: &eq_ring_norm,
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false, step: 0,
@@ -3028,12 +3075,13 @@ mod tests {
         let model: ElasticityNet<B> = net_cfg.init(&device);
         let problem = kirsch_problem_from_fixture(&config, &engine);
 
+        let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
         let ctx = StepCtx {
             config: &config, engine: &engine, problem: &problem, fd: &fd,
             k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm: &empty_int_norm, bnd_norm: &bnd_norm,
             bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
             eq_ring_norm: &eq_ring_norm,
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false, step: 0,
@@ -3070,12 +3118,13 @@ mod tests {
         let model: ElasticityNet<B> = net_cfg.init(&device);
         let problem = kirsch_problem_from_fixture(&config, &engine);
 
+        let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
         let ctx = StepCtx {
             config: &config, engine: &engine, problem: &problem, fd: &fd,
             k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm: &empty_int_norm, bnd_norm: &bnd_norm,
             bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
             eq_ring_norm: &empty_eq_ring_norm,
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false, step: 0,
@@ -3123,6 +3172,7 @@ mod tests {
             int_norm: int_norm.clone(), bnd_norm: bnd_norm.clone(),
             bnd_nx: bnd_nx.clone(), bnd_ny: bnd_ny.clone(), bnd_tx: bnd_tx.clone(), bnd_ty: bnd_ty.clone(),
             trac_idx: trac_idx.clone(), hole_idx: hole_idx.clone(), right_idx: right_idx.clone(),
+            gathered: build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device),
             eq_ring_norm: eq_ring_norm.clone(),
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false,
@@ -3172,6 +3222,7 @@ mod tests {
             int_norm: int_norm.clone(), bnd_norm: bnd_norm.clone(),
             bnd_nx: bnd_nx.clone(), bnd_ny: bnd_ny.clone(), bnd_tx: bnd_tx.clone(), bnd_ty: bnd_ty.clone(),
             trac_idx: trac_idx.clone(), hole_idx: hole_idx.clone(), right_idx: right_idx.clone(),
+            gathered: build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device),
             eq_ring_norm: eq_ring_norm.clone(),
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false,
@@ -3240,12 +3291,13 @@ mod tests {
 
         let problem = KirschProblemWithMysteryTerm { inner: kirsch_problem_from_fixture(&config, &engine) };
 
+        let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
         let ctx = StepCtx {
             config: &config, engine: &engine, problem: &problem, fd: &fd,
             k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm: &int_norm, bnd_norm: &bnd_norm,
             bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
             eq_ring_norm: &eq_ring_norm,
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false, step: 0,
@@ -3283,6 +3335,7 @@ mod tests {
             int_norm: int_norm.clone(), bnd_norm: bnd_norm.clone(),
             bnd_nx: bnd_nx.clone(), bnd_ny: bnd_ny.clone(), bnd_tx: bnd_tx.clone(), bnd_ty: bnd_ty.clone(),
             trac_idx: trac_idx.clone(), hole_idx: hole_idx.clone(), right_idx: right_idx.clone(),
+            gathered: build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device),
             eq_ring_norm: eq_ring_norm.clone(),
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false,
@@ -3337,6 +3390,7 @@ mod tests {
             int_norm: int_norm.clone(), bnd_norm: bnd_norm.clone(),
             bnd_nx: bnd_nx.clone(), bnd_ny: bnd_ny.clone(), bnd_tx: bnd_tx.clone(), bnd_ty: bnd_ty.clone(),
             trac_idx: trac_idx.clone(), hole_idx: hole_idx.clone(), right_idx: right_idx.clone(),
+            gathered: build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device),
             eq_ring_norm: eq_ring_norm.clone(),
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: true,
@@ -3380,6 +3434,7 @@ mod tests {
             int_norm: int_norm.clone(), bnd_norm: bnd_norm.clone(),
             bnd_nx: bnd_nx.clone(), bnd_ny: bnd_ny.clone(), bnd_tx: bnd_tx.clone(), bnd_ty: bnd_ty.clone(),
             trac_idx: trac_idx.clone(), hole_idx: hole_idx.clone(), right_idx: right_idx.clone(),
+            gathered: build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device),
             eq_ring_norm: eq_ring_norm.clone(),
             dynamic_lam_h_cap: 10.0, dynamic_lam_d_cap: 50.0,
             phase2_active: true,
@@ -3444,12 +3499,13 @@ mod tests {
         let mut saw = SawBrdr::with_base(engine.init_weights(), 0.95);
         let mut lr_sched = LrSchedule::new(engine.peak_lr, 200, 1000);
 
+        let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
         let ctx = StepCtx {
             config: &config, engine: &engine, problem: &problem, fd: &fd,
             k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm: &int_norm, bnd_norm: &bnd_norm,
             bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
             eq_ring_norm: &eq_ring_norm,
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false, step: 0,
@@ -3488,12 +3544,13 @@ mod tests {
             config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
         );
 
+        let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
         let ctx = StepCtx {
             config: &config, engine: &engine, problem: &problem, fd: &fd,
             k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm: &int_norm, bnd_norm: &bnd_norm,
             bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
             eq_ring_norm: &eq_ring_norm,
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false, step: 0,
@@ -3553,6 +3610,7 @@ mod tests {
             trac_idx: trac_idx.clone(),
             hole_idx: hole_idx.clone(),
             right_idx: right_idx.clone(),
+            gathered: build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device),
             eq_ring_norm: eq_ring_norm.clone(),
             dynamic_lam_h_cap: 50.0,
             dynamic_lam_d_cap: 50.0,
@@ -3623,6 +3681,7 @@ mod tests {
             trac_idx: trac_idx.clone(),
             hole_idx: hole_idx.clone(),
             right_idx: right_idx.clone(),
+            gathered: build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device),
             eq_ring_norm: eq_ring_norm.clone(),
             dynamic_lam_h_cap: 50.0,
             dynamic_lam_d_cap: 50.0,
@@ -3652,9 +3711,12 @@ mod tests {
     /// model / GPU forward pass through `compute_loss_for_lbfgs` itself.
     #[test]
     fn lbfgs_ctx_scalars_from_ctx_threads_ref_energy_for_both_scaling_modes() {
+        use burn::backend::wgpu::WgpuDevice;
         use crate::engine::EngineParams;
         use crate::kirsch_problem::KirschProblem;
         use pinn_core::messages::SolverConfig;
+
+        let device = WgpuDevice::default();
 
         for use_uts in [false, true] {
             let mut config = SolverConfig::default_kirsch();
@@ -3691,12 +3753,13 @@ mod tests {
                 config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
             );
 
+            let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
             let ctx = StepCtx {
                 config: &config, engine: &engine, problem: &problem, fd: &fd,
                 k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
                 int_norm: &int_norm, bnd_norm: &bnd_norm,
                 bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-                trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+                trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
                 eq_ring_norm: &eq_ring_norm,
                 dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
                 phase2_active: false, step: 0,
@@ -3820,12 +3883,13 @@ mod tests {
         };
 
         for step in 0..2usize {
+            let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
             let ctx = StepCtx {
                 config: &config, engine: &engine, problem: &problem, fd: &fd,
                 k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
                 int_norm: &int_norm, bnd_norm: &bnd_norm,
                 bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-                trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+                trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
                 eq_ring_norm: &eq_ring_norm,
                 dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
                 phase2_active: false, step,
@@ -3932,12 +3996,13 @@ mod tests {
         let mut lr_sched = LrSchedule::new(engine.peak_lr, 200, 1000);
 
         for step in 0..8usize {
+            let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
             let ctx = StepCtx {
                 config: &config, engine: &engine, problem: &problem, fd: &fd,
                 k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
                 int_norm: &int_norm, bnd_norm: &bnd_norm,
                 bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-                trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+                trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
                 eq_ring_norm: &eq_ring_norm,
                 dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
                 phase2_active: false, step,
@@ -5188,12 +5253,13 @@ mod tests {
         let mut saw = SawBrdr::with_base(engine.init_weights(), 0.95);
         let mut lr_sched = LrSchedule::new(engine.peak_lr, 200, 1000);
 
+        let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
         let ctx = StepCtx {
             config: &config, engine: &engine, problem: &problem, fd: &fd,
             k: engine.ansatz_k, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm: &int_norm, bnd_norm: &bnd_norm,
             bnd_nx: &bnd_nx, bnd_ny: &bnd_ny, bnd_tx: &bnd_tx, bnd_ty: &bnd_ty,
-            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx,
+            trac_idx: &trac_idx, hole_idx: &hole_idx, right_idx: &right_idx, gathered: &gathered,
             eq_ring_norm: &eq_ring_norm,
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false, step: 0,
@@ -5829,11 +5895,12 @@ mod tests {
         let bnd_ty: Vec<f32> = bnd_pts.iter().map(|b| b.ty as f32).collect();
         let (trac_idx, hole_idx, right_idx) = extract_boundary_indices(&bnd_pts, &bnd_nx);
         let eq_ring_norm: Vec<[f32; 2]> = eq_ring.iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
+        let gathered = build_gathered_boundary_tensors(&trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, &device);
 
         let owned = StepCtxOwned {
             fd, u_ref, ref_energy, ref_stress2, cx, cy, ref_div2,
             int_norm, bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
-            trac_idx, hole_idx, right_idx, eq_ring_norm,
+            trac_idx, hole_idx, right_idx, eq_ring_norm, gathered,
         };
         (config, engine, owned, device)
     }
@@ -5847,6 +5914,7 @@ mod tests {
         bnd_nx: Vec<f32>, bnd_ny: Vec<f32>, bnd_tx: Vec<f32>, bnd_ty: Vec<f32>,
         trac_idx: Vec<usize>, hole_idx: Vec<usize>, right_idx: Vec<usize>,
         eq_ring_norm: Vec<[f32; 2]>,
+        gathered: GatheredBoundaryTensors,
     }
 
     /// Runs one `step_physics` call against `compute_skip_test_fixture`'s setup, on a
@@ -5881,6 +5949,7 @@ mod tests {
             int_norm: &owned.int_norm, bnd_norm: &owned.bnd_norm,
             bnd_nx: &owned.bnd_nx, bnd_ny: &owned.bnd_ny, bnd_tx: &owned.bnd_tx, bnd_ty: &owned.bnd_ty,
             trac_idx: &owned.trac_idx, hole_idx: &owned.hole_idx, right_idx: &owned.right_idx,
+            gathered: &owned.gathered,
             eq_ring_norm: &owned.eq_ring_norm,
             dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
             phase2_active: false, step: 0,

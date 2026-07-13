@@ -29,9 +29,9 @@ use crate::{
     stiffness::StiffnessController,
     lr_schedule::LrSchedule,
     training_core::{
-        compute_gradient_conflict, compute_reference_scales, extract_boundary_indices,
-        make_lbfgs, normalize_point, probe_kt_shared, step_lbfgs, step_physics,
-        LbfgsCtxScalars, StepCtx, StepOutput,
+        build_gathered_boundary_tensors, compute_gradient_conflict, compute_reference_scales,
+        extract_boundary_indices, make_lbfgs, normalize_point, probe_kt_shared, step_lbfgs,
+        step_physics, GatheredBoundaryTensors, LbfgsCtxScalars, StepCtx, StepOutput,
     },
 };
 
@@ -82,6 +82,11 @@ struct TrainingState {
     trac_idx: Vec<usize>,
     hole_idx: Vec<usize>,
     right_idx: Vec<usize>,
+    /// The 6 `trac_idx`/`hole_idx`-gathered boundary tensors `step_physics`/
+    /// `compute_gradient_conflict` need every step — rebuilt only in `new()`/`warm_start()`
+    /// (when `bnd_nx`/`bnd_ny`/`bnd_tx`/`bnd_ty`/`trac_idx`/`hole_idx` actually change), not
+    /// once per step. See `GatheredBoundaryTensors`'s doc comment.
+    gathered: GatheredBoundaryTensors,
 
     eq_ring_norm: Vec<[f32; 2]>,
     vis_pts_norm: Vec<[f32; 2]>,
@@ -122,6 +127,9 @@ impl TrainingState {
         let bnd_tx: Vec<f32> = bnd_pts.iter().map(|b| b.tx as f32).collect();
         let bnd_ty: Vec<f32> = bnd_pts.iter().map(|b| b.ty as f32).collect();
         let (trac_idx, hole_idx, right_idx) = extract_boundary_indices(&bnd_pts, &bnd_nx);
+        let gathered = build_gathered_boundary_tensors(
+            &trac_idx, &hole_idx, &bnd_nx, &bnd_ny, &bnd_tx, &bnd_ty, device,
+        );
 
         let eq_ring_norm: Vec<[f32; 2]> = sample_eq_ring(&config.geometry, engine.n_eq_ring)
             .iter().map(|&[x, y]| normalize_point(x, y, config)).collect();
@@ -147,7 +155,7 @@ impl TrainingState {
             int_pts_phys: sample_interior(&config.geometry, engine.phase1_n_interior),
             amr: None,
             bnd_norm, bnd_nx, bnd_ny, bnd_tx, bnd_ty,
-            trac_idx, hole_idx, right_idx,
+            trac_idx, hole_idx, right_idx, gathered,
             eq_ring_norm, vis_pts_norm, vis_mask,
             current_config: config.clone(),
             current_engine: engine.clone(),
@@ -204,6 +212,9 @@ impl TrainingState {
         self.bnd_tx   = bnd_pts.iter().map(|b| b.tx as f32).collect();
         self.bnd_ty   = bnd_pts.iter().map(|b| b.ty as f32).collect();
         (self.trac_idx, self.hole_idx, self.right_idx) = extract_boundary_indices(&bnd_pts, &self.bnd_nx);
+        self.gathered = build_gathered_boundary_tensors(
+            &self.trac_idx, &self.hole_idx, &self.bnd_nx, &self.bnd_ny, &self.bnd_tx, &self.bnd_ty, device,
+        );
 
         self.eq_ring_norm = sample_eq_ring(&new_cfg.geometry, new_engine.n_eq_ring)
             .iter().map(|&[x, y]| normalize_point(x, y, &new_cfg)).collect();
@@ -392,6 +403,7 @@ pub fn run_training(
             trac_idx:          &state.trac_idx,
             hole_idx:          &state.hole_idx,
             right_idx:         &state.right_idx,
+            gathered:          &state.gathered,
             eq_ring_norm:      &state.eq_ring_norm,
             dynamic_lam_h_cap: state.dynamic_lam_h_cap,
             dynamic_lam_d_cap: state.dynamic_lam_d_cap,
@@ -727,8 +739,12 @@ pub fn run_training_pinlug(
         let lug_int_norm: Vec<[f32; 2]> = lug_int.iter().map(|&[x, y]| normalize_point_generic_pinlug(x, y, &lug_geom)).collect();
         let n_colloc = pin_int_norm.len() + lug_int_norm.len();
 
-        let mut pin_named = std::collections::HashMap::new();
-        let mut lug_named = std::collections::HashMap::new();
+        // Sized to the known closed set of names each domain's `named_point_sets()` populates
+        // (pin: "interface" + optionally "driving"; lug: "interface" + "shank_anchor", plus
+        // "boundary" inserted below) — avoids the incremental resize/rehash `HashMap::new()`
+        // would otherwise pay as entries are inserted one at a time, every step.
+        let mut pin_named = std::collections::HashMap::with_capacity(2);
+        let mut lug_named = std::collections::HashMap::with_capacity(3);
         for set in pin_sampling.named_point_sets(&[]) {
             pin_named.insert(set.name, build_pointset(&set.points, &pin_geom));
         }
