@@ -17,7 +17,7 @@ use burn::{
 use burn::backend::wgpu::WgpuDevice;
 use pinn_core::{
     amr::AdaptiveGrid,
-    messages::SolverConfig,
+    messages::{DecisionMakerConfig, SolverConfig, StiffnessConfig},
     sampling::{sample_boundary, sample_interior, sample_eq_ring},
     units::{IN_TO_M, KSI_TO_PA, MSI_TO_PA},
 };
@@ -32,7 +32,7 @@ use crate::{
     kirsch_problem::KirschProblem,
     lr_schedule::LrSchedule,
     network::{fwd, ElasticityNet, ElasticityNetConfig},
-    optim::{make_bias_optim, make_gate_optim, WeightOptim},
+    optim::{make_bias_optim, make_gate_optim, BiasOptim, GateOptim, WeightOptim},
     problem::validate_loss_terms,
     saw_brdr::SawBrdr,
     stiffness::StiffnessController,
@@ -65,6 +65,62 @@ pub(crate) struct KirschHeadlessResult {
     /// see CLAUDE.md / issue #26).
     #[allow(dead_code)]
     pub model_reinit_count: usize,
+}
+
+/// Bundles every piece of mutable training state that Kirsch's four restart bodies (crash,
+/// plateau, stuck-nan, and the Param-NaN full reinit — see `run_headless_inner`) reset in
+/// lockstep, so the shared ~10-line reset sequence can live in one place
+/// (`reset_kirsch_restart_state`) instead of being repeated at all four call sites. Whatever
+/// genuinely differs between the four sites (the new cap value, whether tracker history is
+/// cleared, the `phase2_active` argument fed to `PinnDecisionMaker::new`, restart-specific
+/// logging/counters, and — Param-NaN only — the model reinit itself) stays OUT of this struct
+/// and is passed/handled at the call site.
+struct KirschRestartState<'a> {
+    dynamic_lam_h_cap: &'a mut f64,
+    dynamic_lam_d_cap: &'a mut f64,
+    tracker: &'a mut ConvergenceTracker,
+    saw: &'a mut SawBrdr,
+    lr_sched: &'a mut LrSchedule,
+    decision_maker: &'a mut PinnDecisionMaker,
+    optim_w: &'a mut WeightOptim,
+    optim_b: &'a mut BiasOptim,
+    optim_gate: &'a mut GateOptim,
+    stiffness_controller: &'a mut StiffnessController,
+    lbfgs_opt: &'a mut Option<burn::optim::LBFGS<B>>,
+    frozen_lbfgs_ctx: &'a mut Option<LbfgsCtxScalars>,
+    frozen_lbfgs_lams: &'a mut Option<HashMap<&'static str, f64>>,
+}
+
+/// Shared reset sequence for Kirsch's four restart bodies. Order/effects are identical to
+/// what each site did inline before this extraction: cap update → optional history clear →
+/// SAW reset → LR-schedule reset → decision-maker/optimizer rebuild (tier-derived from the
+/// FRESH decision maker, mirroring every call site's original ordering) → stiffness-controller
+/// reset → L-BFGS context/cache clear. Does NOT touch `model` or any restart counter/log
+/// line — those genuinely differ per site and stay at the call site.
+fn reset_kirsch_restart_state(
+    state: KirschRestartState<'_>,
+    new_cap: f64,
+    clear_history: bool,
+    decision_maker_phase2: bool,
+    dm_config: &DecisionMakerConfig,
+    stiff_config: &StiffnessConfig,
+    use_soap_muon: bool,
+) {
+    *state.dynamic_lam_h_cap = new_cap;
+    *state.dynamic_lam_d_cap = new_cap;
+    if clear_history {
+        state.tracker.clear_history();
+    }
+    state.saw.reset();
+    state.lr_sched.reset_for_phase2();
+    *state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), decision_maker_phase2, false);
+    *state.optim_w = WeightOptim::from_tier(use_soap_muon, &state.decision_maker.current_tier);
+    *state.optim_b = make_bias_optim();
+    *state.optim_gate = make_gate_optim();
+    *state.stiffness_controller = StiffnessController::new(stiff_config.clone());
+    *state.lbfgs_opt = None;
+    *state.frozen_lbfgs_ctx = None;
+    *state.frozen_lbfgs_lams = None;
 }
 
 /// Run headless training. Returns `true` if converged, `false` if exhausted max_steps.
@@ -401,21 +457,28 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                     match tracker.force_crash_restart() {
                         Some(new_cap) => {
                             model = net_cfg.init(&device);
-                            dynamic_lam_h_cap = new_cap;
-                            dynamic_lam_d_cap = new_cap;
-                            tracker.clear_history();
-                            saw.reset();
-                            lr_sched.reset_for_phase2();
                             // Live `phase2_started` (NOT hardcoded `true` the way the
                             // phase2-only restart bodies below do — they can hardcode it
                             // because they only ever fire once already in Phase 2; this check
                             // fires in both phases).
-                            decision_maker = PinnDecisionMaker::new(dm_config.clone(), phase2_started, false);
-                            optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
-                            optim_b = make_bias_optim();
-                            optim_gate = make_gate_optim();
-                            stiffness_controller = StiffnessController::new(stiff_config.clone());
-                            lbfgs_opt = None; frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None;
+                            reset_kirsch_restart_state(
+                                KirschRestartState {
+                                    dynamic_lam_h_cap: &mut dynamic_lam_h_cap,
+                                    dynamic_lam_d_cap: &mut dynamic_lam_d_cap,
+                                    tracker: &mut tracker,
+                                    saw: &mut saw,
+                                    lr_sched: &mut lr_sched,
+                                    decision_maker: &mut decision_maker,
+                                    optim_w: &mut optim_w,
+                                    optim_b: &mut optim_b,
+                                    optim_gate: &mut optim_gate,
+                                    stiffness_controller: &mut stiffness_controller,
+                                    lbfgs_opt: &mut lbfgs_opt,
+                                    frozen_lbfgs_ctx: &mut frozen_lbfgs_ctx,
+                                    frozen_lbfgs_lams: &mut frozen_lbfgs_lams,
+                                },
+                                new_cap, true, phase2_started, &dm_config, &stiff_config, use_soap_muon,
+                            );
                             model_reinit_count += 1;
                             println!("\n  [PARAM-NAN REINIT #{}] Param-level NaN/Inf in model weights (phase2_started={phase2_started}) → full reinit from scratch (Option A): lr+adam+SAW, lam_caps→{new_cap:.0}",
                                 tracker.total_restarts());
@@ -439,30 +502,47 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                         // Crash recovery: K_t collapsed ≥50% from recent peak → fresh restart.
                         // Clear history after to prevent cascade crash detections while recovering.
                         if let Some(new_cap) = tracker.check_kt_crash(kt as f64) {
-                            dynamic_lam_h_cap = new_cap;
-                            dynamic_lam_d_cap = new_cap;
-                            tracker.clear_history();
-                            saw.reset();
-                            lr_sched.reset_for_phase2();
-                            decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
-                            optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
-                            optim_b = make_bias_optim();
-                            optim_gate = make_gate_optim();
-                            stiffness_controller = StiffnessController::new(stiff_config.clone());
-                            lbfgs_opt = None; frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None;
+                            reset_kirsch_restart_state(
+                                KirschRestartState {
+                                    dynamic_lam_h_cap: &mut dynamic_lam_h_cap,
+                                    dynamic_lam_d_cap: &mut dynamic_lam_d_cap,
+                                    tracker: &mut tracker,
+                                    saw: &mut saw,
+                                    lr_sched: &mut lr_sched,
+                                    decision_maker: &mut decision_maker,
+                                    optim_w: &mut optim_w,
+                                    optim_b: &mut optim_b,
+                                    optim_gate: &mut optim_gate,
+                                    stiffness_controller: &mut stiffness_controller,
+                                    lbfgs_opt: &mut lbfgs_opt,
+                                    frozen_lbfgs_ctx: &mut frozen_lbfgs_ctx,
+                                    frozen_lbfgs_lams: &mut frozen_lbfgs_lams,
+                                },
+                                new_cap, true, true, &dm_config, &stiff_config, use_soap_muon,
+                            );
                             println!("\n  [CRASH RECOVERY #{}] K_t={kt:.3} collapsed → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
                                 tracker.total_restarts());
                         } else if let Some(new_cap) = tracker.check_plateau() {
-                            dynamic_lam_h_cap = new_cap;
-                            dynamic_lam_d_cap = new_cap;
-                            saw.reset();
-                            lr_sched.reset_for_phase2();
-                            decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
-                            optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
-                            optim_b = make_bias_optim();
-                            optim_gate = make_gate_optim();
-                            stiffness_controller = StiffnessController::new(stiff_config.clone());
-                            lbfgs_opt = None; frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None;
+                            // clear_history=false: plateau restarts must NOT clear tracker
+                            // history (only crash-type restarts do) — see CLAUDE.md.
+                            reset_kirsch_restart_state(
+                                KirschRestartState {
+                                    dynamic_lam_h_cap: &mut dynamic_lam_h_cap,
+                                    dynamic_lam_d_cap: &mut dynamic_lam_d_cap,
+                                    tracker: &mut tracker,
+                                    saw: &mut saw,
+                                    lr_sched: &mut lr_sched,
+                                    decision_maker: &mut decision_maker,
+                                    optim_w: &mut optim_w,
+                                    optim_b: &mut optim_b,
+                                    optim_gate: &mut optim_gate,
+                                    stiffness_controller: &mut stiffness_controller,
+                                    lbfgs_opt: &mut lbfgs_opt,
+                                    frozen_lbfgs_ctx: &mut frozen_lbfgs_ctx,
+                                    frozen_lbfgs_lams: &mut frozen_lbfgs_lams,
+                                },
+                                new_cap, false, true, &dm_config, &stiff_config, use_soap_muon,
+                            );
                             println!("\n  [WARM RESTART #{}] K_t plateau → reset: lr+adam+SAW, lam_caps→{new_cap:.0}",
                                 tracker.total_restarts());
                         }
@@ -478,17 +558,24 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                         // None) for STUCK_NONE_THRESHOLD consecutive probes with zero recovery
                         // signal reaching the cascade above — mirror check_kt_crash's restart
                         // body exactly so the same cap-tighten/reset machinery applies.
-                        dynamic_lam_h_cap = new_cap;
-                        dynamic_lam_d_cap = new_cap;
-                        tracker.clear_history();
-                        saw.reset();
-                        lr_sched.reset_for_phase2();
-                        decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
-                        optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
-                        optim_b = make_bias_optim();
-                        optim_gate = make_gate_optim();
-                        stiffness_controller = StiffnessController::new(stiff_config.clone());
-                        lbfgs_opt = None; frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None;
+                        reset_kirsch_restart_state(
+                            KirschRestartState {
+                                dynamic_lam_h_cap: &mut dynamic_lam_h_cap,
+                                dynamic_lam_d_cap: &mut dynamic_lam_d_cap,
+                                tracker: &mut tracker,
+                                saw: &mut saw,
+                                lr_sched: &mut lr_sched,
+                                decision_maker: &mut decision_maker,
+                                optim_w: &mut optim_w,
+                                optim_b: &mut optim_b,
+                                optim_gate: &mut optim_gate,
+                                stiffness_controller: &mut stiffness_controller,
+                                lbfgs_opt: &mut lbfgs_opt,
+                                frozen_lbfgs_ctx: &mut frozen_lbfgs_ctx,
+                                frozen_lbfgs_lams: &mut frozen_lbfgs_lams,
+                            },
+                            new_cap, true, true, &dm_config, &stiff_config, use_soap_muon,
+                        );
                         println!("\n  [STUCK-NAN RECOVERY #{}] {} consecutive missed K_t readings → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
                             tracker.total_restarts(), STUCK_NONE_THRESHOLD);
                     }
@@ -632,6 +719,74 @@ pub(crate) fn run_headless_pinlug_inner(
         },
         training_core::{compute_gradient_conflict_multi, step_lbfgs_multi, step_physics_multi, TwoDomainModels},
     };
+
+    /// Bundles every piece of mutable training state that pin-lug's four restart bodies
+    /// (Param-NaN reinit, crash, plateau, stuck-nan — see below) reset in lockstep, so the
+    /// shared reset sequence can live in one place (`reset_pinlug_restart_state`) instead of
+    /// being repeated at all four call sites. Nested inside `run_headless_pinlug_inner` (not
+    /// module-level) so it can reuse this function's own local `use` imports (`DomainOptim`,
+    /// `FrozenMultiStepCtx`) without duplicating them at module scope, mirroring the Kirsch
+    /// cascade's module-level `KirschRestartState`/`reset_kirsch_restart_state` pattern.
+    struct PinLugRestartState<'a> {
+        dynamic_lam_h_cap: &'a mut f64,
+        dynamic_lam_d_cap: &'a mut f64,
+        dynamic_lam_penetration_cap: &'a mut f64,
+        dynamic_lam_non_tension_cap: &'a mut f64,
+        tracker: &'a mut ConvergenceTracker,
+        saw: &'a mut SawBrdr,
+        lr_sched: &'a mut LrSchedule,
+        decision_maker: &'a mut PinnDecisionMaker,
+        optims: &'a mut Vec<DomainOptim>,
+        lbfgs_opt: &'a mut Option<burn::optim::LBFGS<B>>,
+        frozen_ctx: &'a mut Option<FrozenMultiStepCtx>,
+        frozen_lams: &'a mut Option<HashMap<&'static str, f64>>,
+    }
+
+    /// Shared reset sequence for pin-lug's four restart bodies. Order/effects identical to
+    /// what each site did inline before this extraction: h/d cap update → optional interface
+    /// (penetration/non-tension) cap update — the stuck-nan body is the one site that never
+    /// touched these two caps even before this refactor, preserved exactly via
+    /// `set_interface_caps` — → optional history clear → SAW reset → LR-schedule reset →
+    /// decision-maker rebuild (always `(true, true)`: phase2_active + allow_converge, same at
+    /// every one of the four sites) → two-domain optimizer rebuild → L-BFGS context/cache
+    /// clear. Does NOT touch `model_pin`/`model_lug` or any restart counter/log line — those
+    /// genuinely differ per site and stay at the call site.
+    fn reset_pinlug_restart_state(
+        state: PinLugRestartState<'_>,
+        new_cap: f64,
+        clear_history: bool,
+        set_interface_caps: bool,
+        dm_config: &DecisionMakerConfig,
+        use_soap_muon: bool,
+    ) {
+        *state.dynamic_lam_h_cap = new_cap;
+        *state.dynamic_lam_d_cap = new_cap;
+        if set_interface_caps {
+            *state.dynamic_lam_penetration_cap = new_cap;
+            *state.dynamic_lam_non_tension_cap = new_cap;
+        }
+        if clear_history {
+            state.tracker.clear_history();
+        }
+        state.saw.reset();
+        state.lr_sched.reset_for_phase2();
+        *state.decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, true);
+        *state.optims = vec![
+            DomainOptim {
+                weight: WeightOptim::from_tier(use_soap_muon, &state.decision_maker.current_tier),
+                bias: make_bias_optim(),
+                gate: make_gate_optim(),
+            },
+            DomainOptim {
+                weight: WeightOptim::from_tier(use_soap_muon, &state.decision_maker.current_tier),
+                bias: make_bias_optim(),
+                gate: make_gate_optim(),
+            },
+        ];
+        *state.lbfgs_opt = None;
+        *state.frozen_ctx = None;
+        *state.frozen_lams = None;
+    }
 
     const N_INTERFACE: usize = 64;
     const OUTPUT_DIM: usize = 5; // mDEM (u, v, sxx, syy, sxy)
@@ -973,19 +1128,23 @@ pub(crate) fn run_headless_pinlug_inner(
                     Some(new_cap) => {
                         model_pin = net_cfg(pin_geom.half_w, pin_geom.half_h).init(&device);
                         model_lug = net_cfg(lug_geom.half_w, lug_geom.half_h).init(&device);
-                        dynamic_lam_h_cap = new_cap;
-                        dynamic_lam_d_cap = new_cap;
-                        dynamic_lam_penetration_cap = new_cap;
-                        dynamic_lam_non_tension_cap = new_cap;
-                        tracker.clear_history();
-                        saw.reset();
-                        lr_sched.reset_for_phase2();
-                        decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, true);
-                        optims = vec![
-                            DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
-                            DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
-                        ];
-                        lbfgs_opt = None; frozen_ctx = None; frozen_lams = None;
+                        reset_pinlug_restart_state(
+                            PinLugRestartState {
+                                dynamic_lam_h_cap: &mut dynamic_lam_h_cap,
+                                dynamic_lam_d_cap: &mut dynamic_lam_d_cap,
+                                dynamic_lam_penetration_cap: &mut dynamic_lam_penetration_cap,
+                                dynamic_lam_non_tension_cap: &mut dynamic_lam_non_tension_cap,
+                                tracker: &mut tracker,
+                                saw: &mut saw,
+                                lr_sched: &mut lr_sched,
+                                decision_maker: &mut decision_maker,
+                                optims: &mut optims,
+                                lbfgs_opt: &mut lbfgs_opt,
+                                frozen_ctx: &mut frozen_ctx,
+                                frozen_lams: &mut frozen_lams,
+                            },
+                            new_cap, true, true, &dm_config, config.use_soap_muon,
+                        );
                         model_reinit_count += 1;
                         println!("\n  [PARAM-NAN REINIT #{}] Param-level NaN/Inf in pin/lug model weights → full reinit from scratch (Option A): lr+adam+SAW, lam_caps→{new_cap:.0}",
                             tracker.total_restarts());
@@ -1010,36 +1169,47 @@ pub(crate) fn run_headless_pinlug_inner(
                 // Crash recovery: gap RMS spiked >=2x its recent best → fresh restart.
                 // Clear history after to prevent cascade detections while recovering.
                 if let Some(new_cap) = tracker.check_kt_crash(rms) {
-                    dynamic_lam_h_cap = new_cap;
-                    dynamic_lam_d_cap = new_cap;
-                    dynamic_lam_penetration_cap = new_cap;
-                    dynamic_lam_non_tension_cap = new_cap;
-                    tracker.clear_history();
-                    saw.reset();
-                    lr_sched.reset_for_phase2();
                     // Always restart fresh at Align (phase2_active=true), allow_converge
                     // preserved — mirrors Kirsch's own restart convention exactly.
-                    decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, true);
-                    optims = vec![
-                        DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
-                        DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
-                    ];
-                    lbfgs_opt = None; frozen_ctx = None; frozen_lams = None;
+                    reset_pinlug_restart_state(
+                        PinLugRestartState {
+                            dynamic_lam_h_cap: &mut dynamic_lam_h_cap,
+                            dynamic_lam_d_cap: &mut dynamic_lam_d_cap,
+                            dynamic_lam_penetration_cap: &mut dynamic_lam_penetration_cap,
+                            dynamic_lam_non_tension_cap: &mut dynamic_lam_non_tension_cap,
+                            tracker: &mut tracker,
+                            saw: &mut saw,
+                            lr_sched: &mut lr_sched,
+                            decision_maker: &mut decision_maker,
+                            optims: &mut optims,
+                            lbfgs_opt: &mut lbfgs_opt,
+                            frozen_ctx: &mut frozen_ctx,
+                            frozen_lams: &mut frozen_lams,
+                        },
+                        new_cap, true, true, &dm_config, config.use_soap_muon,
+                    );
                     println!("\n  [CRASH RECOVERY #{}] gap_rms={rms:.3e} collapsed → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
                         tracker.total_restarts());
                 } else if let Some(new_cap) = tracker.check_plateau() {
-                    dynamic_lam_h_cap = new_cap;
-                    dynamic_lam_d_cap = new_cap;
-                    dynamic_lam_penetration_cap = new_cap;
-                    dynamic_lam_non_tension_cap = new_cap;
-                    saw.reset();
-                    lr_sched.reset_for_phase2();
-                    decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, true);
-                    optims = vec![
-                        DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
-                        DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
-                    ];
-                    lbfgs_opt = None; frozen_ctx = None; frozen_lams = None;
+                    // clear_history=false: plateau restarts must NOT clear tracker history
+                    // (only crash-type restarts do) — see CLAUDE.md.
+                    reset_pinlug_restart_state(
+                        PinLugRestartState {
+                            dynamic_lam_h_cap: &mut dynamic_lam_h_cap,
+                            dynamic_lam_d_cap: &mut dynamic_lam_d_cap,
+                            dynamic_lam_penetration_cap: &mut dynamic_lam_penetration_cap,
+                            dynamic_lam_non_tension_cap: &mut dynamic_lam_non_tension_cap,
+                            tracker: &mut tracker,
+                            saw: &mut saw,
+                            lr_sched: &mut lr_sched,
+                            decision_maker: &mut decision_maker,
+                            optims: &mut optims,
+                            lbfgs_opt: &mut lbfgs_opt,
+                            frozen_ctx: &mut frozen_ctx,
+                            frozen_lams: &mut frozen_lams,
+                        },
+                        new_cap, false, true, &dm_config, config.use_soap_muon,
+                    );
                     println!("\n  [WARM RESTART #{}] gap_rms plateau → reset: lr+adam+SAW, lam_caps→{new_cap:.0}",
                         tracker.total_restarts());
                 }
@@ -1047,17 +1217,25 @@ pub(crate) fn run_headless_pinlug_inner(
                 // Both domains have been fully NaN-diverged (convergence_metric returning None)
                 // for STUCK_NONE_THRESHOLD consecutive probes with zero recovery signal
                 // reaching the cascade above — mirror the crash-recovery restart body exactly.
-                dynamic_lam_h_cap = new_cap;
-                dynamic_lam_d_cap = new_cap;
-                tracker.clear_history();
-                saw.reset();
-                lr_sched.reset_for_phase2();
-                decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, true);
-                optims = vec![
-                    DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
-                    DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &decision_maker.current_tier), bias: make_bias_optim(), gate: make_gate_optim() },
-                ];
-                lbfgs_opt = None; frozen_ctx = None; frozen_lams = None;
+                // set_interface_caps=false: this site never touched the penetration/
+                // non-tension caps even before this refactor — preserved exactly.
+                reset_pinlug_restart_state(
+                    PinLugRestartState {
+                        dynamic_lam_h_cap: &mut dynamic_lam_h_cap,
+                        dynamic_lam_d_cap: &mut dynamic_lam_d_cap,
+                        dynamic_lam_penetration_cap: &mut dynamic_lam_penetration_cap,
+                        dynamic_lam_non_tension_cap: &mut dynamic_lam_non_tension_cap,
+                        tracker: &mut tracker,
+                        saw: &mut saw,
+                        lr_sched: &mut lr_sched,
+                        decision_maker: &mut decision_maker,
+                        optims: &mut optims,
+                        lbfgs_opt: &mut lbfgs_opt,
+                        frozen_ctx: &mut frozen_ctx,
+                        frozen_lams: &mut frozen_lams,
+                    },
+                    new_cap, true, false, &dm_config, config.use_soap_muon,
+                );
                 println!("\n  [STUCK-NAN RECOVERY #{}] {} consecutive missed gap_rms readings → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
                     tracker.total_restarts(), STUCK_NONE_THRESHOLD);
             }
