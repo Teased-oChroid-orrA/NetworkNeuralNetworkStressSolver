@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use burn::{
     backend::{Autodiff, Wgpu},
     module::AutodiffModule,
+    tensor::Tensor,
 };
 use burn::backend::wgpu::WgpuDevice;
 use crossbeam_channel::{Receiver, Sender};
@@ -909,16 +910,21 @@ fn evaluate_vis_grid_mdem(
     const N_FOURIER: usize = 0;
     let raw = fwd::<BInner>(model, pts_t, N_FOURIER, device);
 
-    let u_vals: Vec<f32> = raw.clone().slice([0..n_act, 0..1]).reshape([n_act])
-        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
-    let v_vals: Vec<f32> = raw.clone().slice([0..n_act, 1..2]).reshape([n_act])
-        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
-    let sxx_vals: Vec<f32> = raw.clone().slice([0..n_act, 2..3]).reshape([n_act])
-        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
-    let syy_vals: Vec<f32> = raw.clone().slice([0..n_act, 3..4]).reshape([n_act])
-        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
-    let sxy_vals: Vec<f32> = raw.slice([0..n_act, 4..5]).reshape([n_act])
-        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
+    // Batch all 5 field columns into a single `Tensor::cat` + ONE `.into_data()` GPU sync
+    // instead of 5 separate syncs (each pays a fixed wgpu queue-flush/buffer-map cost
+    // independent of payload size).
+    let u_col   = raw.clone().slice([0..n_act, 0..1]).reshape([n_act]);
+    let v_col   = raw.clone().slice([0..n_act, 1..2]).reshape([n_act]);
+    let sxx_col = raw.clone().slice([0..n_act, 2..3]).reshape([n_act]);
+    let syy_col = raw.clone().slice([0..n_act, 3..4]).reshape([n_act]);
+    let sxy_col = raw.slice([0..n_act, 4..5]).reshape([n_act]);
+    let batched: Vec<f32> = Tensor::cat(vec![u_col, v_col, sxx_col, syy_col, sxy_col], 0)
+        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; 5 * n_act]);
+    let u_vals   = &batched[..n_act];
+    let v_vals   = &batched[n_act..2 * n_act];
+    let sxx_vals = &batched[2 * n_act..3 * n_act];
+    let syy_vals = &batched[3 * n_act..4 * n_act];
+    let sxy_vals = &batched[4 * n_act..5 * n_act];
 
     let _ = fd; // fd is not needed by the plain-mDEM identity-ansatz path (no FD stencil/strains)
 
@@ -994,19 +1000,24 @@ fn evaluate_vis_grid(
         &stencil_coords, cfg.geometry.symmetry, k,
     ).mul_scalar(u_ref as f64);
 
-    let u_vals: Vec<f32> = out.clone().slice([0..n_act, 0..1]).reshape([n_act])
-        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
-    let v_vals: Vec<f32> = out.clone().slice([0..n_act, 1..2]).reshape([n_act])
-        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
+    // `u_col`/`v_col` read from `out` and `eps_xx`/`eps_yy`/`eps_xy` (computed from `out` via
+    // `compute_strains`, independent of any host read of `u_col`/`v_col`) are batched into a
+    // single `Tensor::cat` + ONE `.into_data()` GPU sync instead of 5 separate syncs.
+    let u_col = out.clone().slice([0..n_act, 0..1]).reshape([n_act]);
+    let v_col = out.clone().slice([0..n_act, 1..2]).reshape([n_act]);
 
     let (eps_xx, eps_yy, eps_xy) = compute_strains::<BInner>(out, n_act, fd);
     let e  = cfg.material.e  as f32;
     let nu = cfg.material.nu as f32;
     let f  = e / (1.0 - nu * nu);
 
-    let exx_v: Vec<f32> = eps_xx.into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
-    let eyy_v: Vec<f32> = eps_yy.into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
-    let exy_v: Vec<f32> = eps_xy.into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_act]);
+    let batched: Vec<f32> = Tensor::cat(vec![u_col, v_col, eps_xx, eps_yy, eps_xy], 0)
+        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; 5 * n_act]);
+    let u_vals = &batched[..n_act];
+    let v_vals = &batched[n_act..2 * n_act];
+    let exx_v  = &batched[2 * n_act..3 * n_act];
+    let eyy_v  = &batched[3 * n_act..4 * n_act];
+    let exy_v  = &batched[4 * n_act..5 * n_act];
 
     for (i_act, &i_full) in active.iter().enumerate() {
         let exx = exx_v[i_act]; let eyy = eyy_v[i_act]; let exy = exy_v[i_act];
