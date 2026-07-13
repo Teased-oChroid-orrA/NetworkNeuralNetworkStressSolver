@@ -209,6 +209,13 @@ pub struct SolverConfig {
     /// stress reference changes every loss term's O(1) magnitude by roughly
     /// `(Px/ultimate_strength_pa)^2` and must be an explicit, informed choice.
     pub use_ultimate_strength_scaling: bool,
+    /// Skip forward/backward compute (not just SOAP-Muon preconditioning) for PirateNet
+    /// hidden blocks whose gate magnitude is below `stiffness.gate_awake_epsilon`. No-op
+    /// when `use_piratenet=false` (gates are empty). Default false — opt-in, matching
+    /// `use_ultimate_strength_scaling`'s convention: a numerically-provable-lossless
+    /// optimization (see network.rs's `dormant_block_gradient_is_exactly_zero`) that still
+    /// ships behind a kill-switch because it changes autodiff-graph structure per step.
+    pub use_piratenet_compute_skip: bool,
 }
 
 impl SolverConfig {
@@ -229,6 +236,7 @@ impl SolverConfig {
             use_piratenet:  false,
             stiffness:      StiffnessConfig::default(),
             use_ultimate_strength_scaling: false,
+            use_piratenet_compute_skip: false,
         }
     }
 
@@ -274,6 +282,7 @@ impl SolverConfig {
             use_piratenet:  false,
             stiffness:      StiffnessConfig::default(),
             use_ultimate_strength_scaling: false,
+            use_piratenet_compute_skip: false,
         }
     }
 }
@@ -290,5 +299,10 @@ mod tests {
     #[test]
     fn default_pinlug_has_ultimate_strength_scaling_disabled() {
         assert!(!SolverConfig::default_pinlug().use_ultimate_strength_scaling);
+    }
+
+    #[test]
+    fn solver_config_use_piratenet_compute_skip_defaults_to_false() {
+        assert!(!SolverConfig::default_kirsch().use_piratenet_compute_skip);
     }
 }

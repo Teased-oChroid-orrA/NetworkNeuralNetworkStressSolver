@@ -91,6 +91,7 @@ fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>, skip_problem
     // Optimizer
     parse_bool!("USE_SOAP_MUON", cfg.use_soap_muon);
     parse_bool!("USE_PIRATENET", cfg.use_piratenet);
+    parse_bool!("USE_PIRATENET_COMPUTE_SKIP", cfg.use_piratenet_compute_skip);
 
     // Decision maker
     {
