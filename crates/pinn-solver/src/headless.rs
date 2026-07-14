@@ -973,6 +973,14 @@ pub(crate) fn run_headless_pinlug_inner(
     // see CLAUDE.md's Reference-scale normalization section), a gap-RMS reading is noise,
     // not signal — mirrors CRASH_MIN_PEAK_KT's role for K_t but derived from the problem,
     // not a hand-rolled literal.
+    //
+    // Risk flagged in issue #42, untuned: `5.0 * u_ref` is LARGER than u_ref itself, while a
+    // well-converged solution should drive interface-gap RMS well BELOW u_ref — meaning this
+    // floor may be non-binding almost immediately after training starts (crash/plateau
+    // detection effectively unguarded by the noise floor for most of a run, relying entirely
+    // on `crash_spike_factor`/`plateau_rel_eps` to reject noise). Empirically retuning this
+    // multiplier against a real multi-thousand-step pin-lug run remains a follow-up (issue
+    // #42) — not changed here since no such run's data is available in this session.
     let significant_floor = 5.0 * u_ref as f64;
     let mut tracker = ConvergenceTracker::for_metric(
         MetricDirection::SmallerIsBetter,

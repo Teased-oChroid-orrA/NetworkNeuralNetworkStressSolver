@@ -3,6 +3,16 @@
 /// Half-window for plateau comparison (recent vs older max). Must stay at 20 for the
 /// cascade mechanism to fire correctly — the older window retains the pre-AMR@7000 peak.
 /// 20 readings × 200-step interval = 4 000 steps per half.
+///
+/// Shared verbatim by pin-lug (issue #42), whose 200-step probe cadence is identical (see
+/// `run_headless_pinlug_inner`'s `step % 200 == 0` gate in headless.rs) so the 4 000-step
+/// half-window magnitude carries over unchanged — but pin-lug has no AMR, so the "retains the
+/// pre-AMR@7000 peak" rationale above does not apply to it. Untuned first pass for pin-lug:
+/// no empirical evidence yet that 4 000 steps is the right plateau-detection horizon for its
+/// Signorini KKT complementarity dynamics (structurally different gradient-conflict regime
+/// from Kirsch's smooth energy landscape — see `converge_cosine_min`/`converge_grad_threshold`
+/// in decision_maker.rs for the same caveat). Retuning requires a real multi-thousand-step
+/// pin-lug run (tracked in issue #42) — do not hand-tune this from code reading alone.
 const PLATEAU_WINDOW: usize = 20;
 /// Readings required for `is_kt_converged`. Smaller than `PLATEAU_WINDOW` to exit sooner
 /// after the cascade drives K_t above target (saves ~1 600 steps vs window=20).
@@ -236,19 +246,26 @@ impl ConvergenceTracker {
                 max_prev5 > crash_min_peak && current_kt < max_prev5 * crash_drop_fraction
             }
             MetricMode::Relative { direction, crash_spike_factor, significant_floor, .. } => {
-                // 5 readings suffice — the "recent best" window, not requiring the current
-                // reading to have already been pushed (unlike KtLegacy's convention above).
-                if self.kt_history.len() < 5 { return None; }
+                // Need >=6 readings so we have 5 prior readings before the current push — same
+                // convention as KtLegacy above: every caller (Kirsch's `run_headless` and
+                // pin-lug's `run_headless_pinlug_inner`) does `tracker.push(x); check_kt_crash(x)`,
+                // so the just-pushed current reading must be `skip(1)`-ed past here too, or the
+                // "recent best" window is contaminated by the very reading being tested against
+                // it. Previously this branch omitted the skip; it happened to self-cancel
+                // because the current reading, being the spike/drop itself, could never also be
+                // the window's own min/max — but that was an accident of the crash condition's
+                // shape, not a property this code should have depended on.
+                if self.kt_history.len() < 6 { return None; }
                 match direction {
                     MetricDirection::SmallerIsBetter => {
                         let min_prev5: f64 = self.kt_history.iter().rev()
-                            .take(5)
+                            .skip(1).take(5)
                             .cloned().fold(f64::INFINITY, f64::min);
                         min_prev5 > significant_floor && current_kt > crash_spike_factor * min_prev5
                     }
                     MetricDirection::LargerIsBetter => {
                         let max_prev5: f64 = self.kt_history.iter().rev()
-                            .take(5)
+                            .skip(1).take(5)
                             .cloned().fold(f64::NEG_INFINITY, f64::max);
                         max_prev5 > significant_floor && current_kt < max_prev5 / crash_spike_factor
                     }
@@ -475,6 +492,7 @@ mod tests {
     fn for_metric_smaller_is_better_crash_fires_on_spike_above_floor() {
         let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
         for _ in 0..5 { t.push(1e-4); }
+        t.push(2.5e-4); // production convention: caller pushes current before checking
         assert!(t.check_kt_crash(2.5e-4).is_some());
         assert_eq!(t.crash_restarts, 1);
     }
@@ -483,6 +501,7 @@ mod tests {
     fn for_metric_smaller_is_better_crash_does_not_fire_on_sub_spike_ratio() {
         let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
         for _ in 0..5 { t.push(1e-4); }
+        t.push(1.5e-4);
         assert_eq!(t.check_kt_crash(1.5e-4), None);
     }
 
@@ -490,8 +509,26 @@ mod tests {
     fn for_metric_smaller_is_better_crash_suppressed_below_significant_floor() {
         let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1e-6);
         for _ in 0..5 { t.push(1e-8); }
+        t.push(1e-7);
         assert_eq!(t.check_kt_crash(1e-7), None);
         assert_eq!(t.crash_restarts, 0);
+    }
+
+    /// Proves the `.skip(1)` fix actually changes behavior (not a no-op cleanup): builds a
+    /// prior-5 window whose true min (2.0) sits at the OLDEST slot, so including the just-
+    /// pushed current reading in the window (the pre-fix bug) evicts that true min and
+    /// silently raises `min_prev5` from 2.0 to 3.0 — enough to suppress a crash that should
+    /// fire. With the fix, the prior window is exactly the 5 pre-current readings regardless
+    /// of what current is.
+    #[test]
+    fn for_metric_smaller_is_better_crash_skip_one_excludes_just_pushed_current_from_window() {
+        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 1.0);
+        t.push(2.0); // true prior min — must anchor min_prev5, not get evicted by current
+        for _ in 0..4 { t.push(3.0); }
+        t.push(5.0); // current: correct min_prev5=2.0 -> 5.0 > 2.0*2.0=4.0 fires;
+                     // buggy min_prev5=3.0 (current evicts the 2.0) -> 5.0 > 3.0*2.0=6.0 does not
+        assert!(t.check_kt_crash(5.0).is_some(),
+            "must fire using the true 5-prior-reading window, not one contaminated by current");
     }
 
     #[test]
@@ -500,12 +537,14 @@ mod tests {
         for _ in 0..MAX_CRASH_RESTARTS {
             t.clear_history();
             for _ in 0..5 { t.push(1e-4); }
+            t.push(3e-4);
             assert!(t.check_kt_crash(3e-4).is_some());
         }
         assert_eq!(t.crash_restarts, MAX_CRASH_RESTARTS);
         assert_eq!(t.plateau_restarts, 0);
         t.clear_history();
         for _ in 0..5 { t.push(1e-4); }
+        t.push(3e-4);
         assert_eq!(t.check_kt_crash(3e-4), None);
         for _ in 0..PLATEAU_WINDOW { t.push(1e-4); }
         for _ in 0..PLATEAU_WINDOW { t.push(1e-4); }
@@ -558,6 +597,7 @@ mod tests {
     fn for_metric_larger_is_better_crash_fires_on_drop_below_floor_ratio() {
         let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
         for _ in 0..5 { t.push(2.0); } // max_prev5 = 2.0, well above significant_floor
+        t.push(0.9);
         // current < max_prev5 / crash_spike_factor = 1.0 -> crash
         assert!(t.check_kt_crash(0.9).is_some());
         assert_eq!(t.crash_restarts, 1);
@@ -567,6 +607,7 @@ mod tests {
     fn for_metric_larger_is_better_crash_does_not_fire_above_drop_ratio() {
         let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
         for _ in 0..5 { t.push(2.0); }
+        t.push(1.5);
         assert_eq!(t.check_kt_crash(1.5), None); // 1.5 > 1.0 threshold -> no crash
     }
 
@@ -574,6 +615,7 @@ mod tests {
     fn for_metric_larger_is_better_crash_suppressed_below_significant_floor() {
         let mut t = ConvergenceTracker::for_metric(MetricDirection::LargerIsBetter, 0.05, 2.0, 1e-6);
         for _ in 0..5 { t.push(1e-8); } // max_prev5 below significant_floor=1e-6
+        t.push(1e-9);
         assert_eq!(t.check_kt_crash(1e-9), None);
         assert_eq!(t.crash_restarts, 0);
     }
