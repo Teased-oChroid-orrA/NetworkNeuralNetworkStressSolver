@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 
 use burn::{
-    backend::{Autodiff, Wgpu},
     module::AutodiffModule,
     tensor::Tensor,
 };
-use burn::backend::wgpu::WgpuDevice;
 use crossbeam_channel::{Receiver, Sender};
 use ndarray::Array2;
 use pinn_core::{
@@ -31,7 +29,8 @@ use crate::{
     training_core::{
         build_gathered_boundary_tensors, compute_gradient_conflict, compute_reference_scales,
         extract_boundary_indices, make_lbfgs, normalize_point, probe_kt_shared, step_lbfgs,
-        step_physics, GatheredBoundaryTensors, LbfgsCtxScalars, StepCtx, StepOutput,
+        step_physics, GatheredBoundaryTensors, LbfgsCtxScalars, StepCtx, StepOutput, B, BDevice,
+        BInner,
     },
 };
 
@@ -44,9 +43,6 @@ fn make_kirsch_problem(config: &SolverConfig, engine: &EngineParams) -> KirschPr
     validate_loss_terms(&problem);
     problem
 }
-
-type B = Autodiff<Wgpu>;
-type BInner = Wgpu;
 
 // ─── Training state ────────────────────────────────────────────────────────────
 
@@ -118,7 +114,7 @@ struct TrainingState {
 }
 
 impl TrainingState {
-    fn new(config: &SolverConfig, engine: &EngineParams, net_cfg: &ElasticityNetConfig, device: &WgpuDevice) -> Self {
+    fn new(config: &SolverConfig, engine: &EngineParams, net_cfg: &ElasticityNetConfig, device: &BDevice) -> Self {
         let (x0, x1) = config.geometry.x_range();
         let (y0, y1) = config.geometry.y_range();
         let fd = FdConfig::new(config.fd_h, x1 - x0, y1 - y0);
@@ -206,7 +202,7 @@ impl TrainingState {
         &mut self,
         new_cfg: SolverConfig,
         net_cfg: &ElasticityNetConfig,
-        device: &WgpuDevice,
+        device: &BDevice,
         geometry_changed: bool,
     ) {
         let new_engine = EngineParams::analyze(&new_cfg);
@@ -318,7 +314,7 @@ pub fn run_training(
     let engine = EngineParams::analyze(&config);
     engine.apply_to(&mut config);
 
-    let device = WgpuDevice::default();
+    let device = BDevice::default();
     let net_cfg = ElasticityNetConfig::new()
         .with_input_dim(engine.net_input_dim())
         .with_hidden_dim(config.hidden_dim)
@@ -640,7 +636,7 @@ pub fn run_training_pinlug(
     const PHASE1_STEPS: usize = usize::MAX; // no phase-2 cascade for pin-in-lug
 
     let mut config = config;
-    let device = WgpuDevice::default();
+    let device = BDevice::default();
 
     let mut problem = PinLugProblem::new(
         config.material.clone(), OUTPUT_DIM, PHASE1_STEPS, N_INTERFACE,
@@ -918,7 +914,7 @@ fn evaluate_vis_grid_mdem(
     fd:       &FdConfig,
     u_ref:    f32,
     px_pa:    f64,
-    device:   &WgpuDevice,
+    device:   &BDevice,
 ) -> VisFields {
     let n_total = nx * ny;
     let mut pts = Vec::with_capacity(n_total);
@@ -1009,7 +1005,7 @@ fn evaluate_vis_grid(
     fd:        &FdConfig,
     cfg:       &SolverConfig,
     [nx, ny]:  [usize; 2],
-    device:    &WgpuDevice,
+    device:    &BDevice,
     u_ref:     f32,
     k:         f32,
     n_fourier: usize,
@@ -1139,6 +1135,18 @@ mod tests {
     /// background thread — required because the channel is `bounded(1)` (matching
     /// `pinn-gui`'s real wiring) and the trainer's final `tx.send(TrainingMsg::Done)` blocks
     /// if the channel is full and nobody is reading concurrently.
+    ///
+    /// The 60s per-message timeout is tuned to Wgpu (GPU-dispatched) throughput. Under the
+    /// `ndarray-backend` feature (CPU-only, and dramatically slower again in an unoptimized
+    /// `cargo test` debug build with no per-op JIT/shader caching) a full tiny-config training
+    /// run can legitimately exceed 60s end-to-end even though it never hangs — so the
+    /// ndarray-backend build uses a much longer allowance here. This is a test-harness-only
+    /// constant; nothing production-facing has a timeout.
+    #[cfg(not(feature = "ndarray-backend"))]
+    const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    #[cfg(feature = "ndarray-backend")]
+    const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
     fn run_and_drain<F>(train: F) -> Vec<TrainingMsg>
     where
         F: FnOnce(Sender<TrainingMsg>) + Send + 'static,
@@ -1146,7 +1154,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let handle = std::thread::spawn(move || train(tx));
         let mut msgs = Vec::new();
-        while let Ok(msg) = rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        while let Ok(msg) = rx.recv_timeout(RECV_TIMEOUT) {
             let is_done = matches!(msg, TrainingMsg::Done);
             msgs.push(msg);
             if is_done { break; }
@@ -1156,11 +1164,11 @@ mod tests {
     }
 
     /// Build a `TrainingState` for a tiny Kirsch config, mirroring `run_training`'s own setup.
-    fn tiny_training_state() -> (TrainingState, SolverConfig, EngineParams, ElasticityNetConfig, WgpuDevice) {
+    fn tiny_training_state() -> (TrainingState, SolverConfig, EngineParams, ElasticityNetConfig, BDevice) {
         let mut config = tiny_kirsch_config();
         let engine = EngineParams::analyze(&config);
         engine.apply_to(&mut config);
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)

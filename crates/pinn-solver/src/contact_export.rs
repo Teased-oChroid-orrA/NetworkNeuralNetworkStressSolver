@@ -146,7 +146,7 @@ mod tests {
     use burn::module::{Module, ModuleMapper, Param};
     use burn::tensor::Tensor;
     use crate::network::ElasticityNetConfig;
-    use crate::problem::B;
+    use crate::problem::{B, BDevice};
 
     /// Forces every Linear layer's weight to zero, and rewrites any 1-D bias whose length
     /// matches `output_dim` (i.e. only the final `out` layer's bias — hidden-layer biases
@@ -181,7 +181,7 @@ mod tests {
     /// `hidden_dim` (8) is chosen distinct from `output.len()` (5) so the mapper can tell
     /// hidden biases and the output bias apart purely by shape.
     fn constant_output_net(output: &[f32]) -> ElasticityNet<B> {
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(3)
             .with_hidden_dim(8)
@@ -198,7 +198,7 @@ mod tests {
         // Constant network output: u=0, v=0, sxx=1.0 (raw), syy=0.5 (raw), sxy=0.0 (raw).
         // With px_pa=1.0 (identity scale), physical sxx=1.0, syy=0.5, sxy=0.0 everywhere.
         let model = constant_output_net(&[0.0, 0.0, 1.0, 0.5, 0.0]);
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let lug_geom = GeometryConfig::pinlug_lug_inches();
         let px_pa = 1.0;
 
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn export_writes_csv_with_expected_header_and_row_count() {
         let model = constant_output_net(&[0.0, 0.0, 2.0, 1.0, 0.3]);
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let lug_geom = GeometryConfig::pinlug_lug_inches();
         let n = 8;
         let samples = sample_contact_pressure::<B>(&model, &lug_geom, 1.0, n, &device);
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn export_theta_range_is_bounded_to_loaded_half() {
         let model = constant_output_net(&[0.0, 0.0, 1.0, 1.0, 0.0]);
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let lug_geom = GeometryConfig::pinlug_lug_inches();
         let samples = sample_contact_pressure::<B>(&model, &lug_geom, 1.0, 64, &device);
         for s in &samples {

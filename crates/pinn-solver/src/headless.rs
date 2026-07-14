@@ -10,11 +10,7 @@
 
 use std::collections::HashMap;
 
-use burn::{
-    backend::{Autodiff, Wgpu},
-    module::AutodiffModule,
-};
-use burn::backend::wgpu::WgpuDevice;
+use burn::module::AutodiffModule;
 use pinn_core::{
     amr::AdaptiveGrid,
     messages::{DecisionMakerConfig, SolverConfig, StiffnessConfig},
@@ -39,11 +35,9 @@ use crate::{
     training_core::{
         build_gathered_boundary_tensors, compute_gradient_conflict, compute_reference_scales,
         extract_boundary_indices, make_lbfgs, model_is_finite, normalize_point, probe_kt_shared,
-        step_lbfgs, step_physics, BInner, LbfgsCtxScalars, StepCtx, StepOutput,
+        step_lbfgs, step_physics, BInner, LbfgsCtxScalars, StepCtx, StepOutput, B, BDevice,
     },
 };
-
-type B = Autodiff<Wgpu>;
 
 const BAR_WIDTH: usize = 40;
 
@@ -169,7 +163,7 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
         "step", "total", "energy", "neumann", "h_loss", "d_loss", "eq_loss", "k_stress", "lr", "K_t");
     println!("────────────────────────────────────────────────────────────────────────────────────────────────────────");
 
-    let device = WgpuDevice::default();
+    let device = BDevice::default();
 
     let (x0, x1) = config.geometry.x_range();
     let (y0, y1) = config.geometry.y_range();
@@ -885,7 +879,7 @@ pub(crate) fn run_headless_pinlug_inner(
         problem.equivalent_traction_pa() / KSI_TO_PA);
     println!("──────────────────────────────────────────────────────────────────────────────────────────────");
 
-    let device = WgpuDevice::default();
+    let device = BDevice::default();
 
     let pin_geom = problem.domains()[0].geometry.clone();
     let lug_geom = problem.domains()[1].geometry.clone();
@@ -1423,7 +1417,7 @@ mod tests {
         use burn::module::Module;
         use burn::tensor::Tensor;
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let mut config_off = small_pinlug_config();
         config_off.decision_maker.enabled = false;
 
@@ -1570,7 +1564,7 @@ mod tests {
     /// here. Until then, this branch's wiring is verified at the unit level only (via
     /// `ConvergenceTracker::note_missed_reading` directly, see the two tests above), not
     /// integration-tested end-to-end through `run_headless_pinlug_inner`.
-    fn nan_pinlug_models(config: &pinn_core::messages::SolverConfig, device: &WgpuDevice) -> (ElasticityNet<B>, ElasticityNet<B>) {
+    fn nan_pinlug_models(config: &pinn_core::messages::SolverConfig, device: &BDevice) -> (ElasticityNet<B>, ElasticityNet<B>) {
         use burn::module::{Module, ModuleMapper, Param};
         use burn::tensor::Tensor;
         use crate::network::ElasticityNetConfig;
@@ -1632,7 +1626,7 @@ mod tests {
     fn run_headless_pinlug_param_nan_reinit_fires_on_first_probe_not_after_threshold_misses() {
         let mut config = small_pinlug_config();
         config.max_steps = 1;
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let (model_pin, model_lug) = nan_pinlug_models(&config, &device);
         let result = run_headless_pinlug_inner(config, Some((model_pin, model_lug)));
         assert_eq!(result.model_reinit_count, 1,
@@ -1646,7 +1640,7 @@ mod tests {
     fn run_headless_pinlug_param_nan_reinit_uses_the_shared_crash_budget_and_cap_cascade() {
         let mut config = small_pinlug_config();
         config.max_steps = 1;
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let (model_pin, model_lug) = nan_pinlug_models(&config, &device);
         let result = run_headless_pinlug_inner(config, Some((model_pin, model_lug)));
         assert_eq!(result.total_restarts, 1);
@@ -1721,7 +1715,7 @@ mod tests {
         use burn::module::Module;
         use burn::tensor::Tensor;
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let mut config = small_pinlug_config();
         config.max_steps = 220;
         config.decision_maker.enabled = false;
@@ -1845,7 +1839,7 @@ mod tests {
     /// input_dim/output_dim are NOT simply the caller's raw `SolverConfig` fields — the engine
     /// derives/overrides them from geometry) so the injected model's shape matches what
     /// `run_headless_inner` will actually feed it.
-    fn nan_kirsch_model(config: &SolverConfig, device: &WgpuDevice) -> ElasticityNet<B> {
+    fn nan_kirsch_model(config: &SolverConfig, device: &BDevice) -> ElasticityNet<B> {
         use burn::module::{Module, ModuleMapper, Param};
         use burn::tensor::Tensor;
 
@@ -1872,7 +1866,7 @@ mod tests {
     fn run_headless_kirsch_param_nan_reinit_fires_immediately_in_phase1() {
         let mut config = small_kirsch_config();
         config.max_steps = 1;
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let model = nan_kirsch_model(&config, &device);
         let result = run_headless_inner(config, Some(model));
         assert_eq!(result.model_reinit_count, 1,
@@ -1968,7 +1962,7 @@ mod tests {
         use burn::module::{Module, ModuleVisitor, Param};
         use burn::tensor::Tensor;
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let config = small_kirsch_config(); // width_growth.enabled = false (default); max_steps=10
         let engine = EngineParams::analyze(&config);
         let mut config_for_net = config.clone();

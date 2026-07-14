@@ -164,6 +164,20 @@ full eigh is microseconds).
 self-contained optimizer, not a composable building block — but its Newton-Schulz defaults
 (`ns_coefficients`, `ns_steps`) are mirrored for consistency.
 
+## Tensor backend
+
+`training_core::BInner` is the canonical single-source-of-truth backend alias (`B =
+Autodiff<BInner>`, `BDevice = <BInner as BackendTypes>::Device`) — every other module
+(`headless`/`runner`/`pinlug_problem`/`kirsch_problem`/`contact_export`) imports `B`/`BDevice`
+from `training_core` rather than redeclaring its own. The default build is `BInner =
+burn::backend::Wgpu`, byte-identical to before this alias existed. The opt-in Cargo feature
+`ndarray-backend` on `pinn-solver` (passed through by `pinn-app`'s own `ndarray-backend`
+feature, `["pinn-solver/ndarray-backend"]`) swaps `BInner` to `burn::backend::NdArray` at
+compile time — a CPU-only path useful on machines without a working Wgpu device. `network.rs`/
+`energy.rs`/`soap_muon.rs` each keep their own `TB` test-oracle alias hardcoded to `Wgpu`
+regardless of this feature, by design — they're self-contained test fixtures, not part of the
+training-loop backend selection this alias controls.
+
 ## Convergence cascade
 
 `pinn_solver::controllers::ConvergenceTracker` drives warm restarts when a problem's

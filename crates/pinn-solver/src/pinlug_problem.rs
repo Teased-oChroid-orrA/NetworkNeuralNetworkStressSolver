@@ -64,7 +64,7 @@ use pinn_core::{
 
 use crate::{
     energy::{dem_energy_loss, hole_traction_loss_direct, neumann_loss},
-    problem::{BoundaryValueProblem, DomainForwardOutputs, DomainState, LossTerm, B},
+    problem::{BoundaryValueProblem, DomainForwardOutputs, DomainState, LossTerm, BDevice, B},
 };
 
 pub const PIN_DOMAIN: DomainId = DomainId(0);
@@ -648,7 +648,7 @@ impl BoundaryValueProblem for PinLugProblem {
             HoleType::None => 0.0,
         };
 
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
 
         // normalize_point only needs geometry ranges, threaded through a SolverConfig — build
         // a throwaway one per domain purely to reuse the exact normalization formula (single
@@ -766,7 +766,7 @@ mod tests {
         use crate::problem::DomainState;
 
         let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(3)
             .with_hidden_dim(8)
@@ -803,7 +803,7 @@ mod tests {
         use crate::problem::DomainState;
 
         let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(3)
             .with_hidden_dim(8)
@@ -845,7 +845,7 @@ mod tests {
         use crate::problem::DomainState;
 
         let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(3)
             .with_hidden_dim(8)
@@ -880,7 +880,7 @@ mod tests {
         use crate::problem::DomainState;
 
         let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(3)
             .with_hidden_dim(8)
@@ -914,7 +914,7 @@ mod tests {
 
     #[test]
     fn interface_penetration_term_zero_at_zero_gap_boundary() {
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let n = 4;
         let thetas: Vec<f64> = (0..n).map(|i| 2.0 * std::f64::consts::PI * i as f64 / n as f64).collect();
         let r_pin = 0.5_f64;
@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn interface_penetration_term_new_impl_matches_old_cpu_math_mixed_active_inactive() {
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let n = 4;
         let thetas: Vec<f64> = (0..n).map(|i| 2.0 * std::f64::consts::PI * i as f64 / n as f64).collect();
         let (r_pin, r_lug) = (0.5_f64, 0.52_f64);
@@ -984,7 +984,7 @@ mod tests {
 
     #[test]
     fn interface_non_tension_term_new_impl_matches_old_cpu_math_mixed_active_inactive() {
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let n = 4;
         let thetas: Vec<f64> = (0..n).map(|i| 2.0 * std::f64::consts::PI * i as f64 / n as f64).collect();
 
@@ -1019,7 +1019,7 @@ mod tests {
 
     #[test]
     fn interface_penetration_term_gradient_nonzero_when_penetrating() {
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let thetas = vec![0.0_f64];
         let (r_pin, r_lug) = (0.5_f64, 0.5_f64);
 
@@ -1057,7 +1057,7 @@ mod tests {
 
     #[test]
     fn interface_penetration_term_gradient_zero_when_non_penetrating() {
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let thetas = vec![0.0_f64];
         let (r_pin, r_lug) = (0.5_f64, 0.5_f64);
 
@@ -1090,7 +1090,7 @@ mod tests {
 
     #[test]
     fn interface_non_tension_term_gradient_nonzero_when_tensile() {
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let thetas = vec![0.0_f64];
 
         let pin_raw = Tensor::<B, 2>::from_data(
@@ -1120,7 +1120,7 @@ mod tests {
 
     #[test]
     fn interface_non_tension_term_gradient_zero_when_compressive() {
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let thetas = vec![0.0_f64];
 
         let pin_raw = Tensor::<B, 2>::from_data(
@@ -1154,7 +1154,7 @@ mod tests {
     // to that factor of 2 specifically.
     #[test]
     fn interface_non_tension_term_shear_cross_term_matches_oracle_at_45_degrees() {
-        let device: burn::backend::wgpu::WgpuDevice = Default::default();
+        let device: BDevice = Default::default();
         let theta = std::f64::consts::FRAC_PI_4;
         let thetas = vec![theta];
         let sxy = 100.0_f32;
