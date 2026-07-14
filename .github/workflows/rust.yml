@@ -37,3 +37,28 @@ jobs:
       run: cargo test --features eframe/x11,eframe/wayland --verbose -- --test-threads=1
       env:
         RUST_BACKTRACE: 1
+
+  # Validates the opt-in ndarray-backend feature (issue #58): default job above never
+  # exercises it, so without this job the CPU backend path would go untested by CI entirely.
+  # Still installs lavapipe: Cargo feature unification means burn/wgpu stays linked in even
+  # with ndarray-backend on (additive, not a replacement), so pinn-app/pinn-gui's Wgpu-only
+  # code paths still need a Vulkan driver present to build/link.
+  build-ndarray:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Mesa software Vulkan driver (lavapipe)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y mesa-vulkan-drivers
+
+    - name: Build (ndarray-backend)
+      run: cargo build -p pinn-app --features eframe/x11,eframe/wayland,ndarray-backend --verbose
+
+    - name: Run tests (ndarray-backend)
+      run: cargo test -p pinn-solver --features ndarray-backend --verbose -- --test-threads=1
+      env:
+        RUST_BACKTRACE: 1
