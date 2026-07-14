@@ -107,9 +107,21 @@ pub struct DecisionMakerConfig {
     /// Cosine similarity above which Align → Explore (hysteresis, default: 0.25).
     pub alignment_threshold: f32,
     /// Minimum cosine similarity to enter Converge tier (default: 0.75).
+    ///
+    /// Kirsch-derived; reused verbatim for pin-lug (`PinnDecisionMaker::new`'s `allow_converge`
+    /// arm, see CLAUDE.md's Multi-domain Converge-tier L-BFGS section) with no problem-specific
+    /// derivation (issue #42, untuned). Pin-lug's Signorini KKT complementarity terms
+    /// (`interface_penetration`/`interface_non_tension`) have discontinuous curvature at the
+    /// active-set boundary — a structurally different gradient-conflict regime from Kirsch's
+    /// smooth energy landscape — so this threshold may gate Converge entry too early or too
+    /// late for pin-lug specifically. Retuning requires a real multi-thousand-step pin-lug run
+    /// (tracked in issue #42), not a code-only change.
     pub converge_cosine_min: f32,
     /// g_total_norm (g_pde_norm + g_bc_norm) threshold for Converge entry (default: 5.0).
     /// Dimensionless, relative to O(1)-normalized losses on a 25% collocation subset.
+    ///
+    /// Same Kirsch-derived-but-untuned-for-pin-lug caveat as `converge_cosine_min` above
+    /// (issue #42) — shared verbatim across both problems' `DecisionMakerConfig`.
     pub converge_grad_threshold: f32,
     /// Use exact dual-pass cosine similarity; if false, use cheap proxy ratio (default: true).
     /// Converge tier (L-BFGS) is only entered when this is true.
