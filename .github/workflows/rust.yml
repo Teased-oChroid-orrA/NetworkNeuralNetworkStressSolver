@@ -22,6 +22,20 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y mesa-vulkan-drivers
 
+    # mold links noticeably faster than GNU ld, and this workspace's dependency tree
+    # (burn/wgpu/cubecl) produces large debug binaries — link time is a real fraction of
+    # total CI wall-clock here. rui314/setup-mold wires it in as the default linker for every
+    # subsequent cargo invocation in this job (both Build and Run tests below) via RUSTFLAGS.
+    - name: Set up mold linker
+      uses: rui314/setup-mold@v1
+
+    # Caches ~/.cargo (registry/git deps) and target/ keyed on Cargo.lock — without this,
+    # every push recompiles the full burn/wgpu/cubecl dependency tree from scratch, which
+    # dominates this workflow's wall-clock far more than link time or single-vs-split build
+    # steps (those already share target/debug within one job run via normal incremental
+    # compilation; this cache is what makes that persist ACROSS separate workflow runs).
+    - uses: Swatinem/rust-cache@v2
+
     - name: Build
       run: cargo build --features eframe/x11,eframe/wayland --verbose
 
