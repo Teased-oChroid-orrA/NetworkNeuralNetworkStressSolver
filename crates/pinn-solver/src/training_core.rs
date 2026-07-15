@@ -10,12 +10,11 @@
 use std::collections::HashMap;
 
 use burn::{
-    backend::{Autodiff, Wgpu},
+    backend::Autodiff,
     module::{Module, ModuleVisitor, Param},
     optim::{GradientsParams, LBFGSConfig, Optimizer},
     tensor::{backend::Backend, Tensor, TensorData},
 };
-use burn::backend::wgpu::WgpuDevice;
 use pinn_core::{
     geometry::HoleType,
     kirsch::kirsch_stress,
@@ -46,8 +45,14 @@ use crate::{
     saw_brdr::SawBrdr,
 };
 
-pub type B = Autodiff<Wgpu>;
-pub type BInner = Wgpu;
+#[cfg(not(feature = "ndarray-backend"))]
+pub type BInner = burn::backend::Wgpu;
+#[cfg(feature = "ndarray-backend")]
+pub type BInner = burn::backend::NdArray;
+
+pub type B = Autodiff<BInner>;
+/// Device type for the currently-selected `BInner` backend.
+pub type BDevice = <BInner as burn::tensor::backend::BackendTypes>::Device;
 
 /// Two-domain model wrapper so `burn::optim::LBFGS::step()` (which requires a SINGLE
 /// `AutodiffModule<B>`) can take one combined quasi-Newton step across pin-in-lug's two
@@ -192,7 +197,7 @@ pub struct GatheredBoundaryTensors {
 /// `v_to_t` used to do inline, per-step, per-call-site. Exposed only so
 /// [`build_gathered_boundary_tensors`] (called ONCE, outside the loop) can build it; no
 /// per-step call site should invoke this directly anymore.
-fn gather_to_tensor(idxs: &[usize], src: &[f32], device: &WgpuDevice) -> Tensor<B, 1> {
+fn gather_to_tensor(idxs: &[usize], src: &[f32], device: &BDevice) -> Tensor<B, 1> {
     let v: Vec<f32> = idxs.iter().map(|&i| src[i]).collect();
     Tensor::<B, 1>::from_data(TensorData::new(v, vec![idxs.len()]), device)
 }
@@ -208,7 +213,7 @@ pub fn build_gathered_boundary_tensors(
     bnd_ny: &[f32],
     bnd_tx: &[f32],
     bnd_ty: &[f32],
-    device: &WgpuDevice,
+    device: &BDevice,
 ) -> GatheredBoundaryTensors {
     GatheredBoundaryTensors {
         trac_nx: gather_to_tensor(trac_idx, bnd_nx, device),
@@ -331,7 +336,7 @@ pub fn step_physics(
     ctx: &StepCtx,
     saw: &mut SawBrdr,
     lr_sched: &mut LrSchedule,
-    device: &WgpuDevice,
+    device: &BDevice,
     tier_u8: u8,
     physics_boost: f64,
     alpha_lr_mult: f64,
@@ -824,7 +829,7 @@ fn compute_domain_forwards(
     ctx: &crate::problem::MultiStepCtx,
     models: &[&ElasticityNet<B>],
     active_terms: &[Box<dyn LossTerm>],
-    device: &WgpuDevice,
+    device: &BDevice,
     forward_masks: &[Option<&[bool]>],
 ) -> Vec<Computed> {
     use pinn_core::problem::DomainId;
@@ -951,7 +956,7 @@ pub fn step_physics_multi(
     ctx: &crate::problem::MultiStepCtx,
     saw: &mut SawBrdr,
     lr_sched: &mut LrSchedule,
-    device: &WgpuDevice,
+    device: &BDevice,
     tier_u8: u8,
     physics_boost: f64,
     alpha_lr_mult: f64,
@@ -1129,7 +1134,7 @@ pub fn probe_kt_shared(
     fd:     &FdConfig,
     k:      f32,
     u_ref:  f32,
-    device: &WgpuDevice,
+    device: &BDevice,
 ) -> Option<f32> {
     let HoleType::Circular { radius } = config.geometry.hole else { return None };
     if config.load.px.abs() < 1e-10 { return None; }
@@ -1316,7 +1321,7 @@ pub fn compute_gradient_conflict(
     model: &ElasticityNet<B>,
     ctx: &StepCtx,
     step: usize,
-    device: &WgpuDevice,
+    device: &BDevice,
 ) -> GradientConflict {
     let n_int = ctx.int_norm.len();
     let n_sub = (n_int / 4).max(1);
@@ -1858,7 +1863,7 @@ fn compute_loss_for_lbfgs(
     ctx: &LbfgsCtxScalars,
     term_names: &[(&'static str, bool)],
     lams: &HashMap<&'static str, f64>,
-    device: &WgpuDevice,
+    device: &BDevice,
 ) -> (Tensor<B, 1>, f32) {
     // Fail fast (debug builds only — compiled out entirely in release, same as every other
     // `debug_assert!`) if `lams` is missing an entry for a real, active loss term. Contrast
@@ -2237,7 +2242,7 @@ pub fn step_lbfgs(
     ctx: &LbfgsCtxScalars,
     problem: &dyn BoundaryValueProblem,
     lams: &HashMap<&'static str, f64>,
-    device: &WgpuDevice,
+    device: &BDevice,
 ) -> (ElasticityNet<B>, f64) {
     // Computed ONCE per outer step, before the closure LBFGS invokes 5-20 times internally —
     // see `lbfgs_term_names`'s doc comment (Issue #36).
@@ -2316,7 +2321,7 @@ fn sum_group_loss(
     ctx: &crate::problem::MultiStepCtx,
     model_refs: &[&ElasticityNet<B>],
     terms: &[Box<dyn LossTerm>],
-    device: &WgpuDevice,
+    device: &BDevice,
 ) -> Option<Tensor<B, 1>> {
     use crate::problem::DomainForwardOutputs as DFO;
     use pinn_core::problem::DomainId;
@@ -2362,7 +2367,7 @@ fn sum_group_loss(
 pub fn compute_gradient_conflict_multi(
     models: &TwoDomainModels<B>,
     ctx: &crate::problem::MultiStepCtx,
-    device: &WgpuDevice,
+    device: &BDevice,
 ) -> GradientConflict {
     let active_terms: Vec<Box<dyn LossTerm>> = ctx.problem.loss_terms().into_iter()
         .filter(|t| t.name() != "constitutive_consistency")
@@ -2445,7 +2450,7 @@ fn compute_loss_for_lbfgs_multi(
     problem: &dyn BoundaryValueProblem,
     active_terms: &[Box<dyn LossTerm>],
     lams: &HashMap<&'static str, f64>,
-    device: &WgpuDevice,
+    device: &BDevice,
 ) -> (Tensor<B, 1>, f32) {
     use crate::problem::DomainForwardOutputs as DFO;
     use pinn_core::problem::DomainId;
@@ -2500,7 +2505,7 @@ pub fn step_lbfgs_multi(
     frozen_ctx: &crate::problem::FrozenMultiStepCtx,
     problem: &dyn BoundaryValueProblem,
     lams: &HashMap<&'static str, f64>,
-    device: &WgpuDevice,
+    device: &BDevice,
 ) -> (TwoDomainModels<B>, f64) {
     // Computed ONCE per outer step, before the closure LBFGS invokes 5-20 times internally —
     // mirrors `step_lbfgs`'s `term_names` hoist (Issue #36). Unlike the Kirsch path this keeps
@@ -2537,6 +2542,25 @@ mod tests {
         constitutive_consistency_loss, dem_energy_loss, equilibrium_residual_loss,
         hole_traction_loss, hole_traction_loss_direct, neumann_loss,
     };
+
+    #[cfg(feature = "ndarray-backend")]
+    #[test]
+    fn ndarray_backend_tensor_op_matches_known_value() {
+        let device = BDevice::default();
+        let a = Tensor::<B, 1>::from_floats([1.0, 2.0, 3.0], &device);
+        let b = Tensor::<B, 1>::from_floats([10.0, 20.0, 30.0], &device);
+        let sum = a + b;
+        let out: Vec<f32> = sum.into_data().to_vec().unwrap();
+        assert_eq!(out, vec![11.0_f32, 22.0_f32, 33.0_f32]);
+    }
+
+    #[cfg(not(feature = "ndarray-backend"))]
+    #[test]
+    fn default_build_backend_is_wgpu() {
+        fn assert_type_eq<T>() {}
+        assert_type_eq::<BInner>();
+        let _: fn() -> BInner = || burn::backend::Wgpu::default();
+    }
 
     #[test]
     fn compute_reference_scales_relationships_hold() {
@@ -2746,7 +2770,6 @@ mod tests {
 
     #[test]
     fn compute_gradient_conflict_reflects_loss_term_removed_from_bc_group() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -2761,7 +2784,7 @@ mod tests {
         assert!(!hole_idx.is_empty(), "fixture sanity: hole_idx must be non-empty");
         assert!(!right_idx.is_empty(), "fixture sanity: right_idx must be non-empty");
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -2833,7 +2856,7 @@ mod tests {
         engine: &EngineParams,
         right_norm: &[[f32; 2]],
         u_ref: f32,
-        device: &burn::backend::wgpu::WgpuDevice,
+        device: &crate::training_core::BDevice,
         include_w_neumann: bool,
     ) -> f32 {
         let n_fourier = engine.n_fourier;
@@ -2888,7 +2911,6 @@ mod tests {
 
     #[test]
     fn compute_gradient_conflict_bc_group_includes_w_neumann_again() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -2898,7 +2920,7 @@ mod tests {
         ) = zero_px_test_fixture(6.0e7);
         assert!(!right_idx.is_empty(), "fixture sanity: right_idx must be non-empty");
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -2956,7 +2978,6 @@ mod tests {
 
     #[test]
     fn compute_gradient_conflict_all_physics_terms_yields_zero_bc_norm_and_epsilon_guarded_cosine() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -2966,7 +2987,7 @@ mod tests {
         ) = zero_px_test_fixture(6.0e7);
         assert!(!eq_ring_norm.is_empty(), "fixture sanity: eq_ring_norm must be non-empty");
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3006,7 +3027,6 @@ mod tests {
 
     #[test]
     fn compute_gradient_conflict_zero_loss_terms_yields_all_zero_finite_conflict() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -3017,7 +3037,7 @@ mod tests {
         // Prevent constitutive_consistency from sneaking into the Physics group unconditionally.
         engine.use_mdem = false;
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3054,7 +3074,6 @@ mod tests {
 
     #[test]
     fn compute_gradient_conflict_zero_interior_points_does_not_panic() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -3065,7 +3084,7 @@ mod tests {
         assert!(!eq_ring_norm.is_empty(), "fixture sanity: eq_ring_norm must be non-empty to isolate n_int==0 alone");
 
         let empty_int_norm: Vec<[f32; 2]> = Vec::new();
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3097,7 +3116,6 @@ mod tests {
 
     #[test]
     fn compute_gradient_conflict_zero_interior_and_zero_eq_ring_yields_zero_pde_norm_and_epsilon_guarded_cosine() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -3108,7 +3126,7 @@ mod tests {
 
         let empty_int_norm: Vec<[f32; 2]> = Vec::new();
         let empty_eq_ring_norm: Vec<[f32; 2]> = Vec::new();
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3139,7 +3157,6 @@ mod tests {
 
     #[test]
     fn compute_loss_for_lbfgs_zero_terms_and_no_constitutive_contribution_returns_zero_without_panicking() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -3149,7 +3166,7 @@ mod tests {
         ) = zero_px_test_fixture(6.0e7);
         engine.use_mdem = false;
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3189,7 +3206,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "Node should have a step registered")]
     fn step_lbfgs_zero_terms_panics_on_disconnected_backward() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -3199,7 +3215,7 @@ mod tests {
         ) = zero_px_test_fixture(6.0e7);
         engine.use_mdem = false;
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3271,7 +3287,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "unhandled loss term")]
     fn compute_gradient_conflict_panics_on_unrecognized_loss_term_name() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -3280,7 +3295,7 @@ mod tests {
             trac_idx, hole_idx, right_idx, eq_ring_norm,
         ) = zero_px_test_fixture(6.0e7);
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3309,7 +3324,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "unhandled loss term")]
     fn compute_loss_for_lbfgs_panics_on_unrecognized_loss_term_name() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -3318,7 +3332,7 @@ mod tests {
             trac_idx, hole_idx, right_idx, eq_ring_norm,
         ) = zero_px_test_fixture(6.0e7);
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3364,7 +3378,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "hole_traction")]
     fn compute_loss_for_lbfgs_panics_on_lams_missing_a_real_term_key() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -3373,7 +3386,7 @@ mod tests {
             trac_idx, hole_idx, right_idx, eq_ring_norm,
         ) = zero_px_test_fixture(6.0e7);
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3408,7 +3421,6 @@ mod tests {
 
     #[test]
     fn compute_loss_for_lbfgs_still_applies_dynamic_hole_traction_cap_via_hashmap_lams() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -3417,7 +3429,7 @@ mod tests {
             trac_idx, hole_idx, right_idx, eq_ring_norm,
         ) = zero_px_test_fixture(6.0e7);
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3467,7 +3479,6 @@ mod tests {
 
     #[test]
     fn step_physics_finite_at_zero_px_load() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::{
             kirsch_problem::KirschProblem,
             network::ElasticityNetConfig,
@@ -3480,7 +3491,7 @@ mod tests {
             trac_idx, hole_idx, right_idx, eq_ring_norm,
         ) = zero_px_test_fixture(0.0);
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3521,7 +3532,6 @@ mod tests {
 
     #[test]
     fn compute_gradient_conflict_finite_at_zero_px_load() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::network::ElasticityNetConfig;
 
         let (
@@ -3530,7 +3540,7 @@ mod tests {
             trac_idx, hole_idx, right_idx, eq_ring_norm,
         ) = zero_px_test_fixture(0.0);
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3569,7 +3579,6 @@ mod tests {
     /// a separate divisor from `w_val`'s) is floored too.
     #[test]
     fn step_lbfgs_finite_at_near_zero_negative_px_load() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::kirsch_problem::KirschProblem;
         use crate::network::ElasticityNetConfig;
 
@@ -3579,7 +3588,7 @@ mod tests {
             trac_idx, hole_idx, right_idx, eq_ring_norm,
         ) = zero_px_test_fixture(-0.5);
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3640,7 +3649,6 @@ mod tests {
     /// from raw `config.load.px` instead of reusing this already-floored value.
     #[test]
     fn step_lbfgs_finite_at_literal_zero_px_load() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::kirsch_problem::KirschProblem;
         use crate::network::ElasticityNetConfig;
 
@@ -3650,7 +3658,7 @@ mod tests {
             trac_idx, hole_idx, right_idx, eq_ring_norm,
         ) = zero_px_test_fixture(0.0);
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3711,12 +3719,11 @@ mod tests {
     /// model / GPU forward pass through `compute_loss_for_lbfgs` itself.
     #[test]
     fn lbfgs_ctx_scalars_from_ctx_threads_ref_energy_for_both_scaling_modes() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::engine::EngineParams;
         use crate::kirsch_problem::KirschProblem;
         use pinn_core::messages::SolverConfig;
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
 
         for use_uts in [false, true] {
             let mut config = SolverConfig::default_kirsch();
@@ -3794,7 +3801,6 @@ mod tests {
     /// exactly, not just at step 0 on a frozen network.
     #[test]
     fn step_physics_trait_driven_matches_independently_reimplemented_old_formula() {
-        use burn::backend::wgpu::WgpuDevice;
         use burn::module::Module;
         use pinn_core::messages::SolverConfig;
         use crate::{
@@ -3811,7 +3817,7 @@ mod tests {
         let engine = EngineParams::analyze(&config);
         engine.apply_to(&mut config);
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -3954,7 +3960,6 @@ mod tests {
     /// several real steps, and `probe_kt_shared` must still return a finite K_t afterward.
     #[test]
     fn step_physics_stays_finite_with_mdem_and_ultimate_strength_scaling_combined() {
-        use burn::backend::wgpu::WgpuDevice;
         use burn::module::AutodiffModule;
         use pinn_core::messages::SolverConfig;
         use crate::{
@@ -3976,7 +3981,7 @@ mod tests {
             "default Kirsch config must be mDEM-capable (has_hole=true) for this test to \
              actually exercise the use_mdem + use_ultimate_strength_scaling combination");
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -4046,7 +4051,7 @@ mod tests {
         ctx: &StepCtx,
         saw: &mut SawBrdr,
         lr_sched: &mut LrSchedule,
-        device: &WgpuDevice,
+        device: &BDevice,
     ) -> (ElasticityNet<B>, StepOutput) {
         use pinn_core::geometry::HoleType;
 
@@ -4410,7 +4415,7 @@ mod tests {
         let engine = EngineParams::analyze(&config);
         engine.apply_to(&mut config);
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(3) // no Fourier embedding on the multi-domain path
             .with_hidden_dim(config.hidden_dim)
@@ -4664,7 +4669,7 @@ mod tests {
     /// different hidden_dim/n_hidden — burn's default initializer is randomized per-call,
     /// so any two independently-constructed nets already have different weights; we only
     /// need domain-labeled models here, not KirschProblem's full sampling/loss machinery).
-    fn tiny_net(device: &WgpuDevice) -> ElasticityNet<B> {
+    fn tiny_net(device: &BDevice) -> ElasticityNet<B> {
         crate::network::ElasticityNetConfig::new()
             .with_input_dim(3) // stencil coords are [N, 3] (x, y, z=0) — see assemble_stencil
             .with_hidden_dim(4)
@@ -4764,7 +4769,7 @@ mod tests {
     /// contaminated by another domain's gradients.
     #[test]
     fn gradient_split_attributes_domain_b_step_only_to_domain_b_params() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let model_a = tiny_net(&device);
         let model_b = tiny_net(&device);
         struct TouchVisitor;
@@ -4838,7 +4843,7 @@ mod tests {
     /// domains' weights changed after one step.
     #[test]
     fn gradient_split_two_domains_both_receive_nonzero_updates_when_both_contribute() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let model_a = tiny_net(&device);
         let model_b = tiny_net(&device);
         struct TouchVisitor;
@@ -4916,7 +4921,7 @@ mod tests {
 
     #[test]
     fn two_domain_models_wrapper_visits_both_inner_models_params() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let pin = tiny_net(&device);
         let lug = tiny_net(&device);
         let expected = param_l2_sq(&pin) + param_l2_sq(&lug);
@@ -4932,7 +4937,7 @@ mod tests {
     /// Clone` bound via its `#[derive(Module, Debug)]`? Get this compiling/passing FIRST.
     #[test]
     fn two_domain_models_round_trips_through_lbfgs_flatten_params() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let pin = tiny_net(&device);
         let lug = tiny_net(&device);
         let models = TwoDomainModels { pin, lug };
@@ -4961,7 +4966,7 @@ mod tests {
 
     #[test]
     fn step_lbfgs_multi_reduces_loss_and_updates_both_domains_params() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let pin = tiny_net(&device);
         let lug = tiny_net(&device);
         let models = TwoDomainModels { pin, lug };
@@ -5099,7 +5104,7 @@ mod tests {
 
     #[test]
     fn compute_gradient_conflict_multi_produces_finite_cosine_and_norms_on_toy_problem() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let pin = tiny_net(&device);
         let lug = tiny_net(&device);
         let models = TwoDomainModels { pin, lug };
@@ -5148,7 +5153,7 @@ mod tests {
 
     #[test]
     fn compute_gradient_conflict_multi_bc_group_empty_yields_finite_not_nan_cosine() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let pin = tiny_net(&device);
         let lug = tiny_net(&device);
         let models = TwoDomainModels { pin, lug };
@@ -5213,7 +5218,7 @@ mod tests {
         let engine = EngineParams::analyze(&config);
         engine.apply_to(&mut config);
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)
@@ -5277,7 +5282,7 @@ mod tests {
 
     #[test]
     fn step_physics_multi_step_output_exposes_lam_by_name_for_every_active_term() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let model_a = tiny_net(&device);
         let model_b = tiny_net(&device);
         struct TouchVisitor;
@@ -5354,7 +5359,7 @@ mod tests {
     /// from its base weights, `lam_by_name` reflects the adapted values, not the seed.
     #[test]
     fn step_physics_multi_lam_by_name_reflects_saw_adaptation_not_base_weight_seed() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let model_a = tiny_net(&device);
         let model_b = tiny_net(&device);
         struct TouchVisitor;
@@ -5548,7 +5553,7 @@ mod tests {
         (problem, config, fd)
     }
 
-    fn tiny_pinlug_nets(device: &WgpuDevice) -> (ElasticityNet<B>, ElasticityNet<B>) {
+    fn tiny_pinlug_nets(device: &BDevice) -> (ElasticityNet<B>, ElasticityNet<B>) {
         let net_cfg = crate::network::ElasticityNetConfig::new()
             .with_input_dim(3)
             .with_hidden_dim(4)
@@ -5566,7 +5571,7 @@ mod tests {
     /// DIFFERENT random weights on first use). Tests that need two runs to start from the
     /// EXACT same weights (not just the same distribution) must build ONE pair here, then
     /// `.clone()` it into each run.
-    fn touched_tiny_pinlug_nets(device: &WgpuDevice) -> (ElasticityNet<B>, ElasticityNet<B>) {
+    fn touched_tiny_pinlug_nets(device: &BDevice) -> (ElasticityNet<B>, ElasticityNet<B>) {
         let (model_pin, model_lug) = tiny_pinlug_nets(device);
         struct TouchVisitor;
         impl ModuleVisitor<B> for TouchVisitor {
@@ -5586,7 +5591,7 @@ mod tests {
     /// (1.0/n as f32)` is not bit-exact for all n).
     #[test]
     fn step_physics_multi_interface_penetration_cap_is_noop_at_step_zero_when_cap_equals_base_weight() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let (problem, config, fd) = pinlug_test_fixture();
         let (pin_data, lug_data, u_ref, ref_energy, ref_stress2) = build_pinlug_test_domain_data(&problem, 8, 6);
         let (model_pin, model_lug) = tiny_pinlug_nets(&device);
@@ -5622,7 +5627,7 @@ mod tests {
     /// exactly that cap — and must NOT leak into the pre-existing h/d caps' own dispatch arms.
     #[test]
     fn step_physics_multi_interface_penetration_cap_binds_when_below_live_weight() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let (problem, config, fd) = pinlug_test_fixture();
         let (pin_data, lug_data, u_ref, ref_energy, ref_stress2) = build_pinlug_test_domain_data(&problem, 8, 6);
 
@@ -5678,7 +5683,7 @@ mod tests {
     /// h/d arms' documented gating (matches `runner.rs`'s GUI-path construction).
     #[test]
     fn step_physics_multi_interface_penetration_cap_inert_when_phase2_active_false() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let (problem, config, fd) = pinlug_test_fixture();
         let (pin_data, lug_data, u_ref, ref_energy, ref_stress2) = build_pinlug_test_domain_data(&problem, 8, 6);
         let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
@@ -5724,7 +5729,7 @@ mod tests {
     /// (proves they aren't accidentally aliased to the same local).
     #[test]
     fn step_physics_multi_interface_penetration_and_non_tension_caps_are_independent() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let (problem, config, fd) = pinlug_test_fixture();
         let (pin_data, lug_data, u_ref, ref_energy, ref_stress2) = build_pinlug_test_domain_data(&problem, 8, 6);
         let (model_pin, model_lug) = tiny_pinlug_nets(&device);
@@ -5755,7 +5760,7 @@ mod tests {
     /// exact-equality behavior explicitly so a future refactor away from `.min()` is caught.
     #[test]
     fn step_physics_multi_interface_penetration_cap_exactly_at_live_weight_is_noop() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let (problem, config, fd) = pinlug_test_fixture();
         let (pin_data, lug_data, u_ref, ref_energy, ref_stress2) = build_pinlug_test_domain_data(&problem, 8, 6);
         let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
@@ -5813,7 +5818,7 @@ mod tests {
     /// ordering; this test would catch that off-by-one directly.
     #[test]
     fn pinlug_stencil_coords_closed_form_matches_old_gpu_readback_path() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let (problem, _config, fd) = pinlug_test_fixture();
         let (pin_data, lug_data, _u_ref, _ref_energy, _ref_stress2) =
             build_pinlug_test_domain_data(&problem, 8, 6);
@@ -5858,7 +5863,7 @@ mod tests {
     /// `gate_awake_epsilon` — so no explicit `force_gate_for_test` call is needed to exercise
     /// the "gate forced dormant" scenario these tests are named after).
     fn compute_skip_test_fixture(compute_skip: bool) -> (
-        pinn_core::messages::SolverConfig, crate::engine::EngineParams, StepCtxOwned, WgpuDevice,
+        pinn_core::messages::SolverConfig, crate::engine::EngineParams, StepCtxOwned, BDevice,
     ) {
         use crate::engine::EngineParams;
         use pinn_core::messages::SolverConfig;
@@ -5873,7 +5878,7 @@ mod tests {
         let engine = EngineParams::analyze(&config);
         engine.apply_to(&mut config);
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
 
         let (x0, x1) = config.geometry.x_range();
         let (y0, y1) = config.geometry.y_range();
@@ -5925,7 +5930,7 @@ mod tests {
         config: &SolverConfig,
         engine: &crate::engine::EngineParams,
         owned: &StepCtxOwned,
-        device: &WgpuDevice,
+        device: &BDevice,
         model: ElasticityNet<B>,
     ) -> (ElasticityNet<B>, StepOutput) {
         use crate::{
@@ -5961,7 +5966,7 @@ mod tests {
         )
     }
 
-    fn compute_skip_seed_model(engine: &crate::engine::EngineParams, config: &SolverConfig, device: &WgpuDevice) -> ElasticityNet<B> {
+    fn compute_skip_seed_model(engine: &crate::engine::EngineParams, config: &SolverConfig, device: &BDevice) -> ElasticityNet<B> {
         use crate::network::ElasticityNetConfig;
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
@@ -6082,7 +6087,7 @@ mod tests {
 
     #[test]
     fn model_is_finite_true_for_freshly_initialized_model() {
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = crate::network::ElasticityNetConfig::new()
             .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(3)
             .with_use_piratenet(false);
@@ -6099,7 +6104,7 @@ mod tests {
                 param.map(|t| t.zeros_like().add_scalar(f32::NAN))
             }
         }
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = crate::network::ElasticityNetConfig::new()
             .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(3)
             .with_use_piratenet(false);
@@ -6116,7 +6121,7 @@ mod tests {
                 if D == 1 { param.map(|t| t.zeros_like().add_scalar(f32::NAN)) } else { param }
             }
         }
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = crate::network::ElasticityNetConfig::new()
             .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(3)
             .with_use_piratenet(false);
@@ -6133,7 +6138,7 @@ mod tests {
                 param.map(|t| t.zeros_like().add_scalar(f32::INFINITY))
             }
         }
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = crate::network::ElasticityNetConfig::new()
             .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(3)
             .with_use_piratenet(false);
@@ -6150,7 +6155,7 @@ mod tests {
                 param.map(|t| t.zeros_like().add_scalar(f32::NEG_INFINITY))
             }
         }
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = crate::network::ElasticityNetConfig::new()
             .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(3)
             .with_use_piratenet(false);

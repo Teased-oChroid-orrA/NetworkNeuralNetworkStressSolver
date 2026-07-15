@@ -10,3 +10,6 @@ nalgebra          = { workspace = true }
 ndarray           = { workspace = true }
 anyhow            = { workspace = true }
 crossbeam-channel = { workspace = true }
+
+[features]
+ndarray-backend = ["burn/ndarray"]

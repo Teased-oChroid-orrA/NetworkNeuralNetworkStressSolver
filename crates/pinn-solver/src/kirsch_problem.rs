@@ -32,6 +32,8 @@ use crate::{
     },
     problem::{BoundaryValueProblem, DomainForwardOutputs, DomainState, LossTerm, B},
 };
+#[cfg(test)]
+use crate::problem::BDevice;
 
 // ─── Sampling — copied verbatim from `pinn_core::sampling` so output is bit-identical ────
 
@@ -740,7 +742,6 @@ mod tests {
     /// (never-trained) network, within 1e-5 relative tolerance.
     #[test]
     fn kirsch_regression_matches_hardcoded_step_physics() {
-        use burn::backend::wgpu::WgpuDevice;
         use crate::{
             engine::EngineParams,
             fd_stencil::FdConfig,
@@ -761,7 +762,7 @@ mod tests {
         let engine = EngineParams::analyze(&config);
         engine.apply_to(&mut config);
 
-        let device = WgpuDevice::default();
+        let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(engine.net_input_dim())
             .with_hidden_dim(config.hidden_dim)

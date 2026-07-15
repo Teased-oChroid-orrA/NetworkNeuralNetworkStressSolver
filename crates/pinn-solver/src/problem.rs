@@ -19,7 +19,7 @@ use crate::optim::{BiasOptim, GateOptim, WeightOptim};
 
 /// Autodiff-enabled backend used throughout the training loop. Re-exported from
 /// `training_core` (the pre-existing single source of truth) rather than redefined here.
-pub use crate::training_core::B;
+pub use crate::training_core::{BDevice, B};
 
 /// Mutable per-domain state threaded through training: the domain's own network plus its
 /// normalization/reference scales (analogous to today's Kirsch-only `u_ref`/`ref_energy`/

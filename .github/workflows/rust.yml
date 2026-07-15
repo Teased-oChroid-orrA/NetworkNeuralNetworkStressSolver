@@ -51,3 +51,54 @@ jobs:
       run: cargo test --features eframe/x11,eframe/wayland --verbose -- --test-threads=1
       env:
         RUST_BACKTRACE: 1
+
+    # A/B benchmark half (Wgpu side) for issue #58's AC3 — bounded step count so this stays
+    # fast. MAX_STEPS is read from a pinn.env-format FILE (main.rs's load_pinn_env), not a
+    # process env var — a plain `MAX_STEPS=1200` shell env has no effect and silently runs
+    # the full un-capped step count (confirmed the hard way locally before writing this).
+    - name: Headless bench (Wgpu)
+      run: |
+        echo "MAX_STEPS=1200" > pinn.env
+        cargo run -p pinn-app --release --features eframe/x11,eframe/wayland -- --headless | tee wgpu-bench.log
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: wgpu-bench-log
+        path: wgpu-bench.log
+
+  # Validates the opt-in ndarray-backend feature (issue #58): default job above never
+  # exercises it, so without this job the CPU backend path would go untested by CI entirely.
+  # Still installs lavapipe: Cargo feature unification means burn/wgpu stays linked in even
+  # with ndarray-backend on (additive, not a replacement), so pinn-app/pinn-gui's Wgpu-only
+  # code paths still need a Vulkan driver present to build/link.
+  build-ndarray:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Mesa software Vulkan driver (lavapipe)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y mesa-vulkan-drivers
+
+    - name: Build (ndarray-backend)
+      run: cargo build -p pinn-app --features eframe/x11,eframe/wayland,ndarray-backend --verbose
+
+    - name: Run tests (ndarray-backend)
+      run: cargo test -p pinn-solver --features ndarray-backend --verbose -- --test-threads=1
+      env:
+        RUST_BACKTRACE: 1
+
+    # A/B benchmark half (NdArray side) for issue #58's AC3 — same MAX_STEPS, same
+    # collocation/network config as the Wgpu job's bench step, only the backend differs.
+    - name: Headless bench (NdArray)
+      run: |
+        echo "MAX_STEPS=1200" > pinn.env
+        cargo run -p pinn-app --release --features eframe/x11,eframe/wayland,ndarray-backend -- --headless | tee ndarray-bench.log
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ndarray-bench-log
+        path: ndarray-bench.log
