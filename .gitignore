@@ -4,3 +4,5 @@ target/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 pinlug_contact_pressure.csv
+.cargo/
+.shared-cargo-target/

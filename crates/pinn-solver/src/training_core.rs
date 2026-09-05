@@ -1331,6 +1331,23 @@ pub fn compute_gradient_conflict(
     let px        = ctx.config.load.px;
     let u_ref_f64 = ctx.u_ref as f64;
 
+    // Mirror `step_physics`'s own compute-skip mask exactly (same `awake_mask` snapshot,
+    // same `use_piratenet_compute_skip` gate). Without this, a block `step_physics` has kept
+    // fully asleep (never entering its forward graph) suddenly gets its FIRST forward+backward
+    // roundtrip here via the unmasked `fwd` — burn-autodiff's leaf/node registration for a
+    // `Param` that has sat outside every graph for many consecutive steps does not survive
+    // that reintroduction, and `.backward()` panics with "Node should have a step registered"
+    // the moment such a block is touched (reproduced directly: crash disappears with
+    // `use_piratenet_compute_skip=false`, all else unchanged). Using the SAME mask here also
+    // keeps the conflict metric honest — a block `step_physics` isn't training this step
+    // shouldn't contribute to the gradient-conflict reading either.
+    let forward_mask: Option<Vec<bool>> = if ctx.config.use_piratenet_compute_skip {
+        Some(model.awake_mask(ctx.config.stiffness.gate_awake_epsilon))
+    } else {
+        None
+    };
+    let forward_mask = forward_mask.as_deref();
+
     let scale_out = |ansatz: Tensor<B, 2>| -> Tensor<B, 2> {
         if use_mdem {
             let nr = ansatz.dims()[0];
@@ -1376,7 +1393,7 @@ pub fn compute_gradient_conflict(
         let pts_t = norm_pts_to_tensor::<B>(&sub_int_norm, device);
         let stencil_coords = assemble_stencil::<B>(&pts_t, ctx.fd, device);
         let stencil_out = scale_out(apply_dirichlet_ansatz::<B>(
-            fwd(model, stencil_coords.clone(), n_fourier, device),
+            fwd_masked(model, stencil_coords.clone(), n_fourier, device, forward_mask),
             &stencil_coords, ctx.config.geometry.symmetry, ctx.k,
         ));
         let int_raw_out = stencil_out.clone().slice([0..n_sub_int, 0..stencil_out.dims()[1]]);
@@ -1413,7 +1430,7 @@ pub fn compute_gradient_conflict(
         let bnd_t = norm_pts_to_tensor::<B>(&trac_norm, device);
         let stencil_bnd = assemble_stencil::<B>(&bnd_t, ctx.fd, device);
         let out_bnd = scale_out(apply_dirichlet_ansatz::<B>(
-            fwd(model, stencil_bnd.clone(), n_fourier, device),
+            fwd_masked(model, stencil_bnd.clone(), n_fourier, device, forward_mask),
             &stencil_bnd, ctx.config.geometry.symmetry, ctx.k,
         ));
         let (ex, ey, exy) = compute_strains::<B>(out_bnd.clone(), nt, ctx.fd);
@@ -1449,7 +1466,7 @@ pub fn compute_gradient_conflict(
         let nr = right_norm.len();
         let right_t = norm_pts_to_tensor::<B>(&right_norm, device);
         let out_r = scale_out(apply_dirichlet_ansatz::<B>(
-            fwd(model, right_t.clone(), n_fourier, device),
+            fwd_masked(model, right_t.clone(), n_fourier, device, forward_mask),
             &right_t, ctx.config.geometry.symmetry, ctx.k,
         ));
         let right_forward = DomainForwardOutputs {
@@ -1479,7 +1496,7 @@ pub fn compute_gradient_conflict(
         let bnd_h = norm_pts_to_tensor::<B>(&hole_norm, device);
         if use_mdem {
             let out_h = scale_out(apply_dirichlet_ansatz::<B>(
-                fwd(model, bnd_h.clone(), n_fourier, device),
+                fwd_masked(model, bnd_h.clone(), n_fourier, device, forward_mask),
                 &bnd_h, ctx.config.geometry.symmetry, ctx.k,
             ));
             let hole_forward = DomainForwardOutputs {
@@ -1496,7 +1513,7 @@ pub fn compute_gradient_conflict(
         } else {
             let stencil_h = assemble_stencil::<B>(&bnd_h, ctx.fd, device);
             let out_h = scale_out(apply_dirichlet_ansatz::<B>(
-                fwd(model, stencil_h.clone(), n_fourier, device),
+                fwd_masked(model, stencil_h.clone(), n_fourier, device, forward_mask),
                 &stencil_h, ctx.config.geometry.symmetry, ctx.k,
             ));
             let (ex, ey, exy) = compute_strains::<B>(out_h.clone(), nh, ctx.fd);
@@ -1529,7 +1546,7 @@ pub fn compute_gradient_conflict(
             }).collect();
             let pts_all = norm_pts_to_tensor::<B>(&all_shifted, device);
             let out_all = scale_out(apply_dirichlet_ansatz::<B>(
-                fwd(model, pts_all.clone(), n_fourier, device),
+                fwd_masked(model, pts_all.clone(), n_fourier, device, forward_mask),
                 &pts_all, ctx.config.geometry.symmetry, ctx.k,
             ));
             let seg = |i: usize| -> (Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) {
@@ -1547,7 +1564,7 @@ pub fn compute_gradient_conflict(
                 let pts = norm_pts_to_tensor::<B>(&shifted, device);
                 let stencil = assemble_stencil::<B>(&pts, ctx.fd, device);
                 let out = scale_out(apply_dirichlet_ansatz::<B>(
-                    fwd(model, stencil.clone(), n_fourier, device),
+                    fwd_masked(model, stencil.clone(), n_fourier, device, forward_mask),
                     &stencil, ctx.config.geometry.symmetry, ctx.k,
                 ));
                 let (exx, eyy, exy) = compute_strains::<B>(out, n_eq, ctx.fd);
@@ -1584,7 +1601,7 @@ pub fn compute_gradient_conflict(
             };
             if use_mdem {
                 let out_pr = scale_out(apply_dirichlet_ansatz::<B>(
-                    fwd(model, pts_pr.clone(), n_fourier, device),
+                    fwd_masked(model, pts_pr.clone(), n_fourier, device, forward_mask),
                     &pts_pr, ctx.config.geometry.symmetry, ctx.k,
                 ));
                 let kirsch_forward = DomainForwardOutputs {
@@ -1602,7 +1619,7 @@ pub fn compute_gradient_conflict(
             } else {
                 let stencil_pr = assemble_stencil::<B>(&pts_pr, ctx.fd, device);
                 let out_pr = scale_out(apply_dirichlet_ansatz::<B>(
-                    fwd(model, stencil_pr.clone(), n_fourier, device),
+                    fwd_masked(model, stencil_pr.clone(), n_fourier, device, forward_mask),
                     &stencil_pr, ctx.config.geometry.symmetry, ctx.k,
                 ));
                 let (exx_pr, eyy_pr, exy_pr) = compute_strains::<B>(out_pr.clone(), n_pr, ctx.fd);
