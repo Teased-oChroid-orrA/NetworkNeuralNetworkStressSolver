@@ -202,3 +202,51 @@ pin-lug, `MultiStepCtx.phase2_active` is hardcoded `true` (independent of the de
 own `PHASE2_ACTIVE` constant, which stays `false`) purely to activate `step_physics_multi`'s
 pre-existing `lug_free_edge_traction`/`lug_shank_anchor` cap-dispatch arms — the two booleans
 are unrelated axes that happen to share a name.
+
+## Hardware-adaptive execution (Phase 1)
+
+`pinn_solver::execution` (`Executor` trait, `SerialExecutor`, `ExecutionPlanner`) and
+`pinn_core::messages::{ExecutionMode, ExecutionConfig, PerformanceProfile}` are Phase 1 of a
+multi-phase hardware-adaptive-execution effort (see the "Epic Addendum" this reconciles against
+the actual codebase before implementing). **Deliberately narrow scope — do not expand without
+re-reading this section:**
+
+- `Executor` wraps ONLY the free-function resample calls
+  (`pinn_core::sampling::sample_interior`/`sample_boundary`) that Kirsch's pre-trait, frozen
+  `runner.rs`/`headless.rs` call sites use directly. It does **not** wrap
+  `pinn_core::problem::DomainSamplingStrategy` (the existing per-*domain* sampling abstraction
+  `KirschSamplingStrategy`/`PinLugSamplingStrategy` implement — an orthogonal axis, per-domain
+  behavior vs. per-hardware execution strategy) — pin-lug's every-step resample is untouched.
+  It does **not** wrap `training_core::step_physics`/`step_physics_multi` — those are single
+  batched `burn` tensor graphs with nothing embarrassingly parallel inside them, and the
+  step_physics-must-not-become-a-thin-wrapper warning earlier in this file applies with full
+  force to any temptation to route it through an `Executor` too.
+- No `TensorBackend` trait exists or should be added — `burn::tensor::backend::Backend`
+  (already threaded through everything via `training_core::B`/`BInner`) already is that layer.
+- `ExecutionPlanner::plan` is a deliberate stub: it always returns `SerialExecutor` regardless
+  of `ExecutionMode`/`PerformanceProfile`. `EXEC_MODE`/`EXEC_PROFILE` (`pinn.env`) are accepted,
+  validated, and threaded through `SolverConfig`, but change no executed code path yet — do not
+  assume setting `EXEC_PROFILE=eco` does anything at runtime until a later phase says otherwise.
+- Rayon is intentionally NOT a dependency of this crate's own code (criterion's dev-dependency
+  pulls it in transitively for benchmarking only). The one real per-step CPU-bound host loop,
+  `pinn_core::sampling::sample_interior`, is **RNG-order-sensitive** (seeded LCG; a near-hole-
+  guarantee ring is explicitly prepended before truncation) — naively `par_iter`-ing it would
+  silently change point streams. Parallelizing it requires deterministic RNG-stream
+  partitioning as its own reviewed change, informed by real profiling data, not assumed.
+
+`crates/pinn-solver/benches/training_step.rs` (criterion, `cargo bench -p pinn-solver`)
+benchmarks `step_physics` at 5 tiers (tiny/small/medium/large/very_large; `medium` matches
+`SolverConfig::default_kirsch()`'s real shipped config exactly). It constructs its own
+`StepCtx` using already-`pub` production setup functions (`EngineParams::analyze`,
+`build_gathered_boundary_tensors`, etc. — the same ones `headless::run_headless` calls) rather
+than touching `training_core.rs`'s private test-fixture helpers, which are `#[cfg(test)]`-gated
+and invisible to an external bench crate. **First real measurement already surfaced something
+worth knowing**: a short `cargo bench -- --sample-size 10` run showed near-identical wall time
+(~550-900ms) across all 5 tiers on the default Wgpu backend, despite a 64x difference in
+`n_interior` and 16x in `hidden_dim` between `tiny` and `very_large`. This is consistent with
+Wgpu/cubecl-fusion kernel-compile/dispatch overhead dominating at these problem sizes on this
+hardware, not the actual tensor compute — exactly the kind of profiling evidence the epic's own
+"tiny tensor operation → avoid GPU transfer" guidance is about. Don't assume this bench shows
+clean O(n) scaling without re-running it with a real sample size and warm-up first; a longer,
+statistically-sound run (not the quick `--sample-size 10` smoke check) is what any future
+Rayon/backend-comparison decision should be based on.

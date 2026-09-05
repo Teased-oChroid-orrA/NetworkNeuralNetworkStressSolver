@@ -87,6 +87,47 @@ pub enum ProblemKind {
     PinLug,
 }
 
+/// Which execution strategy the training loop should use for host-side work (resampling
+/// today; a future CPU-parallel/GPU-dispatch executor later — see `pinn_solver::execution`).
+/// Phase 1 of the hardware-adaptive-execution epic: `Serial` is what every code path already
+/// does, and `Auto` currently resolves to `Serial` unconditionally
+/// (`pinn_solver::execution::ExecutionPlanner` is a deliberate stub until a real workload-aware
+/// decision is warranted by profiling data — see that module's own doc comment). No
+/// `CpuParallel`/`Gpu` variants yet: adding them with nothing behind them would invite dead-code
+/// noise and a false impression of capability that doesn't exist yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ExecutionMode {
+    #[default]
+    Auto,
+    Serial,
+}
+
+/// Coarse hardware/resource-usage target (Eco/Balanced/Performance/Maximum), independent of
+/// `ExecutionMode` (mode picks *how* work executes; profile is meant to eventually cap *how
+/// much* — batch size, thread count). Phase 1 only accepts, validates, and threads this value
+/// through `SolverConfig`/`pinn.env`; nothing reads it yet to change behavior (see
+/// `pinn_solver::execution`'s module doc for why: profiling-driven optimization, not a guess,
+/// decides what `Eco`/`Performance`/`Maximum` should each concretely do). Never alters the
+/// mathematical formulation being solved — only ever execution strategy, once wired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PerformanceProfile {
+    Eco,
+    #[default]
+    Balanced,
+    Performance,
+    Maximum,
+}
+
+/// `ExecutionMode` + `PerformanceProfile` bundled onto `SolverConfig`, following the same
+/// opt-in-subsystem-config shape as `DecisionMakerConfig`/`StiffnessConfig`/`WidthGrowthConfig`.
+/// Phase 1: read from `pinn.env`'s `EXEC_MODE`/`EXEC_PROFILE` keys (`pinn-app/src/main.rs`'s
+/// `apply_env`), round-tripped and validated, not yet load-bearing on any executed code path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ExecutionConfig {
+    pub mode: ExecutionMode,
+    pub profile: PerformanceProfile,
+}
+
 /// Configuration for the meta-optimizer decision maker (opt-in, disabled by default).
 ///
 /// When `enabled = false`, the existing training loop runs unchanged (SOAP-Muon for
@@ -255,6 +296,9 @@ pub struct SolverConfig {
     /// One-shot function-preserving network width growth (issue #50). Disabled by default —
     /// see [`WidthGrowthConfig`]'s doc comment for scope (Kirsch headless only in v1).
     pub width_growth: WidthGrowthConfig,
+    /// Execution-mode/performance-profile selection (hardware-adaptive-execution epic, Phase
+    /// 1). See [`ExecutionConfig`]'s doc comment — accepted/validated, not yet load-bearing.
+    pub execution: ExecutionConfig,
 }
 
 impl SolverConfig {
@@ -277,6 +321,7 @@ impl SolverConfig {
             use_ultimate_strength_scaling: false,
             use_piratenet_compute_skip: false,
             width_growth: WidthGrowthConfig::default(),
+            execution: ExecutionConfig::default(),
         }
     }
 
@@ -324,6 +369,7 @@ impl SolverConfig {
             use_ultimate_strength_scaling: false,
             use_piratenet_compute_skip: false,
             width_growth: WidthGrowthConfig::default(),
+            execution: ExecutionConfig::default(),
         }
     }
 }

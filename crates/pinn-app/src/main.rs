@@ -118,6 +118,32 @@ fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>, skip_problem
         parse_f32!("STIFF_GATE_AWAKE_EPSILON",   st.gate_awake_epsilon);
     }
 
+    // Execution / performance profile (hardware-adaptive-execution epic, Phase 1). Neither
+    // key changes any executed code path yet - see `pinn_solver::execution`'s module doc for
+    // why (profiling-driven optimization, not a guess, decides what each value should
+    // concretely do). No existing macro parses enums/strings, so this is a plain match block
+    // rather than a new one-off macro for just two keys, mirroring `parse_problem_arg`'s own
+    // string-match style below.
+    {
+        let ex = &mut cfg.execution;
+        if let Some(v) = env.get("EXEC_MODE") {
+            match v.to_lowercase().as_str() {
+                "auto"   => ex.mode = pinn_core::messages::ExecutionMode::Auto,
+                "serial" => ex.mode = pinn_core::messages::ExecutionMode::Serial,
+                _ => {}
+            }
+        }
+        if let Some(v) = env.get("EXEC_PROFILE") {
+            match v.to_lowercase().as_str() {
+                "eco"         => ex.profile = pinn_core::messages::PerformanceProfile::Eco,
+                "balanced"    => ex.profile = pinn_core::messages::PerformanceProfile::Balanced,
+                "performance" => ex.profile = pinn_core::messages::PerformanceProfile::Performance,
+                "maximum"     => ex.profile = pinn_core::messages::PerformanceProfile::Maximum,
+                _ => {}
+            }
+        }
+    }
+
     if skip_problem_specific {
         return;
     }
@@ -222,5 +248,40 @@ mod tests {
     fn parse_problem_arg_default_matches_pinn_core_kirsch() {
         let k: pinn_core::messages::ProblemKind = pinn_core::messages::ProblemKind::Kirsch;
         assert_eq!(k, pinn_core::messages::ProblemKind::Kirsch);
+    }
+
+    #[test]
+    fn apply_env_parses_exec_mode_and_exec_profile() {
+        let mut cfg = SolverConfig::default_kirsch();
+        let mut env = HashMap::new();
+        env.insert("EXEC_MODE".to_string(), "serial".to_string());
+        env.insert("EXEC_PROFILE".to_string(), "performance".to_string());
+        apply_env(&mut cfg, &env, false);
+        assert_eq!(cfg.execution.mode, pinn_core::messages::ExecutionMode::Serial);
+        assert_eq!(cfg.execution.profile, pinn_core::messages::PerformanceProfile::Performance);
+    }
+
+    #[test]
+    fn apply_env_ignores_unrecognized_exec_mode_and_exec_profile_values() {
+        let mut cfg = SolverConfig::default_kirsch();
+        let mut env = HashMap::new();
+        env.insert("EXEC_MODE".to_string(), "quantum".to_string());
+        env.insert("EXEC_PROFILE".to_string(), "ludicrous".to_string());
+        apply_env(&mut cfg, &env, false);
+        // Unrecognized values leave the (default) config untouched, matching this file's
+        // existing "unknown keys are silently ignored" convention.
+        assert_eq!(cfg.execution.mode, pinn_core::messages::ExecutionMode::Auto);
+        assert_eq!(cfg.execution.profile, pinn_core::messages::PerformanceProfile::Balanced);
+    }
+
+    #[test]
+    fn apply_env_exec_keys_are_not_skipped_by_skip_problem_specific() {
+        // Execution config is not part of the problem definition (unlike material/load/
+        // geometry) - it must still apply when skip_problem_specific=true (the pin-lug path).
+        let mut cfg = SolverConfig::default_pinlug();
+        let mut env = HashMap::new();
+        env.insert("EXEC_MODE".to_string(), "serial".to_string());
+        apply_env(&mut cfg, &env, true);
+        assert_eq!(cfg.execution.mode, pinn_core::messages::ExecutionMode::Serial);
     }
 }

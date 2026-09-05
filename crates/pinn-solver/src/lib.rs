@@ -4,6 +4,7 @@ pub mod controllers; // ConvergenceTracker is `pub` (see controllers.rs) for cro
 pub mod decision_maker;
 pub mod engine;
 pub mod energy;
+pub mod execution;
 pub mod fd_stencil;
 pub mod headless;
 pub mod kirsch_problem;
