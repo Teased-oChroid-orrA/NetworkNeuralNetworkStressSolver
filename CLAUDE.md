@@ -203,7 +203,7 @@ own `PHASE2_ACTIVE` constant, which stays `false`) purely to activate `step_phys
 pre-existing `lug_free_edge_traction`/`lug_shank_anchor` cap-dispatch arms — the two booleans
 are unrelated axes that happen to share a name.
 
-## Hardware-adaptive execution (Phase 1)
+## Hardware-adaptive execution (Phase 1 + 2)
 
 `pinn_solver::execution` (`Executor` trait, `SerialExecutor`, `ExecutionPlanner`) and
 `pinn_core::messages::{ExecutionMode, ExecutionConfig, PerformanceProfile}` are Phase 1 of a
@@ -250,3 +250,38 @@ hardware, not the actual tensor compute — exactly the kind of profiling eviden
 clean O(n) scaling without re-running it with a real sample size and warm-up first; a longer,
 statistically-sound run (not the quick `--sample-size 10` smoke check) is what any future
 Rayon/backend-comparison decision should be based on.
+
+### Phase 2: per-step profiling instrumentation
+
+`pinn_solver::diagnostics` (`StepTimer`, `StepTiming`) and `pinn_core::messages::
+DiagnosticsConfig` (`SolverConfig::diagnostics`, `pinn.env`'s `DIAGNOSTICS_ENABLED`, default
+`false`) instrument `training_core::step_physics` with three wall-clock buckets: forward pass +
+SAW-BRDR loss assembly, the single `.backward()` call, and gradient-extraction + all three
+optimizer `.step()` calls. Populated into the new `StepOutput.timing: Option<StepTiming>` field
+(every other `StepOutput` construction site — `step_physics_multi`, both GUI/headless
+Converge-tier synthetic outputs, the `old_hardcoded_step_physics` test oracle — sets this to
+`None`; **only `step_physics` itself is instrumented in this pass**, a deliberate smaller slice
+rather than doing `step_physics_multi` in the same edit).
+
+**A device sync is required for honest numbers, and that's a real, disclosed, opt-in cost.**
+`burn`'s tensor ops on a GPU backend are queued, not executed synchronously — timing without a
+sync at each boundary would measure "time to enqueue," not "time to actually compute" (this is
+exactly what Phase 1's bench's suspiciously-flat tiny-vs-very_large timing turned out to be
+evidence of). `training_core::sync_device` wraps `<B as Backend>::sync(device)`
+("ensure all computation are finished," `burn-backend`'s own doc comment) and is called at
+every `StepTimer` checkpoint — but ONLY when `diagnostics.enabled == true`. When disabled (the
+default), `step_physics` performs zero extra `Instant::now()` calls and zero extra syncs -
+genuinely zero-cost, not just cheap. **Regression-safety was the primary risk here** (this
+inserts new code into the frozen byte-exact `step_physics` path) — proven by
+`step_physics_diagnostics_enabled_matches_disabled_and_populates_timing`
+(`training_core.rs`), which asserts enabling diagnostics changes `StepOutput.timing` and
+nothing else (`total_scalar`/`e_scalar`/`lam_e`/`lam_h` all byte-identical), and by the full
+216-test suite passing unchanged both before and after this instrumentation landed.
+
+Real end-to-end confirmation (a 5-step headless Kirsch run, `DIAGNOSTICS_ENABLED=true`):
+step 0 showed forward=264ms/backward=256ms, step 4 showed forward=35ms/backward=117ms - the
+same one-time GPU kernel-compile-overhead pattern Phase 1's bench finding predicted, now
+visible per-step rather than only as a flat aggregate. `headless::run_headless` prints an
+indented `[diagnostics] forward=...us backward=...us optimizer=...us` line under each printed
+step row when `out.timing` is `Some` - this is the one place the data is actually surfaced to a
+human, not just populated silently into a struct nobody reads.

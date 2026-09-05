@@ -144,6 +144,11 @@ fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>, skip_problem
         }
     }
 
+    // Per-step profiling instrumentation (hardware-adaptive-execution epic, Phase 2). Real,
+    // opt-in wall-time measurement - see pinn_solver::diagnostics's module doc for the
+    // device-sync cost this adds when enabled.
+    parse_bool!("DIAGNOSTICS_ENABLED", cfg.diagnostics.enabled);
+
     if skip_problem_specific {
         return;
     }
@@ -283,5 +288,15 @@ mod tests {
         env.insert("EXEC_MODE".to_string(), "serial".to_string());
         apply_env(&mut cfg, &env, true);
         assert_eq!(cfg.execution.mode, pinn_core::messages::ExecutionMode::Serial);
+    }
+
+    #[test]
+    fn apply_env_parses_diagnostics_enabled() {
+        let mut cfg = SolverConfig::default_kirsch();
+        assert!(!cfg.diagnostics.enabled, "must default to disabled");
+        let mut env = HashMap::new();
+        env.insert("DIAGNOSTICS_ENABLED".to_string(), "true".to_string());
+        apply_env(&mut cfg, &env, false);
+        assert!(cfg.diagnostics.enabled);
     }
 }

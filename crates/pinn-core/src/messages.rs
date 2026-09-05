@@ -128,6 +128,17 @@ pub struct ExecutionConfig {
     pub profile: PerformanceProfile,
 }
 
+/// Per-step profiling instrumentation (hardware-adaptive-execution epic, Phase 2). Opt-in,
+/// disabled by default - when `enabled = false`, `training_core::step_physics` performs zero
+/// extra `Instant::now()`/device-sync calls (see `pinn_solver::diagnostics`'s module doc for
+/// why a device sync is unavoidable for honest GPU timing, and why it's therefore gated
+/// behind this flag rather than always-on). Wall time only in Phase 2 - memory/numerical
+/// diagnostics are a later phase's scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct DiagnosticsConfig {
+    pub enabled: bool,
+}
+
 /// Configuration for the meta-optimizer decision maker (opt-in, disabled by default).
 ///
 /// When `enabled = false`, the existing training loop runs unchanged (SOAP-Muon for
@@ -299,6 +310,9 @@ pub struct SolverConfig {
     /// Execution-mode/performance-profile selection (hardware-adaptive-execution epic, Phase
     /// 1). See [`ExecutionConfig`]'s doc comment — accepted/validated, not yet load-bearing.
     pub execution: ExecutionConfig,
+    /// Per-step profiling instrumentation (hardware-adaptive-execution epic, Phase 2). See
+    /// [`DiagnosticsConfig`]'s doc comment — disabled by default, zero cost when off.
+    pub diagnostics: DiagnosticsConfig,
 }
 
 impl SolverConfig {
@@ -322,6 +336,7 @@ impl SolverConfig {
             use_piratenet_compute_skip: false,
             width_growth: WidthGrowthConfig::default(),
             execution: ExecutionConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
         }
     }
 
@@ -370,6 +385,7 @@ impl SolverConfig {
             use_piratenet_compute_skip: false,
             width_growth: WidthGrowthConfig::default(),
             execution: ExecutionConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
         }
     }
 }

@@ -422,6 +422,7 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                 optimizer_tier: OptimizerTier::Converge.as_u8(),
                 cosine_sim: None,
                 lam_by_name: None,
+                timing: None,
             };
             (new_m, synthetic_out)
         } else {
@@ -655,6 +656,13 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                     t = out.total_scalar, e = out.e_scalar, n = out.n_scalar,
                     h = out.h_scalar, d = out.d_scalar, eq = out.eq_scalar,
                     k = out.kirsch_scalar, lr = out.lr);
+                // Hardware-adaptive-execution epic, Phase 2: only printed when
+                // `DIAGNOSTICS_ENABLED=true` (out.timing is None otherwise) - the one place
+                // this profiling data is actually surfaced to a human, not just populated.
+                if let Some(timing) = out.timing {
+                    println!("        [diagnostics] forward={:>7}us  backward={:>7}us  optimizer={:>7}us",
+                        timing.forward_us, timing.backward_us, timing.optimizer_us);
+                }
             } else {
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
@@ -1105,6 +1113,7 @@ pub(crate) fn run_headless_pinlug_inner(
                 optimizer_tier: OptimizerTier::Converge.as_u8(),
                 cosine_sim: None,
                 lam_by_name: None,
+                timing: None,
             }
         } else {
             // tier_u8 is a pure logging passthrough (StepOutput.optimizer_tier) — never

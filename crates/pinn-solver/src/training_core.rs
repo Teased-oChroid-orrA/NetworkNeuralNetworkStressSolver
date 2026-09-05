@@ -54,6 +54,16 @@ pub type B = Autodiff<BInner>;
 /// Device type for the currently-selected `BInner` backend.
 pub type BDevice = <BInner as burn::tensor::backend::BackendTypes>::Device;
 
+/// Blocks until every queued op on `device` has actually finished executing.
+/// Used only by `diagnostics::StepTimer` (opt-in, `SolverConfig::diagnostics.
+/// enabled` default `false`) - a GPU backend's tensor ops are queued, not
+/// synchronous, so timing without this would measure enqueue cost, not real
+/// compute cost. A sync failure is ignored (best-effort for diagnostics
+/// only; never worth failing a training step over).
+pub(crate) fn sync_device(device: &BDevice) {
+    let _ = <B as Backend>::sync(device);
+}
+
 /// Two-domain model wrapper so `burn::optim::LBFGS::step()` (which requires a SINGLE
 /// `AutodiffModule<B>`) can take one combined quasi-Newton step across pin-in-lug's two
 /// domains' parameter spaces. `#[derive(Module, Debug)]` auto-derives `Module<B>`/
@@ -299,6 +309,10 @@ pub struct StepOutput {
     /// `frozen_lams` construction) so L-BFGS inherits the LIVE SAW+cap-adapted weight active
     /// on the step Converge was entered, not the static Phase-1 SAW-BRDR seed.
     pub lam_by_name:   Option<std::collections::HashMap<&'static str, f64>>,
+    /// Per-stage wall-clock cost of this step (hardware-adaptive-execution epic, Phase 2).
+    /// `None` unless `SolverConfig::diagnostics.enabled` - see `diagnostics::StepTimer`'s doc
+    /// comment for why enabling this has a real (opt-in, disclosed) timing cost of its own.
+    pub timing: Option<crate::diagnostics::StepTiming>,
 }
 
 /// Extract (σ_xx, σ_yy, σ_xy) from rows `[row_start, row_end)` of an mDEM network output
@@ -341,6 +355,10 @@ pub fn step_physics(
     physics_boost: f64,
     alpha_lr_mult: f64,
 ) -> (ElasticityNet<B>, StepOutput) {
+    // Hardware-adaptive-execution epic, Phase 2: zero-cost when
+    // `ctx.config.diagnostics.enabled == false` (the default) — see
+    // `diagnostics::StepTimer`'s doc comment.
+    let mut timer = crate::diagnostics::StepTimer::start(&ctx.config.diagnostics, device);
     let n_int      = ctx.int_norm.len();
     let n_fourier  = ctx.engine.n_fourier;
     let use_mdem   = ctx.engine.use_mdem;
@@ -757,7 +775,9 @@ pub fn step_physics(
         None => default_weight_ids,
     };
     let gate_ids = model.gate_ids();
+    timer.mark_forward_done(device);
     let mut grads = loss.backward();
+    timer.mark_backward_done(device);
     let weight_grads = GradientsParams::from_params(&mut grads, &model, &weight_ids);
     let bias_grads = GradientsParams::from_params(&mut grads, &model, &bias_ids);
     let gate_grads = GradientsParams::from_params(&mut grads, &model, &gate_ids);
@@ -765,6 +785,7 @@ pub fn step_physics(
     let model = optim_b.step(lr, model, bias_grads);
     // Stiffness-accelerated gate LR; empty gate_grads (use_piratenet=false) makes this a no-op.
     let model = optim_gate.step(lr * alpha_lr_mult, model, gate_grads);
+    let timing = timer.finish(device);
 
     let proxy_ratio = (e_scalar + eq_scalar + const_scalar)
         / (n_scalar + h_scalar + d_scalar + w_scalar + 1e-8);
@@ -777,6 +798,7 @@ pub fn step_physics(
         optimizer_tier: tier_u8,
         cosine_sim: None,
         lam_by_name: None,
+        timing,
     })
 }
 
@@ -1114,6 +1136,10 @@ pub fn step_physics_multi(
         optimizer_tier: tier_u8,
         cosine_sim: None,
         lam_by_name: Some(lam_by_name),
+        // step_physics_multi is not instrumented in this pass - see CLAUDE.md's Phase 2
+        // note for why this was kept a separate, smaller slice rather than doing both
+        // functions in one edit.
+        timing: None,
     })
 }
 
@@ -4348,6 +4374,7 @@ mod tests {
             optimizer_tier: 0,
             cosine_sim: None,
             lam_by_name: None,
+            timing: None,
         })
     }
 
@@ -6049,6 +6076,36 @@ mod tests {
         close(out_on.lam_e as f32, out_off.lam_e as f32, "lam_e");
         close(out_on.lam_h as f32, out_off.lam_h as f32, "lam_h");
         close(out_on.lam_d as f32, out_off.lam_d as f32, "lam_d");
+    }
+
+    /// Hardware-adaptive-execution epic, Phase 2: enabling `diagnostics.enabled` must be
+    /// numerically inert (it only inserts device-sync + `Instant::now()` calls, never touches
+    /// a tensor value) while actually populating `StepOutput.timing`. The regression-safety
+    /// half of this test matters as much as the population half — this is exactly the class
+    /// of "opt-in flag that turns out to perturb the frozen path" bug this codebase has hit
+    /// before (see `use_piratenet_compute_skip`'s own history above).
+    #[test]
+    fn step_physics_diagnostics_enabled_matches_disabled_and_populates_timing() {
+        let (config_off, engine, owned, device) = compute_skip_test_fixture(false);
+        assert!(!config_off.diagnostics.enabled, "fixture default must be diagnostics-disabled");
+        let mut config_on = config_off.clone();
+        config_on.diagnostics.enabled = true;
+
+        let seed = compute_skip_seed_model(&engine, &config_off, &device);
+        let (_m_off, out_off) = run_compute_skip_step(&config_off, &engine, &owned, &device, seed.clone());
+        let (_m_on, out_on) = run_compute_skip_step(&config_on, &engine, &owned, &device, seed);
+
+        assert_eq!(out_off.timing, None, "diagnostics disabled by default must produce no timing");
+        let timing = out_on.timing.expect("diagnostics enabled must populate timing");
+        assert!(
+            timing.forward_us > 0 || timing.backward_us > 0 || timing.optimizer_us > 0,
+            "at least one stage must show nonzero wall time: {timing:?}"
+        );
+
+        assert_eq!(out_on.total_scalar, out_off.total_scalar, "enabling diagnostics must not change total_scalar");
+        assert_eq!(out_on.e_scalar, out_off.e_scalar, "enabling diagnostics must not change e_scalar");
+        assert_eq!(out_on.lam_e, out_off.lam_e, "enabling diagnostics must not change lam_e");
+        assert_eq!(out_on.lam_h, out_off.lam_h, "enabling diagnostics must not change lam_h");
     }
 
     /// Proves the two enforcement points (`forward_masked`'s structural forward-skip and

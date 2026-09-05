@@ -452,6 +452,7 @@ pub fn run_training(
                 optimizer_tier: OptimizerTier::Converge.as_u8(),
                 cosine_sim: None,
                 lam_by_name: None,
+                timing: None,
             };
             (new_m, synthetic)
         } else {
