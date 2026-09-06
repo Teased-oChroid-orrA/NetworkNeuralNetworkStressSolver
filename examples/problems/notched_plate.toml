@@ -1,0 +1,44 @@
+# Example user-defined problem: a rectangular plate with two holes — one traction-free,
+# one fixed (zero-displacement) — under uniaxial far-field tension.
+#
+# Run with: cargo run -p pinn-app --release -- --headless --problem-spec examples/problems/notched_plate.toml
+#
+# All lengths in meters [m], all stresses/moduli in pascals [Pa] (this codebase's internal
+# SI convention — see pinn-core/src/units.rs for inch/ksi conversion constants if you'd
+# rather compute these by hand from US Customary values).
+
+[geometry]
+half_w = 0.10   # plate half-width  -> full width  = 0.20 m (~7.9 in)
+half_h = 0.05   # plate half-height -> full height = 0.10 m (~3.9 in)
+thickness = 0.005 # 5 mm (~0.2 in)
+
+[[geometry.holes]]
+center = [-0.03, 0.0]
+radius = 0.01           # 10 mm
+bc = "Free"             # traction-free hole boundary
+
+[[geometry.holes]]
+center = [0.03, 0.0]
+radius = 0.008          # 8 mm
+bc = "Fixed"            # zero-displacement (soft penalty) hole boundary
+
+[material]
+e = 71.7e9              # Young's modulus, Al 7075-T6 (~10.4 Msi)
+nu = 0.33
+density = 2810.0        # kg/m^3
+ultimate_strength_pa = 503e6
+
+[load]
+px = 6.9e7              # far-field traction in x, ~10 ksi
+py = 0.0
+
+[network]
+hidden_dim = 64
+n_hidden = 3
+
+[training]
+max_steps = 2000
+n_interior = 2048
+n_boundary = 512
+fd_h = 1e-3
+lr = 1e-3

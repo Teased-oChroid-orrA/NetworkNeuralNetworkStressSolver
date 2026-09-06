@@ -24,6 +24,10 @@ crossbeam-channel = "0.5"
 # ndarray-backend feature is active) already uses internally. Already resolved
 # transitively via burn/wgpu/image regardless - this adds no new supply-chain surface.
 rayon             = "1"
+# User-defined-problem-ingestion feature: TOML is the on-disk format for a user-authored
+# ProblemSpec (pinn-core::problem_spec) - a small, pure-Rust, zero-unsafe parser with no
+# further transitive dependencies of its own beyond serde (already a workspace dependency).
+toml              = "0.8"
 
 [profile.release]
 opt-level     = 3

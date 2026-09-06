@@ -198,7 +198,38 @@ fn parse_problem_arg() -> ProblemKind {
     ProblemKind::Kirsch
 }
 
+/// Parse `--problem-spec <path>` from argv — a user-defined-problem TOML file (see
+/// `pinn_core::problem_spec::ProblemSpec`). `None` if absent, the existing, unaffected
+/// default behavior (falls through to `parse_problem_arg`'s hardcoded Kirsch/pin-lug
+/// dispatch).
+fn parse_problem_spec_arg() -> Option<String> {
+    let args: Vec<String> = env::args().collect();
+    for i in 0..args.len() {
+        if args[i] == "--problem-spec" {
+            return args.get(i + 1).cloned();
+        }
+    }
+    None
+}
+
 fn main() -> anyhow::Result<()> {
+    // User-defined-problem ingestion: checked BEFORE any Kirsch/pin-lug dispatch below, so
+    // that dispatch (and pinn.env loading, which is irrelevant to a self-contained spec
+    // file) is completely untouched when this flag is absent — the "default to the
+    // already-defined hardcoded problems" behavior this feature was required to preserve.
+    if let Some(spec_path) = parse_problem_spec_arg() {
+        let spec_str = std::fs::read_to_string(&spec_path)
+            .map_err(|e| anyhow::anyhow!("failed to read --problem-spec file '{spec_path}': {e}"))?;
+        let spec: pinn_core::problem_spec::ProblemSpec = toml::from_str(&spec_str)
+            .map_err(|e| anyhow::anyhow!("failed to parse --problem-spec TOML '{spec_path}': {e}"))?;
+        let ok = pinn_solver::user_runner::run_headless_user_problem(spec);
+        return if ok {
+            Ok(())
+        } else {
+            anyhow::bail!("user-defined problem training ended with a non-finite loss")
+        };
+    }
+
     let env_path_str = env::var("PINN_ENV").unwrap_or_else(|_| "pinn.env".to_string());
     let env_map = load_pinn_env(Path::new(&env_path_str));
 

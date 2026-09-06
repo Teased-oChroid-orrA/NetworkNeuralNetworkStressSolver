@@ -20,6 +20,8 @@ pub mod signorini;
 pub mod stiffness;
 pub mod toy_beam;
 pub mod training_core;
+pub mod user_problem;
+pub mod user_runner;
 
 pub use runner::{run_training, run_training_pinlug};
 pub use headless::{run_headless, run_headless_pinlug};

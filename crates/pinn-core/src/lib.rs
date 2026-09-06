@@ -5,9 +5,11 @@ pub mod loading;
 pub mod material;
 pub mod messages;
 pub mod problem;
+pub mod problem_spec;
 pub mod sampling;
 pub mod state;
 pub mod units;
+pub mod user_geometry;
 
 pub use geometry::{GeometryConfig, HoleType, SymmetryMode};
 pub use kirsch::{kirsch_stress, stress_concentration_factor};
