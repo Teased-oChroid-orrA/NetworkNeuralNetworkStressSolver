@@ -1,9 +1,21 @@
 use egui::Ui;
 use pinn_core::{
     messages::{ProblemKind, SolverConfig},
+    problem_spec::ProblemSpec,
     units::{IN_TO_M, KSI_TO_PA, MSI_TO_PA},
     FieldType, SolverStatus, TrainingState,
 };
+
+/// Bundles the user-defined-problem UI's mutable state — kept as one parameter rather than
+/// 4 more loose ones, since (unlike `problem_kind`) none of this lives in `pinn_core` (see
+/// CLAUDE.md's "User-defined problem ingestion" section for why `ProblemKind` itself stays
+/// untouched).
+pub struct UserProblemUi<'a> {
+    pub active: &'a mut bool,
+    pub spec_path: &'a mut String,
+    pub spec: &'a mut Option<ProblemSpec>,
+    pub error: &'a mut Option<String>,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -17,6 +29,7 @@ pub fn show(
     on_warm_start: &mut bool,
     on_stop: &mut bool,
     on_export: &mut bool,
+    user: &mut UserProblemUi,
 ) {
     ui.heading("PINN Stress Solver");
     ui.separator();
@@ -26,14 +39,60 @@ pub fn show(
         ui.label("Problem:");
         if ui.radio_value(problem_kind, ProblemKind::Kirsch, "Kirsch").changed() {
             *config = SolverConfig::default_kirsch();
+            *user.active = false;
         }
         if ui.radio_value(problem_kind, ProblemKind::PinLug, "Pin-in-Lug").changed() {
             *config = SolverConfig::default_pinlug();
+            *user.active = false;
+        }
+        if ui.radio(*user.active, "User-Defined").clicked() {
+            *user.active = true;
         }
     });
 
     ui.separator();
 
+    if *user.active {
+        egui::CollapsingHeader::new("User-Defined Problem").default_open(true).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Spec path:");
+                ui.text_edit_singleline(user.spec_path);
+            });
+            if ui.button("Load").clicked() {
+                match std::fs::read_to_string(user.spec_path.as_str()) {
+                    Ok(contents) => match toml::from_str::<ProblemSpec>(&contents) {
+                        Ok(spec) => {
+                            *user.spec = Some(spec);
+                            *user.error = None;
+                        }
+                        Err(e) => *user.error = Some(format!("parse error: {e}")),
+                    },
+                    Err(e) => *user.error = Some(format!("read error: {e}")),
+                }
+            }
+            if let Some(err) = user.error.as_deref() {
+                ui.colored_label(egui::Color32::from_rgb(248, 113, 113), err);
+            }
+            if let Some(spec) = user.spec.as_ref() {
+                ui.separator();
+                ui.label(format!(
+                    "Plate: {:.4}×{:.4} m", 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h
+                ));
+                ui.label(format!("Holes: {}", spec.geometry.holes.len()));
+                for (i, h) in spec.geometry.holes.iter().enumerate() {
+                    ui.label(format!(
+                        "  #{i}: r={:.4} m @ ({:.3}, {:.3})  [{:?}]",
+                        h.radius, h.center[0], h.center[1], h.bc
+                    ));
+                }
+                ui.label(format!("Material E = {:.3e} Pa,  ν = {:.3}", spec.material.e, spec.material.nu));
+                ui.label(format!("Load Px = {:.3e} Pa,  Py = {:.3e} Pa", spec.load.px, spec.load.py));
+                ui.label(format!("Steps: {}   Interior: {}", spec.training.max_steps, spec.training.n_interior));
+            }
+        });
+
+        ui.separator();
+    } else {
     match problem_kind {
         ProblemKind::Kirsch => {
             // ── Material ───────────────────────────────────────
@@ -146,6 +205,7 @@ pub fn show(
             });
         }
     }
+    } // end `if *user.active { ... } else { <existing match> }`
 
     ui.separator();
 
@@ -186,15 +246,19 @@ pub fn show(
             ui.label(format!("LR: {:.2e}", last));
         }
         ui.label(format!("Colloc pts: {}", state.n_colloc));
-        match problem_kind {
-            ProblemKind::Kirsch => {
-                if let Some(kt) = state.kt_estimate {
-                    ui.label(format!("K_t = {:.3}  (theory: 3.000)", kt));
+        // No closed-form convergence metric exists for an arbitrary user-defined geometry
+        // (unlike Kirsch's K_t or pin-lug's interface-gap RMS) — nothing to show here.
+        if !*user.active {
+            match problem_kind {
+                ProblemKind::Kirsch => {
+                    if let Some(kt) = state.kt_estimate {
+                        ui.label(format!("K_t = {:.3}  (theory: 3.000)", kt));
+                    }
                 }
-            }
-            ProblemKind::PinLug => {
-                if let Some(metric) = state.convergence_metric {
-                    ui.label(format!("Interface gap RMS = {:.3e} m (target: 0)", metric));
+                ProblemKind::PinLug => {
+                    if let Some(metric) = state.convergence_metric {
+                        ui.label(format!("Interface gap RMS = {:.3e} m (target: 0)", metric));
+                    }
                 }
             }
         }
@@ -220,7 +284,8 @@ pub fn show(
     // ── Buttons ────────────────────────────────────────────
     ui.horizontal(|ui| {
         let running = state.status == SolverStatus::Running;
-        if ui.add_enabled(!running, egui::Button::new("▶ Solve")).clicked() {
+        let can_solve = !running && (!*user.active || user.spec.is_some());
+        if ui.add_enabled(can_solve, egui::Button::new("▶ Solve")).clicked() {
             *on_solve = true;
         }
         if ui.add_enabled(running, egui::Button::new("⏹ Stop")).clicked() {
@@ -231,14 +296,18 @@ pub fn show(
     // Pin-lug's `run_training_pinlug` only honors scalar config fields on `WarmStart`
     // (no full two-domain resample in this slice) — disable the warm-start trigger
     // entirely for PinLug rather than silently pretending full warm-start works.
-    let can_warm = *problem_kind == ProblemKind::Kirsch
+    // `run_training_user_problem` accepts but ignores `WarmStart` entirely (a loaded
+    // `ProblemSpec` isn't a `SolverConfig` there's anything scalar to warm-start into) —
+    // same disabled treatment.
+    let can_warm = !*user.active
+        && *problem_kind == ProblemKind::Kirsch
         && state.step > 0
         && state.status != SolverStatus::Running;
     if ui.add_enabled(can_warm, egui::Button::new("⚡ Warm-Start")).clicked() {
         *on_warm_start = true;
     }
 
-    if *problem_kind == ProblemKind::PinLug {
+    if !*user.active && *problem_kind == ProblemKind::PinLug {
         let can_export = state.step > 0;
         if ui.add_enabled(can_export, egui::Button::new("Export Contact Pressure CSV")).clicked() {
             *on_export = true;

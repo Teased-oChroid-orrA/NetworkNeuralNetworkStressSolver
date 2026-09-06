@@ -7,6 +7,7 @@ use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use egui::TextureHandle;
 use pinn_core::{
     messages::{ControlMsg, ProblemKind, SolverConfig, TrainingMsg},
+    problem_spec::ProblemSpec,
     FieldType, SolverStatus, TrainingState,
 };
 
@@ -16,6 +17,17 @@ pub struct StressSolverApp {
     config: SolverConfig,
     state:  Arc<Mutex<TrainingState>>,
     problem_kind: ProblemKind,
+
+    // User-defined-problem state — deliberately NOT folded into `problem_kind`
+    // (`pinn_core::messages::ProblemKind` stays untouched; see CLAUDE.md's "User-defined
+    // problem ingestion" section for why). `user_defined_active` is the 3rd radio option's
+    // selection flag; when true, it overrides `problem_kind`-driven dispatch everywhere
+    // below (`start_solver`, the heatmap's hole overlay) without changing any of the
+    // existing Kirsch/pin-lug code paths.
+    user_defined_active: bool,
+    user_spec_path: String,
+    user_spec: Option<ProblemSpec>,
+    user_spec_error: Option<String>,
 
     // Channels
     tx_control: Option<Sender<ControlMsg>>,
@@ -53,6 +65,10 @@ impl StressSolverApp {
             config,
             state,
             problem_kind,
+            user_defined_active: false,
+            user_spec_path: String::new(),
+            user_spec: None,
+            user_spec_error: None,
             tx_control:    None,
             rx_training:   None,
             selected_field: FieldType::VonMises,
@@ -83,6 +99,25 @@ impl StressSolverApp {
         self.prev_geo_hash = config.geometry.geometry_hash();
 
         let problem_kind = self.problem_kind;
+        if self.user_defined_active {
+            let spec = match self.user_spec.clone() {
+                Some(s) => s,
+                None => {
+                    let mut s = state.lock().expect("state mutex poisoned");
+                    s.status = SolverStatus::Error;
+                    s.error_msg = Some("No user-defined problem loaded — click Load first".to_string());
+                    return;
+                }
+            };
+            thread::Builder::new()
+                .name("pinn-solver".into())
+                .spawn(move || {
+                    pinn_solver::runner::run_training_user_problem(spec, tx_train, rx_ctrl);
+                })
+                .expect("failed to spawn solver thread");
+            return;
+        }
+
         thread::Builder::new()
             .name("pinn-solver".into())
             .spawn(move || match problem_kind {
@@ -255,6 +290,12 @@ impl eframe::App for StressSolverApp {
         let prev_problem_kind = self.problem_kind;
 
         // ── Left panel: parameters ──────────────────────────────
+        let mut user_ui = panels::params::UserProblemUi {
+            active: &mut self.user_defined_active,
+            spec_path: &mut self.user_spec_path,
+            spec: &mut self.user_spec,
+            error: &mut self.user_spec_error,
+        };
         egui::SidePanel::left("params_panel")
             .min_width(220.0)
             .max_width(280.0)
@@ -271,12 +312,15 @@ impl eframe::App for StressSolverApp {
                         &mut on_warm_start,
                         &mut on_stop,
                         &mut on_export,
+                        &mut user_ui,
                     );
                 });
             });
 
-        // Problem kind flipped this frame — swap in the matching default config.
-        if self.problem_kind != prev_problem_kind {
+        // Problem kind flipped this frame — swap in the matching default config. Only
+        // relevant when the user-defined radio isn't active (its own "Load" button is the
+        // equivalent trigger for that mode, handled inside `params::show` itself).
+        if !self.user_defined_active && self.problem_kind != prev_problem_kind {
             self.config = match self.problem_kind {
                 ProblemKind::Kirsch => SolverConfig::default_kirsch(),
                 ProblemKind::PinLug => SolverConfig::default_pinlug(),
@@ -284,17 +328,38 @@ impl eframe::App for StressSolverApp {
         }
 
         // ── Right panel: stress heatmap ─────────────────────────
+        // In user-defined mode, `state_snap`'s vis fields (`von_mises`/etc.) are populated
+        // by the SAME `TrainingMsg::Update` arm Kirsch uses (see CLAUDE.md's ingestion
+        // section — this problem is single-domain, so it reuses `TrainingUpdate`/
+        // `select_field`'s existing `ProblemKind::Kirsch` branch verbatim); only the hole
+        // overlay differs, via `user_holes` below. `heatmap_config` swaps in a placeholder
+        // `SolverConfig` whose geometry matches the loaded spec's real bounding box (so the
+        // grid/border draw correctly), leaving `self.config` itself untouched.
+        let heatmap_config = if self.user_defined_active {
+            self.user_spec.as_ref().map(|spec| {
+                let mut c = SolverConfig::default_kirsch();
+                c.geometry = spec.geometry.to_placeholder();
+                c
+            })
+        } else {
+            None
+        };
+        let heatmap_config = heatmap_config.as_ref().unwrap_or(&self.config);
+        let heatmap_problem_kind = if self.user_defined_active { ProblemKind::Kirsch } else { self.problem_kind };
+        let user_holes = self.user_spec.as_ref().map(|s| s.geometry.holes.as_slice());
+
         egui::SidePanel::right("heatmap_panel")
             .min_width(300.0)
             .show(ctx, |ui| {
                 panels::heatmap::show(
                     ui,
                     &state_snap,
-                    &self.config,
-                    self.problem_kind,
+                    heatmap_config,
+                    heatmap_problem_kind,
                     self.selected_field,
                     &mut self.texture,
                     &mut self.colorbar_range,
+                    if self.user_defined_active { user_holes } else { None },
                 );
             });
 

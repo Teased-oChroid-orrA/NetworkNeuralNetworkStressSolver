@@ -9,6 +9,7 @@ use ndarray::Array2;
 use pinn_core::{
     amr::AdaptiveGrid,
     messages::{ControlMsg, SolverConfig, TrainingMsg, TrainingUpdate, VisFields},
+    problem_spec::ProblemSpec,
     sampling::{sample_boundary, sample_interior, sample_eq_ring},
 };
 
@@ -849,6 +850,145 @@ pub fn run_training_pinlug(
     }
 
     let _ = last_total;
+    let _ = tx.send(TrainingMsg::Done);
+}
+
+/// GUI-facing runner for a [`crate::user_problem::UserDefinedProblem`] — streams the same
+/// `TrainingMsg::Update(Box<TrainingUpdate>)` variant `run_training` sends (not a new
+/// variant, and not `PinLugUpdate`), since `TrainingUpdate`'s fields are already generic
+/// enough (see `energy_loss`/`neumann_loss`'s role-based names, not Kirsch-specific ones) and
+/// this problem is single-domain like Kirsch, not two-domain like pin-lug.
+///
+/// `neumann_loss = out.total_scalar - out.e_scalar` mirrors `run_training_pinlug`'s own
+/// exact convention (`let neumann_loss = out.total_scalar - energy_loss;`) for aggregating
+/// an arbitrary number of differently-named BC terms into one number, without needing this
+/// problem's own term names (`outer_traction`/`hole_free`/`hole_fixed`) to match any of
+/// `StepOutput`'s hardcoded per-name accessors. `out.e_scalar` DOES already match directly —
+/// this problem's energy term is named `"interior_energy"`, the same name `StepOutput::
+/// e_scalar` looks up for every problem.
+///
+/// Deliberately no curriculum/decision-maker/AMR (matches `user_runner::
+/// run_headless_user_problem`'s same v1 scope cut) — plain constant/scheduled-LR AdamW via
+/// `step_physics_multi`, `WarmStart` control messages are accepted but ignored (a loaded
+/// `ProblemSpec` isn't a `SolverConfig` there is anything scalar to warm-start into).
+pub fn run_training_user_problem(
+    spec: ProblemSpec,
+    tx: Sender<TrainingMsg>,
+    stop_rx: Receiver<ControlMsg>,
+) {
+    use crate::problem::{
+        BoundaryValueProblem, DomainOptim, DomainStepCtx, DomainStepData, MultiStepCtx, PointSetData,
+    };
+    use crate::training_core::step_physics_multi;
+    use crate::user_problem::{evaluate_user_vis_grid, UserDefinedProblem, USER_DOMAIN};
+
+    let device = BDevice::default();
+    let half_w = spec.geometry.half_w;
+    let half_h = spec.geometry.half_h;
+
+    let problem = UserDefinedProblem::new(spec.clone());
+    validate_loss_terms(&problem);
+
+    let mut config = SolverConfig::default_kirsch();
+    config.load = spec.load;
+
+    let net_cfg = ElasticityNetConfig::new()
+        .with_input_dim(3)
+        .with_hidden_dim(spec.network.hidden_dim)
+        .with_n_hidden(spec.network.n_hidden)
+        .with_output_dim(5); // mDEM: u, v, sigma_xx, sigma_yy, sigma_xy
+    let mut model = net_cfg.init(&device);
+    let mut optim = DomainOptim {
+        weight: WeightOptim::new(config.use_soap_muon),
+        bias: make_bias_optim(),
+        gate: make_gate_optim(),
+    };
+
+    let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+    let mut saw = SawBrdr::with_base(base_weights, 0.95);
+    let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+
+    let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
+    let u_ref = ((stress_ref / spec.material.e) * half_w) as f32;
+    let ref_energy = (0.5 * stress_ref * stress_ref / spec.material.e).max(1.0) as f32;
+    let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
+
+    let placeholder_geom = pinn_core::geometry::GeometryConfig::kirsch_plate_inches(); // ignored by UserSamplingStrategy
+    let [nx_vis, ny_vis] = config.vis_grid;
+
+    for step in 0..spec.training.max_steps {
+        match handle_control_messages(&stop_rx) {
+            ControlAction::StopAndFinish => break,
+            ControlAction::StopImmediately => return,
+            ControlAction::WarmStart { .. } => {} // no-op: see this function's doc comment
+            ControlAction::Continue => {}
+        }
+
+        let sampling = problem.sampling_strategy(0);
+        let int_pts = sampling.sample_interior(&placeholder_geom, spec.training.n_interior);
+        let bnd_pts = sampling.sample_boundary(&placeholder_geom, &spec.load, spec.training.n_boundary);
+        let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / half_w) as f32, (y / half_h) as f32] };
+        let int_norm: Vec<[f32; 2]> = int_pts.iter().map(|&[x, y]| norm_pt(x, y)).collect();
+        let to_pointset = |pts: &[pinn_core::loading::BoundaryPoint]| -> PointSetData {
+            PointSetData {
+                norm: pts.iter().map(|p| norm_pt(p.x, p.y)).collect(),
+                nx: pts.iter().map(|p| p.nx as f32).collect(),
+                ny: pts.iter().map(|p| p.ny as f32).collect(),
+                tx: pts.iter().map(|p| p.tx as f32).collect(),
+                ty: pts.iter().map(|p| p.ty as f32).collect(),
+            }
+        };
+
+        let mut named = HashMap::with_capacity(1 + spec.geometry.holes.len());
+        named.insert("outer_boundary", to_pointset(&bnd_pts));
+        for set in sampling.named_point_sets(&[]) {
+            named.insert(set.name, to_pointset(&set.points));
+        }
+
+        let data = DomainStepData { id: USER_DOMAIN, int_norm, extra_ring_norm: Vec::new(), named };
+        let ctx = MultiStepCtx {
+            config: &config,
+            problem: &problem,
+            fd: &fd,
+            k: 1.0, // IdentityAnsatz ignores k entirely
+            domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
+            dynamic_lam_h_cap: f64::MAX,
+            dynamic_lam_d_cap: f64::MAX,
+            dynamic_lam_penetration_cap: f64::MAX,
+            dynamic_lam_non_tension_cap: f64::MAX,
+            phase2_active: true,
+            step,
+        };
+
+        let (new_model, out) = step_physics_multi(
+            vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, &device,
+            0, 1.0, 1.0,
+        );
+        model = new_model.into_iter().next().unwrap();
+
+        if step % 10 == 0 || step + 1 == spec.training.max_steps {
+            let model_val: ElasticityNet<BInner> = model.valid();
+            let vis = evaluate_user_vis_grid(&model_val, &spec.geometry, [nx_vis, ny_vis], u_ref, spec.load.px, &device);
+
+            let energy_loss = out.e_scalar;
+            let neumann_loss = out.total_scalar - energy_loss;
+            let update = TrainingUpdate {
+                step,
+                total_loss: out.total_scalar,
+                energy_loss,
+                neumann_loss,
+                lr: out.lr as f32,
+                lam_energy: out.lam_e as f32,
+                lam_neumann: 0.0, // no single generic BC lambda exists for an arbitrary term set
+                n_colloc: spec.training.n_interior,
+                kt_estimate: None,
+                vis: Some(vis),
+            };
+            let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
+        }
+    }
+
     let _ = tx.send(TrainingMsg::Done);
 }
 

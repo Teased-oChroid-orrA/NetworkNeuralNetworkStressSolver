@@ -474,3 +474,55 @@ is real elasticity, not noise. Confirmed the no-flag default (`--headless`, no
 `--problem-spec`) still produces byte-for-byte the same Kirsch banner/output as before this
 feature. Full workspace suite: 229 passed, 0 failed, 2 ignored (the pre-existing `toy_beam`
 ignores) — purely additive, zero regressions.
+
+## GUI wiring for user-defined problems + redesigned training panel
+
+`pinn-gui` now supports a third, GUI-driven mode for the same `ProblemSpec`/
+`UserDefinedProblem` path above: a "User-Defined" radio option in `params.rs` with a spec
+path field + "Load" button, streaming live progress via a new `runner::
+run_training_user_problem` into the heatmap/training panels.
+
+**Deliberately did NOT add a variant to `pinn_core::messages::ProblemKind`.** Doing so would
+ripple required-arm additions through every exhaustive match on it in the frozen Kirsch/
+pin-lug paths for no benefit. Instead `pinn-gui`'s own `StressSolverApp` gained separate
+fields (`user_defined_active: bool`, `user_spec_path/spec/error`) that override
+`problem_kind`-driven dispatch only where needed — every existing `match problem_kind {
+Kirsch, PinLug }` site is byte-for-byte unchanged.
+
+**`run_training_user_problem` reuses `TrainingMsg::Update(Box<TrainingUpdate>)` — not a new
+message variant.** `TrainingUpdate`'s fields are already generically named (`energy_loss`/
+`neumann_loss`, not Kirsch-specific names), and this problem is single-domain like Kirsch,
+not two-domain like pin-lug. `energy_loss = out.e_scalar` (this problem's energy term is
+literally named `"interior_energy"`, matching `StepOutput::e_scalar`'s lookup for every
+problem); `neumann_loss = out.total_scalar - out.e_scalar`, mirroring `run_training_pinlug`'s
+own exact convention for aggregating an arbitrary number of differently-named BC terms into
+one number without needing this problem's own term names to match any hardcoded accessor.
+
+**`evaluate_user_vis_grid`** (`user_problem.rs`) mirrors `runner.rs`'s private
+`evaluate_vis_grid_mdem` (same mDEM direct-column read — no FD stencil needed for
+visualization — same von Mises formula), adapted for `UserGeometry`'s N-hole containment
+check instead of `GeometryConfig`'s single-hole one.
+
+**Heatmap N-hole overlay**: `heatmap::draw_overlays` gained a `user_holes: Option<&[HoleSpec]>`
+parameter — when `Some`, draws each hole as its own full circle (no `QuarterSymm` assumption)
+color-coded by `HoleBc::Free` (green) / `Fixed` (red), instead of the single-hole Kirsch/
+pin-lug arc. The pixel/texture/colorbar core (`field_to_pixels`, `select_field`) needed zero
+changes — already field-agnostic.
+
+**Training panel redesign** (`training.rs`): added a row of 4 stat cards (total loss, energy
+term, boundary term, learning rate — `egui::Frame` with a colored left accent bar) above the
+existing `egui_plot` curves, restyled to a shared accent palette (teal/blue/amber/violet).
+This panel is shared — Kirsch and pin-lug get the same visual upgrade with zero per-mode
+branching, since it only ever reads `TrainingState`'s already-generic fields. Palette/layout
+were prototyped first as an HTML design-reference artifact (dark "instrument panel" aesthetic)
+before writing any egui code — see the artifact link in that session's conversation; egui's
+real capability (immediate-mode 2D, no CSS effects) means the in-app result approximates that
+reference's palette/layout, not a pixel-perfect port.
+
+Verified: `cargo build --workspace` clean, full suite 229 passed/0 failed/2 ignored (same as
+above — purely additive), release binary launches without crashing. Full interactive
+click-through (load a spec, Start, confirm the heatmap/stat cards update) was NOT
+independently verified end-to-end in this pass — the training math itself was already proven
+correct via the headless path's own verification above, and this GUI runner is a thin
+streaming wrapper around the identical `UserDefinedProblem`/`step_physics_multi` call, but an
+actual mouse-driven session is worth a real check before relying on this heavily.

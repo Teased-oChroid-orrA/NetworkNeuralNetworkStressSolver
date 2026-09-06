@@ -3,6 +3,7 @@ use ndarray::Array2;
 use pinn_core::{
     messages::{ProblemKind, SolverConfig},
     units::{IN_TO_M, KSI_TO_PA},
+    user_geometry::{HoleBc, HoleSpec},
     FieldType, TrainingState,
 };
 
@@ -53,6 +54,7 @@ pub fn show(
     selected_field: FieldType,
     texture: &mut Option<TextureHandle>,
     colorbar_range: &mut (f32, f32),
+    user_holes: Option<&[HoleSpec]>,
 ) {
     ui.heading("Stress Field");
     ui.separator();
@@ -112,7 +114,7 @@ pub fn show(
 
     // Draw hole boundary and domain grid overlay.
     if let Some(rect) = img_rect {
-        draw_overlays(ui, rect, config, [nx, ny]);
+        draw_overlays(ui, rect, config, [nx, ny], user_holes);
     }
 
     ui.separator();
@@ -153,12 +155,16 @@ pub fn show(
     });
 }
 
-/// Draw hole boundary circle and a faint measurement grid over the heatmap.
+/// Draw hole boundary circle(s) and a faint measurement grid over the heatmap. When
+/// `user_holes` is `Some`, draws each hole as its own full circle (no `QuarterSymm`
+/// assumption — user-defined geometry has no symmetry concept), color-coded by
+/// `HoleBc::Free`/`Fixed`, instead of the single-hole Kirsch/pin-lug arc below.
 fn draw_overlays(
     ui: &Ui,
     rect: egui::Rect,
     config: &SolverConfig,
     [nx, ny]: [usize; 2],
+    user_holes: Option<&[HoleSpec]>,
 ) {
     use pinn_core::geometry::HoleType;
 
@@ -208,7 +214,24 @@ fn draw_overlays(
     // ── Domain boundary (white border) ───────────────────────────────────
     painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
 
-    // ── Hole boundary circle arc ──────────────────────────────────────────
+    // ── User-defined N-hole overlay ───────────────────────────────────────
+    if let Some(holes) = user_holes {
+        for hole in holes {
+            let r = hole.radius as f32;
+            let center = to_screen(hole.center[0] as f32, hole.center[1] as f32);
+            let r_px_x = r / dom_w * rect.width();
+            let r_px_y = r / dom_h * rect.height();
+            let r_px = (r_px_x + r_px_y) * 0.5;
+            let color = match hole.bc {
+                HoleBc::Free  => egui::Color32::from_rgb(74, 222, 128),  // matches design ref
+                HoleBc::Fixed => egui::Color32::from_rgb(248, 113, 113),
+            };
+            painter.circle_stroke(center, r_px, egui::Stroke::new(2.0, color));
+        }
+    }
+
+    // ── Hole boundary circle arc (Kirsch/pin-lug single-hole path — no-op here since the
+    // user-defined geometry's placeholder `GeometryConfig` always carries `HoleType::None`) ──
     if let HoleType::Circular { radius } = config.geometry.hole {
         let r = radius as f32;
         let center = to_screen(x0 as f32, y0 as f32); // hole at domain origin (0,0)

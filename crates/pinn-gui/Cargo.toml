@@ -12,3 +12,4 @@ egui_plot         = { workspace = true }
 crossbeam-channel = { workspace = true }
 ndarray           = { workspace = true }
 anyhow            = { workspace = true }
+toml              = { workspace = true }

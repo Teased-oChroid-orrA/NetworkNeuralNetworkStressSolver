@@ -309,6 +309,93 @@ impl BoundaryValueProblem for UserDefinedProblem {
     fn convergence_target(&self) -> f64 { 0.0 }
 }
 
+/// Builds a `VisFields` for GUI display by evaluating `model` once over a
+/// `[nx,ny]`-shaped normalized grid masked by `geometry.contains` — mirrors `runner.rs`'s
+/// private `evaluate_vis_grid_mdem` (same mDEM direct-column read, same von Mises formula),
+/// adapted for `UserGeometry`'s N-hole containment check instead of `GeometryConfig`'s
+/// single-hole one. No FD stencil needed: mDEM's `sigma_xx`/`sigma_yy`/`sigma_xy` are direct
+/// network output columns, not derived from strain.
+pub fn evaluate_user_vis_grid(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    geometry: &UserGeometry,
+    [nx, ny]: [usize; 2],
+    u_ref: f32,
+    px_pa: f64,
+    device: &crate::training_core::BDevice,
+) -> pinn_core::messages::VisFields {
+    use crate::network::fwd;
+    use crate::fd_stencil::norm_pts_to_tensor;
+    use crate::training_core::BInner;
+    use ndarray::Array2;
+
+    let n_total = nx * ny;
+    let mut pts = Vec::with_capacity(n_total);
+    let mut mask = Vec::with_capacity(n_total);
+    for iy in 0..ny {
+        for ix in 0..nx {
+            let xn = -1.0 + 2.0 * ix as f64 / (nx.max(2) - 1) as f64;
+            let yn = -1.0 + 2.0 * iy as f64 / (ny.max(2) - 1) as f64;
+            pts.push([xn as f32, yn as f32]);
+            let (xp, yp) = (xn * geometry.half_w, yn * geometry.half_h);
+            mask.push(geometry.contains(xp, yp));
+        }
+    }
+
+    let mut s_vm = vec![f32::NAN; n_total];
+    let mut s_xx = vec![f32::NAN; n_total];
+    let mut s_yy = vec![f32::NAN; n_total];
+    let mut s_xy = vec![f32::NAN; n_total];
+    let mut d_u = vec![f32::NAN; n_total];
+    let mut d_v = vec![f32::NAN; n_total];
+
+    let make_vis = |vm: Vec<f32>, sxx: Vec<f32>, syy: Vec<f32>, sxy: Vec<f32>, u: Vec<f32>, v: Vec<f32>| {
+        let a = |v: Vec<f32>| Array2::from_shape_vec((ny, nx), v).expect("shape mismatch");
+        pinn_core::messages::VisFields {
+            von_mises: a(vm), sigma_xx: a(sxx), sigma_yy: a(syy), sigma_xy: a(sxy),
+            disp_u: a(u), disp_v: a(v),
+        }
+    };
+
+    let active: Vec<usize> = mask.iter().enumerate().filter(|(_, &m)| m).map(|(i, _)| i).collect();
+    if active.is_empty() {
+        return make_vis(s_vm, s_xx, s_yy, s_xy, d_u, d_v);
+    }
+
+    let active_pts: Vec<[f32; 2]> = active.iter().map(|&i| pts[i]).collect();
+    let n_act = active_pts.len();
+    let pts_t = norm_pts_to_tensor::<BInner>(&active_pts, device);
+    let raw = fwd::<BInner>(model, pts_t, 0, device);
+
+    let u_col = raw.clone().slice([0..n_act, 0..1]).reshape([n_act]);
+    let v_col = raw.clone().slice([0..n_act, 1..2]).reshape([n_act]);
+    let sxx_col = raw.clone().slice([0..n_act, 2..3]).reshape([n_act]);
+    let syy_col = raw.clone().slice([0..n_act, 3..4]).reshape([n_act]);
+    let sxy_col = raw.slice([0..n_act, 4..5]).reshape([n_act]);
+    let batched: Vec<f32> = Tensor::cat(vec![u_col, v_col, sxx_col, syy_col, sxy_col], 0)
+        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; 5 * n_act]);
+    let u_vals = &batched[..n_act];
+    let v_vals = &batched[n_act..2 * n_act];
+    let sxx_vals = &batched[2 * n_act..3 * n_act];
+    let syy_vals = &batched[3 * n_act..4 * n_act];
+    let sxy_vals = &batched[4 * n_act..5 * n_act];
+
+    for (i_act, &i_full) in active.iter().enumerate() {
+        let u = u_vals[i_act] * u_ref;
+        let v = v_vals[i_act] * u_ref;
+        let sxx = sxx_vals[i_act] as f64 * px_pa;
+        let syy = syy_vals[i_act] as f64 * px_pa;
+        let sxy = sxy_vals[i_act] as f64 * px_pa;
+        let vm = (sxx * sxx - sxx * syy + syy * syy + 3.0 * sxy * sxy).sqrt();
+        s_xx[i_full] = sxx as f32;
+        s_yy[i_full] = syy as f32;
+        s_xy[i_full] = sxy as f32;
+        s_vm[i_full] = vm as f32;
+        d_u[i_full] = u;
+        d_v[i_full] = v;
+    }
+    make_vis(s_vm, s_xx, s_yy, s_xy, d_u, d_v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
