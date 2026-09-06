@@ -20,3 +20,7 @@ ndarray-backend = ["burn/ndarray"]
 [[bench]]
 name = "training_step"
 harness = false
+
+[[bench]]
+name = "resample"
+harness = false

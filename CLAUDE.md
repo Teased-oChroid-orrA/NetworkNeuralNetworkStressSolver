@@ -285,3 +285,32 @@ visible per-step rather than only as a flat aggregate. `headless::run_headless` 
 indented `[diagnostics] forward=...us backward=...us optimizer=...us` line under each printed
 step row when `out.timing` is `Some` - this is the one place the data is actually surfaced to a
 human, not just populated silently into a struct nobody reads.
+
+### Phase 3: measured, then deliberately did NOT add Rayon
+
+Phase 3's own plan gated adding Rayon on Phase 2's profiling actually identifying a bottleneck
+at pin-lug's every-step resample (the one live candidate — `sample_interior`'s RNG-order-
+sensitivity is what makes it risky to parallelize, so it was never going to be worth doing
+without real evidence first). **The measurement said no**: `crates/pinn-solver/benches/
+resample.rs` (criterion, `cargo bench -p pinn-solver --bench resample`) benchmarks pin-lug's
+real per-step resample (`PinLugSamplingStrategy::sample_interior`/`sample_boundary` for both
+domains, at `SolverConfig::default_pinlug()`'s real shipped sizes — n_interior=2048,
+n_boundary=512) at **~21.7us per step** (release profile, 30-sample criterion run). Compare
+against Phase 2's real headless measurement of `step_physics_multi`'s actual tensor-step cost —
+tens of milliseconds even in steady state. Resample is roughly **0.05-0.1% of step cost**.
+
+**Rayon was NOT added.** Parallelizing a ~22-microsecond operation would add thread-
+spawn/synchronization overhead exceeding the work itself, and would introduce the real,
+already-documented RNG-stream-determinism engineering risk (`sample_interior`'s seeded LCG,
+near-hole-guarantee-ring prepend-then-truncate ordering) for zero measured benefit. This is
+exactly the outcome the epic's own acceptance criteria explicitly calls acceptable ("A
+benchmark should be allowed to demonstrate that serial execution is faster... that is an
+acceptable and expected outcome") — Phase 3 is complete as a measurement-and-conclusion phase,
+not a not-yet-implemented one. **Do not add Rayon here without new evidence**: if a future
+change genuinely increases resample cost (much larger `n_interior`, a more expensive rejection
+test, a different problem's sampling strategy), re-run `benches/resample.rs` first and let a
+new real number — not this note's memory of an old one — justify revisiting this.
+
+No code changes to `pinn_solver::execution`/`ExecutionMode` were needed for this conclusion —
+`CpuParallel` remains unimplemented (Phase 1's stub still applies), which is the correct state
+given nothing yet justifies building it.
