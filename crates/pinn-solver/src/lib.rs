@@ -18,6 +18,7 @@ pub mod runner;
 pub mod saw_brdr;
 pub mod signorini;
 pub mod stiffness;
+pub mod toy_beam;
 pub mod training_core;
 
 pub use runner::{run_training, run_training_pinlug};
