@@ -203,7 +203,7 @@ own `PHASE2_ACTIVE` constant, which stays `false`) purely to activate `step_phys
 pre-existing `lug_free_edge_traction`/`lug_shank_anchor` cap-dispatch arms — the two booleans
 are unrelated axes that happen to share a name.
 
-## Hardware-adaptive execution (Phase 1 + 2)
+## Hardware-adaptive execution (Phase 1-4)
 
 `pinn_solver::execution` (`Executor` trait, `SerialExecutor`, `ExecutionPlanner`) and
 `pinn_core::messages::{ExecutionMode, ExecutionConfig, PerformanceProfile}` are Phase 1 of a
@@ -314,3 +314,47 @@ new real number — not this note's memory of an old one — justify revisiting 
 No code changes to `pinn_solver::execution`/`ExecutionMode` were needed for this conclusion —
 `CpuParallel` remains unimplemented (Phase 1's stub still applies), which is the correct state
 given nothing yet justifies building it.
+
+### Phase 4: `PerformanceProfile` gets a real effect (Eco sampling reduction + rayon thread cap)
+
+Two additions to `pinn_solver::execution`, both derived purely from `SolverConfig.execution.
+profile` — no new `pinn.env` key needed:
+
+- `apply_performance_profile(&mut SolverConfig)`: under `PerformanceProfile::Eco`, divides
+  `n_interior`/`n_boundary` by `ECO_SAMPLING_DIVISOR` (4), floored at `ECO_MIN_INTERIOR`(256)/
+  `ECO_MIN_BOUNDARY`(64). Every other profile leaves them untouched — this function only ever
+  *reduces*, never increases, sampling density.
+- `cpu_thread_count(PerformanceProfile) -> Option<usize>`: `Eco` → `Some(1)`, `Balanced` →
+  `None` (don't touch rayon's global pool), `Performance`/`Maximum` → all available cores. The
+  caller (`pinn-app::main()`) feeds this into
+  `rayon::ThreadPoolBuilder::new().num_threads(n).build_global()`, capping whatever CPU-side
+  parallelism `burn-ndarray` uses internally (confirmed via its own `parallel.rs`:
+  `rayon::scope`) when `--features ndarray-backend` is active. `rayon` is now a direct
+  dependency of `pinn-app` only (not `pinn-solver`) — configuring a dependency's global thread
+  pool is an app-entry-point concern, matching Phase 3's "no rayon dependency of pinn_solver's
+  own code" precedent.
+
+**Call-site ordering is load-bearing and caused a real bug during verification.** Kirsch's
+`headless::run_headless_inner` calls `EngineParams::analyze(&config)` then
+`engine.apply_to(&mut config)`, and `apply_to` **unconditionally overwrites**
+`config.n_interior`/`n_boundary` from geometry-derived analysis — regardless of what
+`pinn.env`/CLI configured them to. The first implementation called `apply_performance_profile`
+in `pinn-app::main()`, *before* `run_headless` — so `apply_to` silently clobbered the Eco
+reduction every time, and a verification run showed the banner printing values *larger* than
+the configured `N_INTERIOR`, not smaller. **Fix**: `apply_performance_profile` is now called
+inside each headless entry point, at the point where it actually sticks — right after
+`engine.apply_to(&mut config)` in `run_headless_inner` (Kirsch), and at the top of
+`run_headless_pinlug_inner` (pin-lug, which has no `EngineParams::analyze`/`apply_to` call at
+all, so nothing to run after). `pinn-app::main()` no longer calls it — only the rayon
+thread-pool setup remains there, since that's a true one-time process-global action independent
+of any one problem's config path. **If a similar profile-application function is added later,
+check whether `EngineParams::apply_to` (or an equivalent geometry-driven recompute) runs between
+`apply_env` and the point you're relying on the value — `main()` is not the right call site for
+anything that touches `n_interior`/`n_boundary` in the Kirsch path.**
+
+Verified end-to-end (`EXEC_PROFILE=eco`, `N_INTERIOR=4096`, `N_BOUNDARY=1024`, `MAX_STEPS=1`,
+release build): banner printed `Interior: 2048  Boundary: 512` — exactly 1/4 of `Balanced`'s
+real engine-analyzed defaults (8192/2048; note `EngineParams::analyze` derives these from
+geometry, not from the configured `N_INTERIOR`/`N_BOUNDARY` values directly — a pre-existing,
+Eco-unrelated behavior, confirmed by reproducing the same 8192/2048 base under `EXEC_PROFILE=
+balanced`). Full workspace suite: 222 passed, 0 failed, unchanged by this phase.

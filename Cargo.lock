@@ -4807,6 +4807,7 @@ dependencies = [
  "pinn-core",
  "pinn-gui",
  "pinn-solver",
+ "rayon",
 ]
 
 [[package]]

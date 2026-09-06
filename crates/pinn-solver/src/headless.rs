@@ -137,6 +137,11 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
     let mut config = config;
     let engine = EngineParams::analyze(&config);
     engine.apply_to(&mut config);
+    // Must run after `apply_to` — `apply_to` unconditionally overwrites `n_interior`/
+    // `n_boundary` from geometry-derived analysis, so an Eco reduction applied any earlier
+    // (e.g. in `pinn-app`'s `main()`) is silently clobbered. See `apply_performance_profile`'s
+    // own doc comment for the "call exactly once" constraint this satisfies.
+    crate::execution::apply_performance_profile(&mut config);
     let k = engine.ansatz_k;
 
     println!("╔══════════════════════════════════════════════════════════╗");
@@ -873,6 +878,11 @@ pub(crate) fn run_headless_pinlug_inner(
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║   PINN Structural Stress Solver — Pin-in-Lug (Headless)  ║");
     println!("╚══════════════════════════════════════════════════════════╝");
+
+    // Pin-lug has no `EngineParams::analyze`/`apply_to` clobber (that's Kirsch-only), so this
+    // is the entry point's one point of effect — mirrors `run_headless_inner`'s own call site.
+    let mut config = config;
+    crate::execution::apply_performance_profile(&mut config);
 
     let problem = PinLugProblem::new(
         config.material.clone(), OUTPUT_DIM, PHASE1_STEPS, N_INTERFACE,

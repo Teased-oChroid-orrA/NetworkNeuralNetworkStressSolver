@@ -209,6 +209,22 @@ fn main() -> anyhow::Result<()> {
     };
     apply_env(&mut config, &env_map, problem_kind == ProblemKind::PinLug);
 
+    // Hardware-adaptive-execution epic, Phase 4. `apply_performance_profile` (the Eco
+    // n_interior/n_boundary reduction) is NOT called here - Kirsch's `run_headless_inner` runs
+    // `EngineParams::apply_to` first, which unconditionally overwrites those fields from
+    // geometry analysis, silently clobbering any reduction applied this early. Each headless
+    // entry point (`run_headless_inner`, `run_headless_pinlug_inner`) calls it itself at the
+    // correct point instead - see those call sites' own comments.
+    if let Some(threads) = pinn_solver::execution::cpu_thread_count(config.execution.profile) {
+        // Configures rayon's PROCESS-GLOBAL thread pool once, before any tensor work starts -
+        // most relevant to burn-ndarray's own internal rayon usage (--features
+        // ndarray-backend), a harmless setting otherwise (default Wgpu backend's tensor
+        // compute is GPU-bound). Errors (e.g. a second call attempting to rebuild an
+        // already-initialized global pool) are intentionally ignored - this is a best-effort
+        // resource cap, never worth failing startup over.
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
+    }
+
     if !env_map.is_empty() {
         eprintln!("[pinn.env] loaded {} key(s) from {env_path_str}",  env_map.len());
     }

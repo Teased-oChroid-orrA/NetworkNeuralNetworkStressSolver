@@ -1,6 +1,9 @@
 //! Hardware-adaptive execution, Phase 1: an explicit seam for *how* host-side
 //! work (resampling collocation points) gets executed, without yet adding any
-//! real parallel/GPU-dispatch path behind it.
+//! real parallel/GPU-dispatch path behind it. Phase 4 adds
+//! [`apply_performance_profile`] (makes `Eco` actually reduce sampling
+//! density) and [`cpu_thread_count`] (caps whatever CPU-side thread pool the
+//! compiled backend uses) - see each function's own doc comment.
 //!
 //! Scope discipline (see the epic addendum this implements, and the plan it
 //! was reconciled against): this module deliberately does NOT wrap
@@ -31,7 +34,7 @@
 
 use pinn_core::geometry::GeometryConfig;
 use pinn_core::loading::{BoundaryPoint, LoadConfig};
-use pinn_core::messages::ExecutionConfig;
+use pinn_core::messages::{ExecutionConfig, PerformanceProfile, SolverConfig};
 use pinn_core::sampling::{sample_boundary, sample_interior};
 
 /// Executes host-side resampling. `SerialExecutor` is the only implementation
@@ -74,6 +77,60 @@ impl ExecutionPlanner {
     }
 }
 
+/// Divides `n_interior`/`n_boundary` by this much under [`PerformanceProfile::Eco`], floored
+/// at [`ECO_MIN_INTERIOR`]/[`ECO_MIN_BOUNDARY`]. Not empirically tuned — a conservative,
+/// disclosed first pass (this codebase already has precedent for shipping an explicitly
+/// untuned-first-pass constant rather than blocking on tuning data that doesn't exist yet —
+/// see pin-lug's reused `PLATEAU_WINDOW` in `controllers.rs`). Revisit if real Eco-profile
+/// runs show this is too aggressive or not aggressive enough for actual low-power hardware.
+const ECO_SAMPLING_DIVISOR: usize = 4;
+const ECO_MIN_INTERIOR: usize = 256;
+const ECO_MIN_BOUNDARY: usize = 64;
+
+/// Phase 4: makes [`PerformanceProfile::Eco`] actually reduce resource usage - fewer
+/// collocation points means less per-step host-side sampling AND less per-step tensor work
+/// (smaller batch dimension into `step_physics`/`step_physics_multi`), matching the epic's
+/// own "Eco: small batches, low CPU/RAM utilization" description. Every other profile
+/// (`Balanced`/`Performance`/`Maximum`) leaves `n_interior`/`n_boundary` exactly as configured
+/// — this function never *increases* them, since more collocation points changes residual
+/// sampling density, and inventing a "Performance means more points" behavior wasn't asked
+/// for and isn't obviously a resource-usage lever in the way fewer points clearly is.
+///
+/// **Never alters the mathematical formulation being solved** (same PDE, same BCs, same
+/// material/geometry/load) — only how finely the residual is sampled, which is squarely an
+/// execution-resource decision, matching `PerformanceProfile`'s own doc comment guarantee.
+/// Call once, after `pinn.env`/CLI overrides are applied and before training starts (calling
+/// it twice would compound the division) — `pinn-app/src/main.rs`'s `main()` is the one call
+/// site today.
+pub fn apply_performance_profile(config: &mut SolverConfig) {
+    if config.execution.profile == PerformanceProfile::Eco {
+        config.n_interior = (config.n_interior / ECO_SAMPLING_DIVISOR).max(ECO_MIN_INTERIOR);
+        config.n_boundary = (config.n_boundary / ECO_SAMPLING_DIVISOR).max(ECO_MIN_BOUNDARY);
+    }
+}
+
+/// CPU thread count to request for whatever the compiled backend's own CPU-side work needs -
+/// most relevant when the `ndarray-backend` Cargo feature is active (`burn-ndarray` uses
+/// `rayon` internally for its own tensor ops, confirmed by reading `burn-ndarray`'s own
+/// `parallel.rs`), a harmless no-op-ish setting for the default Wgpu backend (whose tensor
+/// compute is GPU-bound regardless — though other CPU-side work in the process, e.g. `image`/
+/// `wgpu`'s own internal use of rayon, still respects the same global pool). `None` means
+/// "don't touch rayon's global thread pool at all - let it auto-detect (its own default)."
+/// The caller (`pinn-app/src/main.rs`) is responsible for actually calling
+/// `rayon::ThreadPoolBuilder::new().num_threads(n).build_global()` — this function only
+/// decides the number, matching `pinn_solver`'s existing "no rayon dependency of its own"
+/// precedent (see this module's own doc comment) - configuring the pool used by dependencies
+/// is an app-binary-entry-point concern, not a solver-logic one.
+pub fn cpu_thread_count(profile: PerformanceProfile) -> Option<usize> {
+    match profile {
+        PerformanceProfile::Eco => Some(1),
+        PerformanceProfile::Balanced => None,
+        PerformanceProfile::Performance | PerformanceProfile::Maximum => {
+            std::thread::available_parallelism().ok().map(|n| n.get())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +164,51 @@ mod tests {
                 assert_eq!(pts.len(), 16);
             }
         }
+    }
+
+    #[test]
+    fn apply_performance_profile_eco_reduces_sampling_and_floors_at_minimums() {
+        use pinn_core::messages::SolverConfig;
+
+        let mut cfg = SolverConfig::default_kirsch();
+        cfg.execution.profile = PerformanceProfile::Eco;
+        let (n_int_before, n_bnd_before) = (cfg.n_interior, cfg.n_boundary);
+        apply_performance_profile(&mut cfg);
+        assert_eq!(cfg.n_interior, (n_int_before / ECO_SAMPLING_DIVISOR).max(ECO_MIN_INTERIOR));
+        assert_eq!(cfg.n_boundary, (n_bnd_before / ECO_SAMPLING_DIVISOR).max(ECO_MIN_BOUNDARY));
+        assert!(cfg.n_interior < n_int_before, "Eco must actually reduce n_interior from Kirsch's default");
+        assert!(cfg.n_boundary < n_bnd_before, "Eco must actually reduce n_boundary from Kirsch's default");
+
+        // Floor check: a tiny configured value must not divide below the documented minimum.
+        let mut cfg_tiny = SolverConfig::default_kirsch();
+        cfg_tiny.execution.profile = PerformanceProfile::Eco;
+        cfg_tiny.n_interior = 100;
+        cfg_tiny.n_boundary = 20;
+        apply_performance_profile(&mut cfg_tiny);
+        assert_eq!(cfg_tiny.n_interior, ECO_MIN_INTERIOR);
+        assert_eq!(cfg_tiny.n_boundary, ECO_MIN_BOUNDARY);
+    }
+
+    #[test]
+    fn apply_performance_profile_non_eco_leaves_sampling_unchanged() {
+        use pinn_core::messages::SolverConfig;
+
+        for profile in [PerformanceProfile::Balanced, PerformanceProfile::Performance, PerformanceProfile::Maximum] {
+            let mut cfg = SolverConfig::default_kirsch();
+            cfg.execution.profile = profile;
+            let (n_int_before, n_bnd_before) = (cfg.n_interior, cfg.n_boundary);
+            apply_performance_profile(&mut cfg);
+            assert_eq!(cfg.n_interior, n_int_before);
+            assert_eq!(cfg.n_boundary, n_bnd_before);
+        }
+    }
+
+    #[test]
+    fn cpu_thread_count_eco_is_minimal_balanced_is_auto_others_are_all_cores() {
+        assert_eq!(cpu_thread_count(PerformanceProfile::Eco), Some(1));
+        assert_eq!(cpu_thread_count(PerformanceProfile::Balanced), None);
+        let all_cores = std::thread::available_parallelism().ok().map(|n| n.get());
+        assert_eq!(cpu_thread_count(PerformanceProfile::Performance), all_cores);
+        assert_eq!(cpu_thread_count(PerformanceProfile::Maximum), all_cores);
     }
 }
