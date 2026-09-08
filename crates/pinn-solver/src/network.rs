@@ -76,6 +76,66 @@ impl<B: Backend> ElasticityNet<B> {
             .collect()
     }
 
+    /// Stage I (live network-evolution visualization) - per-layer `(mean |weight|, max
+    /// |weight|)`, read directly from already-computed parameter tensors: no forward pass, no
+    /// gradient computation, safe to call at any point without perturbing training. One entry
+    /// per `self.layers` element (input layer first, then each hidden->hidden layer in order);
+    /// `self.out` is deliberately excluded, matching `awake_mask`'s own scope (`gates` only
+    /// ever covers `layers[1..]`) - the fixed-size output projection is less informative for
+    /// "network evolution" than the hidden representation layers.
+    pub fn layer_weight_stats(&self) -> Vec<(f32, f32)> {
+        self.layers.iter().map(|l| {
+            let data = l.weight.val().abs().into_data().to_vec::<f32>().unwrap_or_default();
+            if data.is_empty() {
+                return (0.0, 0.0);
+            }
+            let mean = data.iter().sum::<f32>() / data.len() as f32;
+            let max = data.iter().copied().fold(0.0f32, f32::max);
+            (mean, max)
+        }).collect()
+    }
+
+    /// Per-output-neuron mean |weight| for each prunable layer (`self.layers`, i.e. every entry
+    /// EXCEPT `out` — mirrors `layer_weight_stats`'/`awake_mask`'s own "excludes `out`" scope),
+    /// used by `architecture_controller::ArchitectureController::plan_prune` to rank INDIVIDUAL
+    /// hidden units for width-shrink, not just whole layers the way `layer_weight_stats` does.
+    /// Each inner `Vec<f32>` has one entry per output column (hidden unit) of that layer, in the
+    /// SAME index space [`Self::prune_width`]'s `drop_indices` uses (this network's one shared
+    /// `hidden_dim` — see `prune_width`'s doc comment for why every layer must share one).
+    pub fn per_neuron_magnitudes(&self) -> Vec<Vec<f32>> {
+        self.layers.iter().map(|l| {
+            let w = l.weight.val(); // [d_input, d_output]
+            let dims = w.dims();
+            let data = w.abs().into_data().to_vec::<f32>().unwrap_or_default();
+            if dims[0] == 0 || data.len() != dims[0] * dims[1] {
+                return vec![0.0; dims[1]];
+            }
+            (0..dims[1]).map(|col| {
+                let sum: f32 = (0..dims[0]).map(|row| data[row * dims[1] + col]).sum();
+                sum / dims[0] as f32
+            }).collect()
+        }).collect()
+    }
+
+    /// Real, end-to-end weight matrices for the network-diagram visualization (approved neuron-
+    /// and-edge design, replacing the earlier per-layer bar-chart aggregate) — `self.layers`
+    /// (input layer first) THEN `self.out`, unlike [`Self::layer_weight_stats`]/[`Self::
+    /// awake_mask`], which deliberately exclude the output projection to mirror `awake_mask`'s
+    /// own scope. A wiring diagram needs the complete input-to-output path to mean anything, so
+    /// this is a genuinely different scope, not an oversight in the other two. Each matrix is
+    /// `[d_input, d_output]`, matching burn's own `Linear::weight` layout, so `M[[i, j]]` is the
+    /// weight from input neuron `i` to output neuron `j` — exactly what an edge in the diagram
+    /// needs, with no transposition.
+    pub fn all_weight_matrices(&self) -> Vec<ndarray::Array2<f32>> {
+        self.layers.iter().chain(std::iter::once(&self.out)).map(|l| {
+            let w = l.weight.val();
+            let dims = w.dims();
+            let data = w.into_data().to_vec::<f32>().unwrap_or_default();
+            ndarray::Array2::from_shape_vec((dims[0], dims[1]), data)
+                .unwrap_or_else(|_| ndarray::Array2::zeros((0, 0)))
+        }).collect()
+    }
+
     /// Returns (weight_param_ids, bias_param_ids) across all `Linear` layers — used to
     /// partition `GradientsParams` between the SOAP-Muon optimizer (2D weights) and AdamW
     /// (1D biases) in a single training step. Gate params are NOT included here — see
@@ -235,6 +295,139 @@ impl<B: Backend> ElasticityNet<B> {
         }
         ElasticityNet { layers: new_layers, gates: self.gates.clone(), out }
     }
+
+    /// Depth growth (Net2DeeperNet-style) — safe ONLY because of PirateNet's gated-residual
+    /// form: `h += tanh(layer(h)) * alpha` degenerates to EXACTLY `h` at `alpha=0`, regardless
+    /// of `tanh`'s nonlinearity. A plain stacked-`tanh` MLP (`use_piratenet=false`) has no
+    /// equivalent safe insertion point — `tanh(x) != x` in general, so there is no identity
+    /// layer to insert there, unlike ReLU-based Net2DeeperNet. Appends one new
+    /// `hidden_dim -> hidden_dim` `Linear` (same `KaimingNormal` init `ElasticityNetConfig::
+    /// init` uses for gated blocks) to `layers`, and a new gate initialized to EXACTLY `0.0` to
+    /// `gates` — the new block computes nothing that reaches the output until something later
+    /// ungates it (proven by `append_dormant_layer_is_output_identical_at_insertion`).
+    ///
+    /// # Panics
+    /// If `self.gates.len() != self.layers.len() - 1` — i.e. the network is not FULLY gated
+    /// (every `layers[1..]` block already has a gate). This is the precondition that keeps
+    /// `forward_masked`'s positional `gates[i-1]` lookup aligned with `layers[i]`; a partially-
+    /// gated network (which never occurs from ordinary construction — `ElasticityNetConfig::
+    /// init` builds either zero gates or exactly `n_hidden-1`) would silently misalign the two
+    /// after this call, so this is checked, not assumed.
+    pub fn append_dormant_layer(&self, kaiming_gain: f64, device: &B::Device) -> ElasticityNet<B> {
+        assert_eq!(
+            self.gates.len(), self.layers.len() - 1,
+            "append_dormant_layer requires a fully-gated network (use_piratenet=true) - got {} \
+             gates for {} layers", self.gates.len(), self.layers.len()
+        );
+        let hidden_dim = self.layers[0].weight.val().dims()[1];
+        let new_layer = LinearConfig::new(hidden_dim, hidden_dim)
+            .with_initializer(Initializer::KaimingNormal { gain: kaiming_gain, fan_out_only: false })
+            .init::<B>(device);
+
+        let mut layers = self.layers.clone();
+        layers.push(new_layer);
+        let mut gates = self.gates.clone();
+        gates.push(Param::from_tensor(Tensor::<B, 1>::zeros([1], device)));
+
+        ElasticityNet { layers, gates, out: self.out.clone() }
+    }
+
+    /// Depth shrink — the inverse of [`Self::append_dormant_layer`], safe ONLY when
+    /// `layers[idx]`'s gate is genuinely dormant (`|alpha| <= gate_epsilon`): removal of a
+    /// truly-dormant block changes nothing, since the block's contribution to `h` was already
+    /// exactly zero (the same `alpha=0` identity `append_dormant_layer`'s doc comment explains,
+    /// in reverse). The caller (`ArchitectureController`) decides WHEN a block has been dormant
+    /// long enough to remove; this function only enforces that the gate is dormant RIGHT NOW,
+    /// as a defensive check, not a policy decision.
+    ///
+    /// # Panics
+    /// If `idx == 0` (`layers[0]` is never gated — no dormancy concept, must never be removed),
+    /// if `idx >= self.layers.len()`, if the network is not fully gated (same precondition as
+    /// `append_dormant_layer`), or if the gate at `idx` is not currently dormant within
+    /// `gate_epsilon`.
+    pub fn remove_layer(&self, idx: usize, gate_epsilon: f32) -> ElasticityNet<B> {
+        assert!(idx >= 1 && idx < self.layers.len(), "remove_layer: idx {idx} out of range (must be 1..{})", self.layers.len());
+        assert_eq!(
+            self.gates.len(), self.layers.len() - 1,
+            "remove_layer requires a fully-gated network (use_piratenet=true)"
+        );
+        let alpha = self.gates[idx - 1].val().into_scalar().elem::<f32>();
+        assert!(
+            alpha.abs() <= gate_epsilon,
+            "remove_layer: gate at idx {idx} is not dormant (|alpha|={} > {gate_epsilon})", alpha.abs()
+        );
+
+        let mut layers = self.layers.clone();
+        layers.remove(idx);
+        let mut gates = self.gates.clone();
+        gates.remove(idx - 1);
+
+        ElasticityNet { layers, gates, out: self.out.clone() }
+    }
+
+    /// Width shrink — the GLOBAL, uniform-hidden_dim mirror of [`Self::grow_width`], in
+    /// reverse. Explicitly LOSSY, unlike [`Self::append_dormant_layer`]/[`Self::remove_layer`]:
+    /// removing an established, contributing neuron necessarily changes what the network
+    /// computes (there is no rescaling trick analogous to `grow_width`'s `split_rows` division
+    /// that makes removal function-preserving — the removed neuron's contribution is simply
+    /// gone, not redistributed).
+    ///
+    /// Must be global, not per-layer: `forward_masked`'s gated residual sum
+    /// (`h = h + tanh(layers[i](h)) * alpha`) requires `layers[i]`'s OUTPUT width to equal
+    /// `h`'s width for every gated `i`, which in turn requires every `layers[1..]` block to
+    /// share the SAME `hidden_dim` as `layers[0]`'s output and `out`'s input. Pruning only one
+    /// layer's boundary (an earlier, incorrect version of this function) would desync that
+    /// shared width and panic on the very next `forward_masked` call — this version removes
+    /// `drop_indices` from every layer uniformly, exactly mirroring `grow_width`'s per-layer
+    /// row/column treatment (`layers[0]`: output columns only; `layers[1..]`: input rows AND
+    /// output columns; `out`: input rows only), just with `remove_*` in place of `duplicate_*`/
+    /// `split_*` and no rescaling (removal has no lossless equivalent). `gates` are untouched
+    /// (pruning neurons within every block doesn't change the block count).
+    ///
+    /// # Panics
+    /// If any `drop_indices` entry is out of range for the current `hidden_dim`, or if dropping
+    /// every entry in `drop_indices` would leave zero hidden units.
+    pub fn prune_width(&self, drop_indices: &[usize], device: &B::Device) -> ElasticityNet<B> {
+        let hidden_dim = self.layers[0].weight.val().dims()[1];
+        let mut sorted_drop: Vec<usize> = drop_indices.to_vec();
+        sorted_drop.sort_unstable();
+        sorted_drop.dedup();
+        assert!(
+            sorted_drop.iter().all(|&i| i < hidden_dim),
+            "prune_width: drop index out of range (hidden_dim {hidden_dim})"
+        );
+        assert!(sorted_drop.len() < hidden_dim, "prune_width: cannot drop every hidden unit");
+
+        let mut new_layers: Vec<Linear<B>> = Vec::with_capacity(self.layers.len());
+        for (i, layer) in self.layers.iter().enumerate() {
+            // Same lazy-Param-clone hazard as `grow_width` - force-materialize before cloning.
+            let _ = layer.weight.val();
+            if let Some(b) = &layer.bias {
+                let _ = b.val();
+            }
+            let drop_input = i >= 1; // layers[0]'s input_dim side never shrinks
+            let weight = layer.weight.clone().map(|w| {
+                let w = if drop_input { remove_rows::<B>(&w, &sorted_drop, device) } else { w };
+                remove_columns::<B>(&w, &sorted_drop, device)
+            });
+            let bias = layer.bias.clone().map(|b| {
+                Param::initialized(ParamId::new(), remove_1d::<B>(&b.val(), &sorted_drop, device))
+            });
+            new_layers.push(Linear { weight, bias });
+        }
+
+        let _ = self.out.weight.val();
+        let out_weight = self.out.weight.clone().map(|w| remove_rows::<B>(&w, &sorted_drop, device));
+        if let Some(b) = &self.out.bias {
+            let _ = b.val();
+        }
+        let out = Linear { weight: out_weight, bias: self.out.bias.clone() };
+
+        for gate in &self.gates {
+            let _ = gate.val();
+        }
+        ElasticityNet { layers: new_layers, gates: self.gates.clone(), out }
+    }
 }
 
 /// Deterministic Net2WiderNet duplication map for growing a dimension of size `h_old` by `k`
@@ -309,6 +502,46 @@ fn duplicate_1d<B: Backend>(b: &Tensor<B, 1>, g: &[usize], device: &B::Device) -
         out.push(data[gj]);
     }
     Tensor::<B, 1>::from_data(TensorData::new(out, vec![d_old + g.len()]), device)
+}
+
+/// `prune_width`'s column-removal primitive — the reverse of [`duplicate_columns`], but with no
+/// rescaling counterpart (unlike `split_rows`'s division on growth, there is no way to make
+/// removal lossless; the dropped columns' contribution is simply gone).
+fn remove_columns<B: Backend>(w: &Tensor<B, 2>, drop: &[usize], device: &B::Device) -> Tensor<B, 2> {
+    let [d0, d1_old] = w.dims();
+    let data = w.clone().into_data().to_vec::<f32>().unwrap();
+    let keep: Vec<usize> = (0..d1_old).filter(|c| !drop.contains(c)).collect();
+    let d1_new = keep.len();
+    let mut out = vec![0f32; d0 * d1_new];
+    for row in 0..d0 {
+        for (new_c, &old_c) in keep.iter().enumerate() {
+            out[row * d1_new + new_c] = data[row * d1_old + old_c];
+        }
+    }
+    Tensor::<B, 2>::from_data(TensorData::new(out, vec![d0, d1_new]), device)
+}
+
+/// `prune_width`'s row-removal primitive — the reverse of [`split_rows`], with no rescaling
+/// (see [`remove_columns`]'s doc comment for why removal has no lossless equivalent).
+fn remove_rows<B: Backend>(w: &Tensor<B, 2>, drop: &[usize], device: &B::Device) -> Tensor<B, 2> {
+    let [d0_old, d1] = w.dims();
+    let data = w.clone().into_data().to_vec::<f32>().unwrap();
+    let keep: Vec<usize> = (0..d0_old).filter(|r| !drop.contains(r)).collect();
+    let d0_new = keep.len();
+    let mut out = vec![0f32; d0_new * d1];
+    for (new_r, &old_r) in keep.iter().enumerate() {
+        out[new_r * d1..new_r * d1 + d1].copy_from_slice(&data[old_r * d1..old_r * d1 + d1]);
+    }
+    Tensor::<B, 2>::from_data(TensorData::new(out, vec![d0_new, d1]), device)
+}
+
+/// Bias analogue of [`remove_columns`] (1D).
+fn remove_1d<B: Backend>(b: &Tensor<B, 1>, drop: &[usize], device: &B::Device) -> Tensor<B, 1> {
+    let d_old = b.dims()[0];
+    let data = b.clone().into_data().to_vec::<f32>().unwrap();
+    let keep: Vec<f32> = (0..d_old).filter(|i| !drop.contains(i)).map(|i| data[i]).collect();
+    let d_new = keep.len();
+    Tensor::<B, 1>::from_data(TensorData::new(keep, vec![d_new]), device)
 }
 
 #[derive(Config, Debug)]
@@ -401,6 +634,30 @@ pub fn fourier_embed<B: Backend>(
 /// `input` is the raw stencil coordinate tensor [M, 3]. The B matrix for Fourier
 /// features is deterministic (seeded by frequency level) and recreated each call.
 /// Cost is negligible for M ~ N_pts × 5 (stencil batch size).
+/// Same threshold `training_core.rs`'s Kirsch/pin-lug paths pass as `gate_awake_epsilon`
+/// (`SolverConfig::stiffness`) - `UserDefinedProblem`/parametric specs have no such config
+/// field (`NetworkSpec` never sets `use_piratenet`, so `awake_mask` is always empty for them
+/// regardless of this value), but reusing the same constant keeps the classification
+/// consistent if that ever changes rather than introducing an unrelated second threshold.
+const GATE_AWAKE_EPSILON: f32 = 1e-4;
+
+/// Stage I ("live network-evolution visualization") - builds a [`pinn_core::messages::
+/// NetworkSnapshot`] from an already-available model reference. Reads ONLY existing parameter
+/// tensors (`layer_weight_stats`/`awake_mask`, both pure reads with zero side effects) - adds
+/// no forward pass, no gradient computation. Callers must gate this behind the SAME vis-cadence
+/// throttle `VisFields` itself is built on (never call this every training step) - the cost is
+/// small per call, but "small per call, called every step for thousands of steps" is exactly
+/// the class of waste this project's own CLAUDE.md documents finding and fixing before.
+pub fn network_snapshot<Bk: Backend>(model: &ElasticityNet<Bk>) -> pinn_core::messages::NetworkSnapshot {
+    let stats = model.layer_weight_stats();
+    pinn_core::messages::NetworkSnapshot {
+        layer_mean_abs_weight: stats.iter().map(|&(mean, _)| mean).collect(),
+        layer_max_abs_weight: stats.iter().map(|&(_, max)| max).collect(),
+        awake_mask: model.awake_mask(GATE_AWAKE_EPSILON),
+        layer_weights: model.all_weight_matrices(),
+    }
+}
+
 pub fn fwd<Bk: Backend>(
     model: &ElasticityNet<Bk>,
     input: Tensor<Bk, 2>,
@@ -808,6 +1065,253 @@ mod tests {
         let device = WgpuDevice::default();
         let model: ElasticityNet<TB> = plain_mlp_config(4, 3).init(&device);
         let _ = model.grow_width(3, &device); // shrink — must panic
+    }
+
+    // ─── Stage I: live network-evolution visualization ──────────────────────────────────────
+
+    #[test]
+    fn layer_weight_stats_returns_one_entry_per_layer_with_finite_nonnegative_values() {
+        let device = WgpuDevice::default();
+        let model: ElasticityNet<TBInner> = plain_mlp_config(4, 3).init(&device);
+        let stats = model.layer_weight_stats();
+        assert_eq!(stats.len(), 3, "one entry per `layers` element (n_hidden), matching plain_mlp_config(4, 3)");
+        for (mean, max) in stats {
+            assert!(mean.is_finite() && mean >= 0.0, "mean |weight| must be finite and non-negative, got {mean}");
+            assert!(max.is_finite() && max >= 0.0, "max |weight| must be finite and non-negative, got {max}");
+            assert!(max >= mean - 1e-6, "max must be >= mean, got mean={mean} max={max}");
+        }
+    }
+
+    #[test]
+    fn per_neuron_magnitudes_has_one_vec_per_prunable_layer_each_hidden_dim_long() {
+        let device = WgpuDevice::default();
+        let model: ElasticityNet<TBInner> = plain_mlp_config(4, 3).init(&device);
+        let mags = model.per_neuron_magnitudes();
+        assert_eq!(mags.len(), 3, "one entry per `layers` element, `out` excluded");
+        for layer_mags in &mags {
+            assert_eq!(layer_mags.len(), 4, "one score per hidden unit (hidden_dim=4)");
+            assert!(layer_mags.iter().all(|m| m.is_finite() && *m >= 0.0));
+        }
+    }
+
+    #[test]
+    fn per_neuron_magnitudes_averages_the_right_column_not_the_whole_matrix() {
+        let device = WgpuDevice::default();
+        let model: ElasticityNet<TBInner> = plain_mlp_config(2, 2).init(&device);
+        let expected: Vec<f32> = {
+            let w = model.all_weight_matrices()[0].clone(); // layers[0], [d_input, d_output]
+            (0..w.ncols()).map(|col| {
+                let sum: f32 = (0..w.nrows()).map(|row| w[[row, col]].abs()).sum();
+                sum / w.nrows() as f32
+            }).collect()
+        };
+        let mags = model.per_neuron_magnitudes();
+        for (got, want) in mags[0].iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn network_snapshot_awake_mask_is_empty_when_piratenet_disabled() {
+        let device = WgpuDevice::default();
+        let model: ElasticityNet<TBInner> = plain_mlp_config(4, 3).init(&device);
+        let snap = network_snapshot(&model);
+        assert_eq!(snap.layer_mean_abs_weight.len(), 3);
+        assert_eq!(snap.layer_max_abs_weight.len(), 3);
+        assert!(snap.awake_mask.is_empty(), "plain MLP (use_piratenet=false) must report an empty awake_mask, not fabricated values");
+    }
+
+    #[test]
+    fn network_snapshot_awake_mask_matches_the_model_s_own_awake_mask_when_piratenet_enabled() {
+        let device = WgpuDevice::default();
+        let model: ElasticityNet<TBInner> = piratenet_config().init(&device);
+        let snap = network_snapshot(&model);
+        assert_eq!(snap.awake_mask, model.awake_mask(GATE_AWAKE_EPSILON), "network_snapshot must reuse the model's own classification, not a second divergent one");
+    }
+
+    // ─── Network diagram (approved neuron-and-edge design): real weight matrices ────────────
+
+    #[test]
+    fn all_weight_matrices_includes_the_output_layer_with_correct_shapes() {
+        let device = WgpuDevice::default();
+        // input_dim=2, hidden_dim=4, n_hidden=3, output_dim=2 (see plain_mlp_config)
+        let model: ElasticityNet<TBInner> = plain_mlp_config(4, 3).init(&device);
+        let mats = model.all_weight_matrices();
+        assert_eq!(mats.len(), 4, "n_hidden (3) layers + 1 output layer");
+        assert_eq!(mats[0].dim(), (2, 4), "layers[0]: input_dim -> hidden_dim");
+        assert_eq!(mats[1].dim(), (4, 4), "layers[1]: hidden_dim -> hidden_dim");
+        assert_eq!(mats[2].dim(), (4, 4), "layers[2]: hidden_dim -> hidden_dim");
+        assert_eq!(mats[3].dim(), (4, 2), "out: hidden_dim -> output_dim - INCLUDED, unlike layer_weight_stats/awake_mask");
+        for m in &mats {
+            assert!(m.iter().all(|v| v.is_finite()), "every weight must be finite for a freshly-initialized model");
+        }
+    }
+
+    #[test]
+    fn all_weight_matrices_values_match_the_model_s_own_layer_weight_stats() {
+        // Cross-check: the (mean, max) `layer_weight_stats` reports for the non-output layers
+        // must be hand-derivable from the SAME raw values `all_weight_matrices` exposes - proves
+        // the two views aren't drifting apart (e.g. a future edit to one that forgets the other).
+        let device = WgpuDevice::default();
+        let model: ElasticityNet<TBInner> = plain_mlp_config(4, 3).init(&device);
+        let mats = model.all_weight_matrices();
+        let stats = model.layer_weight_stats();
+        assert_eq!(stats.len(), 3, "layer_weight_stats excludes the output layer");
+        for (i, (mean, max)) in stats.iter().enumerate() {
+            let vals: Vec<f32> = mats[i].iter().map(|v| v.abs()).collect();
+            let hand_mean = vals.iter().sum::<f32>() / vals.len() as f32;
+            let hand_max = vals.iter().copied().fold(0.0f32, f32::max);
+            assert!((mean - hand_mean).abs() < 1e-6, "layer {i} mean mismatch: {mean} vs {hand_mean}");
+            assert!((max - hand_max).abs() < 1e-6, "layer {i} max mismatch: {max} vs {hand_max}");
+        }
+    }
+
+    #[test]
+    fn network_snapshot_layer_weights_matches_all_weight_matrices() {
+        let device = WgpuDevice::default();
+        let model: ElasticityNet<TBInner> = plain_mlp_config(4, 3).init(&device);
+        let snap = network_snapshot(&model);
+        let direct = model.all_weight_matrices();
+        assert_eq!(snap.layer_weights.len(), direct.len());
+        for (a, b) in snap.layer_weights.iter().zip(direct.iter()) {
+            assert_eq!(a, b, "network_snapshot must carry the exact same matrices all_weight_matrices returns");
+        }
+    }
+
+    // ─── Smart adaptive architecture: depth growth/shrink, width shrink ─────────────────────
+
+    fn probe_input() -> Tensor<TBInner, 2> {
+        let device = WgpuDevice::default();
+        Tensor::from_data(TensorData::new(vec![0.3_f32, -0.7, 0.1, 0.9, -0.2, 0.5], vec![3, 2]), &device)
+    }
+
+    #[test]
+    fn append_dormant_layer_is_output_identical_at_insertion() {
+        let device = WgpuDevice::default();
+        let mut model: ElasticityNet<TBInner> = piratenet_config().init(&device);
+        // Force real (non-zero) gate values first - proves appending doesn't disturb EXISTING
+        // awake blocks' contributions, not just a degenerate all-zero-gates case.
+        model.force_gate_for_test(0, 0.6, &device);
+        model.force_gate_for_test(1, -0.3, &device);
+
+        let x = probe_input();
+        let before = model.forward(x.clone());
+        let grown = model.append_dormant_layer(1.6666666666666667, &device);
+
+        assert_eq!(grown.layers.len(), model.layers.len() + 1);
+        assert_eq!(grown.gates.len(), model.gates.len() + 1);
+        assert_eq!(grown.gates.last().unwrap().val().into_scalar().elem::<f32>(), 0.0);
+
+        let after = grown.forward(x);
+        let diff: f32 = (before - after).abs().sum().into_scalar();
+        assert!(diff < 1e-5, "appending a dormant layer must not change the network's output: diff={diff}");
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a fully-gated network")]
+    fn append_dormant_layer_panics_on_a_plain_mlp() {
+        let device = WgpuDevice::default();
+        let model: ElasticityNet<TBInner> = plain_mlp_config(4, 3).init(&device);
+        let _ = model.append_dormant_layer(1.6666666666666667, &device);
+    }
+
+    #[test]
+    fn remove_layer_is_output_identical_when_gate_is_dormant() {
+        let device = WgpuDevice::default();
+        let mut model: ElasticityNet<TBInner> = piratenet_config().init(&device);
+        model.force_gate_for_test(0, 0.6, &device); // layers[1]: awake
+        model.force_gate_for_test(1, 0.0, &device); // layers[2]: dormant
+
+        let x = probe_input();
+        let before = model.forward(x.clone());
+        let shrunk = model.remove_layer(2, 1e-4);
+
+        assert_eq!(shrunk.layers.len(), model.layers.len() - 1);
+        assert_eq!(shrunk.gates.len(), model.gates.len() - 1);
+
+        let after = shrunk.forward(x);
+        let diff: f32 = (before - after).abs().sum().into_scalar();
+        assert!(diff < 1e-5, "removing an already-dormant block must not change the network's output: diff={diff}");
+    }
+
+    #[test]
+    #[should_panic(expected = "is not dormant")]
+    fn remove_layer_panics_when_gate_is_not_dormant() {
+        let device = WgpuDevice::default();
+        let mut model: ElasticityNet<TBInner> = piratenet_config().init(&device);
+        model.force_gate_for_test(0, 0.6, &device);
+        let _ = model.remove_layer(1, 1e-4);
+    }
+
+    #[test]
+    #[should_panic]
+    fn remove_layer_panics_on_layer_zero() {
+        let device = WgpuDevice::default();
+        let model: ElasticityNet<TBInner> = piratenet_config().init(&device);
+        let _ = model.remove_layer(0, 1e-4);
+    }
+
+    #[test]
+    fn prune_width_removes_the_intended_indices_uniformly_across_every_layer() {
+        let device = WgpuDevice::default();
+        // input_dim=2, hidden_dim=4, n_hidden=3, output_dim=2 (plain_mlp_config)
+        let model: ElasticityNet<TBInner> = plain_mlp_config(4, 3).init(&device);
+        let before = model.all_weight_matrices();
+
+        let pruned = model.prune_width(&[0, 2], &device);
+        let after = pruned.all_weight_matrices();
+
+        // layers[0]: output columns only (input_dim untouched).
+        assert_eq!(after[0].dim(), (before[0].nrows(), before[0].ncols() - 2));
+        // layers[1..]: BOTH input rows and output columns shrink - required for
+        // `forward_masked`'s residual sum (`h = h + tanh(layer(h)) * alpha`) to stay shape-
+        // consistent when this network is gated.
+        assert_eq!(after[1].dim(), (before[1].nrows() - 2, before[1].ncols() - 2));
+        assert_eq!(after[2].dim(), (before[2].nrows() - 2, before[2].ncols() - 2));
+        // `out`: input rows only.
+        let out_idx = after.len() - 1;
+        assert_eq!(after[out_idx].dim(), (before[out_idx].nrows() - 2, before[out_idx].ncols()));
+
+        // Correctness, not just shape: the SURVIVING columns (1, 3) of layers[0] must be
+        // byte-identical to the originals, in order - proves the right global indices were
+        // dropped everywhere, not just shape-compatible ones.
+        for row in 0..before[0].nrows() {
+            assert_eq!(after[0][[row, 0]], before[0][[row, 1]]);
+            assert_eq!(after[0][[row, 1]], before[0][[row, 3]]);
+        }
+        // Same check on `out`'s surviving INPUT rows (1, 3).
+        for col in 0..before[out_idx].ncols() {
+            assert_eq!(after[out_idx][[0, col]], before[out_idx][[1, col]]);
+            assert_eq!(after[out_idx][[1, col]], before[out_idx][[3, col]]);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot drop every hidden unit")]
+    fn prune_width_panics_when_dropping_every_hidden_unit() {
+        let device = WgpuDevice::default();
+        let model: ElasticityNet<TBInner> = plain_mlp_config(4, 3).init(&device);
+        let _ = model.prune_width(&[0, 1, 2, 3], &device);
+    }
+
+    #[test]
+    fn prune_width_on_a_gated_network_does_not_break_forward_masked() {
+        // Regression test for the bug an earlier, per-layer version of `prune_width` had:
+        // shrinking only one layer's boundary desynced the shared hidden_dim the gated
+        // residual sum requires, which would panic on the very next forward pass. This
+        // network has REAL nonzero gates (not the degenerate all-zero launch state), so the
+        // residual sum is actually exercised, not skipped.
+        let device = WgpuDevice::default();
+        let mut model: ElasticityNet<TBInner> = piratenet_config().init(&device);
+        model.force_gate_for_test(0, 0.6, &device);
+        model.force_gate_for_test(1, -0.3, &device);
+
+        let pruned = model.prune_width(&[0, 2], &device);
+        let y = pruned.forward(probe_input());
+        assert_eq!(y.dims(), [3, 2]);
+        let data = y.into_data();
+        let values = data.as_slice::<f32>().unwrap();
+        assert!(values.iter().all(|v| v.is_finite()), "pruned gated network produced non-finite output");
     }
 }
 

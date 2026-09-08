@@ -313,6 +313,19 @@ pub struct StepOutput {
     /// `None` unless `SolverConfig::diagnostics.enabled` - see `diagnostics::StepTimer`'s doc
     /// comment for why enabling this has a real (opt-in, disclosed) timing cost of its own.
     pub timing: Option<crate::diagnostics::StepTiming>,
+    /// `enhancement.txt` item B ("Gradient Norm") - L2 norm of every weight/bias/gate
+    /// gradient this step, via `flatten_grads`. A pure, additional READ of the already-
+    /// computed backward-pass gradients - does not affect `total`/the optimizer step in any
+    /// way, so it cannot change either function's numerical trajectory (verified: every
+    /// existing byte-identical-trajectory regression test - `step_physics_compute_skip_
+    /// disabled_by_default_matches_pre_change_trajectory`,
+    /// `step_physics_multi_single_domain_matches_step_physics_kirsch`, etc. - still passes
+    /// unchanged). Computed on both `step_physics` and `step_physics_multi` (same technique
+    /// `timing` above already established: a real, always-on diagnostic, not gated behind an
+    /// opt-in flag, since it has zero extra device-sync cost beyond what backward() already
+    /// produced). `Option` only for symmetry with `timing`/`cosine_sim` and to leave room for
+    /// a future path that can't cheaply compute it.
+    pub grad_norm: Option<f32>,
 }
 
 /// Extract (σ_xx, σ_yy, σ_xy) from rows `[row_start, row_end)` of an mDEM network output
@@ -781,6 +794,18 @@ pub fn step_physics(
     let weight_grads = GradientsParams::from_params(&mut grads, &model, &weight_ids);
     let bias_grads = GradientsParams::from_params(&mut grads, &model, &bias_ids);
     let gate_grads = GradientsParams::from_params(&mut grads, &model, &gate_ids);
+    // `enhancement.txt` item B ("Gradient Norm") - pure, additional READ of the already-
+    // computed backward-pass gradients (via `flatten_grads`, decomposed the same way
+    // `parametric_problem::step_parametric` does - see that fn's own doc comment). Does not
+    // affect `total`/the optimizer step in any way, so it cannot change this function's
+    // numerical trajectory - computed by reference, BEFORE `weight_grads`/`bias_grads`/
+    // `gate_grads` are moved into the `.step()` calls below.
+    let grad_norm: f32 = {
+        let wn = flatten_grads(&model, &weight_grads).powf_scalar(2.0_f64).sum();
+        let bn = flatten_grads(&model, &bias_grads).powf_scalar(2.0_f64).sum();
+        let gn = flatten_grads(&model, &gate_grads).powf_scalar(2.0_f64).sum();
+        (wn + bn + gn).sqrt().into_scalar()
+    };
     let model = optim_w.step(lr, model, weight_grads);
     let model = optim_b.step(lr, model, bias_grads);
     // Stiffness-accelerated gate LR; empty gate_grads (use_piratenet=false) makes this a no-op.
@@ -799,6 +824,7 @@ pub fn step_physics(
         cosine_sim: None,
         lam_by_name: None,
         timing,
+        grad_norm: Some(grad_norm),
     })
 }
 
@@ -971,6 +997,92 @@ fn compute_domain_forwards(
     computed
 }
 
+/// A `LossTerm` that requests only the `"interior"` forward pass for a fixed set of
+/// domains — never actually used for loss computation (`compute` is unreachable), it exists
+/// purely so [`probe_interior_energy_residuals`] can drive `compute_domain_forwards`'s
+/// existing, already-generic (ansatz-aware, geometry-agnostic) forward-pass machinery
+/// without needing a real training term.
+struct InteriorProbeTerm {
+    domains: Vec<pinn_core::problem::DomainId>,
+}
+impl LossTerm for InteriorProbeTerm {
+    fn name(&self) -> &'static str { "amr_interior_probe" }
+    fn domains(&self) -> Vec<pinn_core::problem::DomainId> { self.domains.clone() }
+    fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
+    fn compute(&self, _inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        unreachable!("InteriorProbeTerm is a probe-only stand-in, never used for real loss computation")
+    }
+}
+
+/// Generic, problem-agnostic per-domain interior-energy residual probe — the AMR refinement
+/// signal any `run_training_*` loop can use, not just Kirsch's own hand-rolled equivalent in
+/// `run_training`'s AMR-sweep block. Reuses `compute_domain_forwards` (already handles any
+/// ansatz/geometry correctly) so this works identically for `UserDefinedProblem`'s
+/// `IdentityAnsatz` and pin-lug's two domains without any problem-specific code here.
+///
+/// ## Indicator choice (Phase 5 of the "Neural-Network-Wide Adaptive Collocation" epic)
+///
+/// The signal is `|dem_energy_per_point|` — absolute local strain-energy density — not a
+/// PDE residual, solution gradient, or stress gradient. This was investigated, not assumed:
+///
+/// - **PDE residual**: does not exist anywhere in this codebase for ANY problem this probe
+///   serves. Every problem here (Kirsch, pin-lug, `UserDefinedProblem`) is trained via DEM
+///   (deep energy method) — a weak/variational form — specifically BECAUSE a strong-form
+///   residual would need a novel 4th-derivative stencil (see `toy_beam.rs`'s own module doc
+///   for the identical rationale in a different problem). Adding a genuine PDE-residual
+///   indicator here would mean building new physics machinery, not swapping a signal — out
+///   of scope for a "verify and harden the existing system" pass with no measured need yet.
+/// - **Solution gradient (`|∇u|`)**: strain IS `∇u` (symmetrized) — already the direct input
+///   to `dem_energy_per_point`. A gradient-magnitude indicator would be a near-monotonic
+///   transform of the energy density already used (`energy ~ C:ε:ε`), not meaningfully new
+///   information for the refinement decision.
+/// - **Stress gradient**: for mDEM domains specifically (`output_dim == 5` — `UserDefinedProblem`,
+///   pin-lug), there IS a genuinely distinct candidate signal not yet used here: the
+///   constitutive-consistency residual itself (`|σ_net − C:ε_fd|`, the same quantity
+///   `ConstitutiveConsistencyTerm`/`LAM_CONSTITUTIVE_CONSISTENCY` train against, added to
+///   `step_physics_multi` this session) directly measures where the network's mDEM stress
+///   output disagrees with its own strain-derived stress — a more targeted "where is this
+///   specific formulation breaking down" signal than energy density for mDEM problems. This
+///   is a real, well-motivated, TESTABLE follow-up — not implemented here because it needs a
+///   measured before/after comparison (solution accuracy, stress accuracy, convergence, AMR
+///   efficiency) before replacing or augmenting a working indicator, per this epic's own
+///   Scientific Rule ("do not declare success because ... the visualization looks plausible")
+///   and the general "do not rewrite working code merely for architectural preference" rule.
+///
+/// Conclusion: the current indicator is a principled, not arbitrary, choice for a DEM-family
+/// solver (it's the same per-point quantity the training objective itself is built from), and
+/// is kept as-is. The mDEM-specific constitutive-residual alternative above is the concrete
+/// candidate for a future, benchmarked change — not a vague "consider gradients someday" note.
+pub(crate) fn probe_interior_energy_residuals(
+    ctx: &crate::problem::MultiStepCtx,
+    models: &[&ElasticityNet<B>],
+    device: &BDevice,
+) -> HashMap<pinn_core::problem::DomainId, Vec<f32>> {
+    let domain_ids: Vec<pinn_core::problem::DomainId> = ctx.problem.domains().iter().map(|d| d.id).collect();
+    let probe_terms: Vec<Box<dyn LossTerm>> = vec![Box::new(InteriorProbeTerm { domains: domain_ids })];
+    let forward_masks: Vec<Option<&[bool]>> = models.iter().map(|_| None).collect();
+    let computed = compute_domain_forwards(ctx, models, &probe_terms, device, &forward_masks);
+
+    let mut out = HashMap::new();
+    for c in computed {
+        let Some((exx, eyy, exy)) = c.strains else { continue };
+        let Some(spec) = ctx.problem.domains().iter().find(|d| d.id == c.key.0) else { continue };
+        let residuals: Vec<f32> = crate::energy::dem_energy_per_point::<B>(exx, eyy, exy, &spec.material)
+            .into_data().to_vec::<f32>().unwrap_or_default()
+            .into_iter().map(|e| e.abs()).collect();
+        out.insert(c.key.0, residuals);
+    }
+    out
+}
+
+/// Fixed weight for the constitutive-consistency term applied by `step_physics_multi` to
+/// every `output_dim == 5` (mDEM) domain - matches `engine.rs`'s `let lam_const = if
+/// use_mdem { 5.0_f32 } else { 0.0 };` exactly (the same fixed value `step_physics`'s own
+/// Kirsch path uses), applied here via `MultiStepCtx`'s per-domain `output_dim` instead of
+/// an `EngineParams` (which `MultiStepCtx` doesn't carry - `run_training_user_problem`/
+/// `run_training_pinlug` never construct one).
+const LAM_CONSTITUTIVE_CONSISTENCY: f64 = 5.0;
+
 #[allow(clippy::too_many_arguments)]
 pub fn step_physics_multi(
     models: Vec<ElasticityNet<B>>,
@@ -1078,7 +1190,50 @@ pub fn step_physics_multi(
             None => weighted,
         });
     }
-    let total = total.unwrap_or_else(|| Tensor::<B, 1>::zeros([1], device));
+    let mut total = total.unwrap_or_else(|| Tensor::<B, 1>::zeros([1], device));
+
+    // (b.5) Constitutive consistency (mDEM only, fixed weight, outside SAW-BRDR) — mirrors
+    // `step_physics`'s own established pattern exactly: construct `kirsch_problem::
+    // ConstitutiveConsistencyTerm` ad-hoc and `.compute()` it on the domain's already-computed
+    // "interior" forward pass (the same (domain, "interior") pair `InteriorEnergyTerm` already
+    // requires — no extra forward pass needed). Previously entirely absent from this function:
+    // `active_terms` above filters this term's NAME out of `ctx.problem.loss_terms()` (matching
+    // `step_physics`'s identical filter), but unlike `step_physics`, nothing here ever added an
+    // equivalent contribution back — so every mDEM domain (`output_dim == 5`) driven through
+    // this function (`UserDefinedProblem`, pin-lug) had its raw σxx/σyy/σxy output columns
+    // completely unconstrained by Hooke's law anywhere in the domain interior, only wherever a
+    // boundary/interface term happened to read them directly. A real, confirmed bug — see
+    // `powershell_tool/CLAUDE.md`'s Stress Solver section for the investigation that found it
+    // (a Von Mises field with no real concentration at a hole, smooth everywhere else).
+    // `const_scalar_sum` is the RAW (unweighted) term value, matching every other
+    // `StepOutput::*_scalar` field's convention (e.g. `e_scalar`/`n_scalar` are also
+    // unweighted - weighting lives separately in `lam_e`/`lam_n`/`lam_by_name`). Only
+    // `total`/`total_scalar` (the actual optimized objective) get the weighted contribution.
+    let mut const_scalar_sum = 0.0_f32;
+    let mut any_mdem = false;
+    for (i, domain) in ctx.problem.domains().iter().enumerate() {
+        if domain.output_dim != 5 {
+            continue;
+        }
+        let Some(f) = forwards.get(&(domain.id, "interior")) else { continue };
+        if f.strains.is_none() {
+            continue;
+        }
+        any_mdem = true;
+        let term = crate::kirsch_problem::ConstitutiveConsistencyTerm {
+            domain: domain.id,
+            material: domain.material.clone(),
+            ref_stress2: ctx.domains[i].ref_stress2,
+        };
+        let const_loss = term.compute(std::slice::from_ref(f));
+        let const_scalar = t_scalar(&const_loss);
+        const_scalar_sum += const_scalar;
+        total_scalar += const_scalar * LAM_CONSTITUTIVE_CONSISTENCY as f32;
+        total = total + const_loss.mul_scalar(LAM_CONSTITUTIVE_CONSISTENCY);
+    }
+    if any_mdem {
+        lam_by_name.insert("constitutive_consistency", LAM_CONSTITUTIVE_CONSISTENCY);
+    }
 
     let lr = lr_sched.step(total_scalar.abs() as f64);
     let mut grads = total.backward();
@@ -1090,6 +1245,12 @@ pub fn step_physics_multi(
     // can "steal" another domain's gradients: each ParamId only ever resolves to the
     // params of the model that actually owns it.
     let mut new_models: Vec<ElasticityNet<B>> = Vec::with_capacity(models.len());
+    // `enhancement.txt` item B ("Gradient Norm") - combined L2 norm across EVERY domain's
+    // weight/bias/gate gradients this step (sum of squared per-domain norms, one sqrt at the
+    // end) - the multi-domain analogue of `step_physics`'s own single-domain computation
+    // (same `flatten_grads` decomposition trick). Pure additional read; does not affect any
+    // domain's optimizer step.
+    let mut grad_norm_sq: f32 = 0.0;
     for (i, model) in models.into_iter().enumerate() {
         let dctx = &ctx.domains[i];
         let (default_weight_ids, bias_ids) = model.param_ids();
@@ -1103,6 +1264,10 @@ pub fn step_physics_multi(
         let weight_grads = GradientsParams::from_params(&mut grads, &model, &weight_ids);
         let bias_grads = GradientsParams::from_params(&mut grads, &model, &bias_ids);
         let gate_grads = GradientsParams::from_params(&mut grads, &model, &gate_ids);
+        let wn: f32 = flatten_grads(&model, &weight_grads).powf_scalar(2.0_f64).sum().into_scalar();
+        let bn: f32 = flatten_grads(&model, &bias_grads).powf_scalar(2.0_f64).sum().into_scalar();
+        let gn: f32 = flatten_grads(&model, &gate_grads).powf_scalar(2.0_f64).sum().into_scalar();
+        grad_norm_sq += wn + bn + gn;
         let optim = &mut optims[i];
         let model = optim.weight.step(lr, model, weight_grads);
         let model = optim.bias.step(lr, model, bias_grads);
@@ -1110,6 +1275,7 @@ pub fn step_physics_multi(
         let _ = dctx;
         new_models.push(model);
     }
+    let grad_norm = grad_norm_sq.max(0.0).sqrt();
 
     let lam_get = |n: &str| *lam_by_name.get(n).unwrap_or(&0.0);
     let scalar_get = |n: &str| term_names.iter().position(|&x| x == n)
@@ -1123,7 +1289,7 @@ pub fn step_physics_multi(
         eq_scalar: scalar_get("equilibrium_ring"),
         w_scalar: 0.0,
         kirsch_scalar: scalar_get("kirsch_stress"),
-        const_scalar: 0.0,
+        const_scalar: const_scalar_sum,
         total_scalar,
         lr,
         lam_e: lam_get("interior_energy"),
@@ -1140,6 +1306,7 @@ pub fn step_physics_multi(
         // note for why this was kept a separate, smaller slice rather than doing both
         // functions in one edit.
         timing: None,
+        grad_norm: Some(grad_norm),
     })
 }
 
@@ -1249,6 +1416,20 @@ pub fn probe_kt_shared(
 
 fn t_scalar(t: &Tensor<B, 1>) -> f32 {
     t.clone().into_data().to_vec::<f32>().unwrap_or(vec![0.0])[0]
+}
+
+/// (RMS, max) of a residual slice — the two summary numbers Phase 11 ("AMR Effectiveness") of
+/// the "Neural-Network-Wide Adaptive Collocation" epic reports before/after every sweep.
+/// `(0.0, 0.0)` on an empty slice (never NaN/panic — a sweep that produced zero residuals,
+/// e.g. an empty domain, is a valid, reportable state).
+pub(crate) fn residual_stats(residuals: &[f32]) -> (f64, f64) {
+    if residuals.is_empty() {
+        return (0.0, 0.0);
+    }
+    let n = residuals.len() as f64;
+    let sum_sq: f64 = residuals.iter().map(|&r| (r as f64) * (r as f64)).sum();
+    let max = residuals.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+    ((sum_sq / n).sqrt(), max)
 }
 
 /// Batched analogue of `t_scalar` for reading back several length-1 scalar tensors at once:
@@ -2572,6 +2753,21 @@ pub fn step_lbfgs_multi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn residual_stats_computes_rms_and_max() {
+        let (rms, max) = residual_stats(&[3.0, 4.0]); // rms = sqrt((9+16)/2) = 3.5355...
+        assert!((rms - 3.5355339).abs() < 1e-5);
+        assert!((max - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn residual_stats_empty_slice_is_zero_not_nan() {
+        let (rms, max) = residual_stats(&[]);
+        assert_eq!(rms, 0.0);
+        assert_eq!(max, 0.0);
+    }
+
     use crate::kirsch_problem::KirschProblem;
     use crate::optim::{make_bias_optim, make_gate_optim};
     use crate::problem::DomainState;
@@ -4375,6 +4571,7 @@ mod tests {
             cosine_sim: None,
             lam_by_name: None,
             timing: None,
+            grad_norm: None,
         })
     }
 
@@ -4601,7 +4798,22 @@ mod tests {
             ], 1);
             let int_raw = scaled.clone().slice([0..n_int, 0..scaled.dims()[1]]);
             let (exx, eyy, exy) = compute_strains::<B>(scaled, n_int, &fd);
-            let e_loss = dem_energy_loss(exx, eyy, exy, &config.material).mul_scalar(1.0 / ref_energy as f64);
+            let e_loss = dem_energy_loss(exx.clone(), eyy.clone(), exy.clone(), &config.material)
+                .mul_scalar(1.0 / ref_energy as f64);
+            // `step_physics_multi` now applies constitutive-consistency (fixed weight, outside
+            // SAW-BRDR) to every `output_dim == 5` domain - this Kirsch config IS mDEM
+            // (`engine.output_dim()` == 5, since Kirsch's geometry always has a hole), so this
+            // hand-rolled reference must include the identical term too, or `model_multi`'s
+            // gradient (which now genuinely differs from `model_single`'s by design) drifts
+            // the two models apart step over step - a real, expected consequence of fixing a
+            // real bug (constitutive_consistency was previously entirely absent from
+            // `step_physics_multi`), not a sign the fix itself is wrong.
+            let sxx_int = int_raw.clone().slice([0..n_int, 2..3]).reshape([n_int]);
+            let syy_int = int_raw.clone().slice([0..n_int, 3..4]).reshape([n_int]);
+            let sxy_int = int_raw.clone().slice([0..n_int, 4..5]).reshape([n_int]);
+            let const_loss_single = crate::energy::constitutive_consistency_loss(
+                sxx_int, syy_int, sxy_int, exx, eyy, exy, &config.material,
+            ).mul_scalar(1.0 / ref_stress2 as f64);
 
             let nt = trac_idx.len();
             let trac_norm: Vec<[f32; 2]> = trac_idx.iter().map(|&i| bnd_norm[i]).collect();
@@ -4666,15 +4878,18 @@ mod tests {
             let n_s = t_scalar(&n_loss);
             let h_s = t_scalar(&h_loss);
             let d_s = t_scalar(&d_loss);
+            let const_s = t_scalar(&const_loss_single);
             let lams = saw_single.update(&[e_s, n_s, h_s, d_s]);
             let loss = e_loss.mul_scalar(lams[0] as f64)
                 + n_loss.mul_scalar(lams[1] as f64)
                 + h_loss.mul_scalar(lams[2] as f64)
-                + d_loss.mul_scalar(lams[3] as f64);
+                + d_loss.mul_scalar(lams[3] as f64)
+                + const_loss_single.mul_scalar(LAM_CONSTITUTIVE_CONSISTENCY);
             let _ = int_raw;
 
             let lr = lr_sched_single.step(
-                (e_s * lams[0] + n_s * lams[1] + h_s * lams[2] + d_s * lams[3]).abs() as f64
+                (e_s * lams[0] + n_s * lams[1] + h_s * lams[2] + d_s * lams[3]
+                    + const_s * LAM_CONSTITUTIVE_CONSISTENCY as f32).abs() as f64
             );
             let (weight_ids, bias_ids) = model_single.param_ids();
             let gate_ids = model_single.gate_ids();
@@ -4690,6 +4905,7 @@ mod tests {
             rel_close(out_multi.n_scalar, n_s, "n_scalar");
             rel_close(out_multi.h_scalar, h_s, "h_scalar");
             rel_close(out_multi.d_scalar, d_s, "d_scalar");
+            rel_close(out_multi.const_scalar, const_s, "const_scalar");
         }
 
         struct NormVisitor { total: f64 }

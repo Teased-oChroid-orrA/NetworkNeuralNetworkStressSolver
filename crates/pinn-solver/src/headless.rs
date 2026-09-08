@@ -428,6 +428,10 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                 cosine_sim: None,
                 lam_by_name: None,
                 timing: None,
+                // L-BFGS's own multi-iteration inner loop has no single per-step gradient
+                // norm comparable to SGD-family steps' - genuinely not available here, not
+                // an oversight.
+                grad_norm: None,
             };
             (new_m, synthetic_out)
         } else {
@@ -1124,6 +1128,7 @@ pub(crate) fn run_headless_pinlug_inner(
                 cosine_sim: None,
                 lam_by_name: None,
                 timing: None,
+                grad_norm: None,
             }
         } else {
             // tier_u8 is a pure logging passthrough (StepOutput.optimizer_tier) — never

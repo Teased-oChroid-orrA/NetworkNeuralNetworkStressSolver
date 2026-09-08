@@ -1,0 +1,48 @@
+# Example user-defined problem: a wider plate with three holes (two free, one fixed)
+# arranged asymmetrically — a harder benchmark than `notched_plate.toml`'s two-hole case,
+# exercising more simultaneous hole-boundary conditions and a non-symmetric layout.
+#
+# Run with: cargo run -p pinn-app --release -- --headless --problem-spec examples/problems/triple_hole_plate.toml
+#
+# All lengths in meters [m], all stresses/moduli in pascals [Pa].
+
+[geometry]
+half_w = 0.15   # full width  = 0.30 m
+half_h = 0.06   # full height = 0.12 m
+thickness = 0.006
+
+[[geometry.holes]]
+center = [-0.06, 0.02]
+radius = 0.009
+bc = "Free"
+
+[[geometry.holes]]
+center = [0.0, -0.02]
+radius = 0.007
+bc = "Fixed"
+
+[[geometry.holes]]
+center = [0.06, 0.02]
+radius = 0.009
+bc = "Free"
+
+[material]
+e = 71.7e9               # Al 7075-T6
+nu = 0.33
+density = 2810.0
+ultimate_strength_pa = 503e6
+
+[load]
+px = 6.9e7
+py = 0.0
+
+[network]
+hidden_dim = 64
+n_hidden = 4
+
+[training]
+max_steps = 3000
+n_interior = 3072
+n_boundary = 768
+fd_h = 1e-3
+lr = 1e-3

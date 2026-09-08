@@ -1,0 +1,18 @@
+# Example beam spec: 1D Euler-Bernoulli simply-supported (pinned-pinned) beam.
+#
+# Loadable from the powershell_tool app-egui Stress Solver toolbox, or directly via
+# `pinn_solver::toy_beam::run_training_beam_streaming` / `train_toy_beam`.
+#
+# Problem: d^4 w/dx^4 = q on x in (0,1), E=I=q=1 (fully normalized, dimensionless).
+# Pinned-pinned: w(0)=w(1)=0 (essential, hard-enforced) / w''(0)=w''(1)=0 (natural).
+# Closed-form exact deflection: w(x) = (1/24) * x * (x^3 - 2x^2 + 1).
+
+bc = "SimplySupported"
+
+[network]
+hidden_dim = 48
+n_hidden = 3
+
+[training]
+steps = 3000
+n_points = 32

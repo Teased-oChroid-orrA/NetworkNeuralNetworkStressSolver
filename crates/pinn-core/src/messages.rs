@@ -3,6 +3,125 @@ use crate::geometry::GeometryConfig;
 use crate::loading::LoadConfig;
 use crate::material::MaterialProps;
 
+/// Per-AMR-sweep effectiveness report (Phase 11, "Neural-Network-Wide Adaptive Collocation"
+/// epic) — before/after residual + point count + timing for ONE sweep event on one domain.
+/// Attached to whichever `TrainingUpdate`/`PinLugTrainingUpdate` corresponds to the step the
+/// sweep fired on; absent (`None`/empty) on every other step. This is the concrete data
+/// behind "did this sweep actually help, and what did it cost" — not just "the collocation
+/// count changed".
+#[derive(Debug, Clone)]
+pub struct AmrSweepReport {
+    /// Which domain this sweep ran on — e.g. `"interior"` (single-domain `UserDefinedProblem`)
+    /// or `"pin"`/`"lug"` (pin-in-lug's two independently-gridded domains).
+    pub domain_label: &'static str,
+    pub step: usize,
+    pub points_before: usize,
+    pub points_after: usize,
+    pub residual_rms_before: f64,
+    pub residual_max_before: f64,
+    pub residual_rms_after: f64,
+    pub residual_max_after: f64,
+    pub sweep_duration_ms: f64,
+    /// Phase 8 ("Plate-With-Hole Physics Validation") diagnostic: mean local point density
+    /// (see `amr::AdaptiveGrid::lock_zone_density`) at this domain's hole zone(s), before vs.
+    /// after this sweep — `0.0`/`0.0` for a geometry with no lock zones (nothing to
+    /// concentrate near, not a missing value). Answers "did AMR actually identify the hole
+    /// region as needing resolution" with a real number, not just "the point count changed".
+    pub hole_zone_density_before: f64,
+    pub hole_zone_density_after: f64,
+    /// Domain-wide mean point density (`points / domain_area`) at the same two instants —
+    /// the denominator `hole_zone_density_*` is meaningfully compared against. A ratio well
+    /// above 1.0 (hole zone denser than the domain average) is the concrete, numeric answer
+    /// to "is AMR targeting the hole", not a plausible-looking visualization.
+    pub domain_mean_density_before: f64,
+    pub domain_mean_density_after: f64,
+}
+
+/// `enhancement.md` Phase 9 ("Force Equilibrium Validation") — result of `pinn_solver::
+/// user_problem::probe_reaction_force`/`parametric_problem::reaction_force_stats`. Lives here
+/// (not in `pinn-solver`) for the same reason `HoleBoundaryPoint`/`VisFields` do: `pinn-core`
+/// owns the SHAPE of any solver-computed value that needs to travel inside a `TrainingUpdate`,
+/// even though only `pinn-solver` knows how to produce one (`pinn-core` never depends on
+/// `pinn-solver`).
+///
+/// `net_fx`/`net_fy` are the model's PREDICTED net force [N] integrated over the entire outer
+/// boundary — this should be close to zero for a converged solution. The applied far-field
+/// traction target is, by construction, self-canceling around the whole closed rectangle (it
+/// pulls one edge one way and the opposite edge the other way), so there is no separate
+/// nonzero "applied resultant" to compare against; a nonzero PREDICTED net force is itself the
+/// meaningful inconsistency. `reference_force` [N] is the nominal one-edge load magnitude used
+/// to normalize `equilibrium_error` into a scale-free ratio.
+#[derive(Debug, Clone, Copy)]
+pub struct ReactionForce {
+    pub net_fx: f64,
+    pub net_fy: f64,
+    pub reference_force: f64,
+    pub equilibrium_error: f64,
+}
+
+/// `enhancement.md` Phase 10 ("Energy Validation") — result of `pinn_solver::user_problem::
+/// probe_energy_balance`/`parametric_problem::energy_balance_stats`. Lives here for the same
+/// reason `ReactionForce` does (see that type's doc comment).
+///
+/// **Distinct from `TrainingUpdate::energy_loss`/`ParametricTrainingUpdate::energy_loss`**,
+/// which are the raw, un-integrated, SAW-BRDR-weighted optimizer LOSS TERM value — NOT a
+/// physical energy in joules (`enhancement.md` Phase 10's own explicit warning: "do not label
+/// a quantity 'energy error' if it is merely the training loss"). `internal_energy` here is a
+/// genuine Monte-Carlo domain integral of the per-point strain energy density over the
+/// plate's real area×thickness; `external_work` is a genuine `∮ t·u ds` integral over the
+/// loaded boundary. For a converged linear-elastic solution under pure traction loading (no
+/// body force), the work-energy theorem requires these to be equal — `energy_balance_error`
+/// is how far apart they are, normalized by `external_work`'s own magnitude.
+#[derive(Debug, Clone, Copy)]
+pub struct EnergyBalance {
+    pub internal_energy: f64,
+    pub external_work: f64,
+    pub energy_balance_error: f64,
+}
+
+/// Stage I ("live network-evolution visualization", the user's own explicit follow-up ask) —
+/// a per-layer snapshot of `pinn_solver::network::ElasticityNet`'s weight tensors, read at the
+/// same vis cadence `VisFields` already uses (never inside the per-step hot loop — see
+/// `pinn_solver::network::network_snapshot`'s doc comment for why this adds zero training-loop
+/// cost). `layer_mean_abs_weight`/`layer_max_abs_weight` are parallel, one entry per hidden
+/// layer (input layer first). `awake_mask` is empty whenever PirateNet gating is disabled —
+/// true for every problem type this toolbox currently trains (`NetworkSpec` has no
+/// `use_piratenet` field), kept here anyway so this type stays correct if that ever changes.
+///
+/// `layer_weights` carries the REAL end-to-end weight matrices (approved neuron-and-edge
+/// diagram, not the earlier per-layer bar-chart version) — one entry per `Linear` layer
+/// INCLUDING the final output projection (`ElasticityNet::all_weight_matrices`), shape
+/// `[d_input, d_output]` each, unlike `layer_mean_abs_weight`/`awake_mask` which deliberately
+/// exclude the output layer to mirror `awake_mask`'s own scope — a wiring diagram needs the
+/// complete input-to-output path to be meaningful. Payload is small (a 64×64 hidden layer is
+/// 16 KB; the input/output layers are far smaller) and sent only at the existing vis cadence.
+#[derive(Debug, Clone)]
+pub struct NetworkSnapshot {
+    pub layer_mean_abs_weight: Vec<f32>,
+    pub layer_max_abs_weight: Vec<f32>,
+    pub awake_mask: Vec<bool>,
+    pub layer_weights: Vec<Array2<f32>>,
+}
+
+/// Smart adaptive architecture — sent exactly once on the step a
+/// `pinn_solver::architecture_controller::ArchitectureController` action was actually applied
+/// to the live model (never every step, and never on a step nothing happened — the UI treats
+/// `Some` as a one-shot event, e.g. a loss-chart marker, not an ongoing status). `NetworkSpec::
+/// adaptive` gates whether this can ever be populated; `None` on every non-adaptive run
+/// (including Kirsch/pin-lug, which have no `adaptive` field at all).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArchitectureEvent {
+    pub step: usize,
+    /// Human-readable summary of what happened, e.g. "Grew width 64 -> 96",
+    /// "Removed dormant layer 2", "Pruned 4 neurons from layer 1", "Reverted last change
+    /// (no improvement)" — built by the caller from the `ArchAction` it just applied.
+    pub description: String,
+    pub hidden_dim_before: usize,
+    pub hidden_dim_after: usize,
+    pub n_hidden_before: usize,
+    pub n_hidden_after: usize,
+}
+
 /// Command sent from GUI thread → solver thread
 pub enum ControlMsg {
     Stop,
@@ -14,6 +133,21 @@ pub enum ControlMsg {
     /// profile to CSV (see `pinn_solver::contact_export`). No-op (treated as `Continue`)
     /// on the single-domain Kirsch path — there is nothing to export there.
     ExportContactPressure,
+    /// Parametric PINN "instant inference" request (`enhancement.txt` items 7/8/17 - "train
+    /// once, change parameters, get a new solution instantly") - query the just-trained
+    /// parametric model at a NEW `(e, nu, px)` without retraining. Only meaningful after
+    /// `TrainingMsg::ParametricReady`; a no-op before that (nothing trained yet to query) or
+    /// on any non-parametric training path.
+    ParametricInfer { e: f64, nu: f64, px: f64 },
+    /// Stage H (model checkpoint save/load) - save the current model's weights + a metadata
+    /// sidecar to disk. Only meaningful once the model has reached a stable, queryable state
+    /// (after `TrainingMsg::Done`/`ParametricReady` - the solver thread stays alive to serve
+    /// exactly this, mirroring the existing `ParametricInfer` post-training serving loop). A
+    /// no-op on any path that doesn't yet implement a save handler for its own control loop.
+    /// `saved_at_unix` is stamped by the UI thread (which naturally has clock access for a
+    /// real user-triggered action) rather than read inside the solver thread, keeping every
+    /// solver-side probe/computation in this codebase a pure function of its arguments.
+    SaveCheckpoint { path: std::path::PathBuf, saved_at_unix: u64 },
 }
 
 /// Data sent from solver thread → GUI thread (bounded channel capacity=1)
@@ -22,10 +156,175 @@ pub enum TrainingMsg {
     /// Pin-in-lug analogue of `Update` — carries both domains' visualization fields and a
     /// generic convergence metric instead of Kirsch's K_t.
     PinLugUpdate(Box<PinLugTrainingUpdate>),
+    /// `toy_beam` analogue of `Update` — a 1D beam has no spatial field/heatmap concept and
+    /// no separate energy/BC loss split (one combined potential-energy scalar), so it
+    /// carries its own shape (a single loss value plus the network-vs-exact comparison
+    /// points) instead of being force-fit into `TrainingUpdate`.
+    BeamUpdate(Box<BeamTrainingUpdate>),
+    /// `ParametricProblemSpec` analogue of `Update` — see `ParametricTrainingUpdate`'s doc
+    /// comment for why this needs its own shape (a per-step sampled `(e, nu, px)` triple,
+    /// no K_t, no AMR in v1).
+    ParametricUpdate(Box<ParametricTrainingUpdate>),
+    /// Sent exactly once, when the parametric training loop reaches `training.max_steps` (or
+    /// is stopped early) and transitions from "training" to "serving instant-inference
+    /// requests" - the model is NOT dropped after this; the training thread stays alive
+    /// blocked on `ControlMsg::ParametricInfer`/`Stop` (see `pinn_solver::parametric_problem`'s
+    /// module doc for why this is the chosen way to keep a trained model queryable without a
+    /// checkpoint-persistence mechanism, which this codebase doesn't have - see
+    /// `pinn_core::inference_envelope`'s doc comment).
+    ParametricReady,
+    /// Result of a `ControlMsg::ParametricInfer` request - the model evaluated at the
+    /// requested `(e, nu, px)`, plus whether that request fell inside the trained ranges
+    /// (`ParametricProblemSpec::in_range`, a min/max check - see that method's doc comment for
+    /// why a real distance-to-training-distribution metric is a stated future refinement, not
+    /// this v1's scope).
+    ParametricInferResult(Box<ParametricInferenceResult>),
     Done,
     Error(String),
     /// Contact-pressure CSV export finished successfully; carries the written file path.
     ExportComplete(String),
+    /// Result of a `ControlMsg::SaveCheckpoint` request - `Ok(path)` on success (the exact
+    /// weights-file path actually written, which may differ slightly from the requested path
+    /// once the recorder's own extension is appended), `Err(message)` on I/O/serialization
+    /// failure. Never silently swallowed - the UI surfaces either outcome as a toast.
+    CheckpointSaved(Result<String, String>),
+}
+
+/// `ParametricProblemSpec` analogue of `TrainingUpdate` — see `TrainingMsg::ParametricUpdate`.
+pub struct ParametricTrainingUpdate {
+    pub step: usize,
+    pub total_loss: f32,
+    pub energy_loss: f32,
+    /// Sum of every boundary-condition term this step (outer traction + every hole term) —
+    /// mirrors `PinLugTrainingUpdate::neumann_loss`'s own "documented approximation: sum of
+    /// all non-energy BC-term scalars" convention.
+    pub boundary_loss: f32,
+    pub lr: f32,
+    /// The `(E, nu, Px)` triple THIS step's forward/backward pass was actually trained
+    /// against - real-time evidence the network is seeing the full range over the course of
+    /// training, not evidence of convergence at any single point in it.
+    pub e_this_step: f64,
+    pub nu_this_step: f64,
+    pub load_this_step: f64,
+    /// `enhancement.txt` item B ("Gradient Norm") — L2 norm of every weight gradient this
+    /// step.
+    pub grad_norm: f32,
+    /// `enhancement.txt` items 4/C ("BC residual RMS/max") — real per-point traction/
+    /// displacement residual at the outer boundary and every hole ring this step, combined.
+    /// Distinct from `VisFields::pde_residual` (the interior constitutive-consistency
+    /// residual) — see that field's doc comment.
+    pub bc_residual_rms: f64,
+    pub bc_residual_max: f64,
+    /// `enhancement.md` Phase 9 — see `ReactionForce`'s doc comment. Computed only on the same
+    /// cadence `vis` is (`None` otherwise — a real absence, not a `0.0` sentinel).
+    pub reaction_force: Option<ReactionForce>,
+    /// `enhancement.md` Phase 10 — see `EnergyBalance`'s doc comment. Same "only on the vis
+    /// cadence" convention as `reaction_force` above.
+    pub energy_balance: Option<EnergyBalance>,
+    /// Stage I — see `NetworkSnapshot`'s doc comment. Same "only on the vis cadence"
+    /// convention as every other `Option` field above.
+    pub network_snapshot: Option<NetworkSnapshot>,
+    /// Smart adaptive architecture — see `ArchitectureEvent`'s doc comment. `Some` only on the
+    /// exact step an action was applied.
+    pub architecture_event: Option<ArchitectureEvent>,
+    /// Visualization at `e_this_step`/`nu_this_step`/`load_this_step` — sent on the same
+    /// periodic cadence `VisFields` uses elsewhere, not every step.
+    pub vis: Option<VisFields>,
+    pub hole_analyses: Vec<HoleAnalysis>,
+}
+
+/// Result of one `ControlMsg::ParametricInfer` request — see `TrainingMsg::
+/// ParametricInferResult`'s doc comment.
+#[derive(Debug, Clone)]
+pub struct ParametricInferenceResult {
+    pub e: f64,
+    pub nu: f64,
+    pub px: f64,
+    pub in_range: bool,
+    /// `enhancement.txt` items 11/12 ("physics-based safety check", GREEN/YELLOW/RED) — the
+    /// real BC residual RMS/max AT THIS QUERY POINT, computed without retraining. `vis.
+    /// pde_residual` carries the equivalent interior-residual field; this is its
+    /// boundary-only, scalar analogue. The UI combines this with `in_range` to classify the
+    /// result, rather than trusting the parameter-range check alone.
+    pub bc_residual_rms: f64,
+    pub bc_residual_max: f64,
+    /// `enhancement.md` Phase 9 — see `ReactionForce`'s doc comment. Always `Some` for this
+    /// result type (every inference query computes it, unlike the periodic training update).
+    pub reaction_force: ReactionForce,
+    /// `enhancement.md` Phase 10 — see `EnergyBalance`'s doc comment. Always computed for
+    /// this result type (every inference query computes it).
+    pub energy_balance: EnergyBalance,
+    /// `enhancement.md` Phase 21 ("Do Not Rely Only on Min/Max") — this query's nearest-
+    /// neighbor distance (in normalized `[-1,1]^3` `(e_n,nu_n,p_n)` space) to the closest
+    /// `(E,nu,Px)` triple actually drawn during training, from a bounded recent-sample
+    /// reservoir (see `pinn_solver::parametric_problem::run_training_parametric`'s doc
+    /// comment). `f64::INFINITY` if the reservoir was empty (no coverage information yet).
+    pub nearest_sample_distance: f64,
+    /// The reservoir's own median pairwise nearest-neighbor spacing (`pinn_core::
+    /// param_distance::median_nn_spacing`) — the self-baseline `nearest_sample_distance`
+    /// should be compared against as a ratio, not an arbitrary absolute constant. `0.0` if
+    /// the reservoir had fewer than 2 samples.
+    pub typical_sample_spacing: f64,
+    pub vis: VisFields,
+    pub hole_analyses: Vec<HoleAnalysis>,
+}
+
+/// `toy_beam` analogue of `TrainingUpdate` — see `TrainingMsg::BeamUpdate`.
+pub struct BeamTrainingUpdate {
+    pub step: usize,
+    pub max_steps: usize,
+    pub loss: f32,
+    pub max_abs_error: f64,
+    pub max_abs_deflection: f64,
+    /// `(x, w_net(x), w_exact(x))` at each evaluation-grid point — mirrors
+    /// `pinn_solver::toy_beam::ToyBeamResult::eval_points` exactly.
+    pub eval_points: Vec<(f64, f64, f64)>,
+}
+
+/// One angular sample around a hole's circumference (Phase 10, "Neural-Network-Wide Adaptive
+/// Collocation" epic) — see `pinn_solver::user_problem::probe_hole_boundary_profile`'s doc
+/// comment for how this is computed. Lives here (not in `pinn-solver`) for the same reason
+/// `VisFields` does: `pinn-core` defines the data SHAPE a solver-computed message carries,
+/// even though only `pinn-solver` knows how to produce one — `pinn-core` never depends on
+/// `pinn-solver`, so a type traveling inside a `TrainingUpdate` can't live on the solver side.
+#[derive(Debug, Clone, Copy)]
+pub struct HoleBoundaryPoint {
+    pub theta_deg: f64,
+    pub x: f64,
+    pub y: f64,
+    pub ux: f32,
+    pub uy: f32,
+    /// Tensor-convention shear strain — see `pinn_solver::user_problem`'s own doc comment
+    /// on this field for the Phase 9 Von Mises pipeline audit that verified this convention.
+    pub eps_xx: f32,
+    pub eps_yy: f32,
+    pub eps_xy: f32,
+    pub sxx: f32,
+    pub syy: f32,
+    pub sxy: f32,
+    pub von_mises: f32,
+}
+
+/// Stress-concentration summary derived from a `HoleBoundaryPoint` profile — see
+/// `pinn_solver::user_problem::stress_concentration_from_profile`'s doc comment. Deliberately
+/// NOT compared against a hardcoded Kt=3 anywhere this travels.
+#[derive(Debug, Clone, Copy)]
+pub struct StressConcentration {
+    pub nominal_stress: f64,
+    pub max_von_mises: f64,
+    pub max_theta_deg: f64,
+    pub kt: f64,
+}
+
+/// One hole's full stress analysis, bundled for transport in a `TrainingUpdate` (Phase 16,
+/// "Final Results Dashboard", of the "Neural-Network-Wide Adaptive Collocation" epic).
+#[derive(Debug, Clone)]
+pub struct HoleAnalysis {
+    /// Index into the originating `UserGeometry::holes` — lets a UI label "Hole 1"/"Hole 2"
+    /// consistently across updates without needing the geometry itself in scope.
+    pub hole_index: usize,
+    pub profile: Vec<HoleBoundaryPoint>,
+    pub concentration: StressConcentration,
 }
 
 pub struct TrainingUpdate {
@@ -39,6 +338,36 @@ pub struct TrainingUpdate {
     pub n_colloc:     usize,
     pub kt_estimate:  Option<f32>,
     pub vis: Option<VisFields>,
+    /// Set only on the step an AMR sweep actually fired (see `AmrSweepReport`'s doc comment).
+    pub amr_sweep: Option<AmrSweepReport>,
+    /// Per-hole stress analysis (Phase 16, "Final Results Dashboard") — populated on the
+    /// same cadence as `vis` (empty otherwise), one entry per hole in the originating
+    /// geometry. Empty for problems with no user-defined geometry (Kirsch's own path).
+    pub hole_analyses: Vec<HoleAnalysis>,
+    /// `enhancement.txt` item B ("Gradient Norm") — mirrors `training_core::StepOutput::
+    /// grad_norm`'s own doc comment for what this is and why it's always real (not gated
+    /// behind a diagnostics flag).
+    pub grad_norm: Option<f32>,
+    /// `enhancement.txt` items 4/C ("BC residual RMS/max") — real per-point traction/
+    /// displacement residual at the outer boundary and every hole ring, sent on the same
+    /// cadence as `vis` (`0.0`/`0.0` otherwise, not a meaningful "no data" sentinel since a
+    /// genuine zero residual is also a valid value — check alongside `vis.is_some()`).
+    pub bc_residual_rms: f64,
+    pub bc_residual_max: f64,
+    /// `enhancement.md` Phase 9 — see `ReactionForce`'s doc comment. Computed only on the same
+    /// cadence `vis` is (`None` otherwise). `None` on Kirsch's own path too (deliberately not
+    /// wired there — see `powershell_tool/CLAUDE.md`'s note on why BC residual was likewise
+    /// only added to the `UserDefinedProblem`/parametric paths, not Kirsch/pin-lug).
+    pub reaction_force: Option<ReactionForce>,
+    /// `enhancement.md` Phase 10 — see `EnergyBalance`'s doc comment. Same treatment as
+    /// `reaction_force` above (Kirsch's own path leaves this `None`).
+    pub energy_balance: Option<EnergyBalance>,
+    /// Stage I ("live network-evolution visualization") — see `NetworkSnapshot`'s doc comment.
+    /// Same "only on the vis cadence" convention as every other `Option` field above.
+    pub network_snapshot: Option<NetworkSnapshot>,
+    /// Smart adaptive architecture — see `ArchitectureEvent`'s doc comment. `Some` only on the
+    /// exact step an action was applied, `None` on every other step (not a vis-cadence field).
+    pub architecture_event: Option<ArchitectureEvent>,
 }
 
 /// Pin-in-lug analogue of `TrainingUpdate` — one entry per domain's visualization fields,
@@ -59,9 +388,23 @@ pub struct PinLugTrainingUpdate {
     /// `kt_estimate`; pin-in-lug has no closed-form K_t.
     pub convergence_metric: Option<f32>,
     pub vis: Option<PinLugVisFields>,
+    /// 0, 1, or 2 entries (pin and/or lug) - populated only on the step an AMR sweep
+    /// actually fired for that domain. See `AmrSweepReport`'s doc comment.
+    pub amr_sweep: Vec<AmrSweepReport>,
+    /// `enhancement.txt` item B ("Gradient Norm") — mirrors `training_core::StepOutput::
+    /// grad_norm`. No BC-residual equivalent here (unlike `TrainingUpdate`) — pin-lug's
+    /// boundary condition is Signorini contact (penetration/non-tension KKT terms), not a
+    /// simple prescribed traction, so "BC residual" isn't the same well-defined quantity;
+    /// giving it one would mean inventing a new metric definition, not surfacing an existing
+    /// one, and this pass didn't do that.
+    pub grad_norm: Option<f32>,
 }
 
-/// Visualization fields — sent every 10 steps (not every step, to keep channel fast)
+/// Visualization fields — sent every 10 steps (not every step, to keep channel fast).
+///
+/// Phase 14 ("Spatial Diagnostic Visualization") of the "Neural-Network-Wide Adaptive
+/// Collocation" epic added the six fields below the original stress/displacement set — all
+/// the same `(ny, nx)` shape, NaN-masked outside the domain exactly like the original six.
 #[derive(Debug, Clone)]
 pub struct VisFields {
     pub von_mises: Array2<f32>,
@@ -70,6 +413,28 @@ pub struct VisFields {
     pub sigma_xy:  Array2<f32>,
     pub disp_u:    Array2<f32>,
     pub disp_v:    Array2<f32>,
+    pub eps_xx: Array2<f32>,
+    pub eps_yy: Array2<f32>,
+    pub eps_xy: Array2<f32>,
+    /// Constitutive-consistency residual magnitude `|sigma_net - C:eps_fd|` (mDEM domains,
+    /// where sigma is a direct, independently-learned network output) — the real,
+    /// already-trained-against quantity `training_core::step_physics_multi`'s
+    /// `constitutive_consistency` term penalizes, now surfaced for display. Exactly `0.0`
+    /// (not NaN) inside the domain for ansatzes where stress is analytically derived from
+    /// strain (Kirsch's `QuarterSymmAnsatz`) — there is no independent network stress output
+    /// to disagree with strain there, so the residual is trivially and correctly zero, not
+    /// missing data.
+    pub pde_residual: Array2<f32>,
+    /// `|dem_energy_per_point|` — the actual signal `AdaptiveGrid`'s residual-driven
+    /// refine/coarsen decision uses (see `training_core::probe_interior_energy_residuals`),
+    /// evaluated on the visualization grid instead of at collocation points. This is "what
+    /// AMR is looking at", not a separate invented indicator.
+    pub amr_score: Array2<f32>,
+    /// Collocation point count per grid cell — a genuine 2D histogram of the domain's
+    /// current collocation set, binned into this same `(ny, nx)` grid. Raw counts, not
+    /// normalized; the UI clips/scales for display the same way it already does for every
+    /// other field.
+    pub collocation_density: Array2<f32>,
 }
 
 /// Per-domain visualization fields for the pin-in-lug 2-domain problem.

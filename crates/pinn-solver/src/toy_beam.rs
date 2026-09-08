@@ -31,6 +31,9 @@
 
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::{Tensor, TensorData};
+use crossbeam_channel::{Receiver, Sender};
+use pinn_core::beam_spec::{BeamBcSpec, BeamSpec};
+use pinn_core::messages::{BeamTrainingUpdate, ControlMsg, TrainingMsg};
 
 use crate::network::{ElasticityNet, ElasticityNetConfig};
 use crate::training_core::{sync_device, BDevice, B};
@@ -41,6 +44,15 @@ pub enum BeamBc {
     Cantilever,
     /// Pinned-pinned: `w(0)=w(1)=0` (essential) / `w''(0)=w''(1)=0` (natural).
     SimplySupported,
+}
+
+impl From<BeamBcSpec> for BeamBc {
+    fn from(spec: BeamBcSpec) -> Self {
+        match spec {
+            BeamBcSpec::Cantilever => BeamBc::Cantilever,
+            BeamBcSpec::SimplySupported => BeamBc::SimplySupported,
+        }
+    }
 }
 
 impl BeamBc {
@@ -160,6 +172,94 @@ pub fn train_toy_beam(
     }
 
     ToyBeamResult { final_loss, max_abs_error, max_abs_deflection, eval_points }
+}
+
+/// GUI-driving analogue of [`train_toy_beam`] — same training loop (energy minimization,
+/// 3-point central stencil for `w''`), but streams [`TrainingMsg::BeamUpdate`] periodically
+/// and polls `stop_rx` for [`ControlMsg::Stop`] instead of running to completion in one
+/// blocking call. `Pause`/`Resume`/`WarmStart`/`ExportContactPressure` are accepted but
+/// treated as no-ops (matches `run_training_user_problem`'s own `WarmStart` no-op scope
+/// cut — a loaded `BeamSpec` isn't a `SolverConfig`, there is nothing to warm-start into).
+pub fn run_training_beam_streaming(
+    spec: BeamSpec,
+    tx: Sender<TrainingMsg>,
+    stop_rx: Receiver<ControlMsg>,
+) {
+    let bc: BeamBc = spec.bc.into();
+    let steps = spec.training.steps;
+    let n_points = spec.training.n_points;
+    let hidden_dim = spec.network.hidden_dim;
+    let n_hidden = spec.network.n_hidden;
+
+    let device = BDevice::default();
+    let h: f32 = 1e-2;
+    let dx = 1.0_f64 / n_points as f64;
+
+    let net_cfg = ElasticityNetConfig::new()
+        .with_input_dim(1)
+        .with_hidden_dim(hidden_dim)
+        .with_n_hidden(n_hidden)
+        .with_output_dim(1);
+    let mut model: ElasticityNet<B> = net_cfg.init(&device);
+    let mut optimizer = AdamWConfig::new().init();
+    let lr = 1e-3;
+
+    let centers: Vec<f32> = (0..n_points)
+        .map(|i| (i as f32 + 0.5) / n_points as f32)
+        .collect();
+    let mut stencil_xs = Vec::with_capacity(3 * n_points);
+    stencil_xs.extend(centers.iter().map(|&x| x - h));
+    stencil_xs.extend(centers.iter().copied());
+    stencil_xs.extend(centers.iter().map(|&x| x + h));
+
+    let eval_xs: Vec<f32> = (1..=20).map(|i| i as f32 * 0.05).collect(); // [0.05 .. 1.0]
+
+    for step in 0..steps {
+        match stop_rx.try_recv() {
+            Ok(ControlMsg::Stop) => break,
+            _ => {}
+        }
+
+        let w_all = forward_tensor(&model, bc, &stencil_xs, &device); // [3*n, 1]
+        let w_minus = w_all.clone().slice([0..n_points, 0..1]);
+        let w_center = w_all.clone().slice([n_points..2 * n_points, 0..1]);
+        let w_plus = w_all.slice([2 * n_points..3 * n_points, 0..1]);
+
+        let w_pp = (w_minus - w_center.clone().mul_scalar(2.0_f64) + w_plus)
+            .div_scalar((h * h) as f64);
+        let energy_density = w_pp.powf_scalar(2.0_f64).mul_scalar(0.5_f64) - w_center;
+        let loss = energy_density.sum().mul_scalar(dx);
+
+        let loss_val = loss.clone().into_scalar() as f64;
+        let grads_raw = loss.backward();
+        let grads = GradientsParams::from_grads(grads_raw, &model);
+        model = optimizer.step(lr, model, grads);
+
+        if step % 10 == 0 || step + 1 == steps {
+            let model_val = model.clone();
+            let net_vals = eval_batch(&model_val, bc, &eval_xs, &device);
+            let mut max_abs_error = 0.0_f64;
+            let mut max_abs_deflection = 0.0_f64;
+            let mut eval_points = Vec::with_capacity(eval_xs.len());
+            for (&x, &w) in eval_xs.iter().zip(net_vals.iter()) {
+                let exact = bc.exact_solution(x as f64);
+                max_abs_error = max_abs_error.max((w as f64 - exact).abs());
+                max_abs_deflection = max_abs_deflection.max((w as f64).abs());
+                eval_points.push((x as f64, w as f64, exact));
+            }
+            let update = BeamTrainingUpdate {
+                step,
+                max_steps: steps,
+                loss: loss_val as f32,
+                max_abs_error,
+                max_abs_deflection,
+                eval_points,
+            };
+            let _ = tx.try_send(TrainingMsg::BeamUpdate(Box::new(update)));
+        }
+    }
+    sync_device(&device);
+    let _ = tx.send(TrainingMsg::Done);
 }
 
 #[cfg(test)]

@@ -268,6 +268,79 @@ fn migrate_moment<B: Backend>(
     Tensor::<B, 2>::from_data(TensorData::new(out, vec![d0_new, d1_new]), device)
 }
 
+/// Smart adaptive architecture: shrink-side analogue of [`migrate_soap_muon_state_for_growth`].
+/// `keep_dim0`/`keep_dim1` are the SURVIVING indices (in order) for each axis, or `None` if that
+/// axis didn't change size — a pure selection/projection, unlike growth's duplication-map
+/// expansion (there is no lossless equivalent for removal; the dropped rows/columns' momentum
+/// state is simply discarded along with the weights they belonged to). `gg0`/`gg1` (SOAP's
+/// per-axis second-moment Gram matrices) are projected onto the kept subspace by selecting the
+/// matching rows AND columns; `q0`/`q1` reset to identity of the new size (same "re-orthogonalize
+/// on next precondition update" convention growth already uses — these are recomputed
+/// periodically during training anyway, never treated as ground truth carried across a resize).
+pub fn migrate_soap_muon_state_for_shrink<B: Backend>(
+    old: &SoapMuonState<B>,
+    keep_dim0: Option<&[usize]>,
+    keep_dim1: Option<&[usize]>,
+    device: &Device<B>,
+) -> SoapMuonState<B> {
+    let gg0 = match keep_dim0 {
+        Some(keep) => select_symmetric::<B>(&old.gg0, keep, device),
+        None => old.gg0.clone(),
+    };
+    let gg1 = match keep_dim1 {
+        Some(keep) => select_symmetric::<B>(&old.gg1, keep, device),
+        None => old.gg1.clone(),
+    };
+    let d0_new = keep_dim0.map(|k| k.len()).unwrap_or_else(|| old.q0.dims()[0]);
+    let d1_new = keep_dim1.map(|k| k.len()).unwrap_or_else(|| old.q1.dims()[0]);
+    let q0 = Tensor::eye(d0_new, device);
+    let q1 = Tensor::eye(d1_new, device);
+
+    let exp_avg = select_moment::<B>(&old.exp_avg, keep_dim0, keep_dim1, device);
+    let exp_avg_sq = select_moment::<B>(&old.exp_avg_sq, keep_dim0, keep_dim1, device);
+
+    SoapMuonState { gg0, gg1, q0, q1, exp_avg, exp_avg_sq, step: old.step }
+}
+
+/// Projects a symmetric `[d_old, d_old]` matrix onto the `keep.len()` kept rows/columns (the
+/// same indices on both axes, since `gg0`/`gg1` are Gram matrices over a single dimension).
+fn select_symmetric<B: Backend>(m: &Tensor<B, 2>, keep: &[usize], device: &Device<B>) -> Tensor<B, 2> {
+    let [d_old, _] = m.dims();
+    let data = m.clone().into_data().to_vec::<f32>().unwrap();
+    let d_new = keep.len();
+    let mut out = vec![0f32; d_new * d_new];
+    for (new_r, &old_r) in keep.iter().enumerate() {
+        for (new_c, &old_c) in keep.iter().enumerate() {
+            out[new_r * d_new + new_c] = data[old_r * d_old + old_c];
+        }
+    }
+    Tensor::<B, 2>::from_data(TensorData::new(out, vec![d_new, d_new]), device)
+}
+
+/// Shrink-side analogue of `migrate_moment` — projects an Adam moment tensor (`exp_avg`/
+/// `exp_avg_sq`, shape `[d0, d1]`) onto the kept rows/columns of each axis independently.
+fn select_moment<B: Backend>(
+    old: &Tensor<B, 2>,
+    keep_dim0: Option<&[usize]>,
+    keep_dim1: Option<&[usize]>,
+    device: &Device<B>,
+) -> Tensor<B, 2> {
+    let [d0_old, d1_old] = old.dims();
+    let data = old.clone().into_data().to_vec::<f32>().unwrap();
+
+    let rows: Vec<usize> = keep_dim0.map(|k| k.to_vec()).unwrap_or_else(|| (0..d0_old).collect());
+    let cols: Vec<usize> = keep_dim1.map(|k| k.to_vec()).unwrap_or_else(|| (0..d1_old).collect());
+    let (d0_new, d1_new) = (rows.len(), cols.len());
+
+    let mut out = vec![0f32; d0_new * d1_new];
+    for (new_r, &old_r) in rows.iter().enumerate() {
+        for (new_c, &old_c) in cols.iter().enumerate() {
+            out[new_r * d1_new + new_c] = data[old_r * d1_old + old_c];
+        }
+    }
+    Tensor::<B, 2>::from_data(TensorData::new(out, vec![d0_new, d1_new]), device)
+}
+
 /// Full eigendecomposition of a symmetric matrix, given already-on-host row-major data —
 /// returns the orthonormal eigenvector matrix, ALSO row-major, flattened (eigenvalues sorted
 /// descending for run-to-run ordering stability). Pure-CPU/host-only: no GPU round trip is
@@ -703,6 +776,105 @@ mod tests {
             let src = old_vals[row * 4]; // g(0) = 0
             assert_eq!(twin, src, "migrated.exp_avg[{row},4] should exactly copy exp_avg[{row},g(0)], no division");
         }
+    }
+
+    // ─── Smart adaptive architecture: shrink-side migration ─────────────────────────────────
+
+    #[test]
+    fn migrate_soap_muon_state_for_shrink_selects_the_kept_columns_of_exp_avg_exactly() {
+        let device = Default::default();
+        let state = build_real_state(&device);
+        let old_data = state.exp_avg.clone().into_data();
+        let old_vals = old_data.as_slice::<f32>().unwrap(); // [3,4] row-major
+
+        let keep = [1usize, 3usize]; // drop columns 0 and 2
+        let migrated = migrate_soap_muon_state_for_shrink(&state, None, Some(&keep), &device);
+        assert_eq!(migrated.exp_avg.dims(), [3, 2]);
+
+        let new_data = migrated.exp_avg.into_data();
+        let new_vals = new_data.as_slice::<f32>().unwrap();
+        for row in 0..3 {
+            assert_eq!(new_vals[row * 2], old_vals[row * 4 + 1], "row {row} col 0 must be the OLD column 1");
+            assert_eq!(new_vals[row * 2 + 1], old_vals[row * 4 + 3], "row {row} col 1 must be the OLD column 3");
+        }
+    }
+
+    #[test]
+    fn migrate_soap_muon_state_for_shrink_projects_gg1_onto_kept_indices() {
+        let device = Default::default();
+        let state = build_real_state(&device);
+        let old_data = state.gg1.clone().into_data();
+        let old_vals = old_data.as_slice::<f32>().unwrap(); // [4,4]
+
+        let keep = [1usize, 3usize];
+        let migrated = migrate_soap_muon_state_for_shrink(&state, None, Some(&keep), &device);
+        assert_eq!(migrated.gg1.dims(), [2, 2]);
+
+        let new_data = migrated.gg1.into_data();
+        let new_vals = new_data.as_slice::<f32>().unwrap();
+        assert_eq!(new_vals[0], old_vals[1 * 4 + 1], "[0,0] must be old gg1[1,1]");
+        assert_eq!(new_vals[1], old_vals[1 * 4 + 3], "[0,1] must be old gg1[1,3]");
+        assert_eq!(new_vals[2], old_vals[3 * 4 + 1], "[1,0] must be old gg1[3,1]");
+        assert_eq!(new_vals[3], old_vals[3 * 4 + 3], "[1,1] must be old gg1[3,3]");
+    }
+
+    #[test]
+    fn migrate_soap_muon_state_for_shrink_resets_q_to_identity_of_new_size() {
+        let device = Default::default();
+        let state = build_real_state(&device);
+        let keep = [0usize, 2usize];
+        let migrated = migrate_soap_muon_state_for_shrink(&state, None, Some(&keep), &device);
+        assert_eq!(migrated.q1.dims(), [2, 2]);
+        let product = migrated.q1.clone().matmul(migrated.q1.transpose());
+        let data = product.into_data();
+        let values = data.as_slice::<f32>().unwrap();
+        for r in 0..2 {
+            for c in 0..2 {
+                let expected = if r == c { 1.0 } else { 0.0 };
+                assert!((values[r * 2 + c] - expected).abs() < 1e-4, "q1 @ q1^T should be identity at [{r},{c}]");
+            }
+        }
+    }
+
+    #[test]
+    fn migrate_soap_muon_state_for_shrink_preserves_step_counter() {
+        let device = Default::default();
+        let state = build_real_state(&device);
+        let original_step = state.step;
+        let keep = [0usize, 1usize];
+        let migrated = migrate_soap_muon_state_for_shrink(&state, None, Some(&keep), &device);
+        assert_eq!(migrated.step, original_step);
+    }
+
+    #[test]
+    fn migrate_soap_muon_state_for_shrink_none_axis_is_untouched() {
+        let device = Default::default();
+        let state = build_real_state(&device);
+        // Only dim1 shrinks - dim0 (rows=3) must be completely unaffected.
+        let keep = [0usize, 2usize];
+        let migrated = migrate_soap_muon_state_for_shrink(&state, None, Some(&keep), &device);
+        assert_eq!(migrated.exp_avg.dims()[0], 3);
+        assert_eq!(migrated.gg0.dims(), state.gg0.dims());
+    }
+
+    #[test]
+    fn soap_muon_step_after_shrink_migration_no_nan_no_discontinuous_spike() {
+        let device = Default::default();
+        let state = build_real_state(&device);
+        let optim: SoapMuon<Wgpu> = SoapMuonConfig::new().with_precondition_frequency(2).build();
+        let keep = [1usize, 2usize, 3usize]; // drop column 0
+        let migrated = migrate_soap_muon_state_for_shrink(&state, None, Some(&keep), &device);
+
+        let tensor = Tensor::<Wgpu, 2>::from_floats(
+            [[0.5, -0.3, 0.2], [1.0, 0.1, -0.4], [0.1, 1.0, 0.3]], &device,
+        );
+        let grad = Tensor::<Wgpu, 2>::from_floats(
+            [[-0.2, 0.05, 0.3], [0.1, -0.1, 0.05], [0.15, 0.2, -0.1]], &device,
+        );
+        let (new_tensor, _) = optim.step(0.01, tensor, grad, Some(migrated));
+        let data = new_tensor.into_data();
+        let vals = data.as_slice::<f32>().unwrap();
+        assert!(vals.iter().all(|v| v.is_finite()), "a step immediately after shrink migration must not produce NaN/Inf");
     }
 
     #[test]

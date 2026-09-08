@@ -1,4 +1,6 @@
+pub mod architecture_controller;
 pub mod bc;
+pub mod checkpoint;
 pub mod contact_export;
 pub mod controllers; // ConvergenceTracker is `pub` (see controllers.rs) for cross-crate curriculum reuse
 pub mod decision_maker;
@@ -12,6 +14,7 @@ pub mod kirsch_problem;
 pub mod lr_schedule;
 pub mod network;
 pub mod optim;
+pub mod parametric_problem;
 pub mod pinlug_problem;
 pub mod problem;
 pub mod runner;

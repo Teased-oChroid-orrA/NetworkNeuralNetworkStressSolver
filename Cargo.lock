@@ -729,7 +729,9 @@ dependencies = [
  "burn-backend",
  "burn-ir",
  "burn-std",
+ "bytemuck",
  "const-random",
+ "itertools 0.14.0",
  "libm",
  "macerator",
  "matrixmultiply",
@@ -739,6 +741,8 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rand 0.10.1",
+ "rayon",
+ "seq-macro",
 ]
 
 [[package]]
@@ -3840,7 +3844,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a06de3016e9fae57a36fd14dba131fccf49f74b40b7fbdb472f96e361ec71a08"
 dependencies = [
  "autocfg",
+ "num_cpus",
+ "once_cell",
  "rawpointer",
+ "thread-tree",
 ]
 
 [[package]]
@@ -4072,6 +4079,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
+ "rayon",
 ]
 
 [[package]]
@@ -4843,11 +4851,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "burn",
+ "burn-ndarray",
  "criterion",
  "crossbeam-channel",
  "nalgebra",
  "ndarray 0.16.1",
  "pinn-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -6179,6 +6190,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "thread-tree"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffbd370cb847953a25954d9f63e14824a36113f8c72eecf6eccef5dc4b45d630"
+dependencies = [
+ "crossbeam-channel",
 ]
 
 [[package]]

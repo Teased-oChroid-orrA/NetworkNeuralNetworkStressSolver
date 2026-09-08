@@ -11,11 +11,30 @@ use crate::{loading::LoadConfig, material::MaterialProps, user_geometry::UserGeo
 pub struct NetworkSpec {
     pub hidden_dim: usize,
     pub n_hidden: usize,
+    /// Smart adaptive architecture master switch (default off - every existing TOML spec
+    /// keeps parsing/behaving unchanged). When true, the training loop internally builds the
+    /// network with PirateNet-style gated residual blocks (regardless of any other setting)
+    /// since that structure is what makes safe depth growth/shrink possible, and runs an
+    /// `architecture_controller::ArchitectureController` alongside training.
+    #[serde(default)]
+    pub adaptive: bool,
+    /// Width growth ceiling when `adaptive`. `None` = no cap beyond hardware limits.
+    #[serde(default)]
+    pub max_hidden_dim: Option<usize>,
+    /// Depth growth ceiling when `adaptive`. `None` = no cap beyond hardware limits.
+    #[serde(default)]
+    pub max_n_hidden: Option<usize>,
 }
 
 impl Default for NetworkSpec {
     fn default() -> Self {
-        Self { hidden_dim: 64, n_hidden: 3 }
+        Self {
+            hidden_dim: 64,
+            n_hidden: 3,
+            adaptive: false,
+            max_hidden_dim: None,
+            max_n_hidden: None,
+        }
     }
 }
 
@@ -78,6 +97,19 @@ mod tests {
         let toml_str = toml::to_string(&spec).expect("serialize");
         let parsed: ProblemSpec = toml::from_str(&toml_str).expect("deserialize");
         assert_eq!(parsed, spec);
+    }
+
+    /// Regression guard: every shipped `examples/problems/*.toml` plate spec must stay
+    /// loadable by this exact struct — a silent field-rename here would otherwise only be
+    /// caught by a human manually running each example file.
+    #[test]
+    fn shipped_plate_example_specs_parse() {
+        let examples_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/problems");
+        for name in ["notched_plate.toml", "single_hole_plate.toml", "triple_hole_plate.toml", "biaxial_steel_plate.toml"] {
+            let path = examples_dir.join(name);
+            let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
+            toml::from_str::<ProblemSpec>(&contents).unwrap_or_else(|e| panic!("failed to parse {path:?}: {e}"));
+        }
     }
 
     #[test]

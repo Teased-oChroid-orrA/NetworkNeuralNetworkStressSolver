@@ -1,0 +1,38 @@
+# Example user-defined problem: a steel plate with one fixed hole under biaxial
+# far-field tension (both px and py nonzero) — exercises the load path differently
+# from the other examples here, which are all uniaxial (py = 0).
+#
+# Run with: cargo run -p pinn-app --release -- --headless --problem-spec examples/problems/biaxial_steel_plate.toml
+#
+# All lengths in meters [m], all stresses/moduli in pascals [Pa].
+
+[geometry]
+half_w = 0.08
+half_h = 0.08   # square plate
+thickness = 0.01
+
+[[geometry.holes]]
+center = [0.0, 0.0]
+radius = 0.015
+bc = "Fixed"
+
+[material]
+e = 200e9                # Steel 4340
+nu = 0.29
+density = 7850.0
+ultimate_strength_pa = 1080e6
+
+[load]
+px = 5.0e7                # far-field traction in x
+py = 3.0e7                # far-field traction in y (biaxial)
+
+[network]
+hidden_dim = 64
+n_hidden = 3
+
+[training]
+max_steps = 2500
+n_interior = 2560
+n_boundary = 640
+fd_h = 1e-3
+lr = 1e-3

@@ -256,7 +256,16 @@ impl EngineParams {
             trend_weight:       0.40,
             interval_steps:     1000,
             pts_per_cell:       1,
+            // Deliberately left unset (`None` = zero behavior change) - Kirsch's own AMR
+            // sweep in `run_training`/`headless.rs` is long-tuned, already-tested, and out
+            // of scope for the "Neural-Network-Wide Adaptive Collocation" epic's Phase 12
+            // safety-net work (see `pinn_core::amr::derive_amr_config`'s own doc comment for
+            // where that new default DOES apply). Preservation Rule: don't change existing,
+            // working behavior without a demonstrated defect.
             max_active_cells:   None,
+            max_growth_fraction: None,
+            residual_threshold: None,
+            nonuniformity_threshold: None,
         };
 
         // Kirsch stress loss probe points.

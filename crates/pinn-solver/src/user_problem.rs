@@ -34,7 +34,7 @@ use pinn_core::{
         DirichletAnsatz, DomainId, DomainSamplingStrategy, DomainSpec, NamedPointSet,
     },
     problem_spec::ProblemSpec,
-    user_geometry::{HoleBc, UserGeometry},
+    user_geometry::{HoleBc, HoleSpec, UserGeometry},
 };
 
 use crate::{
@@ -311,20 +311,31 @@ impl BoundaryValueProblem for UserDefinedProblem {
 
 /// Builds a `VisFields` for GUI display by evaluating `model` once over a
 /// `[nx,ny]`-shaped normalized grid masked by `geometry.contains` — mirrors `runner.rs`'s
-/// private `evaluate_vis_grid_mdem` (same mDEM direct-column read, same von Mises formula),
-/// adapted for `UserGeometry`'s N-hole containment check instead of `GeometryConfig`'s
-/// single-hole one. No FD stencil needed: mDEM's `sigma_xx`/`sigma_yy`/`sigma_xy` are direct
-/// network output columns, not derived from strain.
+/// private `evaluate_vis_grid_mdem` (same mDEM direct-column read, same von Mises formula,
+/// same Phase 14 strain/residual/AMR-score/density extension), adapted for `UserGeometry`'s
+/// N-hole containment check instead of `GeometryConfig`'s single-hole one.
+///
+/// Phase 14 extension reuses the exact FD-stencil + physical-scale-before-derivative
+/// convention `probe_hole_boundary_profile` already established for this same ansatz (see
+/// that function's doc comment): `sigma_xx/yy/xy` are direct network outputs here, so an
+/// independent FD-derived strain estimate is a genuine second measurement, and comparing it
+/// against the direct stress via the material's constitutive law is exactly the
+/// `constitutive_consistency` training term's per-point residual, now surfaced for display.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_user_vis_grid(
     model: &crate::network::ElasticityNet<crate::training_core::BInner>,
     geometry: &UserGeometry,
     [nx, ny]: [usize; 2],
     u_ref: f32,
     px_pa: f64,
+    material: &MaterialProps,
+    fd: &crate::fd_stencil::FdConfig,
+    int_norm: &[[f32; 2]],
     device: &crate::training_core::BDevice,
 ) -> pinn_core::messages::VisFields {
     use crate::network::fwd;
-    use crate::fd_stencil::norm_pts_to_tensor;
+    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor};
+    use crate::energy::dem_energy_per_point;
     use crate::training_core::BInner;
     use ndarray::Array2;
 
@@ -347,53 +358,452 @@ pub fn evaluate_user_vis_grid(
     let mut s_xy = vec![f32::NAN; n_total];
     let mut d_u = vec![f32::NAN; n_total];
     let mut d_v = vec![f32::NAN; n_total];
+    let mut e_xx = vec![f32::NAN; n_total];
+    let mut e_yy = vec![f32::NAN; n_total];
+    let mut e_xy = vec![f32::NAN; n_total];
+    let mut pde = vec![f32::NAN; n_total];
+    let mut amr = vec![f32::NAN; n_total];
 
-    let make_vis = |vm: Vec<f32>, sxx: Vec<f32>, syy: Vec<f32>, sxy: Vec<f32>, u: Vec<f32>, v: Vec<f32>| {
+    #[allow(clippy::too_many_arguments)]
+    let make_vis = |vm: Vec<f32>, sxx: Vec<f32>, syy: Vec<f32>, sxy: Vec<f32>, u: Vec<f32>, v: Vec<f32>,
+                     eps_xx: Vec<f32>, eps_yy: Vec<f32>, eps_xy: Vec<f32>,
+                     pde_residual: Vec<f32>, amr_score: Vec<f32>| {
         let a = |v: Vec<f32>| Array2::from_shape_vec((ny, nx), v).expect("shape mismatch");
+        let density = crate::runner::bin_collocation_density(int_norm, nx, ny);
         pinn_core::messages::VisFields {
             von_mises: a(vm), sigma_xx: a(sxx), sigma_yy: a(syy), sigma_xy: a(sxy),
             disp_u: a(u), disp_v: a(v),
+            eps_xx: a(eps_xx), eps_yy: a(eps_yy), eps_xy: a(eps_xy),
+            pde_residual: a(pde_residual), amr_score: a(amr_score),
+            collocation_density: a(density),
         }
     };
 
     let active: Vec<usize> = mask.iter().enumerate().filter(|(_, &m)| m).map(|(i, _)| i).collect();
     if active.is_empty() {
-        return make_vis(s_vm, s_xx, s_yy, s_xy, d_u, d_v);
+        return make_vis(s_vm, s_xx, s_yy, s_xy, d_u, d_v, e_xx, e_yy, e_xy, pde, amr);
     }
 
     let active_pts: Vec<[f32; 2]> = active.iter().map(|&i| pts[i]).collect();
     let n_act = active_pts.len();
     let pts_t = norm_pts_to_tensor::<BInner>(&active_pts, device);
-    let raw = fwd::<BInner>(model, pts_t, 0, device);
+    let stencil_coords = assemble_stencil::<BInner>(&pts_t, fd, device);
+    let raw_net = fwd::<BInner>(model, stencil_coords, 0, device); // [5*n_act, 5], unscaled
 
-    let u_col = raw.clone().slice([0..n_act, 0..1]).reshape([n_act]);
-    let v_col = raw.clone().slice([0..n_act, 1..2]).reshape([n_act]);
-    let sxx_col = raw.clone().slice([0..n_act, 2..3]).reshape([n_act]);
-    let syy_col = raw.clone().slice([0..n_act, 3..4]).reshape([n_act]);
-    let sxy_col = raw.slice([0..n_act, 4..5]).reshape([n_act]);
-    let batched: Vec<f32> = Tensor::cat(vec![u_col, v_col, sxx_col, syy_col, sxy_col], 0)
-        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; 5 * n_act]);
-    let u_vals = &batched[..n_act];
-    let v_vals = &batched[n_act..2 * n_act];
-    let sxx_vals = &batched[2 * n_act..3 * n_act];
-    let syy_vals = &batched[3 * n_act..4 * n_act];
-    let sxy_vals = &batched[4 * n_act..5 * n_act];
+    // Physical scale BEFORE the FD derivative — same convention as `compute_domain_forwards`'s
+    // `is_mdem` branch and `probe_hole_boundary_profile` (displacement by u_ref, stress by
+    // px_pa), so the strain/residual computed here matches what training itself sees.
+    let m = 5 * n_act;
+    let raw = Tensor::cat(vec![
+        raw_net.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
+        raw_net.slice([0..m, 2..5]).mul_scalar(px_pa),
+    ], 1);
+
+    let (eps_xx, eps_yy, eps_xy) = compute_strains::<BInner>(raw.clone(), n_act, fd);
+    let energy = dem_energy_per_point::<BInner>(eps_xx.clone(), eps_yy.clone(), eps_xy.clone(), material);
+    let (sxx_fd, syy_fd, sxy_fd) =
+        crate::energy::compute_stress::<BInner>(eps_xx.clone(), eps_yy.clone(), eps_xy.clone(), material);
+
+    let center = raw.slice([0..n_act, 0..5]);
+    let batched: Vec<f32> = Tensor::cat(
+        vec![center.reshape([5 * n_act]), eps_xx, eps_yy, eps_xy, sxx_fd, syy_fd, sxy_fd, energy],
+        0,
+    ).into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; 5 * n_act + 7 * n_act]);
+    let center_vals = &batched[..5 * n_act];
+    let chunk = |i: usize| -> &[f32] { &batched[5 * n_act + i * n_act..5 * n_act + (i + 1) * n_act] };
+    let (exx_v, eyy_v, exy_v) = (chunk(0), chunk(1), chunk(2));
+    let (sxx_fd_v, syy_fd_v, sxy_fd_v) = (chunk(3), chunk(4), chunk(5));
+    let energy_v = chunk(6);
 
     for (i_act, &i_full) in active.iter().enumerate() {
-        let u = u_vals[i_act] * u_ref;
-        let v = v_vals[i_act] * u_ref;
-        let sxx = sxx_vals[i_act] as f64 * px_pa;
-        let syy = syy_vals[i_act] as f64 * px_pa;
-        let sxy = sxy_vals[i_act] as f64 * px_pa;
+        let u = center_vals[i_act * 5];
+        let v = center_vals[i_act * 5 + 1];
+        let sxx = center_vals[i_act * 5 + 2] as f64;
+        let syy = center_vals[i_act * 5 + 3] as f64;
+        let sxy = center_vals[i_act * 5 + 4] as f64;
         let vm = (sxx * sxx - sxx * syy + syy * syy + 3.0 * sxy * sxy).sqrt();
+        let dex = sxx - sxx_fd_v[i_act] as f64;
+        let dey = syy - syy_fd_v[i_act] as f64;
+        let dexy = sxy - sxy_fd_v[i_act] as f64;
         s_xx[i_full] = sxx as f32;
         s_yy[i_full] = syy as f32;
         s_xy[i_full] = sxy as f32;
         s_vm[i_full] = vm as f32;
         d_u[i_full] = u;
         d_v[i_full] = v;
+        e_xx[i_full] = exx_v[i_act]; e_yy[i_full] = eyy_v[i_act]; e_xy[i_full] = exy_v[i_act];
+        pde[i_full] = (dex*dex + dey*dey + dexy*dexy).sqrt() as f32;
+        amr[i_full] = energy_v[i_act].abs();
     }
-    make_vis(s_vm, s_xx, s_yy, s_xy, d_u, d_v)
+    make_vis(s_vm, s_xx, s_yy, s_xy, d_u, d_v, e_xx, e_yy, e_xy, pde, amr)
+}
+
+/// `enhancement.txt` items 4/C ("BC residual RMS/max") - real per-point traction/
+/// displacement residual at the outer boundary and every hole ring, combined. Same math
+/// `OuterTractionTerm`/`HoleBcTerm` compute internally (via `neumann_loss`/
+/// `hole_traction_loss_direct`), kept pre-mean here so a real distribution stat is possible -
+/// a side probe at the existing vis cadence (mirrors `training_core::probe_interior_energy_
+/// residuals`'s own "side probe, not the hot per-step path" precedent), NOT a change to
+/// `step_physics_multi`'s per-step loss computation.
+pub fn probe_boundary_residuals(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    spec: &ProblemSpec,
+    device: &crate::training_core::BDevice,
+) -> (f64, f64) {
+    use crate::energy::compute_stress;
+    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig};
+    use crate::network::fwd;
+    use crate::training_core::BInner;
+    use burn::tensor::TensorData;
+
+    let geometry = &spec.geometry;
+    let sampling = UserSamplingStrategy::new(geometry.clone());
+    let placeholder = geometry.to_placeholder();
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+    let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
+    let u_ref = ((stress_ref / spec.material.e) * geometry.half_w) as f32;
+    let px_pa = stress_ref;
+    let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / geometry.half_w) as f32, (y / geometry.half_h) as f32] };
+
+    let mut residuals: Vec<f32> = Vec::new();
+
+    let bnd_pts_phys = sampling.sample_boundary(&placeholder, &spec.load, spec.training.n_boundary);
+    if !bnd_pts_phys.is_empty() {
+        let n_bnd = bnd_pts_phys.len();
+        let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
+        let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
+        let raw = fwd::<BInner>(model, stencil, 0, device);
+        let m = 5 * n_bnd;
+        let scaled = Tensor::cat(vec![
+            raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
+            raw.slice([0..m, 2..5]).mul_scalar(px_pa),
+        ], 1);
+        let (exx, eyy, exy) = compute_strains::<BInner>(scaled, n_bnd, &fd);
+        let (sxx, syy, sxy) = compute_stress::<BInner>(exx, eyy, exy, &spec.material);
+        let nx: Vec<f32> = bnd_pts_phys.iter().map(|p| p.nx as f32).collect();
+        let ny: Vec<f32> = bnd_pts_phys.iter().map(|p| p.ny as f32).collect();
+        let nx_t = Tensor::<BInner, 1>::from_data(TensorData::new(nx, vec![n_bnd]), device);
+        let ny_t = Tensor::<BInner, 1>::from_data(TensorData::new(ny, vec![n_bnd]), device);
+        let tx_target = nx_t.clone().mul_scalar(spec.load.px);
+        let ty_target = ny_t.clone().mul_scalar(spec.load.py);
+        let tx_pred = sxx.clone() * nx_t.clone() + sxy.clone() * ny_t.clone();
+        let ty_pred = sxy * nx_t + syy * ny_t;
+        let ex = tx_pred - tx_target;
+        let ey = ty_pred - ty_target;
+        let mag = (ex.clone() * ex + ey.clone() * ey).sqrt();
+        residuals.extend(mag.into_data().to_vec::<f32>().unwrap_or_default());
+    }
+
+    // `named_point_sets` returns one ring per hole in `geometry.holes.iter()` order (zip,
+    // same construction `UserDefinedProblem::new` itself relies on) - zip directly instead
+    // of re-deriving the correspondence from each set's name string.
+    for (hole, set) in geometry.holes.iter().zip(sampling.named_point_sets(&[]).into_iter()) {
+        let n_h = set.points.len();
+        if n_h == 0 { continue; }
+        let ring_norm: Vec<[f32; 2]> = set.points.iter().map(|p| norm_pt(p.x, p.y)).collect();
+        let raw = fwd::<BInner>(model, norm_pts_to_tensor::<BInner>(&ring_norm, device), 0, device);
+        let scaled = Tensor::cat(vec![
+            raw.clone().slice([0..n_h, 0..2]).mul_scalar(u_ref as f64),
+            raw.slice([0..n_h, 2..5]).mul_scalar(px_pa),
+        ], 1);
+        match hole.bc {
+            HoleBc::Free => {
+                let nx: Vec<f32> = set.points.iter().map(|p| p.nx as f32).collect();
+                let ny: Vec<f32> = set.points.iter().map(|p| p.ny as f32).collect();
+                let nx_t = Tensor::<BInner, 1>::from_data(TensorData::new(nx, vec![n_h]), device);
+                let ny_t = Tensor::<BInner, 1>::from_data(TensorData::new(ny, vec![n_h]), device);
+                let sxx = scaled.clone().slice([0..n_h, 2..3]).reshape([n_h]);
+                let syy = scaled.clone().slice([0..n_h, 3..4]).reshape([n_h]);
+                let sxy = scaled.slice([0..n_h, 4..5]).reshape([n_h]);
+                let tx = sxx.clone() * nx_t.clone() + sxy.clone() * ny_t.clone();
+                let ty = sxy * nx_t + syy * ny_t;
+                let mag = (tx.clone() * tx + ty.clone() * ty).sqrt();
+                residuals.extend(mag.into_data().to_vec::<f32>().unwrap_or_default());
+            }
+            HoleBc::Fixed => {
+                let u = scaled.clone().slice([0..n_h, 0..1]).reshape([n_h]);
+                let v = scaled.slice([0..n_h, 1..2]).reshape([n_h]);
+                let mag = (u.clone() * u.clone() + v.clone() * v.clone()).sqrt();
+                residuals.extend(mag.into_data().to_vec::<f32>().unwrap_or_default());
+            }
+        }
+    }
+
+    crate::training_core::residual_stats(&residuals)
+}
+
+/// `enhancement.md` Phase 9 ("Force Equilibrium Validation") - a real reaction-force check,
+/// distinct from `probe_boundary_residuals`'s pointwise mean residual: integrates the
+/// PREDICTED traction over the outer boundary's real point set (arc-length-weighted,
+/// `traction * ds * thickness`) rather than just averaging point-error magnitudes.
+///
+/// The far-field traction target this problem applies (`tx_target = px*nx`, `ty_target =
+/// py*ny`, see `OuterTractionTerm`) is, by construction, self-canceling around the whole
+/// closed rectangle: `px` pulls the right edge (`nx=+1`) one way and the left edge (`nx=-1`)
+/// the opposite way, so the TARGET net force over the full boundary is analytically zero -
+/// this is what "far-field traction, no body force" equilibrium means, not a bug. That means
+/// there is no separate "applied resultant" to compare a prediction against; instead, the
+/// meaningful check is whether the network's own PREDICTED traction integral is *also* close
+/// to zero - any nonzero net predicted force is a real, physically-meaningful inconsistency
+/// (the trained stress field failing to satisfy global force balance), normalized against the
+/// magnitude of one edge's own nominal load so the error is scale-free.
+pub fn probe_reaction_force(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    spec: &ProblemSpec,
+    device: &crate::training_core::BDevice,
+) -> pinn_core::messages::ReactionForce {
+    use crate::energy::compute_stress;
+    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig};
+    use crate::network::fwd;
+    use crate::training_core::BInner;
+    use burn::tensor::TensorData;
+
+    let geometry = &spec.geometry;
+    let sampling = UserSamplingStrategy::new(geometry.clone());
+    let placeholder = geometry.to_placeholder();
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+    let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
+    let u_ref = ((stress_ref / spec.material.e) * geometry.half_w) as f32;
+    let px_pa = stress_ref;
+    let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / geometry.half_w) as f32, (y / geometry.half_h) as f32] };
+
+    let reference_force = (spec.load.px * 2.0 * geometry.half_h * geometry.thickness).abs()
+        .max((spec.load.py * 2.0 * geometry.half_w * geometry.thickness).abs())
+        .max(1e-30);
+
+    let bnd_pts_phys = sampling.sample_boundary(&placeholder, &spec.load, spec.training.n_boundary);
+    if bnd_pts_phys.is_empty() {
+        return pinn_core::messages::ReactionForce { net_fx: 0.0, net_fy: 0.0, reference_force, equilibrium_error: 0.0 };
+    }
+    let n_bnd = bnd_pts_phys.len();
+    // `UserSamplingStrategy::sample_boundary` pushes exactly `per_edge` points per edge, 4
+    // edges, in a fixed order every iteration - `per_edge = n_bnd / 4` recovers the same value
+    // without needing sample_boundary to expose it separately.
+    let per_edge = (n_bnd / 4).max(1);
+    let ds_x_normal = 2.0 * geometry.half_h / per_edge as f64; // left/right edges (nx = +-1)
+    let ds_y_normal = 2.0 * geometry.half_w / per_edge as f64; // top/bottom edges (ny = +-1)
+
+    let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
+    let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
+    let raw = fwd::<BInner>(model, stencil, 0, device);
+    let m = 5 * n_bnd;
+    let scaled = Tensor::cat(vec![
+        raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
+        raw.slice([0..m, 2..5]).mul_scalar(px_pa),
+    ], 1);
+    let (exx, eyy, exy) = compute_strains::<BInner>(scaled, n_bnd, &fd);
+    let (sxx, syy, sxy) = compute_stress::<BInner>(exx, eyy, exy, &spec.material);
+    let nx: Vec<f32> = bnd_pts_phys.iter().map(|p| p.nx as f32).collect();
+    let ny: Vec<f32> = bnd_pts_phys.iter().map(|p| p.ny as f32).collect();
+    let nx_t = Tensor::<BInner, 1>::from_data(TensorData::new(nx.clone(), vec![n_bnd]), device);
+    let ny_t = Tensor::<BInner, 1>::from_data(TensorData::new(ny.clone(), vec![n_bnd]), device);
+    let tx_pred = (sxx.clone() * nx_t.clone() + sxy.clone() * ny_t.clone())
+        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
+    let ty_pred = (sxy * nx_t + syy * ny_t)
+        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
+
+    let mut net_fx = 0.0f64;
+    let mut net_fy = 0.0f64;
+    for i in 0..n_bnd {
+        let ds = if nx[i].abs() > 0.5 { ds_x_normal } else { ds_y_normal };
+        net_fx += tx_pred[i] as f64 * ds * geometry.thickness;
+        net_fy += ty_pred[i] as f64 * ds * geometry.thickness;
+    }
+    let equilibrium_error = (net_fx * net_fx + net_fy * net_fy).sqrt() / reference_force;
+
+    pinn_core::messages::ReactionForce { net_fx, net_fy, reference_force, equilibrium_error }
+}
+
+/// `enhancement.md` Phase 10 ("Energy Validation") - a real domain-integrated internal-energy-
+/// vs-external-work comparison. See `pinn_core::messages::EnergyBalance`'s doc comment for why
+/// this is DISTINCT from the optimizer's own `energy_loss` field. Internal energy is a
+/// Monte-Carlo estimate of `∫ (strain energy density) dA * thickness` over the plate's real
+/// area (using the SAME interior sampling training itself uses); external work is `∮ t·u ds *
+/// thickness` over the same arc-length-weighted outer-boundary point set `probe_reaction_force`
+/// uses, halved for the same quasi-static-linear-loading `1/2` factor `energy::
+/// dem_energy_per_point`'s own `1/2 * sigma:epsilon` formula carries (so both sides are on a
+/// consistent basis).
+pub fn probe_energy_balance(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    spec: &ProblemSpec,
+    device: &crate::training_core::BDevice,
+) -> pinn_core::messages::EnergyBalance {
+    use crate::energy::{compute_stress, dem_energy_per_point};
+    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig};
+    use crate::network::fwd;
+    use crate::training_core::BInner;
+    use burn::tensor::TensorData;
+
+    let geometry = &spec.geometry;
+    let sampling = UserSamplingStrategy::new(geometry.clone());
+    let placeholder = geometry.to_placeholder();
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+    let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
+    let u_ref = ((stress_ref / spec.material.e) * geometry.half_w) as f32;
+    let px_pa = stress_ref;
+    let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / geometry.half_w) as f32, (y / geometry.half_h) as f32] };
+
+    let interior = sampling.sample_interior(&placeholder, spec.training.n_interior);
+    let area = 4.0 * geometry.half_w * geometry.half_h
+        - geometry.holes.iter().map(|h| std::f64::consts::PI * h.radius * h.radius).sum::<f64>();
+    let internal_energy = if interior.is_empty() {
+        0.0
+    } else {
+        let n_int = interior.len();
+        let int_norm: Vec<[f32; 2]> = interior.iter().map(|&[x, y]| norm_pt(x, y)).collect();
+        let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&int_norm, device), &fd, device);
+        let raw = fwd::<BInner>(model, stencil, 0, device);
+        let m = 5 * n_int;
+        let scaled = Tensor::cat(vec![
+            raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
+            raw.slice([0..m, 2..5]).mul_scalar(px_pa),
+        ], 1);
+        let (exx, eyy, exy) = compute_strains::<BInner>(scaled, n_int, &fd);
+        let energy_density = dem_energy_per_point::<BInner>(exx, eyy, exy, &spec.material);
+        let mean_density: f64 = energy_density.into_data().to_vec::<f32>().unwrap_or_default()
+            .iter().map(|&v| v as f64).sum::<f64>() / n_int as f64;
+        mean_density * area * geometry.thickness
+    };
+
+    let bnd_pts_phys = sampling.sample_boundary(&placeholder, &spec.load, spec.training.n_boundary);
+    let external_work = if bnd_pts_phys.is_empty() {
+        0.0
+    } else {
+        let n_bnd = bnd_pts_phys.len();
+        let per_edge = (n_bnd / 4).max(1);
+        let ds_x_normal = 2.0 * geometry.half_h / per_edge as f64;
+        let ds_y_normal = 2.0 * geometry.half_w / per_edge as f64;
+        let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
+        let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
+        let raw = fwd::<BInner>(model, stencil, 0, device);
+        let m = 5 * n_bnd;
+        let scaled = Tensor::cat(vec![
+            raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
+            raw.slice([0..m, 2..5]).mul_scalar(px_pa),
+        ], 1);
+        let (exx, eyy, exy) = compute_strains::<BInner>(scaled.clone(), n_bnd, &fd);
+        let (sxx, syy, sxy) = compute_stress::<BInner>(exx, eyy, exy, &spec.material);
+        let nx: Vec<f32> = bnd_pts_phys.iter().map(|p| p.nx as f32).collect();
+        let ny: Vec<f32> = bnd_pts_phys.iter().map(|p| p.ny as f32).collect();
+        let nx_t = Tensor::<BInner, 1>::from_data(TensorData::new(nx.clone(), vec![n_bnd]), device);
+        let ny_t = Tensor::<BInner, 1>::from_data(TensorData::new(ny.clone(), vec![n_bnd]), device);
+        let tx_pred = (sxx.clone() * nx_t.clone() + sxy.clone() * ny_t.clone())
+            .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
+        let ty_pred = (sxy * nx_t + syy * ny_t)
+            .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
+        let u_vals: Vec<f32> = scaled.clone().slice([0..n_bnd, 0..1]).reshape([n_bnd])
+            .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
+        let v_vals: Vec<f32> = scaled.slice([0..n_bnd, 1..2]).reshape([n_bnd])
+            .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
+        let mut work = 0.0f64;
+        for i in 0..n_bnd {
+            let ds = if nx[i].abs() > 0.5 { ds_x_normal } else { ds_y_normal };
+            work += (tx_pred[i] as f64 * u_vals[i] as f64 + ty_pred[i] as f64 * v_vals[i] as f64) * ds * geometry.thickness;
+        }
+        0.5 * work
+    };
+
+    let denom = external_work.abs().max(1e-30);
+    let energy_balance_error = (internal_energy - external_work).abs() / denom;
+
+    pinn_core::messages::EnergyBalance { internal_energy, external_work, energy_balance_error }
+}
+
+/// `HoleBoundaryPoint`/`StressConcentration` now live in `pinn_core::messages` (re-exported
+/// at crate root) - not defined here - so they can travel inside a `TrainingUpdate` without
+/// `pinn-core` needing to depend on `pinn-solver`. Same pattern `VisFields` already
+/// established: the solver computes the data, `pinn-core` owns the shape.
+use pinn_core::messages::HoleBoundaryPoint;
+
+/// Hole-boundary stress profile (Phase 10, "Neural-Network-Wide Adaptive Collocation" epic)
+/// — samples the trained solution at fine angular resolution around one hole's
+/// circumference, returning per-angle displacement/strain/stress/Von Mises. This is the
+/// concrete, numerical answer to "does the PINN actually resolve the stress concentration"
+/// that a contour plot alone can't prove — the original motivation for this whole
+/// investigation (a suspicious-looking Von Mises field with no visible concentration at the
+/// hole). Reuses the exact same forward-pass/FD-stencil/scaling machinery `evaluate_user_
+/// vis_grid`/`compute_domain_forwards` already use — no new physics, just a different
+/// (angular, not grid) point layout.
+pub fn probe_hole_boundary_profile(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    geometry: &UserGeometry,
+    hole: &HoleSpec,
+    n_theta: usize,
+    fd: &crate::fd_stencil::FdConfig,
+    u_ref: f32,
+    px_pa: f64,
+    device: &crate::training_core::BDevice,
+) -> Vec<HoleBoundaryPoint> {
+    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor};
+    use crate::network::fwd;
+    use crate::training_core::BInner;
+
+    let n = n_theta.max(1);
+    let half_w = geometry.half_w;
+    let half_h = geometry.half_h;
+    let mut thetas = Vec::with_capacity(n);
+    let mut pts_phys = Vec::with_capacity(n);
+    let mut pts_norm = Vec::with_capacity(n);
+    for i in 0..n {
+        let theta_deg = 360.0 * i as f64 / n as f64;
+        let theta = theta_deg.to_radians();
+        let x = hole.center[0] + hole.radius * theta.cos();
+        let y = hole.center[1] + hole.radius * theta.sin();
+        thetas.push(theta_deg);
+        pts_phys.push((x, y));
+        pts_norm.push([(x / half_w) as f32, (y / half_h) as f32]);
+    }
+
+    let pts_t = norm_pts_to_tensor::<BInner>(&pts_norm, device);
+    let stencil = assemble_stencil::<BInner>(&pts_t, fd, device);
+    let raw_stencil = fwd::<BInner>(model, stencil, 0, device); // [5n, 5]: u,v,sxx,syy,sxy
+
+    // Physical-scale FIRST (same convention as `compute_domain_forwards`/`evaluate_user_
+    // vis_grid`), so the FD-derived strain below is directly the physical strain - no extra
+    // scale factor needed after `compute_strains`.
+    let m = 5 * n;
+    let scaled = Tensor::cat(vec![
+        raw_stencil.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
+        raw_stencil.slice([0..m, 2..5]).mul_scalar(px_pa),
+    ], 1);
+    let center = scaled.clone().slice([0..n, 0..5]);
+    let (eps_xx, eps_yy, eps_xy) = compute_strains::<BInner>(scaled, n, fd);
+
+    let center_vals: Vec<f32> = center.into_data().to_vec().unwrap_or_else(|_| vec![0.0; 5 * n]);
+    let exx_vals: Vec<f32> = eps_xx.into_data().to_vec().unwrap_or_else(|_| vec![0.0; n]);
+    let eyy_vals: Vec<f32> = eps_yy.into_data().to_vec().unwrap_or_else(|_| vec![0.0; n]);
+    let exy_vals: Vec<f32> = eps_xy.into_data().to_vec().unwrap_or_else(|_| vec![0.0; n]);
+
+    (0..n).map(|i| {
+        let ux = center_vals[i * 5];
+        let uy = center_vals[i * 5 + 1];
+        let sxx = center_vals[i * 5 + 2];
+        let syy = center_vals[i * 5 + 3];
+        let sxy = center_vals[i * 5 + 4];
+        let vm = ((sxx * sxx - sxx * syy + syy * syy + 3.0 * sxy * sxy) as f64).sqrt() as f32;
+        let (x, y) = pts_phys[i];
+        HoleBoundaryPoint {
+            theta_deg: thetas[i], x, y, ux, uy,
+            eps_xx: exx_vals[i], eps_yy: eyy_vals[i], eps_xy: exy_vals[i],
+            sxx, syy, sxy, von_mises: vm,
+        }
+    }).collect()
+}
+
+/// Stress-concentration summary derived from a hole-boundary profile. `nominal_stress` is
+/// the applied far-field traction magnitude - the standard Kt denominator for this problem
+/// class. Deliberately NOT compared against a hardcoded Kt=3: that is the closed-form
+/// result for an IDEALIZED INFINITE plate under uniaxial tension specifically - this plate
+/// is finite, may carry biaxial/off-axis load, and may have other holes perturbing the
+/// field, so a real discrepancy from 3.0 is expected, not itself evidence of a bug (see this
+/// epic's own explicit instruction: "Do not hard-code Kt = 3 as a required answer").
+pub fn stress_concentration_from_profile(profile: &[HoleBoundaryPoint], nominal_stress: f64) -> pinn_core::messages::StressConcentration {
+    use pinn_core::messages::StressConcentration;
+    let (max_theta_deg, max_von_mises) = profile.iter()
+        .map(|p| (p.theta_deg, p.von_mises as f64))
+        .fold((0.0, f64::NEG_INFINITY), |acc, x| if x.1 > acc.1 { x } else { acc });
+    let kt = if nominal_stress.abs() > 1e-300 { max_von_mises / nominal_stress.abs() } else { f64::NAN };
+    StressConcentration { nominal_stress, max_von_mises, max_theta_deg, kt }
 }
 
 #[cfg(test)]
@@ -486,5 +896,281 @@ mod tests {
         assert_eq!(names.iter().filter(|&&n| n == "hole_free").count(), 1);
         assert_eq!(names.iter().filter(|&&n| n == "hole_fixed").count(), 1);
         crate::problem::validate_loss_terms(&problem);
+    }
+
+    // ─── Phase 10 (Neural-Network-Wide Adaptive Collocation epic): hole-boundary profile ────
+
+    #[test]
+    fn probe_hole_boundary_profile_samples_points_on_the_circle_and_computes_consistent_von_mises() {
+        let device = crate::training_core::BDevice::default();
+        let net_cfg = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
+        let model: crate::network::ElasticityNet<crate::training_core::BInner> = net_cfg.init(&device);
+        let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] };
+        let hole = HoleSpec { center: [0.0, 0.0], radius: 0.02, bc: HoleBc::Free };
+        let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+
+        let profile = probe_hole_boundary_profile(&model, &geometry, &hole, 8, &fd, 1.0, 1.0, &device);
+        assert_eq!(profile.len(), 8);
+        for (i, p) in profile.iter().enumerate() {
+            let expected_theta = 360.0 * i as f64 / 8.0;
+            assert!((p.theta_deg - expected_theta).abs() < 1e-9, "theta_deg must be evenly spaced");
+            let r = ((p.x - hole.center[0]).powi(2) + (p.y - hole.center[1]).powi(2)).sqrt();
+            assert!((r - hole.radius).abs() < 1e-9, "sampled point must lie exactly on the hole circle, got r={r}");
+            let expected_vm = ((p.sxx * p.sxx - p.sxx * p.syy + p.syy * p.syy + 3.0 * p.sxy * p.sxy) as f64).sqrt() as f32;
+            assert!(
+                (p.von_mises - expected_vm).abs() < 1e-3,
+                "von_mises must match the plane-stress formula applied to the returned stress components: got {} expected {expected_vm}",
+                p.von_mises
+            );
+            assert!(p.ux.is_finite() && p.uy.is_finite() && p.eps_xx.is_finite(), "all fields must be finite for a freshly-initialized model");
+        }
+    }
+
+    #[test]
+    fn stress_concentration_from_profile_finds_the_max_and_computes_kt() {
+        let mk = |theta_deg: f64, von_mises: f32| HoleBoundaryPoint {
+            theta_deg, x: 0.0, y: 0.0, ux: 0.0, uy: 0.0,
+            eps_xx: 0.0, eps_yy: 0.0, eps_xy: 0.0, sxx: 0.0, syy: 0.0, sxy: 0.0, von_mises,
+        };
+        let profile = vec![mk(0.0, 1.0), mk(90.0, 3.0), mk(180.0, 2.0)];
+        let sc = stress_concentration_from_profile(&profile, 1.0);
+        assert_eq!(sc.max_theta_deg, 90.0, "must locate the angle of maximum Von Mises, not just its value");
+        assert!((sc.max_von_mises - 3.0).abs() < 1e-9);
+        assert!((sc.kt - 3.0).abs() < 1e-9, "Kt = max_von_mises / nominal_stress");
+    }
+
+    #[test]
+    fn stress_concentration_from_profile_does_not_hardcode_three() {
+        // A deliberately non-3.0 concentration must be reported as-is, not clamped/assumed
+        // toward the idealized-infinite-plate textbook value (this epic's own explicit rule).
+        let mk = |von_mises: f32| HoleBoundaryPoint {
+            theta_deg: 0.0, x: 0.0, y: 0.0, ux: 0.0, uy: 0.0,
+            eps_xx: 0.0, eps_yy: 0.0, eps_xy: 0.0, sxx: 0.0, syy: 0.0, sxy: 0.0, von_mises,
+        };
+        let sc = stress_concentration_from_profile(&[mk(4.7)], 1.0);
+        assert!((sc.kt - 4.7).abs() < 1e-6, "Kt must be reported honestly, not coerced toward 3.0");
+    }
+
+    // ─── Phase 14 (Neural-Network-Wide Adaptive Collocation epic): spatial diagnostic fields ──
+
+    fn tiny_model() -> crate::network::ElasticityNet<crate::training_core::BInner> {
+        let device = crate::training_core::BDevice::default();
+        crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
+            .init(&device)
+    }
+
+    #[test]
+    fn evaluate_user_vis_grid_masks_every_new_field_outside_the_domain_same_as_the_original_six() {
+        let model = tiny_model();
+        let device = crate::training_core::BDevice::default();
+        let geometry = two_hole_geometry();
+        let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+        let vis = evaluate_user_vis_grid(
+            &model, &geometry, [16, 16], 1.0, 1.0, &MaterialProps::al7075_t6(), &fd, &[], &device,
+        );
+        for ((row, col), &vm) in vis.von_mises.indexed_iter() {
+            let masked_out = vm.is_nan();
+            for field in [&vis.eps_xx, &vis.eps_yy, &vis.eps_xy, &vis.pde_residual, &vis.amr_score] {
+                assert_eq!(
+                    field[(row, col)].is_nan(), masked_out,
+                    "field mask must exactly match von_mises's mask at ({row},{col})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn evaluate_user_vis_grid_pde_residual_is_finite_nonnegative_and_not_trivially_zero() {
+        // A freshly-initialized network's direct sxx/syy/sxy columns have no reason to already
+        // satisfy Hooke's law against the independently FD-derived strain - if this residual
+        // were accidentally wired to compare a value against itself (a copy-paste bug), every
+        // point would read exactly 0.0. Real, independently-computed values essentially never
+        // land on exactly zero float-for-float, so "not identically zero everywhere" is strong
+        // evidence the comparison is real, not a stub.
+        let model = tiny_model();
+        let device = crate::training_core::BDevice::default();
+        let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] };
+        let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+        let vis = evaluate_user_vis_grid(
+            &model, &geometry, [12, 12], 1.0, 1.0, &MaterialProps::al7075_t6(), &fd, &[], &device,
+        );
+        let mut any_nonzero = false;
+        for &r in vis.pde_residual.iter() {
+            assert!(r.is_nan() || (r.is_finite() && r >= 0.0), "pde_residual must be NaN (masked) or a finite, non-negative magnitude, got {r}");
+            if r.is_finite() && r > 1e-12 { any_nonzero = true; }
+        }
+        assert!(any_nonzero, "pde_residual was identically zero everywhere - suspect a copy-paste bug comparing a value against itself");
+    }
+
+    #[test]
+    fn evaluate_user_vis_grid_amr_score_is_finite_and_nonnegative_everywhere_inside_domain() {
+        let model = tiny_model();
+        let device = crate::training_core::BDevice::default();
+        let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] };
+        let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+        let vis = evaluate_user_vis_grid(
+            &model, &geometry, [12, 12], 1.0, 1.0, &MaterialProps::al7075_t6(), &fd, &[], &device,
+        );
+        for &v in vis.amr_score.iter() {
+            assert!(v.is_nan() || (v.is_finite() && v >= 0.0), "amr_score (strain energy density magnitude) must never be negative, got {v}");
+        }
+    }
+
+    #[test]
+    fn evaluate_user_vis_grid_collocation_density_matches_a_hand_binned_histogram() {
+        let model = tiny_model();
+        let device = crate::training_core::BDevice::default();
+        let geometry = UserGeometry { half_w: 1.0, half_h: 1.0, thickness: 0.005, holes: vec![] };
+        let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+        // All 4 points land in the same quadrant (top-right of normalized [-1,1]^2) -> the
+        // whole histogram mass must land in ONE cell of a coarse enough grid, not spread out.
+        let int_norm: Vec<[f32; 2]> = vec![[0.9, 0.9], [0.91, 0.92], [0.95, 0.85], [0.99, 0.99]];
+        let vis = evaluate_user_vis_grid(
+            &model, &geometry, [2, 2], 1.0, 1.0, &MaterialProps::al7075_t6(), &fd, &int_norm, &device,
+        );
+        let total: f32 = vis.collocation_density.iter().sum();
+        assert!((total - int_norm.len() as f32).abs() < 1e-9, "density histogram must sum to the exact point count, got {total}");
+        assert_eq!(vis.collocation_density[(1, 1)], 4.0, "all 4 points fall in the top-right cell (row=1 after the y-flip, col=1)");
+    }
+
+    // ─── enhancement.txt items 4/C: real BC residual RMS/max ────────────────────────────────
+
+    #[test]
+    fn probe_boundary_residuals_is_finite_nonnegative_and_max_at_least_rms() {
+        let model = tiny_model();
+        let device = crate::training_core::BDevice::default();
+        let spec = ProblemSpec {
+            geometry: two_hole_geometry(),
+            material: MaterialProps::al7075_t6(),
+            load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(),
+            training: Default::default(),
+        };
+        let (rms, max) = probe_boundary_residuals(&model, &spec, &device);
+        assert!(rms.is_finite() && rms >= 0.0, "rms must be finite and non-negative, got {rms}");
+        assert!(max.is_finite() && max >= 0.0, "max must be finite and non-negative, got {max}");
+        assert!(max >= rms - 1e-6, "max must be >= rms, got rms={rms} max={max}");
+        // A freshly-initialized network has no reason to already satisfy the far-field
+        // traction target or the hole boundary conditions - if this were accidentally wired
+        // to compare a value against itself, every point would read exactly 0.0.
+        assert!(rms > 1e-12, "boundary residual was ~zero for an untrained network - suspect a copy-paste bug comparing a value against itself");
+    }
+
+    #[test]
+    fn probe_boundary_residuals_handles_a_geometry_with_no_holes() {
+        let model = tiny_model();
+        let device = crate::training_core::BDevice::default();
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(),
+            training: Default::default(),
+        };
+        let (rms, max) = probe_boundary_residuals(&model, &spec, &device);
+        assert!(rms.is_finite() && rms >= 0.0);
+        assert!(max.is_finite() && max >= 0.0);
+    }
+
+    // ─── enhancement.md Phase 9: force equilibrium ──────────────────────────────────────────
+
+    #[test]
+    fn probe_reaction_force_is_finite_and_reference_force_matches_hand_computed_nominal_load() {
+        let model = tiny_model();
+        let device = crate::training_core::BDevice::default();
+        let geometry = two_hole_geometry();
+        let px = 6.9e7;
+        let spec = ProblemSpec {
+            geometry: geometry.clone(),
+            material: MaterialProps::al7075_t6(),
+            load: pinn_core::loading::LoadConfig::uniaxial_x(px),
+            network: Default::default(),
+            training: Default::default(),
+        };
+        let rf = probe_reaction_force(&model, &spec, &device);
+        assert!(rf.net_fx.is_finite() && rf.net_fy.is_finite(), "net force must be finite, got fx={} fy={}", rf.net_fx, rf.net_fy);
+        assert!(rf.equilibrium_error.is_finite() && rf.equilibrium_error >= 0.0);
+        let expected_reference = (px * 2.0 * geometry.half_h * geometry.thickness).abs();
+        assert!(
+            (rf.reference_force - expected_reference).abs() / expected_reference < 1e-9,
+            "reference_force must equal the analytically nominal one-edge load |px * 2*half_h * thickness|: got {} expected {expected_reference}",
+            rf.reference_force
+        );
+    }
+
+    #[test]
+    fn probe_reaction_force_handles_a_geometry_with_no_holes() {
+        let model = tiny_model();
+        let device = crate::training_core::BDevice::default();
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(),
+            training: Default::default(),
+        };
+        let rf = probe_reaction_force(&model, &spec, &device);
+        assert!(rf.net_fx.is_finite() && rf.net_fy.is_finite());
+        assert!(rf.equilibrium_error.is_finite() && rf.equilibrium_error >= 0.0);
+    }
+
+    #[test]
+    fn probe_reaction_force_zero_load_gives_zero_reference_force_floored_and_finite_error() {
+        // px = py = 0.0: `reference_force` would otherwise be exactly 0.0, which must not
+        // produce a NaN/infinite division - the `.max(1e-30)` floor exists exactly for this.
+        let model = tiny_model();
+        let device = crate::training_core::BDevice::default();
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: pinn_core::loading::LoadConfig::uniaxial_x(0.0),
+            network: Default::default(),
+            training: Default::default(),
+        };
+        let rf = probe_reaction_force(&model, &spec, &device);
+        assert!(rf.equilibrium_error.is_finite(), "equilibrium_error must stay finite at zero applied load, got {}", rf.equilibrium_error);
+    }
+
+    // ─── enhancement.md Phase 10: energy balance ────────────────────────────────────────────
+
+    #[test]
+    fn probe_energy_balance_is_finite_for_a_fresh_model() {
+        let model = tiny_model();
+        let device = crate::training_core::BDevice::default();
+        let spec = ProblemSpec {
+            geometry: two_hole_geometry(),
+            material: MaterialProps::al7075_t6(),
+            load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(),
+            training: Default::default(),
+        };
+        let eb = probe_energy_balance(&model, &spec, &device);
+        assert!(eb.internal_energy.is_finite(), "internal_energy must be finite, got {}", eb.internal_energy);
+        assert!(eb.external_work.is_finite(), "external_work must be finite, got {}", eb.external_work);
+        assert!(eb.energy_balance_error.is_finite() && eb.energy_balance_error >= 0.0);
+    }
+
+    #[test]
+    fn probe_energy_balance_distinguishes_internal_from_external_for_an_untrained_model() {
+        // A freshly-initialized network has no reason for its interior energy density and its
+        // boundary work integral to already agree - if this were accidentally wired to compare
+        // a value against itself, internal_energy would exactly equal external_work.
+        let model = tiny_model();
+        let device = crate::training_core::BDevice::default();
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(),
+            training: Default::default(),
+        };
+        let eb = probe_energy_balance(&model, &spec, &device);
+        assert!(
+            (eb.internal_energy - eb.external_work).abs() > 1e-20,
+            "internal_energy and external_work were suspiciously identical - suspect a copy-paste bug comparing a value against itself: {} vs {}",
+            eb.internal_energy, eb.external_work
+        );
     }
 }

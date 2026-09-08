@@ -1,0 +1,48 @@
+# Example PARAMETRIC problem: the same single-centered-hole plate as
+# single_hole_plate.toml, but trained across a RANGE of material.e/material.nu/load.px
+# instead of one fixed value - `enhancement.txt` items 7/8/17 ("train once, change
+# parameters, get a new solution instantly"). See
+# pinn_core::parametric_spec::ParametricProblemSpec's doc comment for the exact v1
+# scope: geometry stays fixed, only e_range/nu_range/load_range are parametric.
+#
+# Run in app-egui's Stress Solver tool by pointing its spec path at this file - it is
+# auto-detected as parametric (distinct TOML shape from a plain ProblemSpec) and
+# unlocks the "Model Validity Envelope" instant-inference card once training reaches
+# ParametricReady.
+#
+# All lengths in meters [m], all stresses/moduli in pascals [Pa].
+#
+# NOTE: every top-level field is written BEFORE `[[geometry.holes]]` - TOML parses any
+# bare `key = value` line after an array-of-tables header as belonging to that array's
+# CURRENT entry, not the document root, so e_range/nu_range/load_range/density/
+# ultimate_strength_pa would silently vanish into geometry.holes[0] if placed after it.
+
+# Brackets Al 7075-T6 (71.7 GPa) roughly in the middle of the range.
+e_range = { min = 50.0e9, max = 100.0e9 }
+nu_range = { min = 0.25, max = 0.35 }
+# Brackets ~10 ksi (6.9e7 Pa) roughly in the middle of the range.
+load_range = { min = 4.0e7, max = 8.0e7 }
+
+density = 2810.0
+ultimate_strength_pa = 503e6
+
+[geometry]
+half_w = 0.10
+half_h = 0.10
+thickness = 0.005
+
+[[geometry.holes]]
+center = [0.0, 0.0]
+radius = 0.02
+bc = "Free"
+
+[network]
+hidden_dim = 64
+n_hidden = 4
+
+[training]
+max_steps = 3000
+n_interior = 1024
+n_boundary = 256
+fd_h = 1e-3
+lr = 1e-3

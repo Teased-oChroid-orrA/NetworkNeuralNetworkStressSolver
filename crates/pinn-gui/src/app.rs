@@ -174,24 +174,22 @@ impl StressSolverApp {
             None    => return,
         };
 
-        // Drain, keeping only the latest message
+        // Drain, keeping only the latest message. Real bug fixed here: the
+        // solver thread's Sender disconnects the instant it returns, which
+        // happens right after its final blocking `tx.send(Done)` succeeds -
+        // so a normal, successful finish can observe `Ok(Done)` immediately
+        // followed by `Err(Disconnected)` within this SAME drain call. Apply
+        // `last` (which may already be Done/Error) BEFORE checking for a
+        // genuine disconnect, so a real terminal message isn't mistaken for
+        // "ended unexpectedly" a moment before it's actually applied.
         let mut last = None;
+        let mut disconnected = false;
         loop {
             match rx.try_recv() {
                 Ok(msg) => last = Some(msg),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    // Solver thread ended without sending a final Done/Error message
-                    // (e.g. it panicked) — surface that as an error rather than silently
-                    // leaving the UI showing a stale "Running" status.
-                    let mut s = self.state.lock().expect("state mutex poisoned");
-                    if s.status == SolverStatus::Running {
-                        s.status = SolverStatus::Error;
-                        s.error_msg = Some("Solver thread ended unexpectedly".to_string());
-                    }
-                    drop(s);
-                    self.rx_training = None;
-                    self.tx_control  = None;
+                    disconnected = true;
                     break;
                 }
             }
@@ -199,6 +197,20 @@ impl StressSolverApp {
 
         if let Some(msg) = last {
             self.apply_msg(msg);
+        }
+        if disconnected {
+            // Sender vanished without ever delivering a terminal Done/Error
+            // message (e.g. the solver thread panicked) — surface that as an
+            // error rather than silently leaving the UI showing a stale
+            // "Running" status.
+            let mut s = self.state.lock().expect("state mutex poisoned");
+            if s.status == SolverStatus::Running {
+                s.status = SolverStatus::Error;
+                s.error_msg = Some("Solver thread ended unexpectedly".to_string());
+            }
+            drop(s);
+            self.rx_training = None;
+            self.tx_control  = None;
         }
     }
 
@@ -262,6 +274,19 @@ impl StressSolverApp {
                 // Running, Converged stays Converged).
                 self.export_status = Some(format!("Exported: {path}"));
             }
+            // This GUI has no beam-problem or parametric-PINN mode (both are app-egui's
+            // Stress Solver toolbox, in the sibling powershell_tool project) —
+            // `run_training_beam_streaming`/`parametric_problem::run_training_parametric`
+            // are never spawned from here, so these variants are unreachable in practice.
+            // No-op arms (not a wildcard) so a future new TrainingMsg variant still fails
+            // to compile here until deliberately handled.
+            TrainingMsg::BeamUpdate(_)
+            | TrainingMsg::ParametricUpdate(_)
+            | TrainingMsg::ParametricReady
+            | TrainingMsg::ParametricInferResult(_)
+            // Stage H (model checkpoint save/load, powershell_tool's app-egui only) - this
+            // GUI never sends `ControlMsg::SaveCheckpoint`, so it never receives this either.
+            | TrainingMsg::CheckpointSaved(_) => {}
         }
     }
 }
@@ -415,7 +440,13 @@ mod tests {
             sigma_yy:  grid.clone(),
             sigma_xy:  grid.clone(),
             disp_u:    grid.clone(),
-            disp_v:    grid,
+            disp_v:    grid.clone(),
+            eps_xx: grid.clone(),
+            eps_yy: grid.clone(),
+            eps_xy: grid.clone(),
+            pde_residual: grid.clone(),
+            amr_score: grid.clone(),
+            collocation_density: grid,
         }
     }
 
@@ -434,6 +465,8 @@ mod tests {
             n_colloc:     128,
             convergence_metric: Some(0.0012),
             vis: Some(PinLugVisFields { pin: tiny_vis_fields(), lug: tiny_vis_fields() }),
+            amr_sweep: Vec::new(),
+            grad_norm: None,
         };
 
         app.apply_msg(TrainingMsg::PinLugUpdate(Box::new(upd)));

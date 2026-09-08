@@ -10,12 +10,34 @@ nalgebra          = { workspace = true }
 ndarray           = { workspace = true }
 anyhow            = { workspace = true }
 crossbeam-channel = { workspace = true }
+# Stage H (model checkpoint save/load) - the `.meta.json` sidecar next to a saved `.mpk.gz`
+# weights file (see `checkpoint.rs`). Already transitively present via burn-core's own
+# `serde_json/std` feature - this is just exposing it directly to this crate rather than
+# reaching through burn's re-exports.
+serde_json        = "1"
+serde             = { workspace = true }
+# Direct (optional) edge onto the SAME burn-ndarray instance `burn/ndarray` (below) already
+# pulls into the dependency graph - purely to piggyback Cargo's feature-unification onto it.
+# The workspace's own `burn` dependency (../../Cargo.toml) uses `default-features = false`
+# with an explicit feature list that does NOT include burn's own `simd`/`accelerate`/
+# `openblas` top-level features or any path to burn-ndarray's `multi-threads` - only burn's
+# own (disabled) `default` feature would forward those. Without this, burn-ndarray compiles
+# with NEITHER macerator SIMD kernels NOR rayon-based parallel matmul: its slowest possible
+# path (confirmed ~1.6s/step_physics call on this crate's own `training_step` bench's
+# "medium" tier before this fix - a real, measured ~13-17x slowdown vs the documented
+# ~150-200ms/step GPU/Wgpu baseline, most of which is this configuration gap, not the
+# inherent GPU-vs-CPU cost). `blas-accelerate`/`blas-openblas`/`blas-netlib` were considered
+# and rejected: Accelerate is macOS-only (this project's documented target is Windows-first),
+# and OpenBLAS/Netlib need a build toolchain or a system-installed library, violating
+# powershell_tool/CLAUDE.md's "no pre-installed runtime of any kind" requirement. `simd`+
+# `multi-threads` are pure-Rust (macerator, rayon) - zero new system dependencies.
+burn-ndarray      = { version = "0.21", optional = true, default-features = false, features = ["std", "simd", "multi-threads"] }
 
 [dev-dependencies]
 criterion = "0.5"
 
 [features]
-ndarray-backend = ["burn/ndarray"]
+ndarray-backend = ["burn/ndarray", "dep:burn-ndarray"]
 
 [[bench]]
 name = "training_step"
