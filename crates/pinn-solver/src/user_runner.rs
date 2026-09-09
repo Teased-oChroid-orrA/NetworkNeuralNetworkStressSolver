@@ -63,7 +63,9 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
     config.load = spec.load;
 
     let net_cfg = ElasticityNetConfig::new()
-        .with_input_dim(3)
+        // Same real fix as `runner::run_training_user_problem` - see `UserGeometry::
+        // n_fourier`'s doc comment.
+        .with_input_dim(spec.geometry.net_input_dim())
         .with_hidden_dim(spec.network.hidden_dim)
         .with_n_hidden(spec.network.n_hidden)
         .with_output_dim(5); // mDEM: u, v, sigma_xx, sigma_yy, sigma_xy
@@ -107,10 +109,22 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
             fd: &fd,
             k: 1.0, // IdentityAnsatz ignores k entirely — value is inert
             domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
-            dynamic_lam_h_cap: f64::MAX,
-            dynamic_lam_d_cap: f64::MAX,
+            // Same real fix as `runner::run_user_problem_training_from`'s per-step `MultiStepCtx`
+            // (this headless CLI path mirrors that GUI path's training loop) - see that call
+            // site's doc comment for the full root-cause explanation.
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
             dynamic_lam_penetration_cap: f64::MAX,
             dynamic_lam_non_tension_cap: f64::MAX,
+            // Same real fix as `runner::run_user_problem_training_from`'s per-step
+            // `MultiStepCtx` - see that call site's doc comment for the full root-cause
+            // explanation of why this matches `dynamic_lam_h_cap` at 50.0.
+            constitutive_consistency_weight: 50.0,
+            // Same real fix as `runner::run_user_problem_training_from`'s per-step
+            // `MultiStepCtx` - see `UserGeometry::n_fourier`'s doc comment for the full
+            // root-cause story. `net_cfg`'s `input_dim` (this function's model-construction
+            // site) MUST use the same value.
+            n_fourier: spec.geometry.n_fourier(),
             phase2_active: true,
             step,
         };
@@ -156,5 +170,31 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
     } else {
         println!("  [ok] displacement is non-trivial.");
     }
+
+    // Real, permanent diagnostic readout (same probes the GUI's vis-cadence block uses, so
+    // these numbers are directly comparable to what the app shows): PDE residual RMS/max and
+    // per-hole Kt, letting a headless CLI run self-report solution quality without needing
+    // the GUI.
+    {
+        use burn::module::AutodiffModule;
+        let model_val: crate::network::ElasticityNet<crate::training_core::BInner> = model.valid();
+        let diag_int_norm: Vec<[f32; 2]> = sampling.sample_interior(&placeholder_geom, 512).iter()
+            .map(|&[x, y]| normalize_point(x, y, half_w, half_h)).collect();
+        let vis = crate::user_problem::evaluate_user_vis_grid(
+            &model_val, &spec.geometry, [96, 96], u_ref, spec.load.px, &spec.material, &fd, &diag_int_norm, &device,
+        );
+        let pde_vals: Vec<f32> = vis.pde_residual.iter().copied().filter(|v| v.is_finite()).collect();
+        let (pde_rms, pde_max) = crate::training_core::residual_stats(&pde_vals);
+        println!("  [diag] PDE residual RMS={pde_rms:.4e}  max={pde_max:.4e} Pa");
+        let nominal_stress = spec.load.px.abs().max(spec.load.py.abs());
+        for (i, hole) in spec.geometry.holes.iter().enumerate() {
+            let profile = crate::user_problem::probe_hole_boundary_profile(
+                &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &device,
+            );
+            let sc = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
+            println!("  [diag] hole {i}: max_von_mises={:.4e} Pa  nominal={:.4e} Pa  Kt={:.4}", sc.max_von_mises, sc.nominal_stress, sc.kt);
+        }
+    }
+
     last_total.is_finite()
 }

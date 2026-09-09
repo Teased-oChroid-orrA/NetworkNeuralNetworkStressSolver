@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use pinn_core::{parametric_spec::ParametricProblemSpec, problem_spec::ProblemSpec};
 
 use crate::network::{ElasticityNet, ElasticityNetConfig};
-use crate::training_core::{BDevice, BInner};
+use crate::training_core::{BDevice, BInner, B};
 
 /// Which problem type a checkpoint was trained for — determines the network's `input_dim` (3
 /// for a plain `ProblemSpec`, 6 for a parametric spec's `x,y,z,e_n,nu_n,p_n`) and which
@@ -77,30 +77,57 @@ pub fn save_checkpoint(
     Ok(written)
 }
 
+fn parse_meta(weights_path: &Path) -> Result<CheckpointMeta, String> {
+    let meta_json = std::fs::read_to_string(meta_path(weights_path))
+        .map_err(|e| format!("failed to read checkpoint metadata (expected a .meta.json file next to the weights): {e}"))?;
+    serde_json::from_str(&meta_json).map_err(|e| format!("failed to parse checkpoint metadata: {e}"))
+}
+
+// Smart adaptive architecture: `hidden_dim`/`n_hidden` here are the LIVE values the caller
+// wrote into `meta.spec` at save time (see `run_training_user_problem`/`run_training_
+// parametric`'s own `current_hidden_dim`/`current_n_hidden` tracking), not necessarily the
+// original spec's static ones - but the gated-residual STRUCTURE (`use_piratenet`) is fixed
+// for the whole run by `adaptive` and must be reproduced exactly, or `load_file` below will
+// fail to match the saved record's `gates` shape.
+fn net_cfg_for_meta(meta: &CheckpointMeta) -> ElasticityNetConfig {
+    // Plate's `input_dim` is no longer a flat `3` - see `UserGeometry::n_fourier`'s doc
+    // comment - it depends on whether the saved spec's geometry has a hole, exactly mirroring
+    // how the model was actually constructed for training (`runner::run_training_user_
+    // problem`). Parametric's `6` (x,y,z + e,nu,px) is unaffected - the Fourier-embedding fix
+    // is plate-only, matching every other change in this pass.
+    let (input_dim, hidden_dim, n_hidden, adaptive) = match &meta.spec {
+        CheckpointSpec::Plate(spec) => (spec.geometry.net_input_dim(), spec.network.hidden_dim, spec.network.n_hidden, spec.network.adaptive),
+        CheckpointSpec::Parametric(spec) => (6, spec.network.hidden_dim, spec.network.n_hidden, spec.network.adaptive),
+    };
+    ElasticityNetConfig::new()
+        .with_input_dim(input_dim).with_hidden_dim(hidden_dim).with_n_hidden(n_hidden)
+        .with_output_dim(5).with_use_piratenet(adaptive)
+}
+
 /// Loads a checkpoint's metadata and reconstructs a fresh model of the matching architecture
 /// with the saved weights loaded in. `device` should be the inference-only `BInner` backend —
 /// matches every other "instant inference" code path in this codebase (no autodiff needed to
-/// just evaluate a loaded model).
+/// just evaluate a loaded model). For resuming TRAINING from a checkpoint, see
+/// `load_checkpoint_for_training` instead.
 pub fn load_checkpoint(weights_path: &Path, device: &BDevice) -> Result<(ElasticityNet<BInner>, CheckpointMeta), String> {
-    let meta_json = std::fs::read_to_string(meta_path(weights_path))
-        .map_err(|e| format!("failed to read checkpoint metadata (expected a .meta.json file next to the weights): {e}"))?;
-    let meta: CheckpointMeta = serde_json::from_str(&meta_json)
-        .map_err(|e| format!("failed to parse checkpoint metadata: {e}"))?;
-
-    let (input_dim, hidden_dim, n_hidden, adaptive) = match &meta.spec {
-        CheckpointSpec::Plate(spec) => (3, spec.network.hidden_dim, spec.network.n_hidden, spec.network.adaptive),
-        CheckpointSpec::Parametric(spec) => (6, spec.network.hidden_dim, spec.network.n_hidden, spec.network.adaptive),
-    };
-    // Smart adaptive architecture: `hidden_dim`/`n_hidden` above are the LIVE values the
-    // caller wrote into `meta.spec` at save time (see `run_training_user_problem`/
-    // `run_training_parametric`'s own `current_hidden_dim`/`current_n_hidden` tracking), not
-    // necessarily the original spec's static ones - but the gated-residual STRUCTURE
-    // (`use_piratenet`) is fixed for the whole run by `adaptive` and must be reproduced
-    // exactly, or `load_file` below will fail to match the saved record's `gates` shape.
-    let net_cfg = ElasticityNetConfig::new()
-        .with_input_dim(input_dim).with_hidden_dim(hidden_dim).with_n_hidden(n_hidden)
-        .with_output_dim(5).with_use_piratenet(adaptive);
+    let meta = parse_meta(weights_path)?;
+    let net_cfg = net_cfg_for_meta(&meta);
     let fresh: ElasticityNet<BInner> = net_cfg.init(device);
+    let model = fresh
+        .load_file(weights_path, &recorder(), device)
+        .map_err(|e| format!("failed to load model weights: {e}"))?;
+    Ok((model, meta))
+}
+
+/// Graceful-stop-and-resume: identical to `load_checkpoint` (same metadata parsing, same
+/// architecture reconstruction), but builds a TRAINABLE (autodiff) model instead of an
+/// inference-only one, for `runner::run_training_user_problem_resume` to continue training
+/// from. Only the backend type parameter differs - `ElasticityNet<B>`'s `Module::load_file`
+/// works the same way regardless of backend.
+pub fn load_checkpoint_for_training(weights_path: &Path, device: &BDevice) -> Result<(ElasticityNet<B>, CheckpointMeta), String> {
+    let meta = parse_meta(weights_path)?;
+    let net_cfg = net_cfg_for_meta(&meta);
+    let fresh: ElasticityNet<B> = net_cfg.init(device);
     let model = fresh
         .load_file(weights_path, &recorder(), device)
         .map_err(|e| format!("failed to load model weights: {e}"))?;
@@ -134,7 +161,13 @@ mod tests {
     #[test]
     fn save_then_load_round_trips_weights_and_metadata_exactly() {
         let device = BDevice::default();
-        let net_cfg = ElasticityNetConfig::new().with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
+        let spec = tiny_plate_spec();
+        // `tiny_plate_spec` has a hole, so `net_input_dim()` is the Fourier-embedded width
+        // (see `UserGeometry::n_fourier`'s doc comment) - must match `net_cfg_for_meta`'s own
+        // derivation exactly, or `load_file` below fails on a real shape mismatch (the actual
+        // bug this test would have caught had it existed before this fix).
+        let n_fourier = spec.geometry.n_fourier();
+        let net_cfg = ElasticityNetConfig::new().with_input_dim(spec.geometry.net_input_dim()).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
         let model: ElasticityNet<BInner> = net_cfg.init(&device);
 
         // Capture a real forward-pass output BEFORE saving, to prove the round-tripped model
@@ -142,10 +175,8 @@ mod tests {
         // same config would have different random weights and fail this check.
         let probe_pts: Vec<[f32; 2]> = vec![[0.1, 0.2], [-0.3, 0.4], [0.5, -0.1]];
         let probe_tensor = crate::fd_stencil::norm_pts_to_tensor::<BInner>(&probe_pts, &device);
-        let before = crate::network::fwd::<BInner>(&model, probe_tensor.clone(), 0, &device)
+        let before = crate::network::fwd::<BInner>(&model, probe_tensor.clone(), n_fourier, &device)
             .into_data().to_vec::<f32>().unwrap();
-
-        let spec = tiny_plate_spec();
         let meta = CheckpointMeta { spec: CheckpointSpec::Plate(spec), steps_completed: 42, final_loss: 0.0123, saved_at_unix: 1_700_000_000 };
         let weights_path = tmp_path("roundtrip");
         let written = save_checkpoint(model, &meta, &weights_path).expect("save must succeed");
@@ -160,7 +191,7 @@ mod tests {
             CheckpointSpec::Parametric(_) => panic!("expected Plate spec"),
         }
 
-        let after = crate::network::fwd::<BInner>(&loaded, probe_tensor, 0, &device)
+        let after = crate::network::fwd::<BInner>(&loaded, probe_tensor, n_fourier, &device)
             .into_data().to_vec::<f32>().unwrap();
         assert_eq!(before.len(), after.len());
         // Half-precision round-trip is lossy - a loose but still meaningful tolerance (not

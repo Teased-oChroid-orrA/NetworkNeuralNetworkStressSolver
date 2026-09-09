@@ -1058,6 +1058,7 @@ mod tests {
             network: NetworkSpec {
                 hidden_dim: 8, n_hidden: 3,
                 adaptive: true, max_hidden_dim: Some(12), max_n_hidden: Some(4),
+                ..Default::default()
             },
             training: TrainingSpec { max_steps, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3 },
         }

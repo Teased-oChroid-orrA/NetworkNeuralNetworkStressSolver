@@ -65,7 +65,26 @@ impl AmrDomain for UserGeometry {
 /// branch. Every other field is a generic, already self-tuning default (percentiles/ema/
 /// trend-weight/interval), not derived from any one problem's own tuning.
 pub fn derive_amr_config(bounds: (f64, f64, f64, f64), lock_zones: &[(f64, f64, f64)]) -> AmrtConfig {
-    const SMALL_FEATURE_RATIO_THRESHOLD: f64 = 0.04;
+    // Raised from 0.04: a real, measured gap found investigating a plate-with-hole stress-
+    // concentration bug (see `powershell_tool/CLAUDE.md`'s Stress Solver section). A hole at
+    // ratio 0.1 (radius 0.02 m in a 0.2 m plate - a completely ordinary, not-unusually-small
+    // feature) fell on the shallow side of the old 0.04 cutoff, and even after fixing the
+    // constitutive-consistency/hole-traction weight imbalance (a real, separate, already-
+    // landed fix), the network still converged to a degenerate near-zero-stress solution at
+    // the hole (Kt stayed ~0 even at 8000 well-trained steps) - confirmed via real training
+    // runs, not assumed. Root cause: `interior_energy`'s domain-mean Monte-Carlo estimator
+    // gives a small feature's TRUE local energy difference (concentration vs. no
+    // concentration) very little influence on the gradient unless that region is heavily
+    // over-represented in the collocation set - and at the old shallow default, the hole
+    // zone's guaranteed floor wasn't enough to break the tie between the degenerate and true
+    // solutions (both satisfy `hole_traction`/`constitutive_consistency` equally well, so
+    // reweighting those two terms against each other - already tried - cannot distinguish
+    // them; only `interior_energy` differs between the two, and it needs enough LOCAL
+    // resolution to feel that difference). 0.15 covers this real case (and any similarly-
+    // proportioned single/multi-hole plate) while leaving Kirsch's own much smaller ratio
+    // (0.025) and the no-hole case (ratio 1.0) on the exact same side of the threshold as
+    // before - both existing regression tests below still pass unchanged.
+    const SMALL_FEATURE_RATIO_THRESHOLD: f64 = 0.15;
     let (x0, x1, y0, y1) = bounds;
     let extent = (x1 - x0).max(y1 - y0).max(1e-12);
     let smallest_zone_r = lock_zones.iter().map(|&(_, _, r)| r).fold(f64::INFINITY, f64::min);

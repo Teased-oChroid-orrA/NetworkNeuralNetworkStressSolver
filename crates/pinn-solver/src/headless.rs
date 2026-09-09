@@ -1078,6 +1078,11 @@ pub(crate) fn run_headless_pinlug_inner(
             dynamic_lam_d_cap,
             dynamic_lam_penetration_cap,
             dynamic_lam_non_tension_cap,
+            // Pin-lug's real cascade path keeps the pre-existing fixed weight - see
+            // `runner::run_training_pinlug`'s equivalent field for why the raise is
+            // plate-path-only (a documented, deliberate scope cut, not an oversight).
+            constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
+            n_fourier: 0,
             // NOTE: `MultiStepCtx::phase2_active` and the `PHASE2_ACTIVE` const below are two
             // INDEPENDENT booleans that happen to share a value by coincidence, not
             // architectural coupling. This one gates `step_physics_multi`'s h/d SAW-BRDR cap

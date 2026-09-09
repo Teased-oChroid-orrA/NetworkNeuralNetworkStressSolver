@@ -882,11 +882,15 @@ fn compute_domain_forwards(
 ) -> Vec<Computed> {
     use pinn_core::problem::DomainId;
 
-    // Multi-domain problems (pin-in-lug) use plain-DEM output (no Fourier embedding, no
-    // hard Dirichlet ansatz — boundary conditions are enforced via loss terms, not a
-    // symmetry-plane ansatz, since neither pin nor lug domain has Kirsch's quarter-symmetry
-    // structure). This mirrors `PinLugSamplingStrategy`'s geometry (see pinlug_problem.rs).
-    let n_fourier = 0usize;
+    // Multi-domain problems use no hard Dirichlet ansatz - boundary conditions are enforced
+    // via loss terms, not a symmetry-plane ansatz, since neither pin-lug's domains nor a
+    // general `UserGeometry` have Kirsch's quarter-symmetry structure (mirrors
+    // `PinLugSamplingStrategy`'s/`UserSamplingStrategy`'s geometry). Fourier embedding is a
+    // SEPARATE, independent concern from the ansatz - `ctx.n_fourier` (see its own doc
+    // comment on `MultiStepCtx`) is non-zero for the plate path specifically, when its
+    // geometry has a hole (`UserGeometry::n_fourier`) - the pin-lug path stays at 0,
+    // byte-identical to before this field existed.
+    let n_fourier = ctx.n_fourier;
 
     let mut needed: Vec<(DomainId, &'static str)> = Vec::new();
     for term in active_terms {
@@ -1065,11 +1069,50 @@ pub(crate) fn probe_interior_energy_residuals(
 
     let mut out = HashMap::new();
     for c in computed {
-        let Some((exx, eyy, exy)) = c.strains else { continue };
+        let Some((exx, eyy, exy)) = c.strains.clone() else { continue };
         let Some(spec) = ctx.problem.domains().iter().find(|d| d.id == c.key.0) else { continue };
-        let residuals: Vec<f32> = crate::energy::dem_energy_per_point::<B>(exx, eyy, exy, &spec.material)
+        let energy_residuals: Vec<f32> = crate::energy::dem_energy_per_point::<B>(exx.clone(), eyy.clone(), exy.clone(), &spec.material)
             .into_data().to_vec::<f32>().unwrap_or_default()
             .into_iter().map(|e| e.abs()).collect();
+
+        // Generalized indicator (see this function's own doc comment, "Indicator choice"):
+        // for mDEM domains (`output_dim == 5`) ONLY, add the constitutive-consistency
+        // residual `|σ_net − C:ε_fd|` (same quantity `ConstitutiveConsistencyTerm`/
+        // `LAM_CONSTITUTIVE_CONSISTENCY` train against) on top of the energy-density signal,
+        // per point. Both terms are in Pa (strain energy density J/m³ = N·m/m³ = N/m² = Pa,
+        // same units as stress) so a plain sum is dimensionally sound - no hand-tuned weight
+        // between them, and whichever signal is locally larger dominates the refinement
+        // ranking there automatically. Non-mDEM domains (Kirsch's `QuarterSymmAnsatz`, which
+        // derives stress FROM strain and has no separate output to disagree with it) get
+        // `raw_out.dims()[1] != 5`, so this is a no-op there — byte-identical to before.
+        //
+        // This closes the "Stress gradient" candidate this function's doc comment already
+        // named as the concrete future follow-up, now backed by a real measurement: a plate-
+        // with-hole run whose energy-residual-only AMR left a real, confirmed stress
+        // concentration undetected (interior energy loss is a domain-mean Monte-Carlo
+        // estimate — a small hole's local concentration barely moves the plate's TOTAL
+        // energy, so pure energy-residual refinement has very little incentive to resolve it,
+        // regardless of oversampling factor). See `powershell_tool/CLAUDE.md`'s Stress Solver
+        // section for the investigation. Deliberately NOT hardcoded to "refine near holes" —
+        // this reacts to wherever the constitutive-consistency residual is actually large,
+        // which generalizes to any geometry/load producing a local mDEM inconsistency, not
+        // just this one case.
+        let n_pts = energy_residuals.len();
+        let residuals = if spec.output_dim == 5 && c.raw_out.dims()[1] == 5 {
+            let sxx_net = c.raw_out.clone().slice([0..n_pts, 2..3]).reshape([n_pts]);
+            let syy_net = c.raw_out.clone().slice([0..n_pts, 3..4]).reshape([n_pts]);
+            let sxy_net = c.raw_out.clone().slice([0..n_pts, 4..5]).reshape([n_pts]);
+            let (sxx_fd, syy_fd, sxy_fd) = crate::energy::compute_stress::<B>(exx, eyy, exy, &spec.material);
+            let dxx: Vec<f32> = (sxx_net - sxx_fd).into_data().to_vec::<f32>().unwrap_or_default();
+            let dyy: Vec<f32> = (syy_net - syy_fd).into_data().to_vec::<f32>().unwrap_or_default();
+            let dxy: Vec<f32> = (sxy_net - sxy_fd).into_data().to_vec::<f32>().unwrap_or_default();
+            energy_residuals.iter().enumerate().map(|(i, &e)| {
+                let (a, b, c) = (dxx.get(i).copied().unwrap_or(0.0), dyy.get(i).copied().unwrap_or(0.0), dxy.get(i).copied().unwrap_or(0.0));
+                e + (a * a + b * b + c * c).sqrt()
+            }).collect()
+        } else {
+            energy_residuals
+        };
         out.insert(c.key.0, residuals);
     }
     out
@@ -1081,7 +1124,7 @@ pub(crate) fn probe_interior_energy_residuals(
 /// Kirsch path uses), applied here via `MultiStepCtx`'s per-domain `output_dim` instead of
 /// an `EngineParams` (which `MultiStepCtx` doesn't carry - `run_training_user_problem`/
 /// `run_training_pinlug` never construct one).
-const LAM_CONSTITUTIVE_CONSISTENCY: f64 = 5.0;
+pub(crate) const LAM_CONSTITUTIVE_CONSISTENCY: f64 = 5.0;
 
 #[allow(clippy::too_many_arguments)]
 pub fn step_physics_multi(
@@ -1192,23 +1235,50 @@ pub fn step_physics_multi(
     }
     let mut total = total.unwrap_or_else(|| Tensor::<B, 1>::zeros([1], device));
 
-    // (b.5) Constitutive consistency (mDEM only, fixed weight, outside SAW-BRDR) — mirrors
-    // `step_physics`'s own established pattern exactly: construct `kirsch_problem::
-    // ConstitutiveConsistencyTerm` ad-hoc and `.compute()` it on the domain's already-computed
-    // "interior" forward pass (the same (domain, "interior") pair `InteriorEnergyTerm` already
-    // requires — no extra forward pass needed). Previously entirely absent from this function:
-    // `active_terms` above filters this term's NAME out of `ctx.problem.loss_terms()` (matching
-    // `step_physics`'s identical filter), but unlike `step_physics`, nothing here ever added an
-    // equivalent contribution back — so every mDEM domain (`output_dim == 5`) driven through
-    // this function (`UserDefinedProblem`, pin-lug) had its raw σxx/σyy/σxy output columns
-    // completely unconstrained by Hooke's law anywhere in the domain interior, only wherever a
+    // (b.5) Constitutive consistency (mDEM only, outside SAW-BRDR) — mirrors `step_physics`'s
+    // own established pattern: construct `kirsch_problem::ConstitutiveConsistencyTerm` ad-hoc
+    // and `.compute()` it on the domain's already-computed "interior" forward pass (the same
+    // (domain, "interior") pair `InteriorEnergyTerm` already requires — no extra forward pass
+    // needed). Previously entirely absent from this function: `active_terms` above filters this
+    // term's NAME out of `ctx.problem.loss_terms()` (matching `step_physics`'s identical
+    // filter), but unlike `step_physics`, nothing here ever added an equivalent contribution
+    // back — so every mDEM domain (`output_dim == 5`) driven through this function
+    // (`UserDefinedProblem`, pin-lug) had its raw σxx/σyy/σxy output columns completely
+    // unconstrained by Hooke's law anywhere in the domain interior, only wherever a
     // boundary/interface term happened to read them directly. A real, confirmed bug — see
     // `powershell_tool/CLAUDE.md`'s Stress Solver section for the investigation that found it
     // (a Von Mises field with no real concentration at a hole, smooth everywhere else).
+    //
+    // The weight is `ctx.constitutive_consistency_weight` — a plain, static, caller-supplied
+    // value (NOT adaptive/per-step) that defaults to `LAM_CONSTITUTIVE_CONSISTENCY` (5.0,
+    // matching `step_physics`'s own hardcoded value in `engine.rs`) at every call site except
+    // `run_user_problem_training_from`'s real per-step `MultiStepCtx` (and the headless CLI
+    // path that mirrors it), which set it to 50.0. This is deliberately a plain CONSTANT
+    // change per caller, not per-step adaptive logic: an earlier version of this fix instead
+    // floored the weight at the step's largest active SAW-adapted weight, which broke
+    // `step_physics_multi_single_domain_matches_step_physics_kirsch` (a real parity guard
+    // proving this shared function reproduces `step_physics`'s exact formula for one Kirsch-
+    // equivalent domain) whenever ANY unrelated term's SAW weight exceeded 5.0 - a real,
+    // ordinary Kirsch-path event, not a bug. A static per-caller constant avoids that risk
+    // entirely: Kirsch/the parity test/every other caller keeps passing 5.0 (byte-identical to
+    // before this field existed), so nothing about `step_physics`'s frozen reference behavior
+    // is at risk of changing, ever, regardless of what any term's SAW weight does at runtime.
+    //
+    // 50.0 (not some other number) is not arbitrary either: it exactly matches `dynamic_lam_
+    // h_cap`'s own new cap on `hole_traction`'s SAW-adapted weight at that same caller (see
+    // `run_user_problem_training_from`'s per-step `MultiStepCtx` for the full root-cause
+    // writeup) - the two terms now share the same ceiling, so `hole_traction` can no longer
+    // structurally outweigh constitutive-consistency the way it could when one was uncapped
+    // and the other was pinned at a 10x-smaller fixed value. Before this pairing, capping
+    // `dynamic_lam_h_cap` alone (a real, previously-landed fix) measurably reduced the
+    // interior PDE residual but left the hole's own stress concentration (Kt) essentially
+    // unmoved - confirmed via a real, `#[ignore]`d training run
+    // (`run_training_user_problem_generalized_amr_indicator_diagnostic`), not assumed.
     // `const_scalar_sum` is the RAW (unweighted) term value, matching every other
     // `StepOutput::*_scalar` field's convention (e.g. `e_scalar`/`n_scalar` are also
     // unweighted - weighting lives separately in `lam_e`/`lam_n`/`lam_by_name`). Only
     // `total`/`total_scalar` (the actual optimized objective) get the weighted contribution.
+    let effective_lam_const = ctx.constitutive_consistency_weight;
     let mut const_scalar_sum = 0.0_f32;
     let mut any_mdem = false;
     for (i, domain) in ctx.problem.domains().iter().enumerate() {
@@ -1228,11 +1298,11 @@ pub fn step_physics_multi(
         let const_loss = term.compute(std::slice::from_ref(f));
         let const_scalar = t_scalar(&const_loss);
         const_scalar_sum += const_scalar;
-        total_scalar += const_scalar * LAM_CONSTITUTIVE_CONSISTENCY as f32;
-        total = total + const_loss.mul_scalar(LAM_CONSTITUTIVE_CONSISTENCY);
+        total_scalar += const_scalar * effective_lam_const as f32;
+        total = total + const_loss.mul_scalar(effective_lam_const);
     }
     if any_mdem {
-        lam_by_name.insert("constitutive_consistency", LAM_CONSTITUTIVE_CONSISTENCY);
+        lam_by_name.insert("constitutive_consistency", effective_lam_const);
     }
 
     let lr = lr_sched.step(total_scalar.abs() as f64);
@@ -4772,6 +4842,8 @@ mod tests {
                 dynamic_lam_d_cap: 50.0,
                 dynamic_lam_penetration_cap: 500.0,
                 dynamic_lam_non_tension_cap: 100.0,
+                constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
+                n_fourier: 0,
                 phase2_active: false,
                 step,
             };
@@ -5071,6 +5143,8 @@ mod tests {
             dynamic_lam_d_cap: 50.0,
             dynamic_lam_penetration_cap: 500.0,
             dynamic_lam_non_tension_cap: 100.0,
+            constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
+            n_fourier: 0,
             phase2_active: false,
             step: 0,
         };
@@ -5145,6 +5219,8 @@ mod tests {
             dynamic_lam_d_cap: 50.0,
             dynamic_lam_penetration_cap: 500.0,
             dynamic_lam_non_tension_cap: 100.0,
+            constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
+            n_fourier: 0,
             phase2_active: false,
             step: 0,
         };
@@ -5261,6 +5337,8 @@ mod tests {
             dynamic_lam_d_cap: 50.0,
             dynamic_lam_penetration_cap: 500.0,
             dynamic_lam_non_tension_cap: 100.0,
+            constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
+            n_fourier: 0,
             phase2_active: false,
             step: 0,
         };
@@ -5399,6 +5477,8 @@ mod tests {
             dynamic_lam_d_cap: 50.0,
             dynamic_lam_penetration_cap: 500.0,
             dynamic_lam_non_tension_cap: 100.0,
+            constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
+            n_fourier: 0,
             phase2_active: false,
             step: 0,
         };
@@ -5448,6 +5528,8 @@ mod tests {
             dynamic_lam_d_cap: 50.0,
             dynamic_lam_penetration_cap: 500.0,
             dynamic_lam_non_tension_cap: 100.0,
+            constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
+            n_fourier: 0,
             phase2_active: false,
             step: 0,
         };
@@ -5584,6 +5666,8 @@ mod tests {
             dynamic_lam_d_cap: 50.0,
             dynamic_lam_penetration_cap: 500.0,
             dynamic_lam_non_tension_cap: 100.0,
+            constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
+            n_fourier: 0,
             phase2_active: false,
             step: 0,
         };
@@ -5666,6 +5750,8 @@ mod tests {
             dynamic_lam_d_cap: 50.0,
             dynamic_lam_penetration_cap: 500.0,
             dynamic_lam_non_tension_cap: 100.0,
+            constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
+            n_fourier: 0,
             phase2_active: false,
             step: 0,
         };
@@ -5797,6 +5883,8 @@ mod tests {
             dynamic_lam_d_cap,
             dynamic_lam_penetration_cap,
             dynamic_lam_non_tension_cap,
+            constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
+            n_fourier: 0,
             phase2_active,
             step: 0,
         }

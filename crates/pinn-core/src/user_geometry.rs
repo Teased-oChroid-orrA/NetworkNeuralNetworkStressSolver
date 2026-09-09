@@ -67,6 +67,48 @@ impl UserGeometry {
         true
     }
 
+    /// Positional-Fourier-feature count the network's input should use for this geometry.
+    /// Currently always `0` (raw x,y,z, no embedding) - see below for why, despite a real
+    /// attempt to enable it.
+    ///
+    /// This mechanism exists (and every consumer downstream of it is real, generalized
+    /// infrastructure, not dead code) because of a genuine, tested hypothesis: Kirsch's own
+    /// problem uses positional-Fourier embedding specifically for its hole
+    /// (`pinn_solver::engine::EngineParams::analyze`: `let n_fourier = if has_hole { 8_usize }
+    /// else { 0 };`, commented "corrects spectral bias near hole") and achieves real Kt
+    /// convergence; the generalized N-hole path never had it
+    /// (`training_core::compute_domain_forwards` hardcoded `n_fourier = 0` unconditionally,
+    /// with a comment explaining only why it skips the *hard Dirichlet ansatz* Fourier
+    /// embedding was originally paired with there - not a deliberate decision to omit it for
+    /// holed geometries). After ruling out weighting (capping `dynamic_lam_h_cap`, matching
+    /// `constitutive_consistency_weight` to it) and sampling density (a 2.47x guaranteed
+    /// hole-zone collocation increase) as the cause of a plate-with-hole run's Kt staying ~0,
+    /// porting Kirsch's own Fourier fix was the next well-motivated, evidence-driven step.
+    ///
+    /// Measured result, not assumed: enabling `n_fourier = 8` for a holed geometry made the
+    /// interior PDE (constitutive-consistency) residual RMS **~28x WORSE** (2.80e7 Pa vs.
+    /// 9.85e5 Pa without it, same 8000-step config) while total_loss converged FASTER and Kt
+    /// stayed at ~0 either way. Interpretation: the higher-frequency basis let the network fit
+    /// the boundary/traction collocation points more precisely while oscillating wildly
+    /// between them - a well-known Fourier-feature pitfall when embedding frequency outstrips
+    /// collocation density, and a straightforward port of Kirsch's own working fix without
+    /// re-deriving whether its frequency/density balance holds for a different point-sampling
+    /// scheme. A real negative result, kept disabled (not deleted) so a future attempt (e.g.
+    /// paired with denser boundary-adjacent sampling, or a lower `n_fourier`) doesn't have to
+    /// re-build this plumbing from scratch or re-discover this pitfall blind.
+    pub fn n_fourier(&self) -> usize {
+        let _ = &self.holes; // kept as a parameter for when this is revisited - see doc comment
+        0
+    }
+
+    /// Network input dimension implied by [`Self::n_fourier`] — `3` (raw x,y,z) when there's
+    /// no Fourier embedding, `4 * n_fourier` when there is. Mirrors `pinn_solver::engine::
+    /// EngineParams::net_input_dim`'s identical formula.
+    pub fn net_input_dim(&self) -> usize {
+        let nf = self.n_fourier();
+        if nf > 0 { 4 * nf } else { 3 }
+    }
+
     /// Inert placeholder `GeometryConfig` sized to this geometry's real bounding box — see
     /// the module doc comment for why this is safe and what it's actually used for.
     pub fn to_placeholder(&self) -> GeometryConfig {

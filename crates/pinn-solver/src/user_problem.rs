@@ -388,7 +388,7 @@ pub fn evaluate_user_vis_grid(
     let n_act = active_pts.len();
     let pts_t = norm_pts_to_tensor::<BInner>(&active_pts, device);
     let stencil_coords = assemble_stencil::<BInner>(&pts_t, fd, device);
-    let raw_net = fwd::<BInner>(model, stencil_coords, 0, device); // [5*n_act, 5], unscaled
+    let raw_net = fwd::<BInner>(model, stencil_coords, geometry.n_fourier(), device); // [5*n_act, 5], unscaled
 
     // Physical scale BEFORE the FD derivative — same convention as `compute_domain_forwards`'s
     // `is_mdem` branch and `probe_hole_boundary_profile` (displacement by u_ref, stress by
@@ -464,6 +464,7 @@ pub fn probe_boundary_residuals(
     let u_ref = ((stress_ref / spec.material.e) * geometry.half_w) as f32;
     let px_pa = stress_ref;
     let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / geometry.half_w) as f32, (y / geometry.half_h) as f32] };
+    let n_fourier = geometry.n_fourier();
 
     let mut residuals: Vec<f32> = Vec::new();
 
@@ -472,7 +473,7 @@ pub fn probe_boundary_residuals(
         let n_bnd = bnd_pts_phys.len();
         let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
         let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
-        let raw = fwd::<BInner>(model, stencil, 0, device);
+        let raw = fwd::<BInner>(model, stencil, n_fourier, device);
         let m = 5 * n_bnd;
         let scaled = Tensor::cat(vec![
             raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
@@ -501,7 +502,7 @@ pub fn probe_boundary_residuals(
         let n_h = set.points.len();
         if n_h == 0 { continue; }
         let ring_norm: Vec<[f32; 2]> = set.points.iter().map(|p| norm_pt(p.x, p.y)).collect();
-        let raw = fwd::<BInner>(model, norm_pts_to_tensor::<BInner>(&ring_norm, device), 0, device);
+        let raw = fwd::<BInner>(model, norm_pts_to_tensor::<BInner>(&ring_norm, device), n_fourier, device);
         let scaled = Tensor::cat(vec![
             raw.clone().slice([0..n_h, 0..2]).mul_scalar(u_ref as f64),
             raw.slice([0..n_h, 2..5]).mul_scalar(px_pa),
@@ -585,7 +586,7 @@ pub fn probe_reaction_force(
 
     let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
     let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
-    let raw = fwd::<BInner>(model, stencil, 0, device);
+    let raw = fwd::<BInner>(model, stencil, geometry.n_fourier(), device);
     let m = 5 * n_bnd;
     let scaled = Tensor::cat(vec![
         raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
@@ -652,7 +653,7 @@ pub fn probe_energy_balance(
         let n_int = interior.len();
         let int_norm: Vec<[f32; 2]> = interior.iter().map(|&[x, y]| norm_pt(x, y)).collect();
         let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&int_norm, device), &fd, device);
-        let raw = fwd::<BInner>(model, stencil, 0, device);
+        let raw = fwd::<BInner>(model, stencil, geometry.n_fourier(), device);
         let m = 5 * n_int;
         let scaled = Tensor::cat(vec![
             raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
@@ -675,7 +676,7 @@ pub fn probe_energy_balance(
         let ds_y_normal = 2.0 * geometry.half_w / per_edge as f64;
         let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
         let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
-        let raw = fwd::<BInner>(model, stencil, 0, device);
+        let raw = fwd::<BInner>(model, stencil, geometry.n_fourier(), device);
         let m = 5 * n_bnd;
         let scaled = Tensor::cat(vec![
             raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
@@ -756,7 +757,7 @@ pub fn probe_hole_boundary_profile(
 
     let pts_t = norm_pts_to_tensor::<BInner>(&pts_norm, device);
     let stencil = assemble_stencil::<BInner>(&pts_t, fd, device);
-    let raw_stencil = fwd::<BInner>(model, stencil, 0, device); // [5n, 5]: u,v,sxx,syy,sxy
+    let raw_stencil = fwd::<BInner>(model, stencil, geometry.n_fourier(), device); // [5n, 5]: u,v,sxx,syy,sxy
 
     // Physical-scale FIRST (same convention as `compute_domain_forwards`/`evaluate_user_
     // vis_grid`), so the FD-derived strain below is directly the physical strain - no extra
@@ -954,18 +955,24 @@ mod tests {
 
     // ─── Phase 14 (Neural-Network-Wide Adaptive Collocation epic): spatial diagnostic fields ──
 
-    fn tiny_model() -> crate::network::ElasticityNet<crate::training_core::BInner> {
+    /// `n_fourier` must match whatever geometry the model will actually be probed against -
+    /// `0` for a no-hole geometry, `8` for a holed one (`UserGeometry::n_fourier`) - or the
+    /// probe's forward pass panics on a tensor width mismatch (the model's `input_dim` is
+    /// fixed at construction time; the probe functions derive their Fourier embedding from
+    /// the geometry they're actually given, independently).
+    fn tiny_model(n_fourier: usize) -> crate::network::ElasticityNet<crate::training_core::BInner> {
         let device = crate::training_core::BDevice::default();
+        let input_dim = if n_fourier > 0 { 4 * n_fourier } else { 3 };
         crate::network::ElasticityNetConfig::new()
-            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
+            .with_input_dim(input_dim).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
             .init(&device)
     }
 
     #[test]
     fn evaluate_user_vis_grid_masks_every_new_field_outside_the_domain_same_as_the_original_six() {
-        let model = tiny_model();
-        let device = crate::training_core::BDevice::default();
         let geometry = two_hole_geometry();
+        let model = tiny_model(geometry.n_fourier());
+        let device = crate::training_core::BDevice::default();
         let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
         let vis = evaluate_user_vis_grid(
             &model, &geometry, [16, 16], 1.0, 1.0, &MaterialProps::al7075_t6(), &fd, &[], &device,
@@ -989,7 +996,7 @@ mod tests {
         // point would read exactly 0.0. Real, independently-computed values essentially never
         // land on exactly zero float-for-float, so "not identically zero everywhere" is strong
         // evidence the comparison is real, not a stub.
-        let model = tiny_model();
+        let model = tiny_model(0);
         let device = crate::training_core::BDevice::default();
         let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] };
         let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
@@ -1006,7 +1013,7 @@ mod tests {
 
     #[test]
     fn evaluate_user_vis_grid_amr_score_is_finite_and_nonnegative_everywhere_inside_domain() {
-        let model = tiny_model();
+        let model = tiny_model(0);
         let device = crate::training_core::BDevice::default();
         let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] };
         let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
@@ -1020,7 +1027,7 @@ mod tests {
 
     #[test]
     fn evaluate_user_vis_grid_collocation_density_matches_a_hand_binned_histogram() {
-        let model = tiny_model();
+        let model = tiny_model(0);
         let device = crate::training_core::BDevice::default();
         let geometry = UserGeometry { half_w: 1.0, half_h: 1.0, thickness: 0.005, holes: vec![] };
         let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
@@ -1039,7 +1046,7 @@ mod tests {
 
     #[test]
     fn probe_boundary_residuals_is_finite_nonnegative_and_max_at_least_rms() {
-        let model = tiny_model();
+        let model = tiny_model(two_hole_geometry().n_fourier());
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: two_hole_geometry(),
@@ -1060,7 +1067,7 @@ mod tests {
 
     #[test]
     fn probe_boundary_residuals_handles_a_geometry_with_no_holes() {
-        let model = tiny_model();
+        let model = tiny_model(0);
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
@@ -1078,9 +1085,9 @@ mod tests {
 
     #[test]
     fn probe_reaction_force_is_finite_and_reference_force_matches_hand_computed_nominal_load() {
-        let model = tiny_model();
-        let device = crate::training_core::BDevice::default();
         let geometry = two_hole_geometry();
+        let model = tiny_model(geometry.n_fourier());
+        let device = crate::training_core::BDevice::default();
         let px = 6.9e7;
         let spec = ProblemSpec {
             geometry: geometry.clone(),
@@ -1102,7 +1109,7 @@ mod tests {
 
     #[test]
     fn probe_reaction_force_handles_a_geometry_with_no_holes() {
-        let model = tiny_model();
+        let model = tiny_model(0);
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
@@ -1120,7 +1127,7 @@ mod tests {
     fn probe_reaction_force_zero_load_gives_zero_reference_force_floored_and_finite_error() {
         // px = py = 0.0: `reference_force` would otherwise be exactly 0.0, which must not
         // produce a NaN/infinite division - the `.max(1e-30)` floor exists exactly for this.
-        let model = tiny_model();
+        let model = tiny_model(0);
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
@@ -1137,7 +1144,7 @@ mod tests {
 
     #[test]
     fn probe_energy_balance_is_finite_for_a_fresh_model() {
-        let model = tiny_model();
+        let model = tiny_model(two_hole_geometry().n_fourier());
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: two_hole_geometry(),
@@ -1157,7 +1164,7 @@ mod tests {
         // A freshly-initialized network has no reason for its interior energy density and its
         // boundary work integral to already agree - if this were accidentally wired to compare
         // a value against itself, internal_energy would exactly equal external_work.
-        let model = tiny_model();
+        let model = tiny_model(0);
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },

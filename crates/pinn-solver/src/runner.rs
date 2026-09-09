@@ -15,7 +15,7 @@ use pinn_core::{
 
 use crate::{
     bc::apply_dirichlet_ansatz,
-    controllers::ConvergenceTracker,
+    controllers::{ConvergenceTracker, MetricDirection},
     decision_maker::{OptimizerTier, PinnDecisionMaker},
     engine::EngineParams,
     energy::dem_energy_per_point,
@@ -892,6 +892,8 @@ pub fn run_training_pinlug(
                 dynamic_lam_d_cap: 50.0,
                 dynamic_lam_penetration_cap: 500.0,
                 dynamic_lam_non_tension_cap: 100.0,
+                constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
+                n_fourier: 0,
                 phase2_active: false,
                 step,
             };
@@ -923,6 +925,8 @@ pub fn run_training_pinlug(
                         ],
                         dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
                         dynamic_lam_penetration_cap: 500.0, dynamic_lam_non_tension_cap: 100.0,
+                        constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
+                        n_fourier: 0,
                         phase2_active: false, step,
                     };
                     let after_r = probe_interior_energy_residuals(&after_ctx, &[&model_pin, &model_lug], &device)
@@ -964,6 +968,8 @@ pub fn run_training_pinlug(
                         ],
                         dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
                         dynamic_lam_penetration_cap: 500.0, dynamic_lam_non_tension_cap: 100.0,
+                        constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
+                        n_fourier: 0,
                         phase2_active: false, step,
                     };
                     let after_r = probe_interior_energy_residuals(&after_ctx, &[&model_pin, &model_lug], &device)
@@ -1003,6 +1009,12 @@ pub fn run_training_pinlug(
             // logic here; a deliberate, tracked scope cut (see CLAUDE.md's GUI section).
             dynamic_lam_penetration_cap: 500.0,
             dynamic_lam_non_tension_cap: 100.0,
+            // Pin-lug's GUI path deliberately keeps the pre-existing fixed weight - the same
+            // documented scope cut as `phase2_active: false` above (no cascade logic here);
+            // only `run_user_problem_training_from`'s plate path was raised to match its own
+            // now-real `dynamic_lam_h_cap` cap.
+            constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
+            n_fourier: 0,
             phase2_active: false,
             step,
         };
@@ -1088,8 +1100,85 @@ pub fn run_training_pinlug(
 /// run_headless_user_problem`'s same v1 scope cut) — plain constant/scheduled-LR AdamW via
 /// `step_physics_multi`, `WarmStart` control messages are accepted but ignored (a loaded
 /// `ProblemSpec` isn't a `SolverConfig` there is anything scalar to warm-start into).
+/// Fresh start: builds a new model from `spec.network` and trains it for the full
+/// `0..spec.training.max_steps`. See `run_user_problem_training_from` for the shared body -
+/// this and `run_training_user_problem_resume` are both thin wrappers around it.
 pub fn run_training_user_problem(
     spec: ProblemSpec,
+    tx: Sender<TrainingMsg>,
+    stop_rx: Receiver<ControlMsg>,
+) {
+    let device = BDevice::default();
+    let net_cfg = ElasticityNetConfig::new()
+        // See `UserGeometry::n_fourier`'s doc comment - was hardcoded `3` (no Fourier
+        // embedding) for every geometry, including holed ones, which is the real root cause
+        // this fixes. MUST match every forward pass's own `n_fourier` (the per-step
+        // `MultiStepCtx.n_fourier` below, and every `user_problem.rs` probe, which all derive
+        // it from this same geometry) or the first forward pass panics on a tensor width
+        // mismatch.
+        .with_input_dim(spec.geometry.net_input_dim())
+        .with_hidden_dim(spec.network.hidden_dim)
+        .with_n_hidden(spec.network.n_hidden)
+        .with_output_dim(5) // mDEM: u, v, sigma_xx, sigma_yy, sigma_xy
+        // Smart adaptive architecture: the gated-residual (PirateNet) structure is what makes
+        // safe depth growth/shrink possible at all (see `ElasticityNet::append_dormant_layer`'s
+        // doc comment) - there is no separate user-facing "use_piratenet" toggle, `adaptive`
+        // forces it internally.
+        .with_use_piratenet(spec.network.adaptive);
+    let model = net_cfg.init(&device);
+    run_user_problem_training_from(spec, model, device, 0, tx, stop_rx);
+}
+
+/// Graceful-stop-and-resume: loads a checkpoint's weights into a fresh TRAINABLE model and
+/// continues training for `additional_steps` more, starting from where the checkpoint left
+/// off. Lightweight resume (a deliberate, documented tradeoff - see the design plan this
+/// shipped with): only the weights carry over - optimizer momentum, SAW-BRDR's adapted loss
+/// weights, the LR schedule's warmup phase, and the AMR grid all restart fresh, exactly as
+/// `run_training_user_problem` builds them for a brand-new run. That's a real, temporary rough
+/// patch for roughly the first few hundred resumed steps (the same self-correcting warmup any
+/// fresh run already goes through), not a bug - not persisting that state at all is what keeps
+/// this a same-session-sized change instead of a new checkpoint file format.
+///
+/// Parametric checkpoints are out of scope - `run_training_parametric`'s own "instant
+/// inference" serving model already covers its post-training use case, and this feature was
+/// requested specifically for the plate/user-defined-problem workflow.
+pub fn run_training_user_problem_resume(
+    weights_path: std::path::PathBuf,
+    additional_steps: usize,
+    tx: Sender<TrainingMsg>,
+    stop_rx: Receiver<ControlMsg>,
+) {
+    let device = BDevice::default();
+    let (model, meta) = match crate::checkpoint::load_checkpoint_for_training(&weights_path, &device) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tx.send(TrainingMsg::Error(format!("failed to load checkpoint for resume: {e}")));
+            return;
+        }
+    };
+    let mut spec = match meta.spec {
+        crate::checkpoint::CheckpointSpec::Plate(s) => s,
+        crate::checkpoint::CheckpointSpec::Parametric(_) => {
+            let _ = tx.send(TrainingMsg::Error(
+                "Resume is only supported for plate specs, not parametric checkpoints.".to_string(),
+            ));
+            return;
+        }
+    };
+    let steps_completed = meta.steps_completed;
+    spec.training.max_steps = steps_completed.saturating_add(additional_steps);
+    run_user_problem_training_from(spec, model, device, steps_completed, tx, stop_rx);
+}
+
+/// Shared body for `run_training_user_problem`/`run_training_user_problem_resume` - identical
+/// either way except where `model`/`device` come from and where the step counter starts
+/// (`step_offset`: `0` for a fresh run, `steps_completed` for a resumed one - `spec.training.
+/// max_steps` is the ABSOLUTE target step either way, already adjusted by the resume wrapper).
+fn run_user_problem_training_from(
+    spec: ProblemSpec,
+    mut model: ElasticityNet<B>,
+    device: BDevice,
+    step_offset: usize,
     tx: Sender<TrainingMsg>,
     stop_rx: Receiver<ControlMsg>,
 ) {
@@ -1107,7 +1196,6 @@ pub fn run_training_user_problem(
     /// network's noisy residual signal.
     const AMR_WARMUP_STEPS: usize = 200;
 
-    let device = BDevice::default();
     let half_w = spec.geometry.half_w;
     let half_h = spec.geometry.half_h;
 
@@ -1117,17 +1205,6 @@ pub fn run_training_user_problem(
     let mut config = SolverConfig::default_kirsch();
     config.load = spec.load;
 
-    let net_cfg = ElasticityNetConfig::new()
-        .with_input_dim(3)
-        .with_hidden_dim(spec.network.hidden_dim)
-        .with_n_hidden(spec.network.n_hidden)
-        .with_output_dim(5) // mDEM: u, v, sigma_xx, sigma_yy, sigma_xy
-        // Smart adaptive architecture: the gated-residual (PirateNet) structure is what makes
-        // safe depth growth/shrink possible at all (see `ElasticityNet::append_dormant_layer`'s
-        // doc comment) - there is no separate user-facing "use_piratenet" toggle, `adaptive`
-        // forces it internally.
-        .with_use_piratenet(spec.network.adaptive);
-    let mut model = net_cfg.init(&device);
     let mut optim = DomainOptim {
         weight: WeightOptim::new(config.use_soap_muon),
         bias: make_bias_optim(),
@@ -1149,6 +1226,33 @@ pub fn run_training_user_problem(
     );
     let mut arch_controller = spec.network.adaptive.then(|| ArchitectureController::new(arch_config.clone()));
     let mut arch_snapshot: Option<(ElasticityNet<B>, usize, usize)> = None;
+
+    // Auto-stop when training plateaus - defaults ON (`spec.network.auto_stop_on_plateau`),
+    // matching prior behavior on the Kirsch path (its own `ConvergenceTracker`-driven cascade
+    // in `headless.rs`), which the plate path never had until now. `ConvergenceTracker::
+    // for_metric` is already generic over any scalar metric - the same reuse this crate's own
+    // `ArchitectureController` already established for the SAME reason. Fed `bc_residual_rms`
+    // at the existing vis cadence below (real, already-computed - no new physics probe).
+    // Unlike a warm restart, a detected plateau here triggers a plain graceful stop (the same
+    // path `ControlAction::StopAndFinish` already takes), not a restart - Kirsch's LR/Adam
+    // reset + tightened `lam_h_cap` cascade is tuned specifically for its own K_t dynamics.
+    let mut plateau_tracker = spec.network.auto_stop_on_plateau.then(|| {
+        ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, f64::INFINITY, 0.0)
+    });
+    let mut auto_stopped = false;
+    // `ConvergenceTracker::check_plateau` needs `PLATEAU_WINDOW * 2` (40) readings before it can
+    // even evaluate a plateau - a real, previously-confirmed characteristic (see
+    // `run_training_user_problem_adaptive_wiring_does_not_crash_and_events_are_consistent`'s own
+    // doc comment for `ArchitectureController`'s identical reuse of this tracker). Kirsch's own
+    // usage feeds it once every 50 real steps, so that warmup is ~2000 real steps there - but
+    // this path's vis cadence (below) is every 10 steps, so pushing every tick would make the
+    // SAME 40-reading warmup fire at only ~400 real steps, long before the plate path has
+    // learned anything meaningful (confirmed via a real run: auto-stop fired at step ~430 with
+    // total_loss still at ~4.0, three orders of magnitude from converged). Throttling the push
+    // to every 5th vis-cadence tick (once per 50 real steps) matches Kirsch's own real cadence-
+    // to-real-step ratio - a principled choice, not an arbitrary number - without touching the
+    // shared, already-tested `ConvergenceTracker`/`PLATEAU_WINDOW` at all.
+    let mut plateau_push_counter: usize = 0;
 
     let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
     let mut saw = SawBrdr::with_base(base_weights, 0.95);
@@ -1204,11 +1308,13 @@ pub fn run_training_user_problem(
 
     // Stage H (model checkpoint save/load) - tracked so the post-training serving loop below
     // can build a real `CheckpointMeta` (steps actually completed, not just `max_steps`, since
-    // `StopAndFinish` can end the run early).
-    let mut last_step = 0usize;
+    // `StopAndFinish` can end the run early). Starts at `step_offset - 1` (not `0`) so a resume
+    // whose loop body never executes (e.g. `additional_steps == 0`) still reports
+    // `steps_completed` as the checkpoint's own starting point, not `1`.
+    let mut last_step = step_offset.saturating_sub(1);
     let mut last_total_loss = 0.0f32;
 
-    for step in 0..spec.training.max_steps {
+    for step in step_offset..spec.training.max_steps {
         match handle_control_messages(&stop_rx) {
             ControlAction::StopAndFinish => break,
             ControlAction::StopImmediately => return,
@@ -1229,6 +1335,8 @@ pub fn run_training_user_problem(
                 dynamic_lam_d_cap: f64::MAX,
                 dynamic_lam_penetration_cap: f64::MAX,
                 dynamic_lam_non_tension_cap: f64::MAX,
+                constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
+                n_fourier: spec.geometry.n_fourier(),
                 phase2_active: true,
                 step,
             };
@@ -1262,6 +1370,8 @@ pub fn run_training_user_problem(
                         domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
+                        constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
+                        n_fourier: spec.geometry.n_fourier(),
                         phase2_active: true, step,
                     };
                     let after_residuals = probe_interior_energy_residuals(&after_ctx, &[&model], &device)
@@ -1290,10 +1400,40 @@ pub fn run_training_user_problem(
             fd: &fd,
             k: 1.0, // IdentityAnsatz ignores k entirely
             domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
-            dynamic_lam_h_cap: f64::MAX,
-            dynamic_lam_d_cap: f64::MAX,
+            // Real root cause of the garbage-Kt/zero-hole-stress bug (see `powershell_tool/
+            // CLAUDE.md`'s Stress Solver section): this path's `hole_traction_loss_direct` term
+            // was left fully UNCAPPED (`f64::MAX`, unlike Kirsch's own real, tested 50→15
+            // cascade), so SAW-BRDR could grow its adapted weight arbitrarily large over a long
+            // run relative to `step_physics_multi`'s fixed `LAM_CONSTITUTIVE_CONSISTENCY` (5.0)
+            // - and an outweighed boundary term has a strictly EASIER minimum available than the
+            // true elasticity solution: drive the direct-stress outputs toward zero everywhere
+            // the boundary term is evaluated (trivially satisfies "traction ≈ 0" without
+            // satisfying "stress matches Hooke's law"). Capped at Kirsch's own starting value
+            // (50.0, a real, already-tuned bound in this codebase, not an arbitrary guess) -
+            // deliberately NOT replicating Kirsch's full plateau-triggered cascade-with-restarts
+            // down to 15.0, which is tuned specifically for Kirsch's own K_t dynamics and a
+            // separate, larger feature this fix doesn't need.
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
             dynamic_lam_penetration_cap: f64::MAX,
             dynamic_lam_non_tension_cap: f64::MAX,
+            // Paired with the `dynamic_lam_h_cap` fix directly above: capping the boundary
+            // term alone (a real, previously-landed fix) measurably reduced the interior PDE
+            // residual but left Kt essentially unmoved - confirmed via a real training run,
+            // not assumed (see `run_training_user_problem_generalized_amr_indicator_
+            // diagnostic`). Raising this to the SAME 50.0 ceiling closes the remaining gap:
+            // `hole_traction` can no longer structurally outweigh constitutive-consistency by
+            // 10x the way it could when one was capped at 50 and the other pinned at 5.
+            constitutive_consistency_weight: 50.0,
+            // Real, evidence-driven fix (see `UserGeometry::n_fourier`'s doc comment for the
+            // full story): after ruling out weighting AND sampling density as the bottleneck
+            // via multiple independent, measured experiments this session, the remaining gap
+            // is representational - Kirsch's own path already uses Fourier positional
+            // encoding for exactly this reason ("corrects spectral bias near hole") and
+            // already achieves real Kt convergence; this path never had it. `net_cfg`'s
+            // `input_dim` (below, at this function's model-construction site) MUST use the
+            // SAME value - see that call site's own comment.
+            n_fourier: spec.geometry.n_fourier(),
             phase2_active: true,
             step,
         };
@@ -1337,6 +1477,21 @@ pub fn run_training_user_problem(
             // `enhancement.txt` items 4/C ("BC residual RMS/max") - same vis cadence as
             // above, a real side probe, not part of the per-step loss computation.
             let (bc_rms, bc_max) = crate::user_problem::probe_boundary_residuals(&model_val, &spec, &device);
+
+            // Auto-stop when training plateaus - see this function's own setup comment above
+            // for the full rationale. A detected plateau just sets a flag here; the actual
+            // `break` happens after this step's `TrainingUpdate` is sent, below, so the GUI
+            // still sees the final state before the run ends.
+            if let Some(tracker) = plateau_tracker.as_mut() {
+                plateau_push_counter += 1;
+                if plateau_push_counter % 5 == 0 {
+                    tracker.push(bc_rms);
+                    if tracker.check_plateau().is_some() {
+                        auto_stopped = true;
+                    }
+                }
+            }
+
             // `enhancement.md` Phase 9 ("Force Equilibrium Validation") - same vis cadence,
             // same "side probe" precedent (see `ReactionForce`'s doc comment in
             // `pinn_core::messages`).
@@ -1405,6 +1560,9 @@ pub fn run_training_user_problem(
             architecture_event,
         };
         let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
+        if auto_stopped {
+            break;
+        }
     }
 
     let _ = tx.send(TrainingMsg::Done);
@@ -1866,7 +2024,7 @@ mod tests {
         let spec = single_hole_like_spec(0);
         let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
-            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
+            .with_input_dim(spec.geometry.net_input_dim()).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
         let model: ElasticityNet<BInner> = net_cfg.init(&device);
 
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -1902,7 +2060,7 @@ mod tests {
         let spec = single_hole_like_spec(0);
         let device = BDevice::default();
         let net_cfg = ElasticityNetConfig::new()
-            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
+            .with_input_dim(spec.geometry.net_input_dim()).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
         let model: ElasticityNet<BInner> = net_cfg.init(&device);
 
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -2003,6 +2161,8 @@ mod tests {
                 domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                 dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
+                constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
+                n_fourier: 0,
                 phase2_active: true, step,
             };
             let (new_model, _out) = step_physics_multi(
@@ -2211,6 +2371,75 @@ mod tests {
         assert!(report.sweep_duration_ms >= 0.0, "sweep timing must be a real, non-negative measurement");
     }
 
+    // Real, `#[ignore]`d (slow - thousands of real steps) diagnostic: runs the REAL GUI code
+    // path (`run_training_user_problem`, with AMR active), unlike the separate headless CLI
+    // path (`user_runner::run_headless_user_problem`, which has no AMR at all and is
+    // therefore not representative of what the app actually does). Prints the same PDE-
+    // residual/Kt/AMR-sweep numbers the app's own diagnostics would show, from the real last
+    // `Update`'s `vis`/`hole_analyses` (always sent on the final step regardless of vis
+    // cadence) - a real, reusable regression check for the garbage-Kt/zero-hole-stress
+    // investigation documented in `powershell_tool/CLAUDE.md`'s Stress Solver section, not a
+    // one-off debugging script.
+    #[test]
+    #[ignore]
+    fn run_training_user_problem_generalized_amr_indicator_diagnostic() {
+        // 8000 steps: deep enough to actually test convergence (not just early dynamics), and
+        // comparable to earlier before/after data points gathered during this investigation.
+        // NOT a direct/synchronous call - `run_user_problem_training_from` deliberately stays
+        // alive after `Done` to serve `SaveCheckpoint` requests (Stage H), so this must run on
+        // its own thread and be told `Stop` once we've seen what we need, matching
+        // `serve_loaded_plate_checkpoint_sends_update_then_done_with_no_training`'s established
+        // pattern - a direct call here would block forever on `stop_rx.recv()`.
+        let spec = single_hole_like_spec(8000);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, rx_ctrl));
+
+        let mut last_vis = None;
+        let mut last_hole_analyses = Vec::new();
+        let mut last_amr = None;
+        let mut last_total_loss = f32::NAN;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline && !saw_done {
+            match rx.try_recv() {
+                Ok(TrainingMsg::Update(upd)) => {
+                    last_total_loss = upd.total_loss;
+                    if upd.vis.is_some() { last_vis = upd.vis; }
+                    if !upd.hole_analyses.is_empty() { last_hole_analyses = upd.hole_analyses; }
+                    if upd.amr_sweep.is_some() { last_amr = upd.amr_sweep; }
+                }
+                Ok(TrainingMsg::Done) => saw_done = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+        tx_ctrl.send(ControlMsg::Stop).unwrap();
+        handle.join().unwrap();
+
+        let vis = last_vis.expect("expected a final vis-carrying Update");
+        let pde_vals: Vec<f32> = vis.pde_residual.iter().copied().filter(|v| v.is_finite()).collect();
+        let (pde_rms, pde_max) = crate::training_core::residual_stats(&pde_vals);
+        println!("  [diag] final total_loss={last_total_loss:.6e}");
+        println!("  [diag] PDE residual RMS={pde_rms:.4e}  max={pde_max:.4e} Pa");
+        for h in &last_hole_analyses {
+            println!(
+                "  [diag] hole {}: max_von_mises={:.4e} Pa  nominal={:.4e} Pa  Kt={:.4}",
+                h.hole_index, h.concentration.max_von_mises, h.concentration.nominal_stress, h.concentration.kt
+            );
+        }
+        if let Some(r) = last_amr {
+            println!(
+                "  [diag] last AMR sweep at step {}: points {}->{}  hole-zone density {:.3}->{:.3}  domain-avg density {:.3}->{:.3}",
+                r.step, r.points_before, r.points_after, r.hole_zone_density_before, r.hole_zone_density_after,
+                r.domain_mean_density_before, r.domain_mean_density_after
+            );
+        } else {
+            println!("  [diag] no AMR sweep report received");
+        }
+    }
+
     // ─── Smart adaptive architecture: end-to-end wiring into run_training_user_problem ───────
 
     fn tiny_adaptive_spec(max_steps: usize) -> ProblemSpec {
@@ -2228,6 +2457,7 @@ mod tests {
             network: NetworkSpec {
                 hidden_dim: 8, n_hidden: 3,
                 adaptive: true, max_hidden_dim: Some(12), max_n_hidden: Some(4),
+                ..Default::default()
             },
             training: TrainingSpec { max_steps, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3 },
         }

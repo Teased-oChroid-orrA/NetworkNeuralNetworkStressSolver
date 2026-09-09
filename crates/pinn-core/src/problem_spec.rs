@@ -24,6 +24,18 @@ pub struct NetworkSpec {
     /// Depth growth ceiling when `adaptive`. `None` = no cap beyond hardware limits.
     #[serde(default)]
     pub max_n_hidden: Option<usize>,
+    /// Auto-stop when training plateaus (no further real progress) - defaults ON, matching
+    /// this toolbox's prior behavior on the Kirsch path (`headless.rs`'s own `ConvergenceTracker`-
+    /// driven cascade), which the plate/user-defined-problem path never had until this field.
+    /// Unlike Kirsch's warm-restart cascade (LR/Adam reset, tightened `lam_h_cap`, tuned
+    /// specifically for K_t dynamics), this triggers a plain graceful stop - the same path
+    /// clicking Stop already takes - not a restart.
+    #[serde(default = "default_auto_stop_on_plateau")]
+    pub auto_stop_on_plateau: bool,
+}
+
+fn default_auto_stop_on_plateau() -> bool {
+    true
 }
 
 impl Default for NetworkSpec {
@@ -34,6 +46,7 @@ impl Default for NetworkSpec {
             adaptive: false,
             max_hidden_dim: None,
             max_n_hidden: None,
+            auto_stop_on_plateau: true,
         }
     }
 }

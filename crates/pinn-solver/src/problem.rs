@@ -233,6 +233,22 @@ pub struct MultiStepCtx<'a> {
     /// Cap on `interface_non_tension`'s SAW-BRDR effective weight — see
     /// `dynamic_lam_penetration_cap`'s doc comment (same convention, seeded at 100.0).
     pub dynamic_lam_non_tension_cap: f64,
+    /// Fixed weight `step_physics_multi` applies to the `constitutive_consistency` term for
+    /// every mDEM (`output_dim == 5`) domain — see `training_core::LAM_CONSTITUTIVE_
+    /// CONSISTENCY`'s own doc comment for why this is a plain ctx field (not adaptive/
+    /// per-step) and why every caller except `run_user_problem_training_from`'s real
+    /// per-step ctx (and the headless CLI path that mirrors it) sets it to that constant,
+    /// unchanged from before this field existed.
+    pub constitutive_consistency_weight: f64,
+    /// Positional-Fourier-feature count every domain's forward pass uses (see
+    /// `UserGeometry::n_fourier`'s doc comment for the full root-cause story). MUST match
+    /// what every domain's model was actually constructed with (`net_input_dim()`) - a
+    /// mismatch panics on the first forward pass (wrong input tensor width), not silently
+    /// corrupts anything. Global across all domains in this ctx (not per-domain) since the
+    /// only caller that sets this non-zero (`run_user_problem_training_from`) is always
+    /// single-domain; every other caller keeps this `0`, byte-identical to before this field
+    /// existed.
+    pub n_fourier: usize,
     pub phase2_active: bool,
     pub step: usize,
 }
@@ -261,6 +277,8 @@ pub struct FrozenMultiStepCtx {
     pub dynamic_lam_d_cap: f64,
     pub dynamic_lam_penetration_cap: f64,
     pub dynamic_lam_non_tension_cap: f64,
+    pub constitutive_consistency_weight: f64,
+    pub n_fourier: usize,
     pub phase2_active: bool,
 }
 
@@ -281,6 +299,8 @@ impl FrozenMultiStepCtx {
             dynamic_lam_d_cap: ctx.dynamic_lam_d_cap,
             dynamic_lam_penetration_cap: ctx.dynamic_lam_penetration_cap,
             dynamic_lam_non_tension_cap: ctx.dynamic_lam_non_tension_cap,
+            constitutive_consistency_weight: ctx.constitutive_consistency_weight,
+            n_fourier: ctx.n_fourier,
             phase2_active: ctx.phase2_active,
         }
     }
@@ -306,6 +326,8 @@ impl FrozenMultiStepCtx {
             dynamic_lam_d_cap: self.dynamic_lam_d_cap,
             dynamic_lam_penetration_cap: self.dynamic_lam_penetration_cap,
             dynamic_lam_non_tension_cap: self.dynamic_lam_non_tension_cap,
+            constitutive_consistency_weight: self.constitutive_consistency_weight,
+            n_fourier: self.n_fourier,
             phase2_active: self.phase2_active,
             step: 0,
         }
@@ -449,6 +471,8 @@ mod tests {
             dynamic_lam_d_cap: 50.0,
             dynamic_lam_penetration_cap: 500.0,
             dynamic_lam_non_tension_cap: 100.0,
+            constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
+            n_fourier: 0,
             phase2_active: true,
             step: 0,
         };
