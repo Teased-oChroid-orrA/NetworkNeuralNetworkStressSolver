@@ -755,6 +755,16 @@ mod tests {
         }
     }
 
+    /// `DomainSamplingStrategy::constitutive_anchor_point_sets`'s default is empty (opt-in,
+    /// see that method's doc comment) — pin-lug never overrides it, so this must stay `[]`.
+    /// An explicit regression guard rather than trusting the default silently.
+    #[test]
+    fn pinlug_sampling_strategy_has_no_constitutive_anchor_point_sets() {
+        let interface = Arc::new(InterfaceParametrization { thetas: vec![0.0] });
+        let strategy = PinLugSamplingStrategy { is_pin: true, interface, contact_radius: 0.5 * pinn_core::units::IN_TO_M };
+        assert!(strategy.constitutive_anchor_point_sets().is_empty());
+    }
+
     /// Real `convergence_metric` test: freshly-initialized (lazy-Param, force-materialized)
     /// 2-domain state must produce `Some(finite, non-negative)` RMS gap, not `None`/NaN/panic.
     /// A hand-computed exact value isn't practical here (`ElasticityNet`'s random init means
@@ -927,8 +937,8 @@ mod tests {
         let pin_raw = Tensor::<B, 2>::from_data(burn::tensor::TensorData::new(zeros.clone(), vec![n, 5]), &device);
         let lug_raw = Tensor::<B, 2>::from_data(burn::tensor::TensorData::new(zeros, vec![n, 5]), &device);
 
-        let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
-        let lug_fwd = DomainForwardOutputs { domain: LUG_DOMAIN, raw_out: &lug_raw, strains: None, normals: None };
+        let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None, shifted_stress: None };
+        let lug_fwd = DomainForwardOutputs { domain: LUG_DOMAIN, raw_out: &lug_raw, strains: None, normals: None, shifted_stress: None };
 
         let term = InterfacePenetrationTerm { thetas, r_pin, r_lug, ref_gap2: 1e-8 };
         let loss = term.compute(&[pin_fwd, lug_fwd]);
@@ -959,8 +969,8 @@ mod tests {
         let pin_raw = Tensor::<B, 2>::from_data(burn::tensor::TensorData::new(pin_flat, vec![n, 5]), &device);
         let lug_raw = Tensor::<B, 2>::from_data(burn::tensor::TensorData::new(lug_flat, vec![n, 5]), &device);
 
-        let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
-        let lug_fwd = DomainForwardOutputs { domain: LUG_DOMAIN, raw_out: &lug_raw, strains: None, normals: None };
+        let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None, shifted_stress: None };
+        let lug_fwd = DomainForwardOutputs { domain: LUG_DOMAIN, raw_out: &lug_raw, strains: None, normals: None, shifted_stress: None };
 
         let term = InterfacePenetrationTerm { thetas: thetas.clone(), r_pin, r_lug, ref_gap2: 1.0 };
         let actual: f32 = term.compute(&[pin_fwd, lug_fwd]).into_data().to_vec::<f32>().unwrap()[0];
@@ -999,7 +1009,7 @@ mod tests {
             pin_flat[i * 5 + 4] = sxy[i];
         }
         let pin_raw = Tensor::<B, 2>::from_data(burn::tensor::TensorData::new(pin_flat, vec![n, 5]), &device);
-        let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
+        let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None, shifted_stress: None };
 
         let term = InterfaceNonTensionTerm { thetas: thetas.clone(), ref_stress2: 1.0 };
         let actual: f32 = term.compute(&[pin_fwd]).into_data().to_vec::<f32>().unwrap()[0];
@@ -1032,8 +1042,8 @@ mod tests {
 
         let term = InterfacePenetrationTerm { thetas, r_pin, r_lug, ref_gap2: 1.0 };
         let loss = {
-            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
-            let lug_fwd = DomainForwardOutputs { domain: LUG_DOMAIN, raw_out: &lug_raw, strains: None, normals: None };
+            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None, shifted_stress: None };
+            let lug_fwd = DomainForwardOutputs { domain: LUG_DOMAIN, raw_out: &lug_raw, strains: None, normals: None, shifted_stress: None };
             term.compute(&[pin_fwd, lug_fwd])
         };
 
@@ -1070,8 +1080,8 @@ mod tests {
 
         let term = InterfacePenetrationTerm { thetas, r_pin, r_lug, ref_gap2: 1.0 };
         let loss = {
-            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
-            let lug_fwd = DomainForwardOutputs { domain: LUG_DOMAIN, raw_out: &lug_raw, strains: None, normals: None };
+            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None, shifted_stress: None };
+            let lug_fwd = DomainForwardOutputs { domain: LUG_DOMAIN, raw_out: &lug_raw, strains: None, normals: None, shifted_stress: None };
             term.compute(&[pin_fwd, lug_fwd])
         };
 
@@ -1099,7 +1109,7 @@ mod tests {
 
         let term = InterfaceNonTensionTerm { thetas, ref_stress2: 1.0 };
         let loss = {
-            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
+            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None, shifted_stress: None };
             term.compute(&[pin_fwd])
         };
 
@@ -1129,7 +1139,7 @@ mod tests {
 
         let term = InterfaceNonTensionTerm { thetas, ref_stress2: 1.0 };
         let loss = {
-            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
+            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None, shifted_stress: None };
             term.compute(&[pin_fwd])
         };
 
@@ -1165,7 +1175,7 @@ mod tests {
 
         let term = InterfaceNonTensionTerm { thetas: thetas.clone(), ref_stress2: 1.0 };
         let loss = {
-            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None };
+            let pin_fwd = DomainForwardOutputs { domain: PIN_DOMAIN, raw_out: &pin_raw, strains: None, normals: None, shifted_stress: None };
             term.compute(&[pin_fwd])
         };
 

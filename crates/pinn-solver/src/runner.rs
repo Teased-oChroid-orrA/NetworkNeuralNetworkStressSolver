@@ -1289,7 +1289,9 @@ fn run_user_problem_training_from(
         }
     };
 
-    let mut named = HashMap::with_capacity(1 + spec.geometry.holes.len());
+    // 1 outer_boundary + 2 per hole (traction ring + constitutive-consistency anchor ring -
+    // see `UserSamplingStrategy::named_point_sets`).
+    let mut named = HashMap::with_capacity(1 + 2 * spec.geometry.holes.len());
     named.insert("outer_boundary", to_pointset(&bnd_pts));
     for set in sampling.named_point_sets(&[]) {
         named.insert(set.name, to_pointset(&set.points));
@@ -1302,9 +1304,20 @@ fn run_user_problem_training_from(
     // residual-driven refine/coarsen runs the same. `int_norm`'s resampling-cache fix (above)
     // stays correct - an AMR sweep is the ONE place `data.int_norm` legitimately changes
     // after this point.
-    let amr_cfg = derive_amr_config((-half_w, half_w, -half_h, half_h), &spec.geometry.lock_zones());
+    // Collocation-only geometry with every hole radius inflated by the FD-safe margin (see
+    // `UserGeometry::inflated_for_collocation`'s doc comment) - used ONLY to build this AMR
+    // grid's own containment gate, never for physics/display. Without this, AMR's hole-zone
+    // refinement (which deliberately concentrates cells near the hole) can produce leaf-cell
+    // centers close enough to the TRUE boundary that an FD stencil there dips back inside the
+    // hole, corrupting the very interior-energy/constitutive-consistency signal AMR exists to
+    // strengthen there. The margin is tiny relative to the hole radius (a few tenths of a
+    // millimeter vs. typically tens of millimeters), so `lock_zones()`/`feature_ratio`
+    // computed from it are practically unchanged from the true-radius values.
+    let collocation_margin_m = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+    let collocation_geometry = spec.geometry.inflated_for_collocation(collocation_margin_m);
+    let amr_cfg = derive_amr_config((-half_w, half_w, -half_h, half_h), &collocation_geometry.lock_zones());
     let amr_interval = amr_cfg.interval_steps;
-    let mut amr_grid = AdaptiveGrid::<UserGeometry>::new(&spec.geometry, amr_cfg);
+    let mut amr_grid = AdaptiveGrid::<UserGeometry>::new(&collocation_geometry, amr_cfg);
 
     // Stage H (model checkpoint save/load) - tracked so the post-training serving loop below
     // can build a real `CheckpointMeta` (steps actually completed, not just `max_steps`, since
@@ -2415,6 +2428,19 @@ mod tests {
             }
         }
         assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+
+        // Checkpoint save/load (same established pattern as the other diagnostics below) to
+        // get a live model for the equilibrium-residual probe - `vis`/`hole_analyses` alone
+        // don't carry it.
+        let path = std::env::temp_dir().join(format!("pinn_solver_amr_kt_diag_{}", std::process::id()));
+        tx_ctrl.send(ControlMsg::SaveCheckpoint { path: path.clone(), saved_at_unix: 0 }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut saved: Option<Result<String, String>> = None;
+        while std::time::Instant::now() < deadline && saved.is_none() {
+            if let Ok(TrainingMsg::CheckpointSaved(r)) = rx.try_recv() { saved = Some(r); }
+            else { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        }
+        let written = saved.expect("must receive a CheckpointSaved response").expect("save must succeed");
         tx_ctrl.send(ControlMsg::Stop).unwrap();
         handle.join().unwrap();
 
@@ -2422,7 +2448,10 @@ mod tests {
         let pde_vals: Vec<f32> = vis.pde_residual.iter().copied().filter(|v| v.is_finite()).collect();
         let (pde_rms, pde_max) = crate::training_core::residual_stats(&pde_vals);
         println!("  [diag] final total_loss={last_total_loss:.6e}");
-        println!("  [diag] PDE residual RMS={pde_rms:.4e}  max={pde_max:.4e} Pa");
+        // "Constitutive residual" - not "PDE residual" - this measures ‖sigma_direct -
+        // Hooke's-law(strain_FD)‖, never an equilibrium/PDE residual. See `EquilibriumTerm`'s
+        // doc comment (user_problem.rs) and `powershell_tool/CLAUDE.md`'s Kt investigation.
+        println!("  [diag] constitutive residual RMS={pde_rms:.4e}  max={pde_max:.4e} Pa");
         for h in &last_hole_analyses {
             println!(
                 "  [diag] hole {}: max_von_mises={:.4e} Pa  nominal={:.4e} Pa  Kt={:.4}",
@@ -2438,6 +2467,456 @@ mod tests {
         } else {
             println!("  [diag] no AMR sweep report received");
         }
+
+        // Real equilibrium residual (‖∇·σ‖, direct-network stress, same formula/point
+        // convention `EquilibriumTerm`/`equilibrium_residual_loss` train on) - genuinely
+        // distinct from the constitutive residual above. Sampled over a grid of interior
+        // points (outside the FD-safe hole margin).
+        {
+            use crate::energy::equilibrium_residual_loss;
+            use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
+            use crate::network::fwd;
+            use crate::training_core::BInner;
+            let (model, _meta) = crate::checkpoint::load_checkpoint(&path, &BDevice::default())
+                .expect("must load the just-saved checkpoint");
+            let _ = std::fs::remove_file(&written);
+            let mut meta_path = path.clone();
+            meta_path.set_file_name(format!("{}.meta.json", path.file_stem().unwrap().to_string_lossy()));
+            let _ = std::fs::remove_file(meta_path);
+
+            let device = BDevice::default();
+            let spec = single_hole_like_spec(8000);
+            let half_w = spec.geometry.half_w;
+            let half_h = spec.geometry.half_h;
+            let hole = spec.geometry.holes[0];
+            let margin = crate::user_problem::ring_anchor_margin_m(1e-3, &spec.geometry);
+            let fd = FdConfig::new(1e-3, 2.0 * half_w, 2.0 * half_h);
+            let cx = fd.sx / (2.0 * fd.hx as f64);
+            let cy = fd.sy / (2.0 * fd.hy as f64);
+            let ref_div2 = (spec.load.px * cx).powi(2).max(1.0);
+
+            let mut residuals: Vec<f32> = Vec::new();
+            for &fx in &[-0.75, -0.5, -0.25, 0.25, 0.5, 0.75] {
+                for &fy in &[-0.75, -0.5, -0.25, 0.25, 0.5, 0.75] {
+                    let x = fx * half_w;
+                    let y = fy * half_h;
+                    let dx = x - hole.center[0];
+                    let dy = y - hole.center[1];
+                    if (dx * dx + dy * dy).sqrt() <= hole.radius + margin { continue; }
+                    let xn = (x / half_w) as f32;
+                    let yn = (y / half_h) as f32;
+                    let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&[[xn, yn]], &device), &fd, &device);
+                    let raw = fwd::<BInner>(&model, stencil, 0, &device).mul_scalar(spec.load.px);
+                    let col = |r0: usize, c: usize| -> Tensor<BInner, 1> { raw.clone().slice([r0..r0 + 1, c..c + 1]).reshape([1]) };
+                    let loss = equilibrium_residual_loss::<BInner>(
+                        col(1, 2), col(1, 4), col(2, 2), col(2, 4),
+                        col(3, 4), col(3, 3), col(4, 4), col(4, 3),
+                        cx, cy, ref_div2,
+                    );
+                    residuals.push(loss.into_data().to_vec::<f32>().unwrap()[0].sqrt());
+                }
+            }
+            let (eq_rms, eq_max) = crate::training_core::residual_stats(&residuals);
+            println!("  [diag] equilibrium residual RMS={eq_rms:.4e}  max={eq_max:.4e}  (dimensionless, normalized by ref_div2)");
+        }
+    }
+
+    // Real, `#[ignore]`d diagnostic: profiles hoop stress/strain vs. radial distance from the
+    // hole boundary on a REAL trained model (same 8000-step `single_hole_like_spec` config as
+    // `run_training_user_problem_generalized_amr_indicator_diagnostic`, so the two are
+    // directly comparable), rather than just reporting a single aggregate Kt number. Built
+    // per a specific, code-level-grounded hypothesis from the Kt investigation (see
+    // `powershell_tool/CLAUDE.md`): does the DIRECT network stress output ever show a hoop-
+    // stress concentration anywhere near the hole, even where the FD-derived (displacement-
+    // based) stress/strain can't be trusted (r too close to the boundary)? If both the direct
+    // and FD-derived hoop stress stay near zero even well outside the FD-unsafe annulus, the
+    // displacement field itself never developed the required curvature - the concentration
+    // never formed, full stop, regardless of which representation you trust.
+    //
+    // Gets a REAL, AMR-trained model (not a separately-built non-AMR training loop) by
+    // training through the actual GUI entry point, then requesting a checkpoint save/load via
+    // the same `ControlMsg::SaveCheckpoint`/`checkpoint::load_checkpoint` path the real
+    // Save/Load Trained Model UI buttons use - reusing already-tested infrastructure rather
+    // than building a parallel one-off training loop just for this diagnostic.
+    #[test]
+    #[ignore]
+    fn run_training_user_problem_radial_hoop_stress_profile_diagnostic() {
+        use crate::energy::compute_stress;
+        use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig};
+        use crate::network::fwd;
+        use crate::training_core::BInner;
+
+        let spec = single_hole_like_spec(8000);
+        let half_w = spec.geometry.half_w;
+        let half_h = spec.geometry.half_h;
+        let hole = spec.geometry.holes[0];
+        let device = crate::training_core::BDevice::default();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || run_training_user_problem(spec.clone(), tx, rx_ctrl));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline && !saw_done {
+            match rx.try_recv() {
+                Ok(TrainingMsg::Done) => saw_done = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+
+        let path = std::env::temp_dir().join(format!("pinn_solver_radial_profile_diag_{}", std::process::id()));
+        tx_ctrl.send(ControlMsg::SaveCheckpoint { path: path.clone(), saved_at_unix: 0 }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut saved: Option<Result<String, String>> = None;
+        while std::time::Instant::now() < deadline && saved.is_none() {
+            if let Ok(TrainingMsg::CheckpointSaved(r)) = rx.try_recv() { saved = Some(r); }
+            else { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        }
+        let written = saved.expect("must receive a CheckpointSaved response").expect("save must succeed");
+        tx_ctrl.send(ControlMsg::Stop).unwrap();
+        handle.join().unwrap();
+
+        // `load_checkpoint` derives the `.meta.json` sidecar path from the ORIGINAL
+        // (pre-extension) `weights_path` it's given - not `written` (the post-extension path
+        // `CheckpointSaved` reports) - matching `save_checkpoint`'s own `meta_path` derivation.
+        // Passing `written` here would look for a nonexistent "*.mpk.meta.json" instead of the
+        // real "*.meta.json" (confirmed via a real failed run, not assumed).
+        let (model, _meta) = crate::checkpoint::load_checkpoint(&path, &device)
+            .expect("must load the just-saved checkpoint");
+        let _ = std::fs::remove_file(&written);
+        let mut meta_path = path.clone();
+        meta_path.set_file_name(format!("{}.meta.json", path.file_stem().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_file(meta_path);
+
+        let stress_ref = 6.9e7_f64; // matches single_hole_like_spec's uniaxial_x load
+        let u_ref = ((stress_ref / 71.7e9) * half_w) as f32;
+        let fd = FdConfig::new(1e-3, 2.0 * half_w, 2.0 * half_h);
+        let material = pinn_core::material::MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 };
+        let margin_m = crate::user_problem::ring_anchor_margin_m(1e-3, &pinn_core::user_geometry::UserGeometry {
+            half_w, half_h, thickness: 0.005, holes: vec![hole],
+        });
+
+        // theta = pi/2 (top of the hole, perpendicular to the uniaxial load direction) is
+        // where the classical Kirsch solution puts the peak hoop-stress concentration
+        // (~3x nominal) - the single most informative angle to profile.
+        let theta = std::f64::consts::FRAC_PI_2;
+        let (sin_t, cos_t) = theta.sin_cos();
+        println!("  [radial-profile] theta=90deg (peak-concentration angle), FD-unsafe margin={margin_m:.4e} m");
+        println!("  [radial-profile] {:>8} {:>10} {:>16} {:>16} {:>16} {:>10}", "r/R", "r-R (mm)", "sigma_tt_direct", "sigma_tt_fd", "eps_tt_fd", "fd_safe");
+        for &ratio in &[1.0005, 1.005, 1.02, 1.05, 1.1, 1.2, 1.3, 1.5, 2.0, 3.0] {
+            let r = hole.radius * ratio;
+            let x = hole.center[0] + r * cos_t;
+            let y = hole.center[1] + r * sin_t;
+            let xn = (x / half_w) as f32;
+            let yn = (y / half_h) as f32;
+            let fd_safe = (r - hole.radius) > margin_m;
+
+            // Direct network stress (no FD needed - always meaningful, even inside the
+            // FD-unsafe annulus, since it doesn't require evaluating neighboring points).
+            let pt_t = norm_pts_to_tensor::<BInner>(&[[xn, yn]], &device);
+            let raw = fwd::<BInner>(&model, pt_t, 0, &device);
+            let sxx_d = raw.clone().slice([0..1, 2..3]).into_data().to_vec::<f32>().unwrap()[0] as f64 * stress_ref;
+            let syy_d = raw.clone().slice([0..1, 3..4]).into_data().to_vec::<f32>().unwrap()[0] as f64 * stress_ref;
+            let sxy_d = raw.slice([0..1, 4..5]).into_data().to_vec::<f32>().unwrap()[0] as f64 * stress_ref;
+            let sigma_tt_direct = sxx_d * sin_t * sin_t + syy_d * cos_t * cos_t - 2.0 * sxy_d * sin_t * cos_t;
+
+            // FD-derived stress/strain - only physically meaningful when `fd_safe`, but
+            // computed and printed regardless so the unsafe-zone garbage is visible too, not
+            // silently hidden.
+            let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&[[xn, yn]], &device), &fd, &device);
+            let raw_stencil = fwd::<BInner>(&model, stencil, 0, &device);
+            let m = 5usize;
+            let scaled = Tensor::<BInner, 2>::cat(vec![
+                raw_stencil.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
+                raw_stencil.slice([0..m, 2..5]).mul_scalar(stress_ref),
+            ], 1);
+            let (exx, eyy, exy) = compute_strains::<BInner>(scaled, 1, &fd);
+            let (sxx_fd, syy_fd, sxy_fd) = compute_stress::<BInner>(exx.clone(), eyy.clone(), exy.clone(), &material);
+            let get = |t: Tensor<BInner, 1>| -> f64 { t.into_data().to_vec::<f32>().unwrap()[0] as f64 };
+            let (sxx_fd, syy_fd, sxy_fd) = (get(sxx_fd), get(syy_fd), get(sxy_fd));
+            let (exx, eyy, exy) = (get(exx), get(eyy), get(exy));
+            let sigma_tt_fd = sxx_fd * sin_t * sin_t + syy_fd * cos_t * cos_t - 2.0 * sxy_fd * sin_t * cos_t;
+            let eps_tt_fd = exx * sin_t * sin_t + eyy * cos_t * cos_t - 2.0 * exy * sin_t * cos_t;
+
+            println!(
+                "  [radial-profile] {:>8.4} {:>10.4} {:>16.4e} {:>16.4e} {:>16.4e} {:>10}",
+                ratio, (r - hole.radius) * 1000.0, sigma_tt_direct, sigma_tt_fd, eps_tt_fd,
+                if fd_safe { "yes" } else { "NO" },
+            );
+        }
+        println!("  [radial-profile] nominal_stress={stress_ref:.4e} Pa (expect sigma_tt -> ~3x this near r/R=1 if the classical concentration formed)");
+    }
+
+    // Real, `#[ignore]`d diagnostic: signed per-edge outer-boundary traction (target vs.
+    // predicted, exactly as `OuterTractionTerm`/`neumann_loss` compute it) plus a horizontal
+    // centerline (y=0) profile of displacement and FD-derived stress. Same 8000-step
+    // `single_hole_like_spec` config and same train-then-checkpoint-load pattern as the two
+    // diagnostics above, for direct comparability. Built to rule out a left/right traction
+    // sign error and to see the far-field stress state directly, cheaper than re-deriving it
+    // from an aggregate residual number.
+    #[test]
+    #[ignore]
+    fn run_training_user_problem_signed_boundary_and_centerline_diagnostic() {
+        use crate::energy::compute_stress;
+        use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig};
+        use crate::network::fwd;
+        use crate::training_core::BInner;
+
+        let spec = single_hole_like_spec(8000);
+        let half_w = spec.geometry.half_w;
+        let half_h = spec.geometry.half_h;
+        let hole = spec.geometry.holes[0];
+        let device = crate::training_core::BDevice::default();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || run_training_user_problem(spec.clone(), tx, rx_ctrl));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline && !saw_done {
+            match rx.try_recv() {
+                Ok(TrainingMsg::Done) => saw_done = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+
+        let path = std::env::temp_dir().join(format!("pinn_solver_signed_bc_diag_{}", std::process::id()));
+        tx_ctrl.send(ControlMsg::SaveCheckpoint { path: path.clone(), saved_at_unix: 0 }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut saved: Option<Result<String, String>> = None;
+        while std::time::Instant::now() < deadline && saved.is_none() {
+            if let Ok(TrainingMsg::CheckpointSaved(r)) = rx.try_recv() { saved = Some(r); }
+            else { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        }
+        let written = saved.expect("must receive a CheckpointSaved response").expect("save must succeed");
+        tx_ctrl.send(ControlMsg::Stop).unwrap();
+        handle.join().unwrap();
+
+        let (model, _meta) = crate::checkpoint::load_checkpoint(&path, &device)
+            .expect("must load the just-saved checkpoint");
+        let _ = std::fs::remove_file(&written);
+        let mut meta_path = path.clone();
+        meta_path.set_file_name(format!("{}.meta.json", path.file_stem().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_file(meta_path);
+
+        let stress_ref = 6.9e7_f64; // matches single_hole_like_spec's uniaxial_x load (px)
+        let u_ref = ((stress_ref / 71.7e9) * half_w) as f32;
+        let fd = FdConfig::new(1e-3, 2.0 * half_w, 2.0 * half_h);
+        let material = pinn_core::material::MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 };
+
+        let get1 = |t: Tensor<BInner, 1>| -> f64 { t.into_data().to_vec::<f32>().unwrap()[0] as f64 };
+        let sigma_at = |x: f64, y: f64| -> (f64, f64, f64) {
+            let xn = (x / half_w) as f32;
+            let yn = (y / half_h) as f32;
+            let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&[[xn, yn]], &device), &fd, &device);
+            let raw = fwd::<BInner>(&model, stencil, 0, &device);
+            let scaled = Tensor::<BInner, 2>::cat(vec![
+                raw.clone().slice([0..5, 0..2]).mul_scalar(u_ref as f64),
+                raw.slice([0..5, 2..5]).mul_scalar(stress_ref),
+            ], 1);
+            let (exx, eyy, exy) = compute_strains::<BInner>(scaled, 1, &fd);
+            let (sxx, syy, sxy) = compute_stress::<BInner>(exx, eyy, exy, &material);
+            (get1(sxx), get1(syy), get1(sxy))
+        };
+
+        // Signed per-edge traction: target vs. predicted, exactly as `OuterTractionTerm`/
+        // `neumann_loss` compute it (FD-derived sigma . n vs. px*nx / py*ny). Midpoint of each
+        // edge - far from the hole, no FD-safety concern there.
+        println!("  [boundary] {:>8} {:>10} {:>14} {:>14} {:>14} {:>14}", "edge", "quantity", "target_tx", "pred_tx", "target_ty", "pred_ty");
+        let edges: [(&str, f64, f64, f64, f64); 4] = [
+            ("left",   -half_w, 0.0,     -1.0, 0.0),
+            ("right",   half_w, 0.0,      1.0, 0.0),
+            ("top",     0.0,    half_h,   0.0, 1.0),
+            ("bottom",  0.0,   -half_h,   0.0, -1.0),
+        ];
+        for (name, x, y, nx, ny) in edges {
+            let (sxx, syy, sxy) = sigma_at(x, y);
+            let tx_pred = sxx * nx + sxy * ny;
+            let ty_pred = sxy * nx + syy * ny;
+            let tx_target = nx * stress_ref; // py = 0 for uniaxial_x
+            let ty_target = ny * 0.0;
+            println!(
+                "  [boundary] {:>8} {:>10} {:>14.4e} {:>14.4e} {:>14.4e} {:>14.4e}   (sigma_xx={sxx:.4e} sigma_yy={syy:.4e} sigma_xy={sxy:.4e})",
+                name, "traction", tx_target, tx_pred, ty_target, ty_pred,
+            );
+        }
+
+        // Full per-edge mean/min/max of the displacement-derived stress tensor itself (not
+        // just the single-point traction projection above) - same point layout convention
+        // `UserSamplingStrategy::sample_boundary` uses (evenly spaced, `frac=(i+0.5)/n` so
+        // exact corners are never sampled), evaluated at 32 points per edge.
+        const N_EDGE_PTS: usize = 32;
+        struct Stats { mean: f64, min: f64, max: f64 }
+        fn stats(vals: &[f64]) -> Stats {
+            let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+            let min = vals.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            Stats { mean, min, max }
+        }
+        println!("  [edge-stats] {:>8} {:>10} {:>14} {:>14} {:>14}", "edge", "component", "mean", "min", "max");
+        for name in ["left", "right", "top", "bottom"] {
+            let mut sxx_v = Vec::with_capacity(N_EDGE_PTS);
+            let mut syy_v = Vec::with_capacity(N_EDGE_PTS);
+            let mut sxy_v = Vec::with_capacity(N_EDGE_PTS);
+            for i in 0..N_EDGE_PTS {
+                let frac = (i as f64 + 0.5) / N_EDGE_PTS as f64; // (0,1), avoids exact corners
+                let (x, y) = match name {
+                    "left" => (-half_w, -half_h + 2.0 * half_h * frac),
+                    "right" => (half_w, -half_h + 2.0 * half_h * frac),
+                    "top" => (-half_w + 2.0 * half_w * frac, half_h),
+                    "bottom" => (-half_w + 2.0 * half_w * frac, -half_h),
+                    _ => unreachable!(),
+                };
+                let (sxx, syy, sxy) = sigma_at(x, y);
+                sxx_v.push(sxx); syy_v.push(syy); sxy_v.push(sxy);
+            }
+            for (label, vals) in [("sigma_xx", &sxx_v), ("sigma_yy", &syy_v), ("sigma_xy", &sxy_v)] {
+                let s = stats(vals);
+                println!("  [edge-stats] {name:>8} {label:>10} {:>14.4e} {:>14.4e} {:>14.4e}", s.mean, s.min, s.max);
+            }
+        }
+        println!("  [edge-stats] intended: left/right sigma_xx~+6.9e7 sigma_xy~0; top/bottom sigma_yy~0 sigma_xy~0 (finite-plate corrections near corners)");
+
+        // Horizontal centerline (y=0), excluding x=0 (inside the hole).
+        println!("  [centerline] {:>10} {:>14} {:>14} {:>16} {:>16} {:>16}", "x", "u(x,0)", "v(x,0)", "sigma_xx", "sigma_yy", "sigma_xy");
+        for &frac in &[-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0] {
+            let x = frac * half_w;
+            if x.abs() <= hole.radius {
+                println!("  [centerline] {x:>10.4}   (inside hole, radius={:.4}, skipped)", hole.radius);
+                continue;
+            }
+            let xn = (x / half_w) as f32;
+            let pt = norm_pts_to_tensor::<BInner>(&[[xn, 0.0]], &device);
+            let raw = fwd::<BInner>(&model, pt, 0, &device);
+            let u = get1(raw.clone().slice([0..1, 0..1]).reshape([1])) * u_ref as f64;
+            let v = get1(raw.slice([0..1, 1..2]).reshape([1])) * u_ref as f64;
+            let (sxx, syy, sxy) = sigma_at(x, 0.0);
+            println!("  [centerline] {x:>10.4} {u:>14.4e} {v:>14.4e} {sxx:>16.4e} {syy:>16.4e} {sxy:>16.4e}");
+        }
+        println!("  [centerline] nominal_stress={stress_ref:.4e} Pa, half_w={half_w}, hole_radius={}", hole.radius);
+    }
+
+    fn no_hole_plate_spec(max_steps: usize) -> ProblemSpec {
+        use pinn_core::loading::LoadConfig;
+        use pinn_core::material::MaterialProps;
+        use pinn_core::problem_spec::{NetworkSpec, TrainingSpec};
+        use pinn_core::user_geometry::UserGeometry;
+        ProblemSpec {
+            geometry: UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] },
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: NetworkSpec { hidden_dim: 64, n_hidden: 3, ..Default::default() },
+            training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3 },
+        }
+    }
+
+    /// Real, `#[ignore]`d sanity test recommended by the Kt investigation
+    /// (`powershell_tool/CLAUDE.md`): before trusting any hole-specific result, confirm the
+    /// generic plate formulation (now including the new `EquilibriumTerm`) can recover the
+    /// trivial exact solution - uniform uniaxial tension with no hole to concentrate around.
+    /// `holes: vec![]` means zero hole-related loss terms register at all (`UserDefinedProblem::
+    /// loss_terms()`'s hole loop is empty), so this exercises exactly: outer traction +
+    /// interior energy + equilibrium + constitutive consistency, nothing else. If this doesn't
+    /// recover sigma_xx~+69 MPa, sigma_yy~0, sigma_xy~0, the hole case is not worth touching
+    /// until this does - per the plan's own explicit stopping condition.
+    #[test]
+    #[ignore]
+    fn run_training_user_problem_no_hole_plate_recovers_uniform_uniaxial_tension() {
+        use crate::energy::compute_stress;
+        use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig};
+        use crate::network::fwd;
+        use crate::training_core::BInner;
+
+        let spec = no_hole_plate_spec(3000); // no hole/AMR complexity - converges much faster
+        let half_w = spec.geometry.half_w;
+        let half_h = spec.geometry.half_h;
+        let device = crate::training_core::BDevice::default();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || run_training_user_problem(spec.clone(), tx, rx_ctrl));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline && !saw_done {
+            match rx.try_recv() {
+                Ok(TrainingMsg::Done) => saw_done = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+
+        let path = std::env::temp_dir().join(format!("pinn_solver_no_hole_sanity_{}", std::process::id()));
+        tx_ctrl.send(ControlMsg::SaveCheckpoint { path: path.clone(), saved_at_unix: 0 }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut saved: Option<Result<String, String>> = None;
+        while std::time::Instant::now() < deadline && saved.is_none() {
+            if let Ok(TrainingMsg::CheckpointSaved(r)) = rx.try_recv() { saved = Some(r); }
+            else { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        }
+        let written = saved.expect("must receive a CheckpointSaved response").expect("save must succeed");
+        tx_ctrl.send(ControlMsg::Stop).unwrap();
+        handle.join().unwrap();
+
+        let (model, _meta) = crate::checkpoint::load_checkpoint(&path, &device)
+            .expect("must load the just-saved checkpoint");
+        let _ = std::fs::remove_file(&written);
+        let mut meta_path = path.clone();
+        meta_path.set_file_name(format!("{}.meta.json", path.file_stem().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_file(meta_path);
+
+        let stress_ref = 6.9e7_f64;
+        let u_ref = ((stress_ref / 71.7e9) * half_w) as f32;
+        let fd = FdConfig::new(1e-3, 2.0 * half_w, 2.0 * half_h);
+        let material = pinn_core::material::MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 };
+        let get1 = |t: Tensor<BInner, 1>| -> f64 { t.into_data().to_vec::<f32>().unwrap()[0] as f64 };
+        let sigma_at = |x: f64, y: f64| -> (f64, f64, f64) {
+            let xn = (x / half_w) as f32;
+            let yn = (y / half_h) as f32;
+            let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&[[xn, yn]], &device), &fd, &device);
+            let raw = fwd::<BInner>(&model, stencil, 0, &device);
+            let scaled = Tensor::<BInner, 2>::cat(vec![
+                raw.clone().slice([0..5, 0..2]).mul_scalar(u_ref as f64),
+                raw.slice([0..5, 2..5]).mul_scalar(stress_ref),
+            ], 1);
+            let (exx, eyy, exy) = compute_strains::<BInner>(scaled, 1, &fd);
+            let (sxx, syy, sxy) = compute_stress::<BInner>(exx, eyy, exy, &material);
+            (get1(sxx), get1(syy), get1(sxy))
+        };
+
+        // A grid of interior points (not just edges/centerline) - the whole point is
+        // uniformity EVERYWHERE, not just where a loss term directly constrains it.
+        let mut sxx_v = Vec::new();
+        let mut syy_v = Vec::new();
+        let mut sxy_v = Vec::new();
+        for &fx in &[-0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75] {
+            for &fy in &[-0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75] {
+                let (sxx, syy, sxy) = sigma_at(fx * half_w, fy * half_h);
+                println!("  [no-hole] x={:>8.4} y={:>8.4}  sigma_xx={sxx:>14.4e}  sigma_yy={syy:>14.4e}  sigma_xy={sxy:>14.4e}", fx * half_w, fy * half_h);
+                sxx_v.push(sxx); syy_v.push(syy); sxy_v.push(sxy);
+            }
+        }
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let (sxx_mean, syy_mean, sxy_mean) = (mean(&sxx_v), mean(&syy_v), mean(&sxy_v));
+        println!("  [no-hole] MEAN sigma_xx={sxx_mean:.4e}  sigma_yy={syy_mean:.4e}  sigma_xy={sxy_mean:.4e}  (target: {stress_ref:.4e}, 0, 0)");
+        println!("  [no-hole] relative error: sigma_xx={:.1}%  sigma_yy={:.1}%(of nominal)  sigma_xy={:.1}%(of nominal)",
+            (sxx_mean - stress_ref).abs() / stress_ref * 100.0,
+            syy_mean.abs() / stress_ref * 100.0,
+            sxy_mean.abs() / stress_ref * 100.0,
+        );
+        // Loose tolerance (this is a finite-plate/network-approximation sanity check, not
+        // exact FEA) - but a genuinely working formulation should land well inside 30%.
+        assert!((sxx_mean - stress_ref).abs() / stress_ref < 0.30,
+            "sigma_xx mean {sxx_mean:.4e} too far from nominal {stress_ref:.4e}");
+        assert!(syy_mean.abs() / stress_ref < 0.30, "sigma_yy mean {syy_mean:.4e} should be ~0");
+        assert!(sxy_mean.abs() / stress_ref < 0.30, "sigma_xy mean {sxy_mean:.4e} should be ~0");
     }
 
     // ─── Smart adaptive architecture: end-to-end wiring into run_training_user_problem ───────

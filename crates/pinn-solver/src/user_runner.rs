@@ -96,7 +96,9 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
 
         let int_norm: Vec<[f32; 2]> = int_pts.iter().map(|&[x, y]| normalize_point(x, y, half_w, half_h)).collect();
 
-        let mut named = HashMap::with_capacity(1 + n_holes);
+        // 1 outer_boundary + 2 per hole (traction ring + constitutive-consistency anchor ring
+        // - see `UserSamplingStrategy::named_point_sets`).
+        let mut named = HashMap::with_capacity(1 + 2 * n_holes);
         named.insert("outer_boundary", build_pointset(&bnd_pts, half_w, half_h));
         for set in sampling.named_point_sets(&[]) {
             named.insert(set.name, build_pointset(&set.points, half_w, half_h));
@@ -185,7 +187,9 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         );
         let pde_vals: Vec<f32> = vis.pde_residual.iter().copied().filter(|v| v.is_finite()).collect();
         let (pde_rms, pde_max) = crate::training_core::residual_stats(&pde_vals);
-        println!("  [diag] PDE residual RMS={pde_rms:.4e}  max={pde_max:.4e} Pa");
+        // "Constitutive residual" - not "PDE residual" - see `EquilibriumTerm`'s doc comment
+        // (user_problem.rs) for why that distinction matters.
+        println!("  [diag] constitutive residual RMS={pde_rms:.4e}  max={pde_max:.4e} Pa");
         let nominal_stress = spec.load.px.abs().max(spec.load.py.abs());
         for (i, hole) in spec.geometry.holes.iter().enumerate() {
             let profile = crate::user_problem::probe_hole_boundary_profile(

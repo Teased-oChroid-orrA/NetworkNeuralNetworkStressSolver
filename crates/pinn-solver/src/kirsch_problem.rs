@@ -606,6 +606,14 @@ mod tests {
     use super::*;
     use pinn_core::{material::MaterialProps, messages::SolverConfig};
 
+    /// `DomainSamplingStrategy::constitutive_anchor_point_sets`'s default is empty (opt-in,
+    /// see that method's doc comment) — Kirsch never overrides it, so this must stay `[]`.
+    /// An explicit regression guard rather than trusting the default silently.
+    #[test]
+    fn kirsch_sampling_strategy_has_no_constitutive_anchor_point_sets() {
+        assert!(KirschSamplingStrategy.constitutive_anchor_point_sets().is_empty());
+    }
+
     #[test]
     fn kirsch_sampling_strategy_matches_pinn_core_sampling_bit_identical() {
         let cfg = SolverConfig::default_kirsch();

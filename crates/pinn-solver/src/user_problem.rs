@@ -38,7 +38,7 @@ use pinn_core::{
 };
 
 use crate::{
-    energy::{dem_energy_loss, hole_traction_loss_direct, neumann_loss},
+    energy::{dem_energy_loss, equilibrium_residual_loss, hole_traction_loss_direct, neumann_loss},
     pinlug_problem::IdentityAnsatz,
     problem::{BoundaryValueProblem, ConflictGroup, DomainForwardOutputs, DomainState, LossTerm, B},
 };
@@ -56,6 +56,21 @@ const HOLE_RING_POINTS: usize = 64;
 const REJECTION_SAMPLE_ATTEMPTS_FACTOR: usize = 20;
 const SEED_INTERIOR: u64 = 90_210;
 
+/// Safety multiple applied to the FD stencil's physical reach when placing each hole's
+/// `"hole_i_anchor"` point set (see [`UserSamplingStrategy::new`]'s margin computation) —
+/// headroom above the bare minimum needed to keep every stencil arm outside the hole.
+const RING_ANCHOR_SAFETY_FACTOR: f64 = 4.0;
+
+/// The margin (physical, meters) an FD stencil needs to clear a hole boundary without any
+/// arm dipping back inside it — see [`UserSamplingStrategy::new`]'s doc comment for the full
+/// derivation. Public (not just internal to `UserSamplingStrategy`) so callers that need to
+/// widen an AMR grid's own containment gate by the same amount (`UserGeometry::
+/// inflated_for_collocation`) can compute it without constructing a full sampling strategy
+/// first — one formula, reused everywhere this margin matters.
+pub fn ring_anchor_margin_m(fd_h: f32, geometry: &UserGeometry) -> f64 {
+    RING_ANCHOR_SAFETY_FACTOR * fd_h as f64 * geometry.half_w.max(geometry.half_h)
+}
+
 /// Per-domain sampling strategy driven directly by a [`UserGeometry`] — ignores the
 /// `&GeometryConfig` parameter every [`DomainSamplingStrategy`] method takes (an
 /// established, precedented pattern — see `FakeInterfaceSampling` in
@@ -67,14 +82,67 @@ pub struct UserSamplingStrategy {
     /// [`Self::named_point_sets`] can return the same content-stable `&'static str` names
     /// every call without leaking memory continuously across a long training run.
     hole_names: Vec<&'static str>,
+    /// `"hole_0_anchor"`, `"hole_1_anchor"`, ... — same leaking convention as `hole_names`.
+    /// See [`Self::constitutive_anchor_point_sets`] and [`Self::new`]'s margin computation.
+    anchor_names: Vec<&'static str>,
+    /// Radial offset [m] applied outside each hole's radius when placing its `"hole_i_anchor"`
+    /// ring — see [`Self::new`] for the derivation. Same margin for every hole (the FD
+    /// stencil's physical reach is a per-domain, not per-hole, quantity).
+    anchor_margin_m: f64,
 }
 
 impl UserSamplingStrategy {
-    pub fn new(geometry: UserGeometry) -> Self {
+    /// `fd_h`: the training config's FD step in *normalized* coordinates
+    /// (`ProblemSpec.training.fd_h`) — needed here (not just by the FD stencil itself) so the
+    /// `"hole_i_anchor"` ring can be placed far enough outside each hole that
+    /// `fd_stencil::assemble_stencil`'s axis-aligned `±hx`/`±hy` arms, evaluated at an anchor
+    /// point, never dip back inside the hole (which would silently evaluate the network on an
+    /// invalid, hole-interior point and produce a meaningless FD-derived strain there — the
+    /// same reason `"hole_i"`'s own ring, which sits exactly ON the hole boundary, is deliberately
+    /// never used for constitutive-consistency checks). Normalized-to-physical conversion:
+    /// `x_norm ∈ [-1,1]` maps to physical `[-half_w, half_w]`, so a stencil arm's physical
+    /// reach is `fd_h * half_w` in x / `fd_h * half_h` in y. The worst case for an anchor point
+    /// at `radius + margin` is a stencil arm pointing straight at the hole center, which stays
+    /// outside the hole iff `margin > fd_h * half_w` AND `margin > fd_h * half_h` — i.e.
+    /// `margin > fd_h * max(half_w, half_h)`. `RING_ANCHOR_SAFETY_FACTOR` adds headroom above
+    /// that bare minimum.
+    pub fn new(geometry: UserGeometry, fd_h: f32) -> Self {
         let hole_names = (0..geometry.holes.len())
             .map(|i| -> &'static str { Box::leak(format!("hole_{i}").into_boxed_str()) })
             .collect();
-        Self { geometry, hole_names }
+        let anchor_names = (0..geometry.holes.len())
+            .map(|i| -> &'static str { Box::leak(format!("hole_{i}_anchor").into_boxed_str()) })
+            .collect();
+        let anchor_margin_m = ring_anchor_margin_m(fd_h, &geometry);
+        Self { geometry, hole_names, anchor_names, anchor_margin_m }
+    }
+
+    /// Like `UserGeometry::contains`, but excludes a `self.anchor_margin_m`-wide annulus just
+    /// outside each hole too — deliberately DIFFERENT from `contains`'s general "is this a
+    /// physically valid point" semantics (used for display/masking, where a point at
+    /// `r = radius + epsilon` legitimately IS inside the domain). This stricter test is only
+    /// for generating COLLOCATION points, where an FD stencil centered too close to a hole
+    /// silently evaluates the network at invalid, inside-the-hole locations and produces
+    /// meaningless (but finite, undetected) strain/energy signal — confirmed as a real
+    /// contributor to the Kt-stays-near-zero investigation (see `powershell_tool/CLAUDE.md`):
+    /// this margin (a few tenths of a millimeter for a typical spec) is smaller than the
+    /// finest AMR cell size near the hole, and quadtree cells aren't boundary-aligned, so
+    /// without this exclusion some of AMR's own hole-zone-refined collocation points land
+    /// close enough to the true edge that their stencils cross into the hole.
+    fn contains_for_collocation(&self, x: f64, y: f64) -> bool {
+        if x < -self.geometry.half_w || x > self.geometry.half_w
+            || y < -self.geometry.half_h || y > self.geometry.half_h {
+            return false;
+        }
+        for hole in &self.geometry.holes {
+            let dx = x - hole.center[0];
+            let dy = y - hole.center[1];
+            let r_excl = hole.radius + self.anchor_margin_m;
+            if dx * dx + dy * dy < r_excl * r_excl {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -89,7 +157,7 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
             attempts += 1;
             let x = (rng.next_f64() * 2.0 - 1.0) * self.geometry.half_w;
             let y = (rng.next_f64() * 2.0 - 1.0) * self.geometry.half_h;
-            if self.geometry.contains(x, y) {
+            if self.contains_for_collocation(x, y) {
                 pts.push([x, y]);
             }
         }
@@ -126,7 +194,7 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
     }
 
     fn named_point_sets(&self, _bnd_pts: &[BoundaryPoint]) -> Vec<NamedPointSet> {
-        self.geometry.holes.iter().zip(self.hole_names.iter()).map(|(hole, &name)| {
+        let rings = self.geometry.holes.iter().zip(self.hole_names.iter()).map(|(hole, &name)| {
             let points = (0..HOLE_RING_POINTS).map(|i| {
                 let theta = 2.0 * std::f64::consts::PI * i as f64 / HOLE_RING_POINTS as f64;
                 let (nx, ny) = (theta.cos(), theta.sin());
@@ -140,7 +208,32 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
                 }
             }).collect();
             NamedPointSet { name, points }
-        }).collect()
+        });
+        // "hole_i_anchor" — same angles, radius pushed out by `anchor_margin_m` so a
+        // constitutive-consistency FD stencil centered here never dips inside the hole. See
+        // `Self::new`'s doc comment for the margin's derivation and
+        // `Self::constitutive_anchor_point_sets` for how this gets wired into training.
+        let anchors = self.geometry.holes.iter().zip(self.anchor_names.iter()).map(|(hole, &name)| {
+            let r = hole.radius + self.anchor_margin_m;
+            let points = (0..HOLE_RING_POINTS).map(|i| {
+                let theta = 2.0 * std::f64::consts::PI * i as f64 / HOLE_RING_POINTS as f64;
+                let (nx, ny) = (theta.cos(), theta.sin());
+                BoundaryPoint {
+                    x: hole.center[0] + r * nx,
+                    y: hole.center[1] + r * ny,
+                    nx: -nx,
+                    ny: -ny,
+                    tx: 0.0, ty: 0.0,
+                    kind: BoundaryKind::NeumannFree,
+                }
+            }).collect();
+            NamedPointSet { name, points }
+        });
+        rings.chain(anchors).collect()
+    }
+
+    fn constitutive_anchor_point_sets(&self) -> Vec<&'static str> {
+        self.anchor_names.clone()
     }
 }
 
@@ -158,6 +251,40 @@ impl LossTerm for InteriorEnergyTerm {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("interior_energy: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("interior_energy: strains must be Some");
         dem_energy_loss(exx, eyy, exy, &self.material).mul_scalar(1.0 / self.ref_energy as f64)
+    }
+}
+
+/// Real strong-form equilibrium (`‖∇·σ‖²`) on the direct mDEM stress output - the piece this
+/// problem was missing entirely (see `powershell_tool/CLAUDE.md`'s Kt investigation: without
+/// this, `InteriorEnergyTerm` minimizes strain energy `U[u]` alone, not total potential energy
+/// `Π=U-W_ext`, whose Euler-Lagrange equation IS equilibrium - nothing forced the stress state
+/// at the loaded edges to propagate consistently through the interior). Reuses `energy::
+/// equilibrium_residual_loss` and its exact physics VERBATIM - this is the same mechanism
+/// Kirsch's own `EquilibriumRingTerm` already uses to achieve real Kt convergence (confirmed
+/// by reading `training_core::step_physics`'s mDEM branch: it differentiates the network's
+/// DIRECT σ output via central difference at 4 points shifted ±hx/±hy, not a second-
+/// derivative-of-displacement chain) - not a new equilibrium formulation. `kirsch_problem.rs`
+/// is untouched; this is a separate, plate-scoped struct so Kirsch's own path/tests can never
+/// be affected by anything here.
+struct EquilibriumTerm {
+    point_set: &'static str,
+    cx: f64,
+    cy: f64,
+    ref_div2: f64,
+}
+impl LossTerm for EquilibriumTerm {
+    fn name(&self) -> &'static str { "equilibrium" }
+    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
+    fn point_sets(&self) -> Vec<&'static str> { vec![self.point_set] }
+    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
+    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("equilibrium: domain missing");
+        let (sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym) = d.shifted_stress.clone()
+            .expect("equilibrium: shifted_stress must be Some (mDEM domain required)");
+        equilibrium_residual_loss(
+            sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym,
+            self.cx, self.cy, self.ref_div2,
+        )
     }
 }
 
@@ -227,6 +354,42 @@ impl LossTerm for HoleBcTerm {
     }
 }
 
+/// Real equilibrium-via-energy-minimization signal (the SAME mechanism `InteriorEnergyTerm`
+/// applies domain-wide) on a hole's `"hole_i_anchor"` point set specifically — closes a gap
+/// `constitutive_consistency`'s own anchor-ring check can't: that term only verifies the
+/// network's direct σ output agrees with the σ implied by its OWN displacement field there,
+/// which is satisfied just as well by a degenerate near-zero-everything solution as by the
+/// true one. This term instead minimizes real strain energy at a point set guaranteed to be
+/// close enough to the hole (but outside the FD-unsafe annulus - see `UserSamplingStrategy::
+/// new`'s margin derivation) to force the DISPLACEMENT field itself to develop the curvature
+/// a real stress concentration requires, not just keep two representations mutually
+/// consistent. A genuine SAW-BRDR-adaptive term (unlike constitutive-consistency, which has
+/// its own specific, unrelated reason to stay static - see that mechanism's doc comment in
+/// `training_core.rs`): `InteriorEnergyTerm` itself is already SAW-adaptive, and this term is
+/// architecturally identical to it, just on a different point set, so there is no Kirsch/
+/// pin-lug parity risk in letting it adapt normally (neither of those problems' sampling
+/// strategies ever produce a `constitutive_anchor_point_sets()` entry, so they never see this
+/// term at all).
+struct HoleAnchorEnergyTerm {
+    /// One of `UserSamplingStrategy`'s leaked `"hole_i_anchor"` strings - reused directly as
+    /// both this term's `name()` and its `point_sets()` entry (already unique per hole, no
+    /// separate leak needed).
+    point_set: &'static str,
+    material: MaterialProps,
+    ref_energy: f32,
+}
+impl LossTerm for HoleAnchorEnergyTerm {
+    fn name(&self) -> &'static str { self.point_set }
+    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
+    fn point_sets(&self) -> Vec<&'static str> { vec![self.point_set] }
+    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
+    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("hole_anchor_energy: domain missing");
+        let (exx, eyy, exy) = d.strains.clone().expect("hole_anchor_energy: strains must be Some");
+        dem_energy_loss(exx, eyy, exy, &self.material).mul_scalar(1.0 / self.ref_energy as f64)
+    }
+}
+
 pub struct UserDefinedProblem {
     spec: ProblemSpec,
     domains: Vec<DomainSpec>,
@@ -250,7 +413,7 @@ impl UserDefinedProblem {
         let hole_names = (0..spec.geometry.holes.len())
             .map(|i| -> &'static str { Box::leak(format!("hole_{i}").into_boxed_str()) })
             .collect();
-        let sampling = UserSamplingStrategy::new(spec.geometry.clone());
+        let sampling = UserSamplingStrategy::new(spec.geometry.clone(), spec.training.fd_h);
         UserDefinedProblem { spec, domains, sampling, ansatz: IdentityAnsatz, hole_names }
     }
 
@@ -275,8 +438,20 @@ impl BoundaryValueProblem for UserDefinedProblem {
         let ref_energy = (0.5 * stress_ref * stress_ref / self.spec.material.e).max(1.0) as f32;
         let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
 
+        // Same cx/cy/ref_div2 formula every other `equilibrium_residual_loss` caller uses
+        // (Kirsch's `step_physics`, `headless.rs`, `runner.rs`'s own Kirsch path) - constant
+        // for the whole run, recomputed here each call since `loss_terms()` itself already is
+        // (see `step_physics_multi`'s per-step `ctx.problem.loss_terms()` call).
+        let fd = crate::fd_stencil::FdConfig::new(
+            self.spec.training.fd_h, 2.0 * self.spec.geometry.half_w, 2.0 * self.spec.geometry.half_h,
+        );
+        let eq_cx = fd.sx / (2.0 * fd.hx as f64);
+        let eq_cy = fd.sy / (2.0 * fd.hy as f64);
+        let eq_ref_div2 = (self.spec.load.px * eq_cx).powi(2).max(1.0);
+
         let mut terms: Vec<Box<dyn LossTerm>> = vec![
             Box::new(InteriorEnergyTerm { material: self.spec.material.clone(), ref_energy }),
+            Box::new(EquilibriumTerm { point_set: "interior", cx: eq_cx, cy: eq_cy, ref_div2: eq_ref_div2 }),
             Box::new(OuterTractionTerm {
                 material: self.spec.material.clone(),
                 ref_stress2,
@@ -287,15 +462,24 @@ impl BoundaryValueProblem for UserDefinedProblem {
         for (hole, &name) in self.spec.geometry.holes.iter().zip(self.hole_names.iter()) {
             terms.push(Box::new(HoleBcTerm { point_set: name, bc: hole.bc, ref_stress2 }));
         }
+        for &name in self.sampling.constitutive_anchor_point_sets().iter() {
+            terms.push(Box::new(HoleAnchorEnergyTerm { point_set: name, material: self.spec.material.clone(), ref_energy }));
+        }
         terms
     }
 
     fn base_weight(&self, term_name: &str) -> f32 {
         match term_name {
             "interior_energy" => LAM_INTERIOR_ENERGY,
+            // Same base weight Kirsch's own EquilibriumRingTerm already uses - the same
+            // physics term, not a newly-tuned number.
+            "equilibrium" => crate::kirsch_problem::LAM_EQ,
             "outer_traction" => LAM_OUTER_TRACTION,
             "hole_free" => LAM_HOLE_FREE,
             "hole_fixed" => LAM_HOLE_FIXED,
+            // `HoleAnchorEnergyTerm.name()` is a per-hole "hole_i_anchor" string, not a fixed
+            // literal - matched by suffix rather than an exact-string arm per hole.
+            name if name.ends_with("_anchor") => LAM_INTERIOR_ENERGY,
             other => panic!("UserDefinedProblem::base_weight: unknown loss term '{other}'"),
         }
     }
@@ -457,7 +641,7 @@ pub fn probe_boundary_residuals(
     use burn::tensor::TensorData;
 
     let geometry = &spec.geometry;
-    let sampling = UserSamplingStrategy::new(geometry.clone());
+    let sampling = UserSamplingStrategy::new(geometry.clone(), spec.training.fd_h);
     let placeholder = geometry.to_placeholder();
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
     let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
@@ -560,7 +744,7 @@ pub fn probe_reaction_force(
     use burn::tensor::TensorData;
 
     let geometry = &spec.geometry;
-    let sampling = UserSamplingStrategy::new(geometry.clone());
+    let sampling = UserSamplingStrategy::new(geometry.clone(), spec.training.fd_h);
     let placeholder = geometry.to_placeholder();
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
     let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
@@ -636,7 +820,7 @@ pub fn probe_energy_balance(
     use burn::tensor::TensorData;
 
     let geometry = &spec.geometry;
-    let sampling = UserSamplingStrategy::new(geometry.clone());
+    let sampling = UserSamplingStrategy::new(geometry.clone(), spec.training.fd_h);
     let placeholder = geometry.to_placeholder();
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
     let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
@@ -812,6 +996,10 @@ mod tests {
     use super::*;
     use pinn_core::user_geometry::HoleSpec;
 
+    /// Representative `fd_h` for tests that don't otherwise have a `ProblemSpec.training.fd_h`
+    /// in scope — matches the default most real TOML specs use (e.g. `single_hole_plate.toml`).
+    const TEST_FD_H: f32 = 1e-3;
+
     fn two_hole_geometry() -> UserGeometry {
         UserGeometry {
             half_w: 0.1,
@@ -827,7 +1015,7 @@ mod tests {
     #[test]
     fn sample_interior_points_never_fall_inside_any_hole_or_outside_the_plate() {
         let geom = two_hole_geometry();
-        let strategy = UserSamplingStrategy::new(geom.clone());
+        let strategy = UserSamplingStrategy::new(geom.clone(), TEST_FD_H);
         let placeholder = GeometryConfig::kirsch_plate_inches(); // ignored by this strategy
         let pts = strategy.sample_interior(&placeholder, 500);
         assert_eq!(pts.len(), 500, "rejection sampling must reach the requested count");
@@ -837,9 +1025,33 @@ mod tests {
     }
 
     #[test]
+    fn sample_interior_points_stay_outside_the_fd_safe_margin_not_just_the_bare_hole_radius() {
+        // Real regression guard for the corrupted-FD-signal bug: a point at r = radius +
+        // epsilon (epsilon smaller than the FD stencil's physical reach) would pass the bare
+        // `UserGeometry::contains` check but still have a stencil arm land inside the hole.
+        let geom = two_hole_geometry();
+        let strategy = UserSamplingStrategy::new(geom.clone(), TEST_FD_H);
+        let placeholder = GeometryConfig::kirsch_plate_inches();
+        let pts = strategy.sample_interior(&placeholder, 2000);
+        let margin = crate::user_problem::ring_anchor_margin_m(TEST_FD_H, &geom);
+        for [x, y] in pts {
+            for hole in &geom.holes {
+                let dx = x - hole.center[0];
+                let dy = y - hole.center[1];
+                let r = (dx * dx + dy * dy).sqrt();
+                assert!(
+                    r >= hole.radius + margin - 1e-12,
+                    "point ({x},{y}) at r={r} is within the FD-unsafe margin of hole radius {} (margin={margin})",
+                    hole.radius,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn sample_boundary_produces_points_on_all_four_outer_edges() {
         let geom = two_hole_geometry();
-        let strategy = UserSamplingStrategy::new(geom.clone());
+        let strategy = UserSamplingStrategy::new(geom.clone(), TEST_FD_H);
         let placeholder = GeometryConfig::kirsch_plate_inches();
         let pts = strategy.sample_boundary(&placeholder, &LoadConfig::uniaxial_x(1.0), 40);
         assert!(!pts.is_empty());
@@ -851,23 +1063,60 @@ mod tests {
     }
 
     #[test]
-    fn named_point_sets_returns_one_ring_per_hole_with_expected_point_count() {
+    fn named_point_sets_returns_one_ring_plus_one_anchor_per_hole_with_expected_point_count() {
         let geom = two_hole_geometry();
-        let strategy = UserSamplingStrategy::new(geom.clone());
+        let strategy = UserSamplingStrategy::new(geom.clone(), TEST_FD_H);
         let sets = strategy.named_point_sets(&[]);
-        assert_eq!(sets.len(), 2);
+        assert_eq!(sets.len(), 4, "2 holes * (ring + anchor) = 4 named point sets");
         let names: Vec<&str> = sets.iter().map(|s| s.name).collect();
-        assert!(names.contains(&"hole_0"));
-        assert!(names.contains(&"hole_1"));
+        for expected in ["hole_0", "hole_1", "hole_0_anchor", "hole_1_anchor"] {
+            assert!(names.contains(&expected), "missing point set {expected:?}, got {names:?}");
+        }
         for set in &sets {
             assert_eq!(set.points.len(), HOLE_RING_POINTS);
         }
     }
 
     #[test]
+    fn constitutive_anchor_point_sets_returns_the_anchor_name_per_hole() {
+        let geom = two_hole_geometry();
+        let strategy = UserSamplingStrategy::new(geom.clone(), TEST_FD_H);
+        let anchors = strategy.constitutive_anchor_point_sets();
+        assert_eq!(anchors, vec!["hole_0_anchor", "hole_1_anchor"]);
+    }
+
+    #[test]
+    fn hole_anchor_points_sit_strictly_outside_the_hole_even_under_the_fd_stencil_reach() {
+        // Real evidence for the margin computation in `UserSamplingStrategy::new`'s doc
+        // comment, not just trusting the arithmetic: replicate `assemble_stencil`'s own
+        // axis-aligned ±hx/±hy offsets (physical, via `FdConfig`) against every anchor point
+        // and confirm every one of the 5 stencil rows (center + 4 arms) stays outside the
+        // hole's radius - the exact invariant the margin exists to guarantee.
+        let geom = two_hole_geometry();
+        let strategy = UserSamplingStrategy::new(geom.clone(), TEST_FD_H);
+        let fd = crate::fd_stencil::FdConfig::new(TEST_FD_H as f32, 2.0 * geom.half_w, 2.0 * geom.half_h);
+        let hx_phys = fd.hx as f64 * geom.half_w;
+        let hy_phys = fd.hy as f64 * geom.half_h;
+        let sets = strategy.named_point_sets(&[]);
+        for hole in &geom.holes {
+            let anchor = &sets.iter().find(|s| s.name.ends_with("_anchor")
+                && ((s.points[0].x - hole.center[0]).powi(2) + (s.points[0].y - hole.center[1]).powi(2)).sqrt() > hole.radius)
+                .expect("each hole must have a matching anchor set");
+            for p in &anchor.points {
+                for &(dx, dy) in &[(0.0, 0.0), (hx_phys, 0.0), (-hx_phys, 0.0), (0.0, hy_phys), (0.0, -hy_phys)] {
+                    let x = p.x + dx;
+                    let y = p.y + dy;
+                    let r = ((x - hole.center[0]).powi(2) + (y - hole.center[1]).powi(2)).sqrt();
+                    assert!(r > hole.radius, "stencil arm ({dx:+.6},{dy:+.6}) from anchor point ({x},{y}) landed inside hole radius {}: r={r}", hole.radius);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hole_ring_points_lie_on_their_hole_circle_at_the_correct_radius() {
         let geom = two_hole_geometry();
-        let strategy = UserSamplingStrategy::new(geom.clone());
+        let strategy = UserSamplingStrategy::new(geom.clone(), TEST_FD_H);
         let sets = strategy.named_point_sets(&[]);
         let hole0 = geom.holes[0];
         let ring0 = &sets.iter().find(|s| s.name == "hole_0").unwrap().points;
@@ -890,12 +1139,15 @@ mod tests {
         };
         let problem = UserDefinedProblem::new(spec);
         let terms = problem.loss_terms();
-        assert_eq!(terms.len(), 4); // interior_energy + outer_traction + 2 holes
+        // interior_energy + equilibrium + outer_traction + 2 hole BC terms + 2 hole anchor-energy terms
+        assert_eq!(terms.len(), 7);
         let names: Vec<&str> = terms.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"interior_energy"));
+        assert!(names.contains(&"equilibrium"));
         assert!(names.contains(&"outer_traction"));
         assert_eq!(names.iter().filter(|&&n| n == "hole_free").count(), 1);
         assert_eq!(names.iter().filter(|&&n| n == "hole_fixed").count(), 1);
+        assert_eq!(names.iter().filter(|&&n| n.ends_with("_anchor")).count(), 2);
         crate::problem::validate_loss_terms(&problem);
     }
 

@@ -74,6 +74,18 @@ pub trait DomainSamplingStrategy: Send + Sync {
         let _ = bnd_pts;
         Vec::new()
     }
+
+    /// Names (a subset of [`Self::named_point_sets`]'s output) that are safe to run
+    /// constitutive-consistency (Hooke's-law-vs-direct-stress) checks on, in addition to the
+    /// always-checked `"interior"` set — e.g. points offset just outside a hole boundary by
+    /// more than the FD stencil's reach, giving a local anchor where `"interior"`'s own
+    /// collocation points can't safely get (a stencil arm centered exactly on a hole ring
+    /// would sample inside the hole). Defaulted to empty: opt-in, zero behavior change for
+    /// every existing strategy (Kirsch, pin-lug, the interface test fake above) unless it
+    /// explicitly overrides this.
+    fn constitutive_anchor_point_sets(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
 }
 
 /// Per-domain Dirichlet (hard) displacement-BC ansatz, evaluated pointwise so this crate

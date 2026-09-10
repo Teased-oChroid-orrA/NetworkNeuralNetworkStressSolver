@@ -67,6 +67,25 @@ impl UserGeometry {
         true
     }
 
+    /// Returns a clone with every hole's radius inflated by `margin_m` — used ONLY to build
+    /// an `AdaptiveGrid<UserGeometry>`'s own containment gate (via `amr::AmrDomain::contains`)
+    /// for collocation purposes, NEVER for physics (hole boundary-condition terms), display,
+    /// or the real `contains`/masking semantics above. AMR's leaf-cell-center containment
+    /// check has no margin of its own, and quadtree cells aren't boundary-aligned, so without
+    /// this a hole-zone-refined cell's center can legitimately satisfy `contains()` (r >
+    /// radius) while still being close enough to the true edge that an FD stencil there
+    /// crosses back inside the hole — silently corrupting the interior-energy/constitutive-
+    /// consistency signal exactly where AMR concentrates the most collocation density. See
+    /// `powershell_tool/CLAUDE.md`'s Kt investigation for the real, measured margin-vs-cell-
+    /// size comparison that confirmed this as a genuine (not merely theoretical) gap.
+    pub fn inflated_for_collocation(&self, margin_m: f64) -> Self {
+        let mut inflated = self.clone();
+        for hole in &mut inflated.holes {
+            hole.radius += margin_m;
+        }
+        inflated
+    }
+
     /// Positional-Fourier-feature count the network's input should use for this geometry.
     /// Currently always `0` (raw x,y,z, no embedding) - see below for why, despite a real
     /// attempt to enable it.
@@ -167,5 +186,32 @@ mod tests {
         assert_eq!(placeholder.thickness, geom.thickness);
         assert_eq!(placeholder.hole, HoleType::None);
         assert_eq!(placeholder.symmetry, SymmetryMode::Full);
+    }
+
+    #[test]
+    fn inflated_for_collocation_grows_every_hole_radius_by_the_margin_and_nothing_else() {
+        let geom = two_hole_geometry();
+        let margin = 0.003;
+        let inflated = geom.inflated_for_collocation(margin);
+        assert_eq!(inflated.half_w, geom.half_w);
+        assert_eq!(inflated.half_h, geom.half_h);
+        assert_eq!(inflated.thickness, geom.thickness);
+        assert_eq!(inflated.holes.len(), geom.holes.len());
+        for (orig, grown) in geom.holes.iter().zip(inflated.holes.iter()) {
+            assert_eq!(grown.center, orig.center);
+            assert_eq!(grown.bc, orig.bc);
+            assert!((grown.radius - (orig.radius + margin)).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn inflated_for_collocation_rejects_points_the_original_geometry_would_accept() {
+        let geom = two_hole_geometry();
+        let margin = 0.02; // deliberately large relative to this fixture's 0.1 m radius
+        let inflated = geom.inflated_for_collocation(margin);
+        let hole = geom.holes[0];
+        let just_outside_true_radius = (hole.center[0] + hole.radius + margin * 0.5, hole.center[1]);
+        assert!(geom.contains(just_outside_true_radius.0, just_outside_true_radius.1));
+        assert!(!inflated.contains(just_outside_true_radius.0, just_outside_true_radius.1));
     }
 }

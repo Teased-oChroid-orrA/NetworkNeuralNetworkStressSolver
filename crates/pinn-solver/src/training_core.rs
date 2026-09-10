@@ -435,6 +435,7 @@ pub fn step_physics(
         raw_out: &int_raw_out,
         strains: Some((eps_xx, eps_yy, eps_xy)),
         normals: None,
+        shifted_stress: None,
     };
 
     // === Neumann traction forward pass ===
@@ -453,6 +454,7 @@ pub fn step_physics(
             raw_out: &out_bnd,
             strains: Some((ex, ey, exy)),
             normals: Some((ctx.gathered.trac_nx.clone(), ctx.gathered.trac_ny.clone())),
+            shifted_stress: None,
         };
         let term = crate::kirsch_problem::NeumannTractionTerm {
             domain: KIRSCH_DOMAIN,
@@ -483,6 +485,7 @@ pub fn step_physics(
             raw_out: &out_r,
             strains: None,
             normals: None,
+            shifted_stress: None,
         };
         let term = crate::kirsch_problem::DisplacementAnchorTerm {
             domain: KIRSCH_DOMAIN,
@@ -516,6 +519,7 @@ pub fn step_physics(
                 raw_out: &out_h,
                 strains: None,
                 normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
+                shifted_stress: None,
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -534,6 +538,7 @@ pub fn step_physics(
                 raw_out: &out_h,
                 strains: Some((ex, ey, exy)),
                 normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
+                shifted_stress: None,
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -625,6 +630,7 @@ pub fn step_physics(
                     ));
                     let kirsch_forward = DomainForwardOutputs {
                         domain: KIRSCH_DOMAIN, raw_out: &out_pr, strains: None, normals: None,
+                        shifted_stress: None,
                     };
                     let term = crate::kirsch_problem::KirschStressTerm {
                         domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: true,
@@ -645,6 +651,7 @@ pub fn step_physics(
                     let kirsch_forward = DomainForwardOutputs {
                         domain: KIRSCH_DOMAIN, raw_out: &out_pr,
                         strains: Some((exx_pr, eyy_pr, exy_pr)), normals: None,
+                        shifted_stress: None,
                     };
                     let term = crate::kirsch_problem::KirschStressTerm {
                         domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: false,
@@ -861,6 +868,11 @@ struct Computed {
     raw_out: Tensor<B, 2>,
     strains: Option<(Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>)>,
     normals: Option<(Tensor<B, 1>, Tensor<B, 1>)>,
+    /// Direct mDEM stress at the 4 FD-shifted stencil positions - see
+    /// `crate::problem::ShiftedStress`'s doc comment. `Some` only for mDEM (`output_dim==5`)
+    /// domains; populated from the SAME stencil rows already computed for `strains` below, no
+    /// extra forward pass.
+    shifted_stress: Option<crate::problem::ShiftedStress<B>>,
 }
 
 /// Enumerate which `(DomainId, point_set_name)` pairs at least one of `active_terms` needs,
@@ -897,6 +909,21 @@ fn compute_domain_forwards(
         for (&id, &ps) in term.domains().iter().zip(term.point_sets().iter()) {
             if !needed.contains(&(id, ps)) {
                 needed.push((id, ps));
+            }
+        }
+    }
+    // Constitutive-consistency anchor point sets (see `DomainSamplingStrategy::
+    // constitutive_anchor_point_sets`'s doc comment) are never declared via any `LossTerm`'s
+    // `point_sets()` - the `(b.5)` block below reads them directly, outside the normal
+    // SAW-BRDR-weighted term machinery (same reason "interior"'s own constitutive-consistency
+    // instance is ad-hoc, not registered in `loss_terms()`). So they must be added to `needed`
+    // here explicitly, or `(b.5)`'s `forwards.get(...)` lookups would always miss. Empty by
+    // default for every domain whose sampling strategy doesn't override the method (Kirsch,
+    // pin-lug) - zero extra work for them.
+    for (domain_idx, domain_spec) in ctx.problem.domains().iter().enumerate() {
+        for name in ctx.problem.sampling_strategy(domain_idx).constitutive_anchor_point_sets() {
+            if !needed.contains(&(domain_spec.id, name)) {
+                needed.push((domain_spec.id, name));
             }
         }
     }
@@ -988,6 +1015,28 @@ fn compute_domain_forwards(
             ansatz_out.mul_scalar(u_ref_f64)
         };
         let raw_out = raw.clone().slice([0..n_pts, 0..raw.dims()[1]]);
+        // Direct σ at the 4 FD-shifted positions - zero extra forward pass, just extracting
+        // columns 2..5 from the SAME `raw` stencil rows `compute_strains` below reads columns
+        // 0,1 from. Row layout matches `assemble_stencil`'s documented order (center, x+hx,
+        // x-hx, y+hy, y-hy). See `EquilibriumTerm`/`crate::problem::ShiftedStress`'s doc
+        // comment for why this exists and what it's for.
+        let shifted_stress: Option<crate::problem::ShiftedStress<B>> = if is_mdem {
+            let block = |r0: usize| -> (Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) {
+                let s = raw.clone().slice([r0..r0 + n_pts, 2..5]);
+                (
+                    s.clone().slice([0..n_pts, 0..1]).reshape([n_pts]), // sxx
+                    s.clone().slice([0..n_pts, 1..2]).reshape([n_pts]), // syy
+                    s.slice([0..n_pts, 2..3]).reshape([n_pts]),         // sxy
+                )
+            };
+            let (sxx_xp, _syy_xp, sxy_xp) = block(n_pts);
+            let (sxx_xm, _syy_xm, sxy_xm) = block(2 * n_pts);
+            let (_sxx_yp, syy_yp, sxy_yp) = block(3 * n_pts);
+            let (_sxx_ym, syy_ym, sxy_ym) = block(4 * n_pts);
+            Some((sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym))
+        } else {
+            None
+        };
         let (eps_xx, eps_yy, eps_xy) = compute_strains::<B>(raw, n_pts, ctx.fd);
 
         computed.push(Computed {
@@ -995,6 +1044,7 @@ fn compute_domain_forwards(
             raw_out,
             strains: Some((eps_xx, eps_yy, eps_xy)),
             normals,
+            shifted_stress,
         });
     }
 
@@ -1174,6 +1224,7 @@ pub fn step_physics_multi(
             raw_out: &c.raw_out,
             strains: c.strains.clone(),
             normals: c.normals.clone(),
+            shifted_stress: c.shifted_stress.clone(),
         }))
         .collect();
 
@@ -1187,7 +1238,7 @@ pub fn step_physics_multi(
         let inputs: Vec<DFO<'_, B>> = term.domains().iter().zip(term.point_sets().iter())
             .filter_map(|(&id, &ps)| forwards.get(&(id, ps)).map(|f| DFO {
                 domain: f.domain, raw_out: f.raw_out,
-                strains: f.strains.clone(), normals: f.normals.clone(),
+                strains: f.strains.clone(), normals: f.normals.clone(), shifted_stress: f.shifted_stress.clone(),
             }))
             .collect();
         let t = term.compute(&inputs);
@@ -1200,11 +1251,18 @@ pub fn step_physics_multi(
     let mut lam_by_name: HashMap<&'static str, f64> = HashMap::new();
     for (name, &raw_lam) in term_names.iter().zip(lams.iter()) {
         let lam = match *name {
-            "hole_traction" | "lug_free_edge_traction" => {
+            // "hole_free" is `UserDefinedProblem`'s own name for exactly the same traction-
+            // free hole condition "hole_traction"/"lug_free_edge_traction" already cap here -
+            // a real, previously-missed gap (confirmed via direct code read, not assumed):
+            // `HoleBcTerm::name()` returns "hole_free"/"hole_fixed" for the plate path, which
+            // matched neither arm here, so `dynamic_lam_h_cap`/`dynamic_lam_d_cap` never
+            // actually applied to `single_hole_plate.toml` despite being the session's first
+            // documented fix. See `powershell_tool/CLAUDE.md`'s Kt investigation.
+            "hole_traction" | "lug_free_edge_traction" | "hole_free" => {
                 let v = raw_lam as f64 * physics_boost;
                 if ctx.phase2_active { v.min(ctx.dynamic_lam_h_cap) } else { v }
             }
-            "displacement_anchor" | "lug_shank_anchor" => {
+            "displacement_anchor" | "lug_shank_anchor" | "hole_fixed" => {
                 let v = raw_lam as f64;
                 if ctx.phase2_active { v.min(ctx.dynamic_lam_d_cap) } else { v }
             }
@@ -1300,6 +1358,35 @@ pub fn step_physics_multi(
         const_scalar_sum += const_scalar;
         total_scalar += const_scalar * effective_lam_const as f32;
         total = total + const_loss.mul_scalar(effective_lam_const);
+
+        // Near-boundary constitutive-consistency anchors (see `DomainSamplingStrategy::
+        // constitutive_anchor_point_sets`'s doc comment and `powershell_tool/CLAUDE.md`'s Kt
+        // investigation writeup) - the same mechanism as above, applied at whatever extra
+        // named point sets this domain's sampling strategy flagged as safe (e.g. a ring just
+        // outside a hole, close enough to give the hoop stress a real local Hooke's-law
+        // anchor that "interior"'s own collocation points can't safely get near a hole
+        // boundary). Same static `effective_lam_const` weight, same ad-hoc/outside-SAW-BRDR
+        // treatment as "interior" - not a new SAW-adaptive term, on purpose (a new adaptive
+        // term would reopen the exact weight-imbalance failure mode this whole mechanism
+        // exists to fix). Empty for Kirsch/pin-lug (default trait method), so this loop is a
+        // no-op there - zero behavior change confirmed by the parity tests in
+        // `training_core.rs`'s own test module.
+        for name in ctx.problem.sampling_strategy(i).constitutive_anchor_point_sets() {
+            let Some(fa) = forwards.get(&(domain.id, name)) else { continue };
+            if fa.strains.is_none() {
+                continue;
+            }
+            let anchor_term = crate::kirsch_problem::ConstitutiveConsistencyTerm {
+                domain: domain.id,
+                material: domain.material.clone(),
+                ref_stress2: ctx.domains[i].ref_stress2,
+            };
+            let anchor_loss = anchor_term.compute(std::slice::from_ref(fa));
+            let anchor_scalar = t_scalar(&anchor_loss);
+            const_scalar_sum += anchor_scalar;
+            total_scalar += anchor_scalar * effective_lam_const as f32;
+            total = total + anchor_loss.mul_scalar(effective_lam_const);
+        }
     }
     if any_mdem {
         lam_by_name.insert("constitutive_consistency", effective_lam_const);
@@ -1680,6 +1767,7 @@ pub fn compute_gradient_conflict(
             raw_out: &int_raw_out,
             strains: Some((eps_xx, eps_yy, eps_xy)),
             normals: None,
+            shifted_stress: None,
         };
         let e_loss = {
             let term = crate::kirsch_problem::InteriorEnergyTerm {
@@ -1716,6 +1804,7 @@ pub fn compute_gradient_conflict(
             raw_out: &out_bnd,
             strains: Some((ex, ey, exy)),
             normals: Some((ctx.gathered.trac_nx.clone(), ctx.gathered.trac_ny.clone())),
+            shifted_stress: None,
         };
         let term = crate::kirsch_problem::NeumannTractionTerm {
             domain: KIRSCH_DOMAIN,
@@ -1751,6 +1840,7 @@ pub fn compute_gradient_conflict(
             raw_out: &out_r,
             strains: None,
             normals: None,
+            shifted_stress: None,
         };
         let term = crate::kirsch_problem::DisplacementAnchorTerm {
             domain: KIRSCH_DOMAIN,
@@ -1781,6 +1871,7 @@ pub fn compute_gradient_conflict(
                 raw_out: &out_h,
                 strains: None,
                 normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
+                shifted_stress: None,
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -1799,6 +1890,7 @@ pub fn compute_gradient_conflict(
                 raw_out: &out_h,
                 strains: Some((ex, ey, exy)),
                 normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
+                shifted_stress: None,
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -1883,6 +1975,7 @@ pub fn compute_gradient_conflict(
                 ));
                 let kirsch_forward = DomainForwardOutputs {
                     domain: KIRSCH_DOMAIN, raw_out: &out_pr, strains: None, normals: None,
+                    shifted_stress: None,
                 };
                 let term = crate::kirsch_problem::KirschStressTerm {
                     domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: true,
@@ -1903,6 +1996,7 @@ pub fn compute_gradient_conflict(
                 let kirsch_forward = DomainForwardOutputs {
                     domain: KIRSCH_DOMAIN, raw_out: &out_pr,
                     strains: Some((exx_pr, eyy_pr, exy_pr)), normals: None,
+                    shifted_stress: None,
                 };
                 let term = crate::kirsch_problem::KirschStressTerm {
                     domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: false,
@@ -2210,6 +2304,7 @@ fn compute_loss_for_lbfgs(
         raw_out: &int_raw_out,
         strains: Some((exx, eyy, exy)),
         normals: None,
+        shifted_stress: None,
     };
     // `ctx.ref_energy` is threaded from `StepCtx::ref_energy` (via `LbfgsCtxScalars::from_ctx`),
     // NOT recomputed here — `compute_reference_scales` (the single source of truth) is the
@@ -2246,6 +2341,7 @@ fn compute_loss_for_lbfgs(
             raw_out: &out_bnd,
             strains: Some((ex, ey, exy_b)),
             normals: Some((ctx.gathered.trac_nx.clone(), ctx.gathered.trac_ny.clone())),
+            shifted_stress: None,
         };
         let term = crate::kirsch_problem::NeumannTractionTerm {
             domain: KIRSCH_DOMAIN,
@@ -2280,6 +2376,7 @@ fn compute_loss_for_lbfgs(
             raw_out: &out_r,
             strains: None,
             normals: None,
+            shifted_stress: None,
         };
         let term = crate::kirsch_problem::DisplacementAnchorTerm {
             domain: KIRSCH_DOMAIN,
@@ -2310,6 +2407,7 @@ fn compute_loss_for_lbfgs(
                 raw_out: &out_h,
                 strains: None,
                 normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
+                shifted_stress: None,
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -2328,6 +2426,7 @@ fn compute_loss_for_lbfgs(
                 raw_out: &out_h,
                 strains: Some((ex, ey, exy_h)),
                 normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
+                shifted_stress: None,
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -2412,6 +2511,7 @@ fn compute_loss_for_lbfgs(
                 ));
                 let kirsch_forward = DomainForwardOutputs {
                     domain: KIRSCH_DOMAIN, raw_out: &out_pr, strains: None, normals: None,
+                    shifted_stress: None,
                 };
                 let term = crate::kirsch_problem::KirschStressTerm {
                     domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: true,
@@ -2432,6 +2532,7 @@ fn compute_loss_for_lbfgs(
                 let kirsch_forward = DomainForwardOutputs {
                     domain: KIRSCH_DOMAIN, raw_out: &out_pr,
                     strains: Some((exx_pr, eyy_pr, exy_pr)), normals: None,
+                    shifted_stress: None,
                 };
                 let term = crate::kirsch_problem::KirschStressTerm {
                     domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: false,
@@ -2634,6 +2735,7 @@ fn sum_group_loss(
             raw_out: &c.raw_out,
             strains: c.strains.clone(),
             normals: c.normals.clone(),
+            shifted_stress: c.shifted_stress.clone(),
         }))
         .collect();
     let mut total: Option<Tensor<B, 1>> = None;
@@ -2641,7 +2743,7 @@ fn sum_group_loss(
         let inputs: Vec<DFO<'_, B>> = term.domains().iter().zip(term.point_sets().iter())
             .filter_map(|(&id, &ps)| forwards.get(&(id, ps)).map(|f| DFO {
                 domain: f.domain, raw_out: f.raw_out,
-                strains: f.strains.clone(), normals: f.normals.clone(),
+                strains: f.strains.clone(), normals: f.normals.clone(), shifted_stress: f.shifted_stress.clone(),
             }))
             .collect();
         let t = term.compute(&inputs);
@@ -2764,6 +2866,7 @@ fn compute_loss_for_lbfgs_multi(
             raw_out: &c.raw_out,
             strains: c.strains.clone(),
             normals: c.normals.clone(),
+            shifted_stress: c.shifted_stress.clone(),
         }))
         .collect();
 
@@ -2774,7 +2877,7 @@ fn compute_loss_for_lbfgs_multi(
         let inputs: Vec<DFO<'_, B>> = term.domains().iter().zip(term.point_sets().iter())
             .filter_map(|(&id, &ps)| forwards.get(&(id, ps)).map(|f| DFO {
                 domain: f.domain, raw_out: f.raw_out,
-                strains: f.strains.clone(), normals: f.normals.clone(),
+                strains: f.strains.clone(), normals: f.normals.clone(), shifted_stress: f.shifted_stress.clone(),
             }))
             .collect();
         let t = term.compute(&inputs);
@@ -3196,6 +3299,7 @@ mod tests {
         ));
         let right_forward = DomainForwardOutputs {
             domain: KIRSCH_DOMAIN, raw_out: &out_r, strains: None, normals: None,
+            shifted_stress: None,
         };
         let term = crate::kirsch_problem::DisplacementAnchorTerm {
             domain: KIRSCH_DOMAIN, u_target: u_target_val,

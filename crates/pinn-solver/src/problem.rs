@@ -35,13 +35,26 @@ pub struct DomainState<Bk: Backend> {
     pub ref_stress2: f32,
 }
 
-/// Per-domain forward-pass outputs handed to `LossTerm::compute`. `strains`/`normals` are
-/// `None` when the term doesn't need them (e.g. a term operating purely on `raw_out`).
+/// Direct mDEM stress (σxx,σyy,σxy - only the 3 components `energy::equilibrium_residual_loss`
+/// needs per shifted position) at the 4 FD-shifted positions `assemble_stencil` already
+/// evaluates - `(sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym)`, matching
+/// that function's parameter order exactly so callers never need to reshuffle. See
+/// `training_core::compute_domain_forwards`'s doc comment for how this is populated at zero
+/// extra forward-pass cost (the same stencil rows already computed for FD strains).
+pub type ShiftedStress<Bk> = (
+    Tensor<Bk, 1>, Tensor<Bk, 1>, Tensor<Bk, 1>, Tensor<Bk, 1>,
+    Tensor<Bk, 1>, Tensor<Bk, 1>, Tensor<Bk, 1>, Tensor<Bk, 1>,
+);
+
+/// Per-domain forward-pass outputs handed to `LossTerm::compute`. `strains`/`normals`/
+/// `shifted_stress` are `None` when the term doesn't need them (e.g. a term operating purely
+/// on `raw_out`).
 pub struct DomainForwardOutputs<'a, Bk: Backend> {
     pub domain: DomainId,
     pub raw_out: &'a Tensor<Bk, 2>,
     pub strains: Option<(Tensor<Bk, 1>, Tensor<Bk, 1>, Tensor<Bk, 1>)>,
     pub normals: Option<(Tensor<Bk, 1>, Tensor<Bk, 1>)>,
+    pub shifted_stress: Option<ShiftedStress<Bk>>,
 }
 
 /// One additive term of the total physics loss. Implementations describe *which* domain(s)

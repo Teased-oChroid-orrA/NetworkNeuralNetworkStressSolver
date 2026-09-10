@@ -115,8 +115,8 @@ struct FixedPoints {
     holes: Vec<(HoleSpec, Vec<BoundaryPoint>)>,
 }
 
-fn build_fixed_points(geometry: &UserGeometry, n_interior: usize, n_boundary: usize) -> FixedPoints {
-    let sampling = UserSamplingStrategy::new(geometry.clone());
+fn build_fixed_points(geometry: &UserGeometry, n_interior: usize, n_boundary: usize, fd_h: f32) -> FixedPoints {
+    let sampling = UserSamplingStrategy::new(geometry.clone(), fd_h);
     let placeholder = geometry.to_placeholder();
     let interior = sampling.sample_interior(&placeholder, n_interior);
     let boundary = sampling.sample_boundary(&placeholder, &LoadConfig::uniaxial_x(0.0), n_boundary);
@@ -735,7 +735,7 @@ pub fn run_training_parametric(spec: ParametricProblemSpec, tx: Sender<TrainingM
     let device = BDevice::default();
     let scales = compute_scales(&spec);
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
-    let points = build_fixed_points(&spec.geometry, spec.training.n_interior, spec.training.n_boundary);
+    let points = build_fixed_points(&spec.geometry, spec.training.n_interior, spec.training.n_boundary, spec.training.fd_h);
     let int_norm: Vec<[f32; 2]> = points.interior.iter().map(|&[x, y]| norm_pt(x, y, &scales)).collect();
     // Fixed geometry (v1 scope) - the plate's area never changes across steps, so this is
     // computed once here rather than inside the per-step/per-query probe (`energy_balance_
@@ -940,7 +940,7 @@ pub fn serve_loaded_checkpoint(
     let device = BDevice::default();
     let scales = compute_scales(&spec);
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
-    let points = build_fixed_points(&spec.geometry, spec.training.n_interior, spec.training.n_boundary);
+    let points = build_fixed_points(&spec.geometry, spec.training.n_interior, spec.training.n_boundary, spec.training.fd_h);
     let int_norm: Vec<[f32; 2]> = points.interior.iter().map(|&[x, y]| norm_pt(x, y, &scales)).collect();
     let area = 4.0 * spec.geometry.half_w * spec.geometry.half_h
         - spec.geometry.holes.iter().map(|h| std::f64::consts::PI * h.radius * h.radius).sum::<f64>();
