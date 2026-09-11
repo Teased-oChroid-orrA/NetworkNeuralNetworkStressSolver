@@ -409,6 +409,9 @@ impl LossTerm for InterfacePenetrationTerm {
     // Couples TWO domains (pin and lug) at their shared contact boundary - the textbook
     // Interface condition (see `domains()` above: both PIN_DOMAIN and LUG_DOMAIN).
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Interface) }
+    // Signorini non-penetration (gap >= 0) - a real inequality constraint, currently enforced
+    // via the squared-hinge penalty `gap.neg().clamp_min(0.0).powf_scalar(2.0)` below.
+    fn constraint_kind(&self) -> crate::problem::ConstraintKind { crate::problem::ConstraintKind::PenaltyInequality }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let pin = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("interface_penetration: pin missing");
         let lug = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("interface_penetration: lug missing");
@@ -456,6 +459,9 @@ impl LossTerm for InterfaceNonTensionTerm {
     // Same reasoning as InterfacePenetrationTerm: Signorini KKT boundary condition.
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
+    // Signorini non-tension (contact pressure <= 0) - the other half of the KKT pair, same
+    // squared-hinge penalty mechanism as InterfacePenetrationTerm.
+    fn constraint_kind(&self) -> crate::problem::ConstraintKind { crate::problem::ConstraintKind::PenaltyInequality }
     // Reads `raw_out` cols 2..5 directly (the pin's own direct mDEM stress).
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Direct) }
     // Same contact physics as `InterfacePenetrationTerm` (the other half of the Signorini KKT
@@ -1422,6 +1428,21 @@ mod tests {
                 .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
             assert_eq!(term.formulation_kind(), *expected_kind,
                 "term '{}' has formulation_kind {:?}, expected {:?}", term.name(), term.formulation_kind(), expected_kind);
+        }
+    }
+
+    #[test]
+    fn pinlug_constraint_report_lists_only_the_two_signorini_terms() {
+        use crate::problem::ConstraintKind as Ck;
+
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
+        let report = crate::training_core::constraint_report(&problem);
+
+        assert!(report.contains(&("interface_penetration", Ck::PenaltyInequality)), "{report:?}");
+        assert!(report.contains(&("interface_non_tension", Ck::PenaltyInequality)), "{report:?}");
+        assert_eq!(report.len(), 2, "report: {report:?}");
+        for absent in ["pin_interior_energy", "lug_interior_energy", "lug_shank_anchor", "lug_free_edge_traction", "pin_driving_traction"] {
+            assert!(!report.iter().any(|(n, _)| *n == absent), "{absent} is not a constraint, must be absent from {report:?}");
         }
     }
 }

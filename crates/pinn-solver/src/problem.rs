@@ -203,6 +203,24 @@ pub trait LossTerm: Send + Sync {
     fn formulation_kind(&self) -> FormulationKind {
         FormulationKind::Strong
     }
+
+    /// Whether this term enforces an inequality/equality CONSTRAINT (an assertion that must
+    /// hold, e.g. "no interpenetration") rather than an unconstrained objective residual (an
+    /// assertion that should be SMALL, e.g. "traction error") - General-PINN architecture
+    /// recommendations §40's "constraint/augmented-Lagrangian framework". Defaults to
+    /// `Unconstrained` - the vast majority of terms in this codebase are plain objective
+    /// residuals, not constraints, and should leave this at the default rather than being
+    /// forced into a category (same "None/default has genuine meaning" convention `stress_
+    /// source`/`boundary_kind`/`derivative_order` already established, not `formulation_kind`'s
+    /// forced-choice one). This codebase's own two real constraint terms (pin-lug's Signorini
+    /// KKT contact conditions, `InterfacePenetrationTerm`/`InterfaceNonTensionTerm`) currently
+    /// enforce their inequality via a pure PENALTY method (squared-hinge, no dual variable) -
+    /// see [`crate::augmented_lagrangian::AugmentedLagrangianState`] for a real, tested
+    /// alternative this classification exists to distinguish from (not yet wired into live
+    /// training - a numerics-changing decision out of scope for a classification pass).
+    fn constraint_kind(&self) -> ConstraintKind {
+        ConstraintKind::Unconstrained
+    }
 }
 
 /// Classifies a [`LossTerm`] as either enforcing interior PDE/equilibrium physics or a
@@ -284,6 +302,20 @@ pub enum FormulationKind {
     /// form (the Deep Energy Method's `Π[u] = U[u] - W_ext[u]`) - satisfies natural (Neumann)
     /// boundary conditions automatically by construction, rather than penalizing them directly.
     Weak,
+}
+
+/// See [`LossTerm::constraint_kind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstraintKind {
+    /// A plain objective residual - "be small", not "must hold".
+    Unconstrained,
+    /// An inequality constraint (`g(x) <= 0` or equivalent) enforced via a pure quadratic
+    /// penalty (squared-hinge) with NO dual variable - this codebase's own real, current
+    /// mechanism for `InterfacePenetrationTerm`/`InterfaceNonTensionTerm`. A pure penalty
+    /// method's solution is only exact in the ρ→∞ limit; a finite, practically-trainable ρ
+    /// always leaves some residual constraint violation, unlike an augmented-Lagrangian
+    /// method's dual variable, which corrects for exactly that bias.
+    PenaltyInequality,
 }
 
 /// A complete boundary-value problem: its domain(s), their sampling/ansatz strategies, loss

@@ -599,6 +599,22 @@ pub fn formulation_kind_report(
         .collect()
 }
 
+/// General-PINN architecture recommendations §40 (Priority 10, "constraint/augmented-
+/// Lagrangian framework") - which active terms enforce a real inequality/equality constraint,
+/// filtered like `stress_source_report` (the vast majority of terms are plain objective
+/// residuals, `ConstraintKind::Unconstrained`, and are excluded rather than padding the report
+/// with a category that applies to almost everything).
+pub fn constraint_report(
+    problem: &dyn crate::problem::BoundaryValueProblem,
+) -> Vec<(&'static str, crate::problem::ConstraintKind)> {
+    problem.loss_terms().iter()
+        .filter_map(|term| match term.constraint_kind() {
+            crate::problem::ConstraintKind::Unconstrained => None,
+            kind => Some((term.name(), kind)),
+        })
+        .collect()
+}
+
 /// General-PINN architecture recommendations §6/§29 (Priority 3, "loss instrumentation" /
 /// "loss ledger"): one structured record per active term instead of separate `raw_scalar_by_
 /// name`/`lam_by_name`/`term_grad_norms`/`GradientShareReport::shares` hashmaps a caller has

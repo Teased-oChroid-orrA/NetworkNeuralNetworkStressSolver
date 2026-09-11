@@ -633,6 +633,7 @@ pub fn run_training(
                 boundary_operator_report: Vec::new(),
                 derivative_order_report: Vec::new(),
                 formulation_kind_report: Vec::new(),
+                constraint_report: Vec::new(),
             };
             let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         }
@@ -1642,6 +1643,15 @@ fn run_user_problem_training_from(
                     crate::problem::FormulationKind::Weak => "Weak",
                 }))
                 .collect();
+        // Priority 10, General-PINN §40 - filtered like stress_source_report/boundary_
+        // operator_report/derivative_order_report (most terms aren't constraints).
+        let constraint_report: Vec<(&'static str, &'static str)> =
+            crate::training_core::constraint_report(&problem).into_iter()
+                .map(|(name, kind)| (name, match kind {
+                    crate::problem::ConstraintKind::Unconstrained => "Unconstrained",
+                    crate::problem::ConstraintKind::PenaltyInequality => "PenaltyInequality",
+                }))
+                .collect();
         let update = TrainingUpdate {
             step,
             total_loss: out.total_scalar,
@@ -1668,6 +1678,7 @@ fn run_user_problem_training_from(
             boundary_operator_report,
             derivative_order_report,
             formulation_kind_report,
+            constraint_report,
         };
         let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         if auto_stopped {
@@ -1787,6 +1798,14 @@ pub fn serve_loaded_plate_checkpoint(
                 crate::problem::FormulationKind::Weak => "Weak",
             }))
             .collect();
+    let constraint_report: Vec<(&'static str, &'static str)> =
+        crate::training_core::constraint_report(&crate::user_problem::UserDefinedProblem::new(spec.clone()))
+            .into_iter()
+            .map(|(name, kind)| (name, match kind {
+                crate::problem::ConstraintKind::Unconstrained => "Unconstrained",
+                crate::problem::ConstraintKind::PenaltyInequality => "PenaltyInequality",
+            }))
+            .collect();
 
     let update = TrainingUpdate {
         step: 0, total_loss: 0.0, energy_loss: 0.0, neumann_loss: 0.0, lr: 0.0,
@@ -1802,6 +1821,7 @@ pub fn serve_loaded_plate_checkpoint(
         boundary_operator_report,
         derivative_order_report,
         formulation_kind_report,
+        constraint_report,
     };
     let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
     let _ = tx.send(TrainingMsg::Done);

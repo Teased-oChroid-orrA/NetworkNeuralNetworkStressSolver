@@ -1,4 +1,5 @@
 pub mod architecture_controller;
+pub mod augmented_lagrangian;
 pub mod bc;
 pub mod checkpoint;
 pub mod contact_export;

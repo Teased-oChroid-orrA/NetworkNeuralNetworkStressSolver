@@ -431,6 +431,14 @@ pub struct TrainingUpdate {
     /// solver's own enum, same "pinn-core never depends on pinn-solver" rule established by
     /// every other report field above. Same "static per problem, never gated" treatment.
     pub formulation_kind_report: Vec<(&'static str, &'static str)>,
+    /// General-PINN architecture recommendations §40 (Priority 10, "constraint/augmented-
+    /// Lagrangian framework") - which active terms enforce a real inequality/equality
+    /// constraint, `(term_name, "PenaltyInequality")` pairs (filtered like `stress_source_
+    /// report` - most terms are plain objective residuals and are excluded). Plain strings,
+    /// same "pinn-core never depends on pinn-solver" rule every other report field here
+    /// established. Empty for Kirsch's own path and for any problem with no real constraint
+    /// terms (the plate path currently has none) - a real absence, not a bug.
+    pub constraint_report: Vec<(&'static str, &'static str)>,
 }
 
 /// Pin-in-lug analogue of `TrainingUpdate` — one entry per domain's visualization fields,
