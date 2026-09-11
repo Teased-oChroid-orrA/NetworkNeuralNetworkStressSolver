@@ -410,6 +410,21 @@ pub fn gradient_share_report(
     GradientShareReport { shares, inert, dominant }
 }
 
+/// General-PINN architecture recommendations §4's "every derived quantity must identify its
+/// source", narrowed to the one dependency edge this codebase's own real bugs have repeatedly
+/// been about - see [`crate::problem::StressSource`]'s doc comment. Generalizes the manual
+/// audit `docs/investigations/kt-investigation-bugsource-new.md`'s own §2/§12 write-up had to
+/// perform by hand (reading every term's `compute()` body to answer "which terms still read
+/// direct σ after the derived-stress fix?") into a one-line, always-available answer. Pure,
+/// no tensor ops - iterates `problem.loss_terms()` and filters to terms that declare a source.
+pub fn stress_source_report(
+    problem: &dyn crate::problem::BoundaryValueProblem,
+) -> Vec<(&'static str, crate::problem::StressSource)> {
+    problem.loss_terms().iter()
+        .filter_map(|term| term.stress_source().map(|source| (term.name(), source)))
+        .collect()
+}
+
 /// Extract (σ_xx, σ_yy, σ_xy) from rows `[row_start, row_end)` of an mDEM network output
 /// tensor (cols 2, 3, 4 — already scaled to Pa by `scale_out`). Shared by every mDEM call
 /// site that reads stress directly off the network rather than via the FD stencil.

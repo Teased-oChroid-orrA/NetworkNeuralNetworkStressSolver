@@ -624,6 +624,10 @@ pub fn run_training(
                 // `StepOutput::term_grad_norms`'s doc comment - it's a `step_physics_multi`-
                 // only diagnostic in this pass).
                 gradient_share_report: None,
+                // Kirsch's per-step computation runs through the hardcoded `step_physics`
+                // path, never through a `&dyn BoundaryValueProblem` trait object -
+                // `stress_source_report` has nothing to iterate. Empty, not fabricated.
+                stress_source_report: Vec::new(),
             };
             let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         }
@@ -1586,6 +1590,17 @@ fn run_user_problem_training_from(
             inert: r.inert,
             dominant: r.dominant,
         });
+        // Static per problem (doesn't change step to step) and genuinely free (pure `Vec`/
+        // string logic over `problem.loss_terms()`, no tensor ops) - computed every update,
+        // never gated, unlike `gradient_share_report` above.
+        let stress_source_report: Vec<(&'static str, &'static str)> =
+            crate::training_core::stress_source_report(&problem).into_iter()
+                .map(|(name, source)| (name, match source {
+                    crate::problem::StressSource::Direct => "Direct",
+                    crate::problem::StressSource::Derived => "Derived",
+                    crate::problem::StressSource::Both => "Both",
+                }))
+                .collect();
         let update = TrainingUpdate {
             step,
             total_loss: out.total_scalar,
@@ -1607,6 +1622,7 @@ fn run_user_problem_training_from(
             network_snapshot,
             architecture_event,
             gradient_share_report,
+            stress_source_report,
         };
         let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         if auto_stopped {
@@ -1689,6 +1705,16 @@ pub fn serve_loaded_plate_checkpoint(
     let reaction_force = crate::user_problem::probe_reaction_force(&model, &spec, &device);
     let energy_balance = crate::user_problem::probe_energy_balance(&model, &spec, &device);
     let network_snapshot = crate::network::network_snapshot(&model);
+    // Transient - constructed only to enumerate `loss_terms()`, no network/training involved.
+    let stress_source_report: Vec<(&'static str, &'static str)> =
+        crate::training_core::stress_source_report(&crate::user_problem::UserDefinedProblem::new(spec.clone()))
+            .into_iter()
+            .map(|(name, source)| (name, match source {
+                crate::problem::StressSource::Direct => "Direct",
+                crate::problem::StressSource::Derived => "Derived",
+                crate::problem::StressSource::Both => "Both",
+            }))
+            .collect();
 
     let update = TrainingUpdate {
         step: 0, total_loss: 0.0, energy_loss: 0.0, neumann_loss: 0.0, lr: 0.0,
@@ -1699,6 +1725,7 @@ pub fn serve_loaded_plate_checkpoint(
         network_snapshot: Some(network_snapshot),
         architecture_event: None, // loaded, not (re)trained this session - nothing happened
         gradient_share_report: None, // no training step ran, so no per-term gradient exists
+        stress_source_report,
     };
     let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
     let _ = tx.send(TrainingMsg::Done);

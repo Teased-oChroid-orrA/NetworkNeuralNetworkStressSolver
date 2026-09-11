@@ -252,6 +252,7 @@ impl LossTerm for InteriorEnergyTerm {
     fn name(&self) -> &'static str { "interior_energy" }
     fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
+    // Strain-energy only - no stress quantity at the term level.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("interior_energy: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("interior_energy: strains must be Some");
@@ -288,6 +289,9 @@ impl LossTerm for EquilibriumTerm {
     fn point_sets(&self) -> Vec<&'static str> { vec![self.point_set] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
     fn needs_hessian(&self) -> bool { true }
+    // `equilibrium_from_displacement_hessian_loss` applies Hooke's law constants to the
+    // Hessian internally (`σ=C:ε(u)`, via second derivatives rather than FD strain) - derived.
+    fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("equilibrium: domain missing");
         let (u_xx, u_yy, u_xy, v_xx, v_yy, v_xy) = d.hessian.clone()
@@ -317,6 +321,8 @@ impl LossTerm for OuterTractionTerm {
     fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["outer_boundary"] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
+    // `neumann_loss` computes stress from strain via `compute_stress`.
+    fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("outer_traction: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("outer_traction: strains must be Some");
@@ -363,6 +369,7 @@ impl LossTerm for ExternalWorkTerm {
     fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["outer_boundary"] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
+    // Displacement-only (`u`,`v` dotted with the applied traction) - no stress quantity.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("external_work: domain missing");
         let (nx, ny) = d.normals.clone().expect("external_work: normals must be Some");
@@ -390,6 +397,14 @@ impl LossTerm for HoleBcTerm {
     fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec![self.point_set] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
+    // Runtime-dependent: `Free` reads `raw_out` cols 2..5 directly (FD is undefined exactly at
+    // the hole boundary); `Fixed` is displacement-only.
+    fn stress_source(&self) -> Option<crate::problem::StressSource> {
+        match self.bc {
+            HoleBc::Free => Some(crate::problem::StressSource::Direct),
+            HoleBc::Fixed => None,
+        }
+    }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("hole_bc: domain missing");
         let n = d.raw_out.dims()[0];
@@ -943,6 +958,8 @@ use pinn_core::messages::HoleBoundaryPoint;
 /// hole). Reuses the exact same forward-pass/FD-stencil/scaling machinery `evaluate_user_
 /// vis_grid`/`compute_domain_forwards` already use — no new physics, just a different
 /// (angular, not grid) point layout.
+///
+/// Reads DIRECT mDEM σ - see [`PROBE_HOLE_BOUNDARY_PROFILE_SOURCE`].
 pub fn probe_hole_boundary_profile(
     model: &crate::network::ElasticityNet<crate::training_core::BInner>,
     geometry: &UserGeometry,
@@ -1009,6 +1026,33 @@ pub fn probe_hole_boundary_profile(
     }).collect()
 }
 
+/// [`crate::problem::StressSource`] of [`probe_hole_boundary_profile`]'s output - a plain
+/// `const`, not a runtime computation, since the source is a static fact about which function
+/// you called. General-PINN architecture recommendations §4's own worked example is literally
+/// this chain (`Kt -> σ -> ...`) - see [`dependency_chain_for_kt`].
+pub const PROBE_HOLE_BOUNDARY_PROFILE_SOURCE: crate::problem::StressSource = crate::problem::StressSource::Direct;
+/// [`crate::problem::StressSource`] of [`probe_hole_boundary_profile_derived`]'s output.
+pub const PROBE_HOLE_BOUNDARY_PROFILE_DERIVED_SOURCE: crate::problem::StressSource = crate::problem::StressSource::Derived;
+
+/// Prints the literal `Kt -> σ -> ...` dependency chain General-PINN architecture
+/// recommendations §4 uses as its own worked example for "diagnostics should be able to print
+/// [this]" - scoped to the one chain this codebase actually has (Kt is always computed from a
+/// [`HoleBoundaryPoint`] profile, which is always built by one of the two probes above).
+/// `derived` should be `true` when the profile came from [`probe_hole_boundary_profile_derived`]
+/// (the production Kt path, since bugSource-New #12), `false` for
+/// [`probe_hole_boundary_profile`] (the hole-BC-satisfaction-only variant).
+pub fn dependency_chain_for_kt(derived: bool) -> String {
+    let source = if derived { PROBE_HOLE_BOUNDARY_PROFILE_DERIVED_SOURCE } else { PROBE_HOLE_BOUNDARY_PROFILE_SOURCE };
+    match source {
+        crate::problem::StressSource::Derived =>
+            "Kt -> von_mises -> derived sigma (energy::compute_stress) -> strain (FD stencil) -> displacement -> network".to_string(),
+        crate::problem::StressSource::Direct =>
+            "Kt -> von_mises -> direct sigma (network output cols 2..5) -> network".to_string(),
+        crate::problem::StressSource::Both =>
+            unreachable!("a Kt profile probe reads exactly one representation, never both"),
+    }
+}
+
 /// Same sampling/forward-pass machinery as [`probe_hole_boundary_profile`], but reads
 /// DERIVED stress (`σ=C:ε`, from FD strain via [`crate::energy::compute_stress`]) at
 /// `r = hole.radius + margin` instead of the network's direct mDEM σ output exactly at the
@@ -1022,7 +1066,7 @@ pub fn probe_hole_boundary_profile(
 /// stencil's arms from crossing into the hole, the same FD-safety concern
 /// `contains_for_collocation` exists for. The exact-boundary, direct-σ variant stays available
 /// for a DIFFERENT, still-meaningful question — "is the traction-free condition satisfied" —
-/// not concentration.
+/// not concentration. See [`PROBE_HOLE_BOUNDARY_PROFILE_DERIVED_SOURCE`].
 pub fn probe_hole_boundary_profile_derived(
     model: &crate::network::ElasticityNet<crate::training_core::BInner>,
     geometry: &UserGeometry,
@@ -1313,6 +1357,48 @@ mod tests {
         assert_eq!(names.iter().filter(|&&n| n == "hole_free").count(), 1);
         assert_eq!(names.iter().filter(|&&n| n == "hole_fixed").count(), 1);
         crate::problem::validate_loss_terms(&problem);
+    }
+
+    /// `stress_source_report` on `UserDefinedProblem` matches `docs/investigations/
+    /// kt-investigation-bugsource-new.md`'s own §2/§12 written conclusion exactly - the
+    /// generalized, always-available answer to the question that document's own audit had to
+    /// resolve by hand ("which terms still read direct σ after the derived-stress fix?").
+    #[test]
+    fn stress_source_report_matches_the_kt_investigation_docs_written_conclusion() {
+        use crate::problem::StressSource;
+
+        let spec = ProblemSpec {
+            geometry: two_hole_geometry(),
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+        };
+        let problem = UserDefinedProblem::new(spec);
+        let report = crate::training_core::stress_source_report(&problem);
+
+        // `two_hole_geometry()` has one `Free` hole and one `Fixed` hole - `hole_fixed`
+        // (displacement-only) correctly reports no stress source and is absent from `report`,
+        // same as `interior_energy`/`external_work` (also displacement/strain-only). 4 entries
+        // total: equilibrium, outer_traction, and one `hole_free` (the `Fixed` hole's own term
+        // never appears here).
+        for &(name, source) in &[
+            ("equilibrium", StressSource::Derived),
+            ("outer_traction", StressSource::Derived),
+            ("hole_free", StressSource::Direct),
+        ] {
+            assert!(report.contains(&(name, source)), "expected ({name}, {source:?}) in {report:?}");
+        }
+        assert_eq!(report.len(), 3, "report: {report:?}");
+        for absent in ["interior_energy", "external_work", "hole_fixed"] {
+            assert!(!report.iter().any(|(n, _)| *n == absent), "{absent} has no stress source, must be absent from {report:?}");
+        }
+    }
+
+    #[test]
+    fn dependency_chain_for_kt_reflects_which_probe_was_used() {
+        assert!(dependency_chain_for_kt(true).contains("derived"));
+        assert!(dependency_chain_for_kt(false).contains("direct"));
     }
 
     // ─── Phase 10 (Neural-Network-Wide Adaptive Collocation epic): hole-boundary profile ────

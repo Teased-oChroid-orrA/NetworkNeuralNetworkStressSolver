@@ -293,6 +293,9 @@ impl LossTerm for InteriorEnergyTerm {
     fn name(&self) -> &'static str { "interior_energy" }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
+    // Reads strain, computes strain-energy density - never produces/compares a stress value
+    // as a term-level quantity, so genuinely has no stress source to report (`dem_energy_loss`
+    // computes stress internally only as an intermediate of the energy formula).
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("interior_energy: domain not present in inputs");
@@ -315,6 +318,9 @@ impl LossTerm for NeumannTractionTerm {
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["traction"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    // `neumann_loss` computes stress from strain via `compute_stress` before comparing it
+    // against the traction target - derived, not direct.
+    fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("neumann_traction: domain not present in inputs");
@@ -345,6 +351,10 @@ impl LossTerm for HoleTractionTerm {
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["hole"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    // Runtime-dependent, mirroring `compute()`'s own `self.direct` branch exactly.
+    fn stress_source(&self) -> Option<crate::problem::StressSource> {
+        Some(if self.direct { crate::problem::StressSource::Direct } else { crate::problem::StressSource::Derived })
+    }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("hole_traction: domain not present in inputs");
@@ -376,6 +386,7 @@ impl LossTerm for DisplacementAnchorTerm {
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["right_edge"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    // Displacement-only (reads `raw_out` column 0) - no stress quantity involved.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("displacement_anchor: domain not present in inputs");
@@ -408,6 +419,11 @@ impl LossTerm for EquilibriumRingTerm {
     // its doc comment), so the point-set name here is purely documentary.
     fn point_sets(&self) -> Vec<&'static str> { vec!["eq_ring"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
+    // `components` is direct network σ shifted to 4 meta-positions - confirmed by reading
+    // `step_physics`'s mDEM branch: central difference at 4 points, not a second-derivative-
+    // of-displacement chain (see `EquilibriumTerm` in user_problem.rs for the contrasting
+    // derived-stress version of this same physics).
+    fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Direct) }
     fn compute(&self, _inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let [sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym] =
             self.components.clone().expect(
@@ -439,6 +455,10 @@ impl LossTerm for KirschStressTerm {
     fn phase2_only(&self) -> bool { true }
     fn point_sets(&self) -> Vec<&'static str> { vec!["kirsch_probes"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    // Runtime-dependent, mirroring `compute()`'s own `self.direct` branch exactly.
+    fn stress_source(&self) -> Option<crate::problem::StressSource> {
+        Some(if self.direct { crate::problem::StressSource::Direct } else { crate::problem::StressSource::Derived })
+    }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("kirsch_stress: domain not present in inputs");
@@ -478,6 +498,9 @@ impl LossTerm for ConstitutiveConsistencyTerm {
     // interior-energy-family term (constitutive-law residual on the SAME collocation points
     // as `InteriorEnergyTerm`/`EquilibriumRingTerm`), not a boundary/interface condition.
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
+    // Reads AND compares both representations - this term's entire purpose is policing the
+    // gap between them (see `StressSource::Both`'s doc comment).
+    fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Both) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("constitutive_consistency: domain not present in inputs");
@@ -734,6 +757,34 @@ mod tests {
         let n_bc = terms.iter().filter(|t| t.conflict_group() == ConflictGroup::Bc).count();
         assert_eq!(n_physics, 2, "expected exactly 2 Physics-group terms (interior_energy + equilibrium_ring)");
         assert_eq!(n_bc, 4, "expected exactly 4 Bc-group terms");
+    }
+
+    /// Pins each of Kirsch's 6 `loss_terms()` to its expected `stress_source()` classification
+    /// - General-PINN architecture recommendations §4's dependency-tracking Priority 1, same
+    /// "RED before the override lands" discipline as `conflict_group`'s own test above.
+    #[test]
+    fn kirsch_loss_terms_have_expected_stress_source_classification() {
+        use crate::problem::StressSource;
+
+        let material = MaterialProps::al7075_t6();
+        let problem = KirschProblem::new(material, 5, 4000, 3.0);
+        let terms = problem.loss_terms();
+
+        let expected: &[(&str, Option<StressSource>)] = &[
+            ("interior_energy", None),
+            ("neumann_traction", Some(StressSource::Derived)),
+            ("hole_traction", Some(StressSource::Direct)),
+            ("displacement_anchor", None),
+            ("equilibrium_ring", Some(StressSource::Direct)),
+            ("kirsch_stress", Some(StressSource::Direct)),
+        ];
+
+        for term in &terms {
+            let (_, expected_source) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.stress_source(), *expected_source,
+                "term '{}' has stress_source {:?}, expected {:?}", term.name(), term.stress_source(), expected_source);
+        }
     }
 
     /// Regression bar: run the OLD hardcoded `step_physics` path and compare its per-step

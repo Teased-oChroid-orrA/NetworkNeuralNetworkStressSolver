@@ -386,6 +386,16 @@ pub struct TrainingUpdate {
     /// only on the same vis cadence `hole_analyses`/`bc_residual_rms` already use (an extra
     /// backward pass per active term is real cost, never paid every step).
     pub gradient_share_report: Option<GradientShareSummary>,
+    /// General-PINN architecture recommendations §4 (Priority 1, "physics dependency graph"),
+    /// narrowed to the one edge this codebase's own real bugs were about - see
+    /// `pinn_solver::problem::StressSource`'s doc comment. `(term_name, "Direct"/"Derived"/
+    /// "Both")` pairs - plain strings, not the solver's own enum, same "pinn-core never
+    /// depends on pinn-solver" rule `GradientShareSummary` already established. Static per
+    /// problem (doesn't change step to step) - genuinely free to compute every update, unlike
+    /// `gradient_share_report`, so this is never gated/`None`, just possibly empty (Kirsch's
+    /// own path, which doesn't drive its per-step computation through a `BoundaryValueProblem`
+    /// trait object at all - see that path's own doc comment).
+    pub stress_source_report: Vec<(&'static str, &'static str)>,
 }
 
 /// Pin-in-lug analogue of `TrainingUpdate` — one entry per domain's visualization fields,

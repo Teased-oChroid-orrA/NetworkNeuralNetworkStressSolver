@@ -132,12 +132,46 @@ pub trait LossTerm: Send + Sync {
     fn conflict_group(&self) -> ConflictGroup {
         ConflictGroup::Bc
     }
+
+    /// Which stress representation this term's physics actually depends on, if any -
+    /// General-PINN architecture recommendations §4's "every derived quantity must identify
+    /// its source", narrowed to the ONE dependency edge this codebase's own real bugs have
+    /// repeatedly been about (bugSource-New #2/#11/#12: does a term read the network's direct
+    /// mDEM σ output, or σ derived via `energy::compute_stress` from strain/Hessian?).
+    /// Defaults to `None` - NOT a cop-out default: a term that operates purely on strain or
+    /// displacement (no stress quantity anywhere in its `compute()`) genuinely has no stress
+    /// source to report, and should leave this at the default rather than picking one
+    /// arbitrarily. Every concrete `LossTerm` impl that DOES read a stress value must override
+    /// this explicitly, classified by actually reading that term's `compute()` body - same
+    /// "no silent default" discipline `conflict_group` already established, extended to this
+    /// new axis. See [`crate::training_core::stress_source_report`] for the generic consumer.
+    fn stress_source(&self) -> Option<StressSource> {
+        None
+    }
 }
 
 /// Classifies a [`LossTerm`] as either enforcing interior PDE/equilibrium physics or a
 /// boundary/interface condition. See [`LossTerm::conflict_group`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConflictGroup { Physics, Bc }
+
+/// Which stress representation a [`LossTerm`] (or a standalone diagnostic probe, e.g.
+/// `user_problem::probe_hole_boundary_profile`/`probe_hole_boundary_profile_derived`) actually
+/// reads. See [`LossTerm::stress_source`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StressSource {
+    /// Read directly from the network's own mDEM output columns (`raw_out`/`shifted_stress`) -
+    /// never validated against Hooke's law by anything outside a `constitutive_consistency`
+    /// term, if one happens to be registered.
+    Direct,
+    /// Computed via `energy::compute_stress` (`σ=C:ε`) from FD- or Hessian-derived strain.
+    Derived,
+    /// Reads AND compares both representations against each other - `constitutive_consistency`
+    /// is the one real example (its entire purpose is `‖σ_direct − σ_derived‖²`), added as a
+    /// third variant rather than forcing this term into `Direct` or `Derived` alone, which
+    /// would misreport exactly the term whose job is to police the gap between them.
+    Both,
+}
 
 /// A complete boundary-value problem: its domain(s), their sampling/ansatz strategies, loss
 /// terms, base SAW-BRDR weights, curriculum length, and convergence metric/target.

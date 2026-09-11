@@ -275,6 +275,7 @@ impl LossTerm for InteriorEnergyTerm {
     }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
+    // Strain-energy only - no stress quantity at the term level.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain).expect("interior_energy: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("interior_energy: strains must be Some");
@@ -291,6 +292,7 @@ impl LossTerm for LugShankAnchorTerm {
     fn domains(&self) -> Vec<DomainId> { vec![LUG_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["shank_anchor"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    // Displacement-only - no stress quantity involved.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("lug_shank_anchor: domain missing");
         let n = d.raw_out.dims()[0];
@@ -311,6 +313,8 @@ impl LossTerm for LugFreeEdgeTractionTerm {
     fn domains(&self) -> Vec<DomainId> { vec![LUG_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["boundary"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    // Reads `raw_out` cols 2..5 directly.
+    fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Direct) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("lug_free_edge_traction: domain missing");
         let (nx, ny) = d.normals.clone().expect("lug_free_edge_traction: normals must be Some");
@@ -334,6 +338,8 @@ impl LossTerm for PinDrivingTractionTerm {
     fn domains(&self) -> Vec<DomainId> { vec![PIN_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["driving"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    // `neumann_loss` computes stress from strain via `compute_stress`.
+    fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("pin_driving_traction: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("pin_driving_traction: strains must be Some");
@@ -382,6 +388,7 @@ impl LossTerm for InterfacePenetrationTerm {
     fn point_sets(&self) -> Vec<&'static str> { vec!["interface", "interface"] }
     // Signorini KKT boundary/interface condition, not an interior PDE residual.
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    // Displacement-only (radial displacement gap) - no stress quantity involved.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let pin = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("interface_penetration: pin missing");
         let lug = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("interface_penetration: lug missing");
@@ -428,6 +435,8 @@ impl LossTerm for InterfaceNonTensionTerm {
     fn point_sets(&self) -> Vec<&'static str> { vec!["interface"] }
     // Same reasoning as InterfacePenetrationTerm: Signorini KKT boundary condition.
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    // Reads `raw_out` cols 2..5 directly (the pin's own direct mDEM stress).
+    fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Direct) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let pin = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("interface_non_tension: pin missing");
         let n = self.thetas.len();
@@ -1284,5 +1293,34 @@ mod tests {
         let n_bc = terms.iter().filter(|t| t.conflict_group() == ConflictGroup::Bc).count();
         assert_eq!(n_physics, 2, "expected exactly 2 Physics-group terms (pin+lug interior energy)");
         assert_eq!(n_bc, 5, "expected exactly 5 Bc-group terms");
+    }
+
+    /// Pins each of PinLugProblem's 7 `loss_terms()` to its expected `stress_source()`
+    /// classification - General-PINN architecture recommendations §4's dependency-tracking
+    /// Priority 1, same "RED before the override lands" discipline as `conflict_group`'s own
+    /// test above.
+    #[test]
+    fn pinlug_loss_terms_have_expected_stress_source_classification() {
+        use crate::problem::StressSource;
+
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
+        let terms = problem.loss_terms();
+
+        let expected: &[(&str, Option<StressSource>)] = &[
+            ("pin_interior_energy", None),
+            ("lug_interior_energy", None),
+            ("lug_shank_anchor", None),
+            ("lug_free_edge_traction", Some(StressSource::Direct)),
+            ("pin_driving_traction", Some(StressSource::Derived)),
+            ("interface_penetration", None),
+            ("interface_non_tension", Some(StressSource::Direct)),
+        ];
+
+        for term in &terms {
+            let (_, expected_source) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.stress_source(), *expected_source,
+                "term '{}' has stress_source {:?}, expected {:?}", term.name(), term.stress_source(), expected_source);
+        }
     }
 }
