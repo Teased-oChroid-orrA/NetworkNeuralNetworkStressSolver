@@ -346,6 +346,68 @@ pub struct StepOutput {
     /// regions is an already-proven pattern in this codebase (`compute_gradient_conflict_
     /// multi`'s dual Physics/Bc-group backward split), not a new technique.
     pub term_grad_norms: Option<std::collections::HashMap<&'static str, f32>>,
+    /// Generic gradient-share/dominance/inertness summary derived from `term_grad_norms` -
+    /// see [`gradient_share_report`]'s doc comment. `Some` under the exact same
+    /// `probe_term_gradients` gate as `term_grad_norms` (a pure, free post-processing step
+    /// over data already computed - no new tensor ops, no new cost beyond that gate's
+    /// existing one).
+    pub gradient_share_report: Option<GradientShareReport>,
+}
+
+/// A term's gradient contributes less than 1% of the total gradient magnitude across all
+/// active terms - flagged as functionally inert (bugSource-New's own investigation found
+/// `equilibrium` at 5-6 orders of magnitude below this before it was fixed; this threshold is
+/// deliberately generous - genuinely-inert terms in practice measure far below 1%, not
+/// hovering just under it).
+pub const GRADIENT_SHARE_INERT_THRESHOLD: f32 = 0.01;
+/// A term's gradient contributes more than 90% of the total gradient magnitude - flagged as
+/// dominating the optimization (every OTHER active term combined gets under 10%).
+pub const GRADIENT_SHARE_DOMINANT_THRESHOLD: f32 = 0.90;
+
+/// Generic (problem-agnostic) summary of how much each active loss term's OWN gradient
+/// contributes to the total gradient magnitude, `r_i = ||∇L_i|| / Σ_j ||∇L_j||` — General-PINN
+/// architecture recommendations §15's "normalized gradient contribution" report and §30's
+/// automatic inert/dominant-term detection, generalized from this session's own ad-hoc,
+/// test-only `term_grad_norms` printouts (which found `EquilibriumTerm` functionally inert by
+/// eye, in a diagnostic that never runs outside a dedicated `#[ignore]`d unit test) into a
+/// standing, always-computable capability whenever `term_grad_norms` itself is computed.
+///
+/// This is a pure post-processing step over `StepOutput::term_grad_norms` - no new tensor ops,
+/// no new per-step cost beyond `probe_term_gradients`'s existing one. `shares` sums to 1.0
+/// (assuming at least one term has a finite, nonzero gradient norm — see below for the
+/// degenerate all-zero case).
+#[derive(Debug, Clone)]
+pub struct GradientShareReport {
+    pub shares: std::collections::HashMap<&'static str, f32>,
+    pub inert: Vec<&'static str>,
+    pub dominant: Option<&'static str>,
+}
+
+/// Builds a [`GradientShareReport`] from raw per-term gradient L2 norms. Non-finite
+/// (NaN/Infinite) readings are excluded from both the sum and the report entirely (same
+/// fail-safe convention `SawBrdr::update` already established for non-finite loss readings —
+/// a transient bad reading shouldn't corrupt every other term's share). If every reading is
+/// zero or excluded, `shares` is empty and `dominant` is `None` (no term can be said to
+/// dominate a total of zero) rather than dividing by zero.
+pub fn gradient_share_report(
+    term_grad_norms: &std::collections::HashMap<&'static str, f32>,
+) -> GradientShareReport {
+    let total: f32 = term_grad_norms.values().copied().filter(|v| v.is_finite()).sum();
+    if total <= 0.0 {
+        return GradientShareReport { shares: std::collections::HashMap::new(), inert: Vec::new(), dominant: None };
+    }
+    let shares: std::collections::HashMap<&'static str, f32> = term_grad_norms.iter()
+        .filter(|(_, &v)| v.is_finite())
+        .map(|(&name, &v)| (name, v / total))
+        .collect();
+    let inert: Vec<&'static str> = shares.iter()
+        .filter(|(_, &s)| s < GRADIENT_SHARE_INERT_THRESHOLD)
+        .map(|(&name, _)| name)
+        .collect();
+    let dominant = shares.iter()
+        .find(|(_, &s)| s > GRADIENT_SHARE_DOMINANT_THRESHOLD)
+        .map(|(&name, _)| name);
+    GradientShareReport { shares, inert, dominant }
 }
 
 /// Extract (σ_xx, σ_yy, σ_xy) from rows `[row_start, row_end)` of an mDEM network output
@@ -860,6 +922,7 @@ pub fn step_physics(
         timing,
         grad_norm: Some(grad_norm),
         raw_scalar_by_name: None,
+        gradient_share_report: None,
         term_grad_norms: None,
     })
 }
@@ -1641,6 +1704,7 @@ pub fn step_physics_multi(
         timing: None,
         grad_norm: Some(grad_norm),
         raw_scalar_by_name,
+        gradient_share_report: term_grad_norms.as_ref().map(gradient_share_report),
         term_grad_norms,
     })
 }
@@ -3133,6 +3197,52 @@ mod tests {
         let (rms, max) = residual_stats(&[]);
         assert_eq!(rms, 0.0);
         assert_eq!(max, 0.0);
+    }
+
+    /// Hand-computed: total = 0.01+0.09+0.90 = 1.0, shares = norms themselves exactly.
+    /// "b" (0.90) sits exactly AT the dominant threshold, not above it - must NOT be flagged
+    /// (the threshold is `>`, not `>=`) - deliberately chosen to catch an off-by-one/boundary
+    /// bug. "a" (0.01) sits exactly AT the inert threshold - same reasoning, must NOT be
+    /// flagged either.
+    #[test]
+    fn gradient_share_report_matches_hand_computed_shares_and_flags() {
+        let norms: std::collections::HashMap<&'static str, f32> =
+            [("a", 0.01), ("b", 0.90), ("c", 0.09)].into_iter().collect();
+        let report = gradient_share_report(&norms);
+        assert!((report.shares["a"] - 0.01).abs() < 1e-6);
+        assert!((report.shares["b"] - 0.90).abs() < 1e-6);
+        assert!((report.shares["c"] - 0.09).abs() < 1e-6);
+        assert!(report.inert.is_empty(), "0.01 sits exactly at the threshold, not below it: {:?}", report.inert);
+        assert_eq!(report.dominant, None, "0.90 sits exactly at the threshold, not above it");
+    }
+
+    #[test]
+    fn gradient_share_report_flags_genuinely_inert_and_dominant_terms() {
+        let norms: std::collections::HashMap<&'static str, f32> =
+            [("inert", 1e-7), ("dominant", 0.999), ("mid", 0.000999)].into_iter().collect();
+        let report = gradient_share_report(&norms);
+        assert!(report.inert.contains(&"inert"), "{:?}", report.inert);
+        assert_eq!(report.dominant, Some("dominant"));
+    }
+
+    #[test]
+    fn gradient_share_report_all_zero_returns_empty_not_nan_or_panic() {
+        let norms: std::collections::HashMap<&'static str, f32> =
+            [("a", 0.0), ("b", 0.0)].into_iter().collect();
+        let report = gradient_share_report(&norms);
+        assert!(report.shares.is_empty());
+        assert!(report.inert.is_empty());
+        assert_eq!(report.dominant, None);
+    }
+
+    #[test]
+    fn gradient_share_report_excludes_non_finite_readings_without_poisoning_others() {
+        let norms: std::collections::HashMap<&'static str, f32> =
+            [("nan_term", f32::NAN), ("a", 0.5), ("b", 0.5)].into_iter().collect();
+        let report = gradient_share_report(&norms);
+        assert!(!report.shares.contains_key("nan_term"));
+        assert!((report.shares["a"] - 0.5).abs() < 1e-6);
+        assert!((report.shares["b"] - 0.5).abs() < 1e-6);
     }
 
     use crate::kirsch_problem::KirschProblem;
@@ -4942,6 +5052,7 @@ mod tests {
             timing: None,
             grad_norm: None,
             raw_scalar_by_name: None,
+            gradient_share_report: None,
             term_grad_norms: None,
         })
     }

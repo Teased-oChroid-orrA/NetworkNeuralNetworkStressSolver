@@ -457,6 +457,7 @@ pub fn run_training(
                 grad_norm: None,
                 raw_scalar_by_name: None,
                 term_grad_norms: None,
+                gradient_share_report: None,
             };
             (new_m, synthetic)
         } else {
@@ -619,6 +620,10 @@ pub fn run_training(
                 // Smart adaptive architecture is out of scope for Kirsch's own path (no
                 // `NetworkSpec::adaptive` field exists on `SolverConfig` to enable it).
                 architecture_event: None,
+                // Kirsch's frozen `step_physics` path never sets `probe_term_gradients` (see
+                // `StepOutput::term_grad_norms`'s doc comment - it's a `step_physics_multi`-
+                // only diagnostic in this pass).
+                gradient_share_report: None,
             };
             let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         }
@@ -1415,6 +1420,14 @@ fn run_user_problem_training_from(
             }
         }
 
+        // Hoisted above `ctx`'s construction (previously computed just before its own use
+        // below) so `probe_term_gradients` can be gated on the same cadence as the other
+        // vis-cadence-only expensive probes (`hole_analyses`/`bc_residual_rms`/etc.) - see
+        // `MultiStepCtx::probe_term_gradients`'s doc comment for why this can never be
+        // unconditionally `true` on a hot path (N extra backward passes/step), but tying it to
+        // the already-established "expensive, infrequent" cadence costs nothing new in kind,
+        // only in the same already-accepted vis-cadence magnitude.
+        let send_vis = step % 10 == 0 || step + 1 == spec.training.max_steps;
         let ctx = MultiStepCtx {
             config: &config,
             problem: &problem,
@@ -1455,7 +1468,7 @@ fn run_user_problem_training_from(
             // `input_dim` (below, at this function's model-construction site) MUST use the
             // SAME value - see that call site's own comment.
             n_fourier: spec.geometry.n_fourier(),
-            probe_term_gradients: false,
+            probe_term_gradients: send_vis,
             phase2_active: true,
             step,
         };
@@ -1474,7 +1487,6 @@ fn run_user_problem_training_from(
         // complaint on a config slow enough that 10 steps takes several seconds. The
         // expensive field probe still only runs on the original every-10th-step/last-step
         // cadence.
-        let send_vis = step % 10 == 0 || step + 1 == spec.training.max_steps;
         let mut architecture_event = None;
         let (vis, hole_analyses, bc_residual_rms, bc_residual_max, reaction_force, energy_balance, network_snapshot) = if send_vis {
             let model_val: ElasticityNet<BInner> = model.valid();
@@ -1566,6 +1578,14 @@ fn run_user_problem_training_from(
         last_total_loss = out.total_scalar;
         let energy_loss = out.e_scalar;
         let neumann_loss = out.total_scalar - energy_loss;
+        // `training_core::GradientShareReport` -> `pinn_core::messages::GradientShareSummary` -
+        // a separate transport-side type so `pinn-core` never depends on `pinn-solver` (same
+        // reasoning as `HoleBoundaryPoint`/`StressConcentration`).
+        let gradient_share_report = out.gradient_share_report.map(|r| pinn_core::messages::GradientShareSummary {
+            shares: r.shares.into_iter().collect(),
+            inert: r.inert,
+            dominant: r.dominant,
+        });
         let update = TrainingUpdate {
             step,
             total_loss: out.total_scalar,
@@ -1586,6 +1606,7 @@ fn run_user_problem_training_from(
             energy_balance,
             network_snapshot,
             architecture_event,
+            gradient_share_report,
         };
         let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         if auto_stopped {
@@ -1677,6 +1698,7 @@ pub fn serve_loaded_plate_checkpoint(
         reaction_force: Some(reaction_force), energy_balance: Some(energy_balance),
         network_snapshot: Some(network_snapshot),
         architecture_event: None, // loaded, not (re)trained this session - nothing happened
+        gradient_share_report: None, // no training step ran, so no per-term gradient exists
     };
     let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
     let _ = tx.send(TrainingMsg::Done);
@@ -3116,18 +3138,24 @@ mod tests {
         let fd = FdConfig::new(1e-3, 2.0 * half_w, 2.0 * half_h);
         let material = pinn_core::material::MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 };
         let get1 = |t: Tensor<BInner, 1>| -> f64 { t.into_data().to_vec::<f32>().unwrap()[0] as f64 };
-        let sigma_at = |x: f64, y: f64| -> (f64, f64, f64) {
+        let sigma_at = |x: f64, y: f64| -> (f64, f64, f64, f64, f64) {
             let xn = (x / half_w) as f32;
             let yn = (y / half_h) as f32;
             let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&[[xn, yn]], &device), &fd, &device);
             let raw = fwd::<BInner>(&model, stencil, 0, &device);
+            // Raw network output at the centre row (row 0 of the 5-row stencil) - the
+            // no-hole plate's `IdentityAnsatz` applies no extra per-point scale factor, so
+            // this IS `u_norm`/`v_norm` exactly (bugSource-New #8's own normalized-slope
+            // diagnostic: `u_norm ≈ x_norm`, `v_norm ≈ -ν·y_norm`).
+            let u_norm = get1(raw.clone().slice([0..1, 0..1]).reshape([1]));
+            let v_norm = get1(raw.clone().slice([0..1, 1..2]).reshape([1]));
             let scaled = Tensor::<BInner, 2>::cat(vec![
                 raw.clone().slice([0..5, 0..2]).mul_scalar(u_ref as f64),
                 raw.slice([0..5, 2..5]).mul_scalar(stress_ref),
             ], 1);
             let (exx, eyy, exy) = compute_strains::<BInner>(scaled, 1, &fd);
             let (sxx, syy, sxy) = compute_stress::<BInner>(exx, eyy, exy, &material);
-            (get1(sxx), get1(syy), get1(sxy))
+            (get1(sxx), get1(syy), get1(sxy), u_norm, v_norm)
         };
 
         // A grid of interior points (not just edges/centerline) - the whole point is
@@ -3135,11 +3163,16 @@ mod tests {
         let mut sxx_v = Vec::new();
         let mut syy_v = Vec::new();
         let mut sxy_v = Vec::new();
+        // (x_norm, u_norm) and (y_norm, v_norm) pairs for bugSource-New #8's slope check.
+        let mut xu_pairs: Vec<(f64, f64)> = Vec::new();
+        let mut yv_pairs: Vec<(f64, f64)> = Vec::new();
         for &fx in &[-0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75] {
             for &fy in &[-0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75] {
-                let (sxx, syy, sxy) = sigma_at(fx * half_w, fy * half_h);
+                let (sxx, syy, sxy, u_norm, v_norm) = sigma_at(fx * half_w, fy * half_h);
                 println!("  [no-hole] x={:>8.4} y={:>8.4}  sigma_xx={sxx:>14.4e}  sigma_yy={syy:>14.4e}  sigma_xy={sxy:>14.4e}", fx * half_w, fy * half_h);
                 sxx_v.push(sxx); syy_v.push(syy); sxy_v.push(sxy);
+                xu_pairs.push((fx, u_norm));
+                yv_pairs.push((fy, v_norm));
             }
         }
         let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
@@ -3150,6 +3183,28 @@ mod tests {
             syy_mean.abs() / stress_ref * 100.0,
             sxy_mean.abs() / stress_ref * 100.0,
         );
+
+        // bugSource-New #8: ordinary least-squares slope+intercept of u_norm vs x_norm and
+        // v_norm vs y_norm across the same 49-point grid. Expected: slope≈1 (u), slope≈-ν≈-0.33
+        // (v), both near-zero intercept - "if those slopes aren't emerging, don't investigate
+        // the hole" (their words). A cheap, no-extra-training diagnostic reusing the grid
+        // already computed above.
+        let ols_slope_intercept = |pairs: &[(f64, f64)]| -> (f64, f64) {
+            let n = pairs.len() as f64;
+            let sx: f64 = pairs.iter().map(|&(x, _)| x).sum();
+            let sy: f64 = pairs.iter().map(|&(_, y)| y).sum();
+            let sxx: f64 = pairs.iter().map(|&(x, _)| x * x).sum();
+            let sxy: f64 = pairs.iter().map(|&(x, y)| x * y).sum();
+            let denom = n * sxx - sx * sx;
+            let slope = (n * sxy - sx * sy) / denom;
+            let intercept = (sy - slope * sx) / n;
+            (slope, intercept)
+        };
+        let (u_slope, u_intercept) = ols_slope_intercept(&xu_pairs);
+        let (v_slope, v_intercept) = ols_slope_intercept(&yv_pairs);
+        let nu = material.nu as f64;
+        println!("  [no-hole] du_norm/dx_norm = {u_slope:.4} (expected ~1.0), intercept={u_intercept:.4e}");
+        println!("  [no-hole] dv_norm/dy_norm = {v_slope:.4} (expected ~{:.4}), intercept={v_intercept:.4e}", -nu);
         // Loose tolerance (this is a finite-plate/network-approximation sanity check, not
         // exact FEA) - but a genuinely working formulation should land well inside 30%.
         assert!((sxx_mean - stress_ref).abs() / stress_ref < 0.30,

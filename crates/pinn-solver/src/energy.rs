@@ -202,6 +202,25 @@ pub fn constitutive_consistency_loss<B: Backend>(
     (ex.clone() * ex + ey.clone() * ey + ez.clone() * ez).mean()
 }
 
+/// General-PINN architecture recommendations §31 ("automatic cheating-solution detection"):
+/// compare two mathematically-equivalent representations of the same physical quantity and
+/// flag divergence — here, direct mDEM σ vs. derived (Hooke) σ at the same point, the exact
+/// dual-representation gap this session's Kt investigation found and fixed by hand (bugSource-
+/// New #2/#11/#12). Computes the SAME quantity `constitutive_consistency_loss` does
+/// (`‖direct − derived‖² / ref_stress2`), but as a plain, non-differentiable, single-point f32
+/// function — a standing diagnostic usable even for a problem that never registers
+/// `constitutive_consistency` as a training loss at all (§28's "residuals and losses are
+/// different concepts": a problem can still ask "are these two representations consistent?" as
+/// a health check without training against the answer).
+pub fn representation_consistency_check(
+    direct: (f32, f32, f32),
+    derived: (f32, f32, f32),
+    ref_stress2: f32,
+) -> f32 {
+    let (dxx, dyy, dxy) = (direct.0 - derived.0, direct.1 - derived.1, direct.2 - derived.2);
+    (dxx * dxx + dyy * dyy + dxy * dxy) / ref_stress2.max(1e-30)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +433,50 @@ mod tests {
         assert!((sxx_v - 1.6).abs() < 1e-4, "sxx: expected 1.6, got {sxx_v}");
         assert!((syy_v - 2.4).abs() < 1e-4, "syy: expected 2.4, got {syy_v}");
         assert!((sxy_v - 0.4).abs() < 1e-4, "sxy: expected 0.4, got {sxy_v}");
+    }
+
+    #[test]
+    fn representation_consistency_check_matches_hand_computed_value() {
+        // direct-derived = (3,4,0) -> ||.||^2 = 25; ref_stress2=5 -> 25/5=5.0
+        let v = representation_consistency_check((13.0, 4.0, 10.0), (10.0, 0.0, 10.0), 5.0);
+        assert!((v - 5.0).abs() < 1e-6, "expected 5.0, got {v}");
+    }
+
+    #[test]
+    fn representation_consistency_check_zero_when_representations_agree() {
+        let v = representation_consistency_check((1.0, 2.0, 3.0), (1.0, 2.0, 3.0), 1.0);
+        assert_eq!(v, 0.0);
+    }
+
+    /// Proves the "computes the SAME quantity as `constitutive_consistency_loss`" claim in
+    /// `representation_consistency_check`'s doc comment, rather than just asserting it - runs
+    /// both on the same single-point (N=1) inputs (a plain scalar strain state, so
+    /// `compute_stress`'s derived output is unambiguous) and confirms they agree to float
+    /// precision.
+    #[test]
+    fn representation_consistency_check_matches_constitutive_consistency_loss_for_a_single_point() {
+        let get = |t: Tensor<TB, 1>| -> f64 { t.into_data().to_vec::<f32>().unwrap()[0] as f64 };
+        let mat = material(71.7e9, 0.33);
+        let (eps_xx, eps_yy, eps_xy) = (1e-3_f64, -2e-4_f64, 5e-4_f64);
+        let (direct_sxx, direct_syy, direct_sxy) = (6.9e7_f32, 1.0e6_f32, -2.0e6_f32);
+
+        let tensor_loss = get(constitutive_consistency_loss::<TB>(
+            t1(direct_sxx), t1(direct_syy), t1(direct_sxy),
+            t1(eps_xx as f32), t1(eps_yy as f32), t1(eps_xy as f32),
+            &mat,
+        ));
+
+        let (derived_sxx, derived_syy, derived_sxy) = {
+            let (sxx, syy, sxy) = compute_stress::<TB>(t1(eps_xx as f32), t1(eps_yy as f32), t1(eps_xy as f32), &mat);
+            (get(sxx) as f32, get(syy) as f32, get(sxy) as f32)
+        };
+        let check = representation_consistency_check(
+            (direct_sxx, direct_syy, direct_sxy),
+            (derived_sxx, derived_syy, derived_sxy),
+            1.0,
+        );
+        assert!((check as f64 - tensor_loss).abs() / tensor_loss.max(1.0) < 1e-4,
+            "representation_consistency_check={check} vs constitutive_consistency_loss={tensor_loss}");
     }
 
     #[test]

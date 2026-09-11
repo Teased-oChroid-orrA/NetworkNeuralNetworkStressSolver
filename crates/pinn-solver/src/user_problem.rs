@@ -61,6 +61,17 @@ const LAM_OUTER_TRACTION: f32 = 10.0;
 /// (~10x, matching the observed gap; also `constitutive_consistency`'s existing fixed weight,
 /// not a new magnitude in this codebase) is the first thing to test, not a final tuned value.
 const LAM_EQUILIBRIUM_PLATE: f32 = 50.0;
+/// Base weight for `ExternalWorkTerm` - deliberately NOT tied to `LAM_INTERIOR_ENERGY` (the
+/// TRUE `Π=U-W_ext` 1:1 ratio `ExternalWorkTerm` was originally given). bugSource-New #8's
+/// displacement-slope diagnostic on the trained no-hole model found `du_norm/dx_norm=0.816`
+/// (target 1.0) and `dv_norm/dy_norm=-0.246` (target -0.33) - the network is systematically
+/// under-stretching, i.e. `interior_energy` (U, preferring less strain) is still winning
+/// against `external_work` (-W_ext, rewarding more strain) even with the 1:1 ratio the true
+/// functional calls for. `5.0` tests whether tipping that ratio in `external_work`'s favor
+/// closes the slope gap - the same "boost the weaker term's weight directly, since SAW-BRDR's
+/// loss-decay-rate-based adaptation doesn't compare cross-term gradients" lever already used
+/// for `equilibrium`, not a final tuned value.
+const LAM_EXTERNAL_WORK: f32 = 20.0;
 const LAM_HOLE_FREE: f32 = 100.0;
 const LAM_HOLE_FIXED: f32 = 50.0;
 
@@ -500,10 +511,7 @@ impl BoundaryValueProblem for UserDefinedProblem {
             "interior_energy" => LAM_INTERIOR_ENERGY,
             "equilibrium" => LAM_EQUILIBRIUM_PLATE,
             "outer_traction" => LAM_OUTER_TRACTION,
-            // Same weight as `interior_energy` - approximates the TRUE Π=U-W_ext functional's
-            // own 1:1 ratio (see `ExternalWorkTerm`'s doc comment), not an arbitrarily tuned
-            // number.
-            "external_work" => LAM_INTERIOR_ENERGY,
+            "external_work" => LAM_EXTERNAL_WORK,
             "hole_free" => LAM_HOLE_FREE,
             "hole_fixed" => LAM_HOLE_FIXED,
             other => panic!("UserDefinedProblem::base_weight: unknown loss term '{other}'"),

@@ -327,6 +327,19 @@ pub struct HoleAnalysis {
     pub concentration: StressConcentration,
 }
 
+/// Transport-side mirror of `pinn_solver::training_core::GradientShareReport` — a separate
+/// type (not the solver's own) so `pinn-core` never needs to depend on `pinn-solver`, same
+/// pattern `HoleBoundaryPoint`/`StressConcentration` already established for this exact reason
+/// (see their own doc comments). General-PINN architecture recommendations §15/§30: which
+/// active loss term's gradient dominates optimization, and which are functionally inert.
+#[derive(Debug, Clone)]
+pub struct GradientShareSummary {
+    /// `(term_name, share)` pairs, `share = ||grad_i|| / Σ_j ||grad_j||`, summing to ~1.0.
+    pub shares: Vec<(&'static str, f32)>,
+    pub inert: Vec<&'static str>,
+    pub dominant: Option<&'static str>,
+}
+
 pub struct TrainingUpdate {
     pub step: usize,
     pub total_loss:   f32,
@@ -368,6 +381,11 @@ pub struct TrainingUpdate {
     /// Smart adaptive architecture — see `ArchitectureEvent`'s doc comment. `Some` only on the
     /// exact step an action was applied, `None` on every other step (not a vis-cadence field).
     pub architecture_event: Option<ArchitectureEvent>,
+    /// General-PINN architecture recommendations §15/§30, generalized from this session's own
+    /// ad-hoc `term_grad_norms` diagnostic — see `GradientShareSummary`'s doc comment. `Some`
+    /// only on the same vis cadence `hole_analyses`/`bc_residual_rms` already use (an extra
+    /// backward pass per active term is real cost, never paid every step).
+    pub gradient_share_report: Option<GradientShareSummary>,
 }
 
 /// Pin-in-lug analogue of `TrainingUpdate` — one entry per domain's visualization fields,

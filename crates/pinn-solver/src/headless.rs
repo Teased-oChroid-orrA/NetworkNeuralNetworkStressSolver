@@ -434,6 +434,7 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                 grad_norm: None,
                 raw_scalar_by_name: None,
                 term_grad_norms: None,
+                gradient_share_report: None,
             };
             (new_m, synthetic_out)
         } else {
@@ -1139,6 +1140,7 @@ pub(crate) fn run_headless_pinlug_inner(
                 grad_norm: None,
                 raw_scalar_by_name: None,
                 term_grad_norms: None,
+                gradient_share_report: None,
             }
         } else {
             // tier_u8 is a pure logging passthrough (StepOutput.optimizer_tier) — never
