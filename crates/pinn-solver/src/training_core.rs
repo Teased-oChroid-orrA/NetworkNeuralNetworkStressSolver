@@ -159,6 +159,42 @@ pub fn compute_reference_scales(config: &SolverConfig) -> (f32, f32, f32) {
     (u_ref, ref_energy, ref_stress2)
 }
 
+/// `UserDefinedProblem` (the plate path)'s analogue of [`compute_reference_scales`] above -
+/// General-PINN architecture recommendations §35-37 (Priority 2, "dimensionless
+/// normalization"). Before this existed, `stress_ref`/`u_ref`/`ref_energy`/`ref_stress2` were
+/// each independently hand-written at ~15 separate call sites across `user_problem.rs`/
+/// `runner.rs` (production AND test code) - the exact class of duplication that let the real
+/// `ref_div2` bug happen (bugSource-New #12/this session's own Kt investigation): a term's
+/// author had to invent/copy a normalization formula by hand and substituted the wrong one
+/// (an `fd_h`-dependent formula for an `fd_h`-independent quantity). `stress_per_length2` is
+/// that exact quantity, computed the one correct way here instead of being reinvented per
+/// caller.
+#[derive(Debug, Clone, Copy)]
+pub struct PlateReferenceScales {
+    pub stress_ref: f64,
+    pub u_ref: f32,
+    pub ref_energy: f32,
+    pub ref_stress2: f32,
+    /// `(px / char_length)^2` - the correct, `fd_h`-INDEPENDENT normalization for any "stress
+    /// per length" quantity (e.g. `equilibrium`'s Hessian-based residual - see
+    /// `user_problem::EquilibriumTerm`'s doc comment for the bug this scale's own formula was
+    /// found fixing). Deliberately keyed on `load.px` specifically, not `stress_ref` (which is
+    /// `max(|px|,|py|)`) - matches the exact pre-existing formula this centralizes, not a new
+    /// (possibly biaxial-load-sensitive) choice; changing that convention is out of scope for
+    /// a value-preserving centralization.
+    pub stress_per_length2: f64,
+}
+
+pub fn compute_reference_scales_for_plate(spec: &pinn_core::problem_spec::ProblemSpec) -> PlateReferenceScales {
+    let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
+    let u_ref = ((stress_ref / spec.material.e) * spec.geometry.half_w) as f32;
+    let ref_energy = (0.5 * stress_ref * stress_ref / spec.material.e).max(1.0) as f32;
+    let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
+    let char_length = spec.geometry.half_w.max(spec.geometry.half_h).max(1e-9);
+    let stress_per_length2 = (spec.load.px / char_length).powi(2).max(1.0);
+    PlateReferenceScales { stress_ref, u_ref, ref_energy, ref_stress2, stress_per_length2 }
+}
+
 /// Floors the MAGNITUDE of a divisor at 1.0 while preserving sign — the linear-divisor
 /// analogue of `ref_div2`'s `.max(1.0)` guard, which is safe to apply directly only because
 /// that divisor is pre-squared (always >= 0). `px * half_w` here is not squared, so a naive
@@ -3205,6 +3241,45 @@ mod tests {
         let (rms, max) = residual_stats(&[3.0, 4.0]); // rms = sqrt((9+16)/2) = 3.5355...
         assert!((rms - 3.5355339).abs() < 1e-5);
         assert!((max - 4.0).abs() < 1e-9);
+    }
+
+    fn plate_spec_for_scale_test(fd_h: f32) -> pinn_core::problem_spec::ProblemSpec {
+        use pinn_core::{loading::LoadConfig, material::MaterialProps, problem_spec::{NetworkSpec, ProblemSpec, TrainingSpec}, user_geometry::UserGeometry};
+        ProblemSpec {
+            geometry: UserGeometry { half_w: 0.1, half_h: 0.05, thickness: 0.005, holes: Vec::new() },
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: NetworkSpec::default(),
+            training: TrainingSpec { max_steps: 1, n_interior: 1, n_boundary: 1, fd_h, lr: 1e-3 },
+        }
+    }
+
+    /// Hand-computed: stress_ref=6.9e7 (px dominates, py=0), u_ref=(6.9e7/71.7e9)*0.1,
+    /// ref_energy=0.5*6.9e7^2/71.7e9, ref_stress2=6.9e7^2, stress_per_length2=(6.9e7/0.1)^2
+    /// (char_length=max(0.1,0.05)=0.1).
+    #[test]
+    fn compute_reference_scales_for_plate_matches_hand_computed_values() {
+        let spec = plate_spec_for_scale_test(1e-3);
+        let s = compute_reference_scales_for_plate(&spec);
+        let stress_ref = 6.9e7_f64;
+        let e = 71.7e9_f64;
+        assert!((s.stress_ref - stress_ref).abs() / stress_ref < 1e-9);
+        assert!((s.u_ref as f64 - (stress_ref / e) * 0.1).abs() / ((stress_ref / e) * 0.1) < 1e-5);
+        assert!((s.ref_energy as f64 - 0.5 * stress_ref * stress_ref / e).abs() / (0.5 * stress_ref * stress_ref / e) < 1e-5);
+        assert!((s.ref_stress2 as f64 - stress_ref * stress_ref).abs() / (stress_ref * stress_ref) < 1e-5);
+        let expected_spl2 = (stress_ref / 0.1_f64).powi(2);
+        assert!((s.stress_per_length2 - expected_spl2).abs() / expected_spl2 < 1e-9);
+    }
+
+    /// Regression guard for the exact bug class `PlateReferenceScales` exists to prevent
+    /// (bugSource-New #12/this session's `ref_div2` bug): `stress_per_length2` must NOT depend
+    /// on `fd_h` - two specs differing ONLY in `training.fd_h` must produce identical values.
+    #[test]
+    fn stress_per_length2_is_independent_of_fd_h() {
+        let a = compute_reference_scales_for_plate(&plate_spec_for_scale_test(1e-3));
+        let b = compute_reference_scales_for_plate(&plate_spec_for_scale_test(1e-1));
+        assert_eq!(a.stress_per_length2, b.stress_per_length2,
+            "stress_per_length2 must be identical regardless of fd_h: {} vs {}", a.stress_per_length2, b.stress_per_length2);
     }
 
     #[test]

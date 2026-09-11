@@ -81,10 +81,8 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
     let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
 
-    let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
-    let u_ref = ((stress_ref / spec.material.e) * half_w) as f32;
-    let ref_energy = (0.5 * stress_ref * stress_ref / spec.material.e).max(1.0) as f32;
-    let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
+    let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+    let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
 
     let sampling = problem.sampling_strategy(0);
     let placeholder_geom = pinn_core::geometry::GeometryConfig::kirsch_plate_inches(); // ignored by UserSamplingStrategy

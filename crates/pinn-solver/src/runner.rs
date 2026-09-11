@@ -1274,10 +1274,8 @@ fn run_user_problem_training_from(
     let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
 
-    let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
-    let u_ref = ((stress_ref / spec.material.e) * half_w) as f32;
-    let ref_energy = (0.5 * stress_ref * stress_ref / spec.material.e).max(1.0) as f32;
-    let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
+    let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+    let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
 
     let placeholder_geom = pinn_core::geometry::GeometryConfig::kirsch_plate_inches(); // ignored by UserSamplingStrategy
     let [nx_vis, ny_vis] = config.vis_grid;
@@ -1681,8 +1679,7 @@ pub fn serve_loaded_plate_checkpoint(
     let device = BDevice::default();
     let half_w = spec.geometry.half_w;
     let half_h = spec.geometry.half_h;
-    let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
-    let u_ref = ((stress_ref / spec.material.e) * half_w) as f32;
+    let u_ref = crate::training_core::compute_reference_scales_for_plate(&spec).u_ref;
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
     let [nx_vis, ny_vis] = SolverConfig::default_kirsch().vis_grid;
 
@@ -2231,10 +2228,8 @@ mod tests {
             extra_ring_norm: Vec::new(), named,
         };
 
-        let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
-        let u_ref = ((stress_ref / spec.material.e) * half_w) as f32;
-        let ref_energy = (0.5 * stress_ref * stress_ref / spec.material.e).max(1.0) as f32;
-        let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
+        let scales = crate::training_core::compute_reference_scales_for_plate(spec);
+        let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
         let config = SolverConfig::default_kirsch();
 
         for step in 0..steps {
@@ -2314,10 +2309,8 @@ mod tests {
             extra_ring_norm: Vec::new(), named,
         };
 
-        let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
-        let u_ref = ((stress_ref / spec.material.e) * half_w) as f32;
-        let ref_energy = (0.5 * stress_ref * stress_ref / spec.material.e).max(1.0) as f32;
-        let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
+        let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+        let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
         let config = SolverConfig::default_kirsch();
 
         let print_steps = [0usize, 10, 50, 100, 199];
@@ -2419,10 +2412,8 @@ mod tests {
             extra_ring_norm: Vec::new(), named,
         };
 
-        let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
-        let u_ref = ((stress_ref / spec.material.e) * half_w) as f32;
-        let ref_energy = (0.5 * stress_ref * stress_ref / spec.material.e).max(1.0) as f32;
-        let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
+        let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+        let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
         let config = SolverConfig::default_kirsch();
 
         let print_steps = [0usize, 10, 50, 100, 199];
@@ -2476,8 +2467,7 @@ mod tests {
         let model = train_small_user_problem(&trained_spec, 300);
         let device = BDevice::default();
         let fd = FdConfig::new(trained_spec.training.fd_h, 2.0 * trained_spec.geometry.half_w, 2.0 * trained_spec.geometry.half_h);
-        let stress_ref = trained_spec.load.px.abs().max(trained_spec.load.py.abs()).max(1.0);
-        let u_ref = ((stress_ref / trained_spec.material.e) * trained_spec.geometry.half_w) as f32;
+        let u_ref = crate::training_core::compute_reference_scales_for_plate(&trained_spec).u_ref;
 
         // "Perturb material after training, without retraining" - keep u_ref/px_pa fixed at
         // the ORIGINAL trained scale (see pinn_core::inference_envelope's doc comment: these
@@ -3291,8 +3281,7 @@ mod tests {
         let spec = single_hole_like_spec(3000);
         let half_w = spec.geometry.half_w;
         let half_h = spec.geometry.half_h;
-        let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
-        let u_ref = ((stress_ref / spec.material.e) * half_w) as f32;
+        let u_ref = crate::training_core::compute_reference_scales_for_plate(&spec).u_ref;
         let fd = crate::fd_stencil::FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
         let margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
 

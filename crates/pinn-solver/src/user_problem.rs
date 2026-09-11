@@ -475,34 +475,14 @@ impl BoundaryValueProblem for UserDefinedProblem {
     }
 
     fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
-        let stress_ref = self.spec.load.px.abs().max(self.spec.load.py.abs()).max(1.0);
-        let ref_energy = (0.5 * stress_ref * stress_ref / self.spec.material.e).max(1.0) as f32;
-        let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
-
-        // `ref_div2` normalizes `equilibrium`'s residual (units Pa/m - stress per length, from
-        // `factor·u_xx`-type terms in `equilibrium_from_displacement_hessian_loss`) to O(1).
-        //
-        // NOT the `(px*cx)^2` formula every OTHER `equilibrium_*_loss` caller uses (Kirsch's
-        // `step_physics`, `headless.rs`, `runner.rs`'s Kirsch path, and this term's own
-        // earlier direct-σ version) - that `cx = sx/(2·fd_h·domain_width)` was calibrated for
-        // a genuinely different quantity, the FIRST-derivative FD-divergence-of-stress
-        // residual, whose own natural scale really does grow as `1/fd_h`. Reusing it here was
-        // a real bug, found via the term-gradient diagnostic (bugSource-New #1/#12): at
-        // production's `fd_h=1e-3`, `cx ~ 1/(fd_h·domain_width)` is astronomically large
-        // (~1e23 once squared), so dividing by it crushed `equilibrium`'s reported loss AND
-        // gradient to near-zero regardless of the real underlying residual - on BOTH the
-        // no-hole case (genuinely near-zero curvature at the true solution, a red herring) AND
-        // the real single-hole case (where curvature is definitely NOT near-zero at
-        // convergence), the diagnostic showed the identical ~1e-7-1e-6 grad_norm, which is the
-        // signature of an `fd_h`-independent quantity being divided by an `fd_h`-DEPENDENT
-        // constant, not of a physically inert term.
-        //
-        // The correct scale has nothing to do with `fd_h` (the Hessian residual is a converged
-        // FD approximation of a smooth quantity, not itself proportional to `1/fd_h`) -
-        // `px / half_w` (Pa/m, matching the residual's own units) is the natural characteristic
-        // scale instead.
-        let char_length = self.spec.geometry.half_w.max(self.spec.geometry.half_h).max(1e-9);
-        let eq_ref_div2 = (self.spec.load.px / char_length).powi(2).max(1.0);
+        // Centralized (General-PINN architecture recommendations §35-37, Priority 2,
+        // "dimensionless normalization") - see `training_core::PlateReferenceScales`'s doc
+        // comment for why this replaced ~15 independently hand-written formula copies, and
+        // for the `ref_div2`/`stress_per_length2` bug (bugSource-New #12/this session's Kt
+        // investigation) this centralization exists to prevent a recurrence of.
+        let scales = crate::training_core::compute_reference_scales_for_plate(&self.spec);
+        let (ref_energy, ref_stress2) = (scales.ref_energy, scales.ref_stress2);
+        let eq_ref_div2 = scales.stress_per_length2;
 
         let mut terms: Vec<Box<dyn LossTerm>> = vec![
             Box::new(InteriorEnergyTerm { material: self.spec.material.clone(), ref_energy }),
@@ -693,8 +673,8 @@ pub fn probe_boundary_residuals(
     let sampling = UserSamplingStrategy::new(geometry.clone(), spec.training.fd_h);
     let placeholder = geometry.to_placeholder();
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
-    let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
-    let u_ref = ((stress_ref / spec.material.e) * geometry.half_w) as f32;
+    let scales = crate::training_core::compute_reference_scales_for_plate(spec);
+    let (stress_ref, u_ref) = (scales.stress_ref, scales.u_ref);
     let px_pa = stress_ref;
     let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / geometry.half_w) as f32, (y / geometry.half_h) as f32] };
     let n_fourier = geometry.n_fourier();
@@ -796,8 +776,8 @@ pub fn probe_reaction_force(
     let sampling = UserSamplingStrategy::new(geometry.clone(), spec.training.fd_h);
     let placeholder = geometry.to_placeholder();
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
-    let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
-    let u_ref = ((stress_ref / spec.material.e) * geometry.half_w) as f32;
+    let scales = crate::training_core::compute_reference_scales_for_plate(spec);
+    let (stress_ref, u_ref) = (scales.stress_ref, scales.u_ref);
     let px_pa = stress_ref;
     let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / geometry.half_w) as f32, (y / geometry.half_h) as f32] };
 
@@ -872,8 +852,8 @@ pub fn probe_energy_balance(
     let sampling = UserSamplingStrategy::new(geometry.clone(), spec.training.fd_h);
     let placeholder = geometry.to_placeholder();
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
-    let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
-    let u_ref = ((stress_ref / spec.material.e) * geometry.half_w) as f32;
+    let scales = crate::training_core::compute_reference_scales_for_plate(spec);
+    let (stress_ref, u_ref) = (scales.stress_ref, scales.u_ref);
     let px_pa = stress_ref;
     let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / geometry.half_w) as f32, (y / geometry.half_h) as f32] };
 
