@@ -461,6 +461,53 @@ pub fn stress_source_report(
         .collect()
 }
 
+/// General-PINN architecture recommendations §6/§29 (Priority 3, "loss instrumentation" /
+/// "loss ledger"): one structured record per active term instead of separate `raw_scalar_by_
+/// name`/`lam_by_name`/`term_grad_norms`/`GradientShareReport::shares` hashmaps a caller has
+/// to manually cross-reference by name. Every field here is data ALREADY computed by
+/// `step_physics_multi` (this is a pure consolidation, not new per-step work) - `raw` is this
+/// codebase's own already-normalized-to-O(1) term convention (every `LossTerm::compute()`
+/// divides by its own reference scale internally, e.g. `ref_energy`/`ref_stress2` - see
+/// `PlateReferenceScales`'s doc comment), not a separate pre-normalization physical value;
+/// `weighted = raw * lambda` is the term's actual contribution to `total_loss`.
+#[derive(Debug, Clone)]
+pub struct LossLedgerEntry {
+    pub name: &'static str,
+    pub raw: f32,
+    pub lambda: f64,
+    pub weighted: f64,
+    /// `None` unless `probe_term_gradients` was set for this step (real per-term backward-pass
+    /// cost - see `StepOutput::term_grad_norms`'s doc comment).
+    pub grad_norm: Option<f32>,
+    /// `r_i = ||grad_i|| / Σ_j ||grad_j||` - `None` under the same condition as `grad_norm`.
+    pub gradient_share: Option<f32>,
+}
+
+/// Builds a [`LossLedgerEntry`] per term present in `raw_scalar_by_name`, joining in
+/// `lam_by_name`/`term_grad_norms`/`gradient_shares` by name where available. A term missing
+/// from `lam_by_name` (should not happen for any real `StepOutput` - `raw_scalar_by_name` and
+/// `lam_by_name` are always populated together, see `step_physics_multi`'s construction) gets
+/// `lambda=0.0`/`weighted=0.0` rather than panicking - a defensive default for a hashmap-join,
+/// not a claim that a real term can meaningfully have zero weight.
+pub fn build_loss_ledger(
+    raw_scalar_by_name: &HashMap<&'static str, f32>,
+    lam_by_name: &HashMap<&'static str, f64>,
+    term_grad_norms: Option<&HashMap<&'static str, f32>>,
+    gradient_shares: Option<&HashMap<&'static str, f32>>,
+) -> Vec<LossLedgerEntry> {
+    raw_scalar_by_name.iter().map(|(&name, &raw)| {
+        let lambda = lam_by_name.get(name).copied().unwrap_or(0.0);
+        LossLedgerEntry {
+            name,
+            raw,
+            lambda,
+            weighted: raw as f64 * lambda,
+            grad_norm: term_grad_norms.and_then(|m| m.get(name).copied()),
+            gradient_share: gradient_shares.and_then(|m| m.get(name).copied()),
+        }
+    }).collect()
+}
+
 /// Extract (σ_xx, σ_yy, σ_xy) from rows `[row_start, row_end)` of an mDEM network output
 /// tensor (cols 2, 3, 4 — already scaled to Pa by `scale_out`). Shared by every mDEM call
 /// site that reads stress directly off the network rather than via the FD stencil.
@@ -3333,6 +3380,52 @@ mod tests {
         assert!(!report.shares.contains_key("nan_term"));
         assert!((report.shares["a"] - 0.5).abs() < 1e-6);
         assert!((report.shares["b"] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn build_loss_ledger_joins_every_source_by_name_correctly() {
+        let raw: HashMap<&'static str, f32> = [("a", 2.0), ("b", 3.0)].into_iter().collect();
+        let lam: HashMap<&'static str, f64> = [("a", 5.0), ("b", 10.0)].into_iter().collect();
+        let grad: HashMap<&'static str, f32> = [("a", 0.5)].into_iter().collect(); // "b" missing on purpose
+        let shares: HashMap<&'static str, f32> = [("a", 0.8), ("b", 0.2)].into_iter().collect();
+
+        let ledger = build_loss_ledger(&raw, &lam, Some(&grad), Some(&shares));
+        assert_eq!(ledger.len(), 2);
+
+        let a = ledger.iter().find(|e| e.name == "a").unwrap();
+        assert_eq!(a.raw, 2.0);
+        assert_eq!(a.lambda, 5.0);
+        assert_eq!(a.weighted, 10.0); // 2.0 * 5.0
+        assert_eq!(a.grad_norm, Some(0.5));
+        assert_eq!(a.gradient_share, Some(0.8));
+
+        let b = ledger.iter().find(|e| e.name == "b").unwrap();
+        assert_eq!(b.raw, 3.0);
+        assert_eq!(b.lambda, 10.0);
+        assert_eq!(b.weighted, 30.0); // 3.0 * 10.0
+        assert_eq!(b.grad_norm, None, "b's grad_norm was deliberately missing from the source map");
+        assert_eq!(b.gradient_share, Some(0.2));
+    }
+
+    #[test]
+    fn build_loss_ledger_defaults_missing_lambda_to_zero_not_a_panic() {
+        let raw: HashMap<&'static str, f32> = [("orphan", 7.0)].into_iter().collect();
+        let lam: HashMap<&'static str, f64> = HashMap::new(); // "orphan" absent
+        let ledger = build_loss_ledger(&raw, &lam, None, None);
+        let e = &ledger[0];
+        assert_eq!(e.lambda, 0.0);
+        assert_eq!(e.weighted, 0.0);
+        assert_eq!(e.grad_norm, None);
+        assert_eq!(e.gradient_share, None);
+    }
+
+    #[test]
+    fn build_loss_ledger_with_no_gradient_data_leaves_both_fields_none() {
+        let raw: HashMap<&'static str, f32> = [("a", 1.0)].into_iter().collect();
+        let lam: HashMap<&'static str, f64> = [("a", 2.0)].into_iter().collect();
+        let ledger = build_loss_ledger(&raw, &lam, None, None);
+        assert_eq!(ledger[0].grad_norm, None);
+        assert_eq!(ledger[0].gradient_share, None);
     }
 
     use crate::kirsch_problem::KirschProblem;

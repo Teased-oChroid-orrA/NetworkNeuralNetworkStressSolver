@@ -2332,18 +2332,21 @@ mod tests {
             model = new_model.into_iter().next().unwrap();
 
             if probe_now {
+                // General-PINN architecture recommendations §6/§29 (Priority 3, "loss ledger")
+                // - one consolidated record per term instead of 4 separately cross-referenced
+                // hashmaps, the real consumer this test now uses instead of its own manual
+                // `raw[name]`/`lam.get(name)`/`grad.get(name)` lookups.
                 let raw = out.raw_scalar_by_name.as_ref().expect("raw_scalar_by_name must be Some on step_physics_multi");
                 let lam = out.lam_by_name.as_ref().expect("lam_by_name must be Some on step_physics_multi");
                 let grad = out.term_grad_norms.as_ref().expect("term_grad_norms must be Some when probe_term_gradients=true");
+                let shares = out.gradient_share_report.as_ref().map(|r| &r.shares);
+                let mut ledger = crate::training_core::build_loss_ledger(raw, lam, Some(grad), shares);
+                ledger.sort_by_key(|e| e.name);
                 println!("  [term-diag] step={step} total_loss={:.4e}", out.total_scalar);
                 println!("  [term-diag] {:>26} {:>14} {:>14} {:>14} {:>14}", "term", "raw", "lambda", "weighted", "grad_norm");
-                let mut names: Vec<&&str> = raw.keys().collect();
-                names.sort();
-                for name in names {
-                    let r = raw[name];
-                    let l = *lam.get(name).unwrap_or(&0.0);
-                    let g = grad.get(name).copied().unwrap_or(f32::NAN);
-                    println!("  [term-diag] {:>26} {:>14.4e} {:>14.4e} {:>14.4e} {:>14.4e}", name, r, l, r as f64 * l, g);
+                for e in &ledger {
+                    println!("  [term-diag] {:>26} {:>14.4e} {:>14.4e} {:>14.4e} {:>14.4e}",
+                        e.name, e.raw, e.lambda, e.weighted, e.grad_norm.unwrap_or(f32::NAN));
                 }
             }
         }
