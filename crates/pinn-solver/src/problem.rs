@@ -184,6 +184,25 @@ pub trait LossTerm: Send + Sync {
     fn derivative_order(&self) -> Option<DerivativeOrder> {
         None
     }
+
+    /// Whether this term enforces a STRONG-form pointwise residual (a PDE/BC defect evaluated
+    /// and penalized AT specific points) or a WEAK/variational functional (an energy integral
+    /// minimized over a region - the Deep Energy Method's `Π=U-W_ext`) - General-PINN
+    /// architecture recommendations §39's "weak/variational formulation API", narrowed the
+    /// same way every other classification in this pass was narrowed: this codebase already
+    /// implements one real weak-form method (DEM, `InteriorEnergyTerm`/`ExternalWorkTerm`)
+    /// alongside several strong-form residual terms, side by side in the SAME loss sum - this
+    /// makes that split a declared, queryable property instead of something only apparent from
+    /// reading each term's own doc comment. `None` has no meaning here (every term is one or
+    /// the other) - every concrete `LossTerm` impl must override this explicitly, same "no
+    /// silent default" discipline `conflict_group` established, except this one has no
+    /// meaningful default at all (unlike `stress_source`/`boundary_kind`/`derivative_order`,
+    /// where `None` genuinely means "not applicable"). Defaults to `Strong` only because a
+    /// trait method needs SOME default to stay backwards-compatible for hypothetical future
+    /// callers - relying on it is exactly what the "must override" tests below are for.
+    fn formulation_kind(&self) -> FormulationKind {
+        FormulationKind::Strong
+    }
 }
 
 /// Classifies a [`LossTerm`] as either enforcing interior PDE/equilibrium physics or a
@@ -251,6 +270,20 @@ pub enum DerivativeOrder {
     /// Second-order spatial derivative (`∂²u/∂x²`, etc.) - the displacement Hessian, read via
     /// `d.hessian`. Implies `needs_hessian() == true`.
     Second,
+}
+
+/// Strong-form (pointwise residual) vs. weak/variational-form (energy functional) - see
+/// [`LossTerm::formulation_kind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormulationKind {
+    /// A PDE/BC defect evaluated and penalized at specific points (e.g. `‖σ·n − t̄‖²` at a
+    /// traction boundary, `‖∇·σ‖²` at interior points) - the classical collocation/PINN
+    /// residual approach.
+    Strong,
+    /// An energy integral minimized over a region, whose Euler-Lagrange equation IS the strong
+    /// form (the Deep Energy Method's `Π[u] = U[u] - W_ext[u]`) - satisfies natural (Neumann)
+    /// boundary conditions automatically by construction, rather than penalizing them directly.
+    Weak,
 }
 
 /// A complete boundary-value problem: its domain(s), their sampling/ansatz strategies, loss

@@ -425,6 +425,12 @@ pub struct TrainingUpdate {
     /// "pinn-core never depends on pinn-solver" rule `stress_source_report`/`boundary_
     /// operator_report` already established. Same "static per problem, never gated" treatment.
     pub derivative_order_report: Vec<(&'static str, &'static str)>,
+    /// General-PINN architecture recommendations §39 (Priority 9, "weak/variational
+    /// formulation API") - `(term_name, "Strong"/"Weak")` pairs, one per active term (no
+    /// filtering - every term always has a meaningful value here). Plain strings, not the
+    /// solver's own enum, same "pinn-core never depends on pinn-solver" rule established by
+    /// every other report field above. Same "static per problem, never gated" treatment.
+    pub formulation_kind_report: Vec<(&'static str, &'static str)>,
 }
 
 /// Pin-in-lug analogue of `TrainingUpdate` — one entry per domain's visualization fields,

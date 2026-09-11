@@ -275,6 +275,7 @@ impl LossTerm for InteriorEnergyTerm {
     }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Weak }
     // Strain-energy only - no stress quantity at the term level.
     // Interior PDE physics, not a boundary condition - correctly `None`.
     // Reads `d.strains` - first-order spatial derivative.
@@ -295,6 +296,7 @@ impl LossTerm for LugShankAnchorTerm {
     fn domains(&self) -> Vec<DomainId> { vec![LUG_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["shank_anchor"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // Displacement-only - no stress quantity involved.
     // Prescribes the displacement VALUE (zero) at the gripped shank edge - Dirichlet.
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Dirichlet) }
@@ -318,6 +320,7 @@ impl LossTerm for LugFreeEdgeTractionTerm {
     fn domains(&self) -> Vec<DomainId> { vec![LUG_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["boundary"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // Reads `raw_out` cols 2..5 directly.
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Direct) }
     // Traction-free is a Neumann condition (zero flux) - same reasoning as Kirsch's
@@ -346,6 +349,7 @@ impl LossTerm for PinDrivingTractionTerm {
     fn domains(&self) -> Vec<DomainId> { vec![PIN_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["driving"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // `neumann_loss` computes stress from strain via `compute_stress`.
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
     // Prescribes stress·n (the driving traction) at the pin's loaded surface - Neumann.
@@ -400,6 +404,7 @@ impl LossTerm for InterfacePenetrationTerm {
     fn point_sets(&self) -> Vec<&'static str> { vec!["interface", "interface"] }
     // Signorini KKT boundary/interface condition, not an interior PDE residual.
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // Displacement-only (radial displacement gap) - no stress quantity involved.
     // Couples TWO domains (pin and lug) at their shared contact boundary - the textbook
     // Interface condition (see `domains()` above: both PIN_DOMAIN and LUG_DOMAIN).
@@ -450,6 +455,7 @@ impl LossTerm for InterfaceNonTensionTerm {
     fn point_sets(&self) -> Vec<&'static str> { vec!["interface"] }
     // Same reasoning as InterfacePenetrationTerm: Signorini KKT boundary condition.
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // Reads `raw_out` cols 2..5 directly (the pin's own direct mDEM stress).
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Direct) }
     // Same contact physics as `InterfacePenetrationTerm` (the other half of the Signorini KKT
@@ -1391,6 +1397,31 @@ mod tests {
                 .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
             assert_eq!(term.derivative_order(), *expected_order,
                 "term '{}' has derivative_order {:?}, expected {:?}", term.name(), term.derivative_order(), expected_order);
+        }
+    }
+
+    #[test]
+    fn pinlug_loss_terms_have_expected_formulation_kind_classification() {
+        use crate::problem::FormulationKind as Fk;
+
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
+        let terms = problem.loss_terms();
+
+        let expected: &[(&str, Fk)] = &[
+            ("pin_interior_energy", Fk::Weak),
+            ("lug_interior_energy", Fk::Weak),
+            ("lug_shank_anchor", Fk::Strong),
+            ("lug_free_edge_traction", Fk::Strong),
+            ("pin_driving_traction", Fk::Strong),
+            ("interface_penetration", Fk::Strong),
+            ("interface_non_tension", Fk::Strong),
+        ];
+
+        for term in &terms {
+            let (_, expected_kind) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.formulation_kind(), *expected_kind,
+                "term '{}' has formulation_kind {:?}, expected {:?}", term.name(), term.formulation_kind(), expected_kind);
         }
     }
 }

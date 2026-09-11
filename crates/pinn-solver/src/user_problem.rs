@@ -252,6 +252,7 @@ impl LossTerm for InteriorEnergyTerm {
     fn name(&self) -> &'static str { "interior_energy" }
     fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Weak }
     // Strain-energy only - no stress quantity at the term level.
     // Interior PDE physics, not a boundary condition - correctly `None`.
     // Reads `d.strains` - first-order spatial derivative.
@@ -291,6 +292,7 @@ impl LossTerm for EquilibriumTerm {
     fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec![self.point_set] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     fn needs_hessian(&self) -> bool { true }
     // `equilibrium_from_displacement_hessian_loss` applies Hooke's law constants to the
     // Hessian internally (`σ=C:ε(u)`, via second derivatives rather than FD strain) - derived.
@@ -328,6 +330,7 @@ impl LossTerm for OuterTractionTerm {
     fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["outer_boundary"] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // `neumann_loss` computes stress from strain via `compute_stress`.
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
     // Prescribes stress·n (the applied far-field traction) at the outer boundary - Neumann.
@@ -380,6 +383,7 @@ impl LossTerm for ExternalWorkTerm {
     fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["outer_boundary"] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Weak }
     // Displacement-only (`u`,`v` dotted with the applied traction) - no stress quantity.
     // The weak-form/energy-functional counterpart of `OuterTractionTerm`'s pointwise Neumann
     // residual, not itself a pointwise boundary-operator residual - `Π=U-W_ext`'s natural BC
@@ -412,6 +416,7 @@ impl LossTerm for HoleBcTerm {
     fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec![self.point_set] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // Runtime-dependent: `Free` reads `raw_out` cols 2..5 directly (FD is undefined exactly at
     // the hole boundary); `Fixed` is displacement-only.
     fn stress_source(&self) -> Option<crate::problem::StressSource> {
@@ -1456,6 +1461,40 @@ mod tests {
         assert_eq!(report.len(), 3, "report: {report:?}");
         for absent in ["external_work", "hole_free", "hole_fixed"] {
             assert!(!report.iter().any(|(n, _)| *n == absent), "{absent} needs no spatial derivative, must be absent from {report:?}");
+        }
+    }
+
+    #[test]
+    fn user_problem_loss_terms_have_expected_formulation_kind_classification() {
+        use crate::problem::FormulationKind as Fk;
+
+        let spec = ProblemSpec {
+            geometry: two_hole_geometry(),
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+        };
+        let problem = UserDefinedProblem::new(spec);
+        let terms = problem.loss_terms();
+
+        // Unlike stress_source/boundary_kind/derivative_order, every term has a meaningful
+        // formulation_kind (no "not applicable" case) - a direct per-term table, same shape as
+        // kirsch_problem.rs/pinlug_problem.rs's own formulation_kind classification tests.
+        let expected: &[(&str, Fk)] = &[
+            ("interior_energy", Fk::Weak),
+            ("equilibrium", Fk::Strong),
+            ("outer_traction", Fk::Strong),
+            ("external_work", Fk::Weak),
+            ("hole_free", Fk::Strong),
+            ("hole_fixed", Fk::Strong),
+        ];
+
+        for term in &terms {
+            let (_, expected_kind) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.formulation_kind(), *expected_kind,
+                "term '{}' has formulation_kind {:?}, expected {:?}", term.name(), term.formulation_kind(), expected_kind);
         }
     }
 

@@ -632,6 +632,7 @@ pub fn run_training(
                 stress_source_report: Vec::new(),
                 boundary_operator_report: Vec::new(),
                 derivative_order_report: Vec::new(),
+                formulation_kind_report: Vec::new(),
             };
             let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         }
@@ -1632,6 +1633,15 @@ fn run_user_problem_training_from(
                     crate::problem::DerivativeOrder::Second => "Second",
                 }))
                 .collect();
+        // Priority 9, General-PINN §39 - unlike the reports above, this doesn't filter (every
+        // active term always has a meaningful formulation_kind).
+        let formulation_kind_report: Vec<(&'static str, &'static str)> =
+            crate::training_core::formulation_kind_report(&problem).into_iter()
+                .map(|(name, kind)| (name, match kind {
+                    crate::problem::FormulationKind::Strong => "Strong",
+                    crate::problem::FormulationKind::Weak => "Weak",
+                }))
+                .collect();
         let update = TrainingUpdate {
             step,
             total_loss: out.total_scalar,
@@ -1657,6 +1667,7 @@ fn run_user_problem_training_from(
             stress_source_report,
             boundary_operator_report,
             derivative_order_report,
+            formulation_kind_report,
         };
         let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         if auto_stopped {
@@ -1768,6 +1779,14 @@ pub fn serve_loaded_plate_checkpoint(
                 crate::problem::DerivativeOrder::Second => "Second",
             }))
             .collect();
+    let formulation_kind_report: Vec<(&'static str, &'static str)> =
+        crate::training_core::formulation_kind_report(&crate::user_problem::UserDefinedProblem::new(spec.clone()))
+            .into_iter()
+            .map(|(name, kind)| (name, match kind {
+                crate::problem::FormulationKind::Strong => "Strong",
+                crate::problem::FormulationKind::Weak => "Weak",
+            }))
+            .collect();
 
     let update = TrainingUpdate {
         step: 0, total_loss: 0.0, energy_loss: 0.0, neumann_loss: 0.0, lr: 0.0,
@@ -1782,6 +1801,7 @@ pub fn serve_loaded_plate_checkpoint(
         stress_source_report,
         boundary_operator_report,
         derivative_order_report,
+        formulation_kind_report,
     };
     let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
     let _ = tx.send(TrainingMsg::Done);

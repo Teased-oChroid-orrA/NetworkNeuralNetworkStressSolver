@@ -300,6 +300,8 @@ impl LossTerm for InteriorEnergyTerm {
     // condition at all - correctly `None`, not a classical operator forced onto it.
     // Reads `d.strains` - first-order spatial derivative.
     fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
+    // The strain-energy half of the DEM functional `Π=U-W_ext` - Weak/variational.
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Weak }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("interior_energy: domain not present in inputs");
@@ -322,6 +324,7 @@ impl LossTerm for NeumannTractionTerm {
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["traction"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // `neumann_loss` computes stress from strain via `compute_stress` before comparing it
     // against the traction target - derived, not direct.
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
@@ -360,6 +363,7 @@ impl LossTerm for HoleTractionTerm {
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["hole"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // Runtime-dependent, mirroring `compute()`'s own `self.direct` branch exactly.
     fn stress_source(&self) -> Option<crate::problem::StressSource> {
         Some(if self.direct { crate::problem::StressSource::Direct } else { crate::problem::StressSource::Derived })
@@ -403,6 +407,7 @@ impl LossTerm for DisplacementAnchorTerm {
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["right_edge"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // Displacement-only (reads `raw_out` column 0) - no stress quantity involved.
     // Prescribes the displacement VALUE at the right edge - the textbook Dirichlet condition.
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Dirichlet) }
@@ -438,6 +443,7 @@ impl LossTerm for EquilibriumRingTerm {
     // its doc comment), so the point-set name here is purely documentary.
     fn point_sets(&self) -> Vec<&'static str> { vec!["eq_ring"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // `components` is direct network σ shifted to 4 meta-positions - confirmed by reading
     // `step_physics`'s mDEM branch: central difference at 4 points, not a second-derivative-
     // of-displacement chain (see `EquilibriumTerm` in user_problem.rs for the contrasting
@@ -480,6 +486,7 @@ impl LossTerm for KirschStressTerm {
     fn phase2_only(&self) -> bool { true }
     fn point_sets(&self) -> Vec<&'static str> { vec!["kirsch_probes"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // Runtime-dependent, mirroring `compute()`'s own `self.direct` branch exactly.
     fn stress_source(&self) -> Option<crate::problem::StressSource> {
         Some(if self.direct { crate::problem::StressSource::Direct } else { crate::problem::StressSource::Derived })
@@ -531,6 +538,7 @@ impl LossTerm for ConstitutiveConsistencyTerm {
     // interior-energy-family term (constitutive-law residual on the SAME collocation points
     // as `InteriorEnergyTerm`/`EquilibriumRingTerm`), not a boundary/interface condition.
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // Reads AND compares both representations - this term's entire purpose is policing the
     // gap between them (see `StressSource::Both`'s doc comment).
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Both) }
@@ -871,6 +879,31 @@ mod tests {
                 .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
             assert_eq!(term.derivative_order(), *expected_order,
                 "term '{}' has derivative_order {:?}, expected {:?}", term.name(), term.derivative_order(), expected_order);
+        }
+    }
+
+    #[test]
+    fn kirsch_loss_terms_have_expected_formulation_kind_classification() {
+        use crate::problem::FormulationKind as Fk;
+
+        let material = MaterialProps::al7075_t6();
+        let problem = KirschProblem::new(material, 5, 4000, 3.0);
+        let terms = problem.loss_terms();
+
+        let expected: &[(&str, Fk)] = &[
+            ("interior_energy", Fk::Weak),
+            ("neumann_traction", Fk::Strong),
+            ("hole_traction", Fk::Strong),
+            ("displacement_anchor", Fk::Strong),
+            ("equilibrium_ring", Fk::Strong),
+            ("kirsch_stress", Fk::Strong),
+        ];
+
+        for term in &terms {
+            let (_, expected_kind) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.formulation_kind(), *expected_kind,
+                "term '{}' has formulation_kind {:?}, expected {:?}", term.name(), term.formulation_kind(), expected_kind);
         }
     }
 

@@ -586,6 +586,19 @@ pub fn derivative_order_report(
         .collect()
 }
 
+/// General-PINN architecture recommendations §39 (Priority 9, "weak/variational formulation
+/// API") - whether each active term is a strong-form pointwise residual or a weak/variational
+/// energy functional. Unlike `stress_source_report`/`boundary_operator_report`/`derivative_
+/// order_report`, every term has a meaningful value here (no "not applicable" case), so this
+/// does NOT filter - it maps every active term directly.
+pub fn formulation_kind_report(
+    problem: &dyn crate::problem::BoundaryValueProblem,
+) -> Vec<(&'static str, crate::problem::FormulationKind)> {
+    problem.loss_terms().iter()
+        .map(|term| (term.name(), term.formulation_kind()))
+        .collect()
+}
+
 /// General-PINN architecture recommendations §6/§29 (Priority 3, "loss instrumentation" /
 /// "loss ledger"): one structured record per active term instead of separate `raw_scalar_by_
 /// name`/`lam_by_name`/`term_grad_norms`/`GradientShareReport::shares` hashmaps a caller has
