@@ -336,6 +336,55 @@ impl QuadNode {
             }
         }
     }
+
+    #[inline] fn area(&self) -> f64 { (self.x1 - self.x0) * (self.y1 - self.y0) }
+
+    /// Same DFS order/leaf-inclusion rule as `collect_points`, additionally carrying each
+    /// leaf's own physical area - see `DensitySample`'s doc comment for why this matters.
+    fn collect_points_with_area<G: AmrDomain>(&self, geom: &G, out: &mut Vec<DensitySample>) {
+        match &self.children {
+            Some(ch) => { for c in ch.iter() { c.collect_points_with_area(geom, out); } }
+            None => {
+                let (cx, cy) = (self.cx(), self.cy());
+                if geom.contains(cx, cy) { out.push(DensitySample { point: [cx, cy], leaf_area: self.area() }); }
+            }
+        }
+    }
+}
+
+/// A sampled point paired with the physical area of the quadtree leaf it was drawn from -
+/// General-PINN architecture recommendations §20-21's "probability-density compensation":
+/// AMR-adaptive sampling places MORE points in smaller cells (higher local density near a
+/// refined region) - a caller that averages some `f(x_i)` over these points via a plain,
+/// UNWEIGHTED mean (as every existing Monte-Carlo domain-integral loss term in this codebase
+/// currently does - `InteriorEnergyTerm`, `ExternalWorkTerm`, `probe_energy_balance`'s internal-
+/// energy integral, etc.) implicitly assumes every point represents an EQUAL slice of the
+/// domain, which becomes false the moment AMR refines the grid unevenly. See
+/// [`compensation_weights`] for the per-point correction factor this enables.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DensitySample {
+    pub point: [f64; 2],
+    pub leaf_area: f64,
+}
+
+/// Per-point multiplier `w_i = leaf_area_i * N / Σ leaf_area_j` (dimensionless, `mean(w_i) ==
+/// 1.0` over the full set) such that `mean(f_i * w_i)` recovers the TRUE area-weighted domain
+/// average `Σ f_i·area_i / Σ area_i` instead of the refinement-biased plain `mean(f_i)` a
+/// nonuniform point set would otherwise silently produce. Drop-in: multiply any per-point
+/// tensor/array elementwise by these weights before calling `.mean()`. Empty input returns an
+/// empty `Vec`; a degenerate all-zero-area input returns all-`1.0` weights (no correction
+/// possible, falls back to the unweighted behavior every existing call site already has) rather
+/// than dividing by zero.
+pub fn compensation_weights(samples: &[DensitySample]) -> Vec<f64> {
+    let n = samples.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let total_area: f64 = samples.iter().map(|s| s.leaf_area).sum();
+    if total_area <= 0.0 {
+        return vec![1.0; n];
+    }
+    samples.iter().map(|s| s.leaf_area * n as f64 / total_area).collect()
 }
 
 // ─── Adaptive grid ────────────────────────────────────────────────────────────
@@ -383,6 +432,19 @@ impl<G: AmrDomain + Clone> AdaptiveGrid<G> {
         let mut pts = Vec::with_capacity(self.cfg.pts_per_cell * self.active_count());
         self.root.collect_points(&self.geom, &mut pts);
         pts
+    }
+
+    /// Same points, same DFS order as [`Self::sample_points`], each paired with its own leaf's
+    /// physical area - General-PINN §20-21 (Priority 8, "adaptive sampling framework /
+    /// probability-density compensation"). See [`DensitySample`]/[`compensation_weights`] for
+    /// what this enables. Additive: `sample_points()` itself is unchanged, and nothing in this
+    /// codebase's training loops calls this yet - existing loss terms' `.mean()` behavior is
+    /// deliberately untouched (this session's own "smallest real increment, don't silently
+    /// change working numerics" discipline, same as every other Priority 1-7 classification).
+    pub fn sample_points_with_density(&self) -> Vec<DensitySample> {
+        let mut out = Vec::with_capacity(self.cfg.pts_per_cell * self.active_count());
+        self.root.collect_points_with_area(&self.geom, &mut out);
+        out
     }
 
     /// Assign per-point residuals back to leaf cells.
@@ -1536,6 +1598,80 @@ mod tests {
         for (pa, pb) in a.iter().zip(b.iter()) {
             assert_eq!(pa[0].to_bits(), pb[0].to_bits(), "AMR must be bit-for-bit deterministic given identical inputs");
             assert_eq!(pa[1].to_bits(), pb[1].to_bits());
+        }
+    }
+
+    // ─── Priority 8 (General-PINN §20-21, probability-density compensation) ──────────────
+
+    #[test]
+    fn compensation_weights_matches_hand_computed_values() {
+        // areas 1.0, 1.0, 2.0 -> total=4.0, n=3 -> w_i = area_i * 3/4
+        let samples = vec![
+            DensitySample { point: [0.0, 0.0], leaf_area: 1.0 },
+            DensitySample { point: [1.0, 0.0], leaf_area: 1.0 },
+            DensitySample { point: [0.0, 1.0], leaf_area: 2.0 },
+        ];
+        let w = compensation_weights(&samples);
+        assert!((w[0] - 0.75).abs() < 1e-12, "{w:?}");
+        assert!((w[1] - 0.75).abs() < 1e-12, "{w:?}");
+        assert!((w[2] - 1.5).abs() < 1e-12, "{w:?}");
+        let mean_w: f64 = w.iter().sum::<f64>() / w.len() as f64;
+        assert!((mean_w - 1.0).abs() < 1e-12, "mean(w) must be exactly 1.0, got {mean_w}");
+    }
+
+    #[test]
+    fn compensation_weights_empty_input_returns_empty() {
+        assert!(compensation_weights(&[]).is_empty());
+    }
+
+    #[test]
+    fn compensation_weights_zero_total_area_falls_back_to_uniform_not_divide_by_zero() {
+        let samples = vec![DensitySample { point: [0.0, 0.0], leaf_area: 0.0 }; 3];
+        let w = compensation_weights(&samples);
+        assert_eq!(w, vec![1.0, 1.0, 1.0]);
+    }
+
+    /// The real motivating case: a small, densely-sampled region (`f=1.0`) and a large,
+    /// sparsely-sampled region (`f=0.0`) - a naive, unweighted mean over the RAW POINT COUNT
+    /// is badly biased toward whichever region has more points, regardless of how much
+    /// physical domain area it represents; `compensation_weights` recovers the TRUE
+    /// area-weighted average. This is the exact failure mode described in `DensitySample`'s
+    /// doc comment, demonstrated with hand-computable numbers rather than asserted abstractly.
+    #[test]
+    fn compensated_mean_recovers_true_area_weighted_average_that_naive_mean_misses() {
+        let mut samples = Vec::new();
+        let mut f = Vec::new();
+        // Region A: 90 points, total area 0.01, f=1.0 (densely refined - small area)
+        for i in 0..90 {
+            samples.push(DensitySample { point: [i as f64, 0.0], leaf_area: 0.01 / 90.0 });
+            f.push(1.0_f64);
+        }
+        // Region B: 10 points, total area 0.99, f=0.0 (coarse - large area)
+        for i in 0..10 {
+            samples.push(DensitySample { point: [i as f64, 1.0], leaf_area: 0.99 / 10.0 });
+            f.push(0.0_f64);
+        }
+        // True area-weighted average = (1.0*0.01 + 0.0*0.99) / 1.0 = 0.01.
+        let naive_mean: f64 = f.iter().sum::<f64>() / f.len() as f64;
+        assert!((naive_mean - 0.9).abs() < 1e-9, "sanity: naive mean should be biased toward the densely-sampled region, got {naive_mean}");
+
+        let w = compensation_weights(&samples);
+        let compensated_mean: f64 = f.iter().zip(&w).map(|(fi, wi)| fi * wi).sum::<f64>() / f.len() as f64;
+        assert!((compensated_mean - 0.01).abs() < 1e-9,
+            "compensated mean {compensated_mean} should recover the true area-weighted average 0.01, not the naive-mean bias {naive_mean}");
+    }
+
+    #[test]
+    fn sample_points_with_density_matches_sample_points_length_and_order() {
+        let geom = test_geom();
+        let cfg = AmrtConfig::default();
+        let grid = AdaptiveGrid::new(&geom, cfg);
+        let pts = grid.sample_points();
+        let densities = grid.sample_points_with_density();
+        assert_eq!(pts.len(), densities.len());
+        for (p, d) in pts.iter().zip(&densities) {
+            assert_eq!(*p, d.point);
+            assert!(d.leaf_area > 0.0, "leaf_area must be positive, got {}", d.leaf_area);
         }
     }
 }
