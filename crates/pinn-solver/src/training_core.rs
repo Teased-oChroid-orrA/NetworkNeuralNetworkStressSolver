@@ -560,6 +560,19 @@ pub fn stress_source_report(
         .collect()
 }
 
+/// General-PINN architecture recommendations §13 (Priority 5, "generic boundary operator
+/// system") - which classical PDE boundary-condition family each active term enforces, if any.
+/// Mirrors `stress_source_report`'s exact shape/purpose: makes "what kind of boundary condition
+/// is this term?" a one-line, always-available answer instead of a manual `compute()`-body
+/// read. See [`crate::problem::BoundaryOperatorKind`]'s doc comment.
+pub fn boundary_operator_report(
+    problem: &dyn crate::problem::BoundaryValueProblem,
+) -> Vec<(&'static str, crate::problem::BoundaryOperatorKind)> {
+    problem.loss_terms().iter()
+        .filter_map(|term| term.boundary_kind().map(|kind| (term.name(), kind)))
+        .collect()
+}
+
 /// General-PINN architecture recommendations §6/§29 (Priority 3, "loss instrumentation" /
 /// "loss ledger"): one structured record per active term instead of separate `raw_scalar_by_
 /// name`/`lam_by_name`/`term_grad_norms`/`GradientShareReport::shares` hashmaps a caller has

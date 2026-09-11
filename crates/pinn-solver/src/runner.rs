@@ -630,6 +630,7 @@ pub fn run_training(
                 // path, never through a `&dyn BoundaryValueProblem` trait object -
                 // `stress_source_report` has nothing to iterate. Empty, not fabricated.
                 stress_source_report: Vec::new(),
+                boundary_operator_report: Vec::new(),
             };
             let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         }
@@ -1608,6 +1609,19 @@ fn run_user_problem_training_from(
                     crate::problem::StressSource::Both => "Both",
                 }))
                 .collect();
+        // Same "static per problem, never gated" treatment as `stress_source_report` above -
+        // Priority 5, General-PINN §13.
+        let boundary_operator_report: Vec<(&'static str, &'static str)> =
+            crate::training_core::boundary_operator_report(&problem).into_iter()
+                .map(|(name, kind)| (name, match kind {
+                    crate::problem::BoundaryOperatorKind::Dirichlet => "Dirichlet",
+                    crate::problem::BoundaryOperatorKind::Neumann => "Neumann",
+                    crate::problem::BoundaryOperatorKind::Robin => "Robin",
+                    crate::problem::BoundaryOperatorKind::Periodic => "Periodic",
+                    crate::problem::BoundaryOperatorKind::Symmetry => "Symmetry",
+                    crate::problem::BoundaryOperatorKind::Interface => "Interface",
+                }))
+                .collect();
         let update = TrainingUpdate {
             step,
             total_loss: out.total_scalar,
@@ -1631,6 +1645,7 @@ fn run_user_problem_training_from(
             gradient_share_report,
             gradient_conflict_report,
             stress_source_report,
+            boundary_operator_report,
         };
         let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         if auto_stopped {
@@ -1722,6 +1737,18 @@ pub fn serve_loaded_plate_checkpoint(
                 crate::problem::StressSource::Both => "Both",
             }))
             .collect();
+    let boundary_operator_report: Vec<(&'static str, &'static str)> =
+        crate::training_core::boundary_operator_report(&crate::user_problem::UserDefinedProblem::new(spec.clone()))
+            .into_iter()
+            .map(|(name, kind)| (name, match kind {
+                crate::problem::BoundaryOperatorKind::Dirichlet => "Dirichlet",
+                crate::problem::BoundaryOperatorKind::Neumann => "Neumann",
+                crate::problem::BoundaryOperatorKind::Robin => "Robin",
+                crate::problem::BoundaryOperatorKind::Periodic => "Periodic",
+                crate::problem::BoundaryOperatorKind::Symmetry => "Symmetry",
+                crate::problem::BoundaryOperatorKind::Interface => "Interface",
+            }))
+            .collect();
 
     let update = TrainingUpdate {
         step: 0, total_loss: 0.0, energy_loss: 0.0, neumann_loss: 0.0, lr: 0.0,
@@ -1734,6 +1761,7 @@ pub fn serve_loaded_plate_checkpoint(
         gradient_share_report: None, // no training step ran, so no per-term gradient exists
         gradient_conflict_report: None,
         stress_source_report,
+        boundary_operator_report,
     };
     let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
     let _ = tx.send(TrainingMsg::Done);

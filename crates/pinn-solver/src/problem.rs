@@ -148,6 +148,23 @@ pub trait LossTerm: Send + Sync {
     fn stress_source(&self) -> Option<StressSource> {
         None
     }
+
+    /// Which classical PDE boundary-condition family this term semantically enforces, if any -
+    /// General-PINN architecture recommendations §13's "generic boundary operator system"
+    /// (Dirichlet/Neumann/Robin/Periodic/Symmetry/Interface), narrowed the same way
+    /// `stress_source` was narrowed for §4: a plain classification label over the terms this
+    /// codebase actually has, not a new operator-application machinery (no term's `compute()`
+    /// body changes because of this method - it only names what a term is already doing).
+    /// Defaults to `None` - a term enforcing interior PDE physics (energy minimization,
+    /// equilibrium, constitutive consistency) is not a boundary condition at all, and should
+    /// leave this at the default rather than being forced into a boundary category. Every
+    /// concrete `LossTerm` impl that DOES enforce a boundary/interface condition must override
+    /// this explicitly, classified by actually reading that term's `compute()` body - same
+    /// "no silent default" discipline `conflict_group`/`stress_source` already established. See
+    /// [`crate::training_core::boundary_operator_report`] for the generic consumer.
+    fn boundary_kind(&self) -> Option<BoundaryOperatorKind> {
+        None
+    }
 }
 
 /// Classifies a [`LossTerm`] as either enforcing interior PDE/equilibrium physics or a
@@ -171,6 +188,33 @@ pub enum StressSource {
     /// third variant rather than forcing this term into `Direct` or `Derived` alone, which
     /// would misreport exactly the term whose job is to police the gap between them.
     Both,
+}
+
+/// The classical PDE boundary-condition family a [`LossTerm`] semantically enforces. See
+/// [`LossTerm::boundary_kind`]. Only the variants this codebase's real terms actually use are
+/// assigned to a term below (`Robin`/`Periodic`/`Symmetry` currently have no concrete term in
+/// this codebase - kept as real, honestly-unused variants, not deleted, since a future term
+/// enforcing one of them should classify against a real label rather than inventing one ad hoc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryOperatorKind {
+    /// Prescribes the solution's VALUE on the boundary (e.g. a fixed displacement/anchor).
+    Dirichlet,
+    /// Prescribes the solution's NORMAL DERIVATIVE/flux on the boundary (e.g. a prescribed
+    /// traction, including the "traction-free" zero-traction case).
+    Neumann,
+    /// A linear combination of value and flux (`a*u + b*∂u/∂n = g`). No concrete term in this
+    /// codebase currently enforces a true Robin condition.
+    Robin,
+    /// Ties values/fluxes at two separate boundary locations together (e.g. opposite edges of a
+    /// unit cell). No concrete term in this codebase currently enforces a periodic condition.
+    Periodic,
+    /// Enforces a reflection/mirror symmetry constraint along an axis. No concrete term in this
+    /// codebase currently enforces a standalone symmetry condition (Kirsch's own quarter-symmetry
+    /// is baked into `QuarterSymmAnsatz`'s network output transform, not a separate loss term).
+    Symmetry,
+    /// A condition coupling two DIFFERENT domains at a shared boundary (e.g. pin-in-lug contact:
+    /// non-penetration/non-tension between the pin and lug domains).
+    Interface,
 }
 
 /// A complete boundary-value problem: its domain(s), their sampling/ansatz strategies, loss

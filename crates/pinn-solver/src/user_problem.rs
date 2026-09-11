@@ -253,6 +253,7 @@ impl LossTerm for InteriorEnergyTerm {
     fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
     // Strain-energy only - no stress quantity at the term level.
+    // Interior PDE physics, not a boundary condition - correctly `None`.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("interior_energy: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("interior_energy: strains must be Some");
@@ -292,6 +293,8 @@ impl LossTerm for EquilibriumTerm {
     // `equilibrium_from_displacement_hessian_loss` applies Hooke's law constants to the
     // Hessian internally (`σ=C:ε(u)`, via second derivatives rather than FD strain) - derived.
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
+    // Interior equilibrium (∇·σ=0), evaluated at interior collocation points, not a boundary
+    // condition - same reasoning as Kirsch's `EquilibriumRingTerm`.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("equilibrium: domain missing");
         let (u_xx, u_yy, u_xy, v_xx, v_yy, v_xy) = d.hessian.clone()
@@ -323,6 +326,8 @@ impl LossTerm for OuterTractionTerm {
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
     // `neumann_loss` computes stress from strain via `compute_stress`.
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
+    // Prescribes stress·n (the applied far-field traction) at the outer boundary - Neumann.
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Neumann) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("outer_traction: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("outer_traction: strains must be Some");
@@ -370,6 +375,10 @@ impl LossTerm for ExternalWorkTerm {
     fn point_sets(&self) -> Vec<&'static str> { vec!["outer_boundary"] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
     // Displacement-only (`u`,`v` dotted with the applied traction) - no stress quantity.
+    // The weak-form/energy-functional counterpart of `OuterTractionTerm`'s pointwise Neumann
+    // residual, not itself a pointwise boundary-operator residual - `Π=U-W_ext`'s natural BC
+    // is satisfied automatically by minimizing this energy, not by a per-point condition it
+    // enforces directly. Correctly `None` rather than mislabeled `Neumann`.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("external_work: domain missing");
         let (nx, ny) = d.normals.clone().expect("external_work: normals must be Some");
@@ -403,6 +412,14 @@ impl LossTerm for HoleBcTerm {
         match self.bc {
             HoleBc::Free => Some(crate::problem::StressSource::Direct),
             HoleBc::Fixed => None,
+        }
+    }
+    // `Free` prescribes stress·n=0 (Neumann, zero flux); `Fixed` prescribes displacement=0
+    // (Dirichlet) - same runtime-dependent pattern as `stress_source` above.
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> {
+        match self.bc {
+            HoleBc::Free => Some(crate::problem::BoundaryOperatorKind::Neumann),
+            HoleBc::Fixed => Some(crate::problem::BoundaryOperatorKind::Dirichlet),
         }
     }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
@@ -1372,6 +1389,37 @@ mod tests {
         assert_eq!(report.len(), 3, "report: {report:?}");
         for absent in ["interior_energy", "external_work", "hole_fixed"] {
             assert!(!report.iter().any(|(n, _)| *n == absent), "{absent} has no stress source, must be absent from {report:?}");
+        }
+    }
+
+    #[test]
+    fn boundary_operator_report_classifies_every_boundary_term_correctly() {
+        use crate::problem::BoundaryOperatorKind as Bok;
+
+        let spec = ProblemSpec {
+            geometry: two_hole_geometry(),
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+        };
+        let problem = UserDefinedProblem::new(spec);
+        let report = crate::training_core::boundary_operator_report(&problem);
+
+        // `two_hole_geometry()`: one `Free` hole (Neumann) and one `Fixed` hole (Dirichlet).
+        // `outer_traction` is Neumann. `equilibrium`/`interior_energy`/`external_work` all
+        // enforce interior physics, not a boundary condition, so are absent - same shape as
+        // `stress_source_report`'s own regression test above.
+        for &(name, kind) in &[
+            ("outer_traction", Bok::Neumann),
+            ("hole_free", Bok::Neumann),
+            ("hole_fixed", Bok::Dirichlet),
+        ] {
+            assert!(report.contains(&(name, kind)), "expected ({name}, {kind:?}) in {report:?}");
+        }
+        assert_eq!(report.len(), 3, "report: {report:?}");
+        for absent in ["interior_energy", "external_work", "equilibrium"] {
+            assert!(!report.iter().any(|(n, _)| *n == absent), "{absent} is not a boundary condition, must be absent from {report:?}");
         }
     }
 

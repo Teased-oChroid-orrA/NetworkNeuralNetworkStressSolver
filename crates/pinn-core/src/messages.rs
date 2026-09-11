@@ -412,6 +412,13 @@ pub struct TrainingUpdate {
     /// own path, which doesn't drive its per-step computation through a `BoundaryValueProblem`
     /// trait object at all - see that path's own doc comment).
     pub stress_source_report: Vec<(&'static str, &'static str)>,
+    /// General-PINN architecture recommendations §13 (Priority 5, "generic boundary operator
+    /// system") - which classical PDE boundary-condition family each active term enforces, if
+    /// any. `(term_name, "Dirichlet"/"Neumann"/"Robin"/"Periodic"/"Symmetry"/"Interface")`
+    /// pairs - plain strings, not the solver's own enum, same "pinn-core never depends on
+    /// pinn-solver" rule `stress_source_report` already established. Same "static per problem,
+    /// never gated" treatment as `stress_source_report` too.
+    pub boundary_operator_report: Vec<(&'static str, &'static str)>,
 }
 
 /// Pin-in-lug analogue of `TrainingUpdate` — one entry per domain's visualization fields,

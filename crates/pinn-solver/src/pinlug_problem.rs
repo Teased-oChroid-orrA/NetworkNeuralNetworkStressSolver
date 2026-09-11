@@ -276,6 +276,7 @@ impl LossTerm for InteriorEnergyTerm {
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
     // Strain-energy only - no stress quantity at the term level.
+    // Interior PDE physics, not a boundary condition - correctly `None`.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain).expect("interior_energy: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("interior_energy: strains must be Some");
@@ -293,6 +294,8 @@ impl LossTerm for LugShankAnchorTerm {
     fn point_sets(&self) -> Vec<&'static str> { vec!["shank_anchor"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     // Displacement-only - no stress quantity involved.
+    // Prescribes the displacement VALUE (zero) at the gripped shank edge - Dirichlet.
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Dirichlet) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("lug_shank_anchor: domain missing");
         let n = d.raw_out.dims()[0];
@@ -315,6 +318,9 @@ impl LossTerm for LugFreeEdgeTractionTerm {
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     // Reads `raw_out` cols 2..5 directly.
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Direct) }
+    // Traction-free is a Neumann condition (zero flux) - same reasoning as Kirsch's
+    // `HoleTractionTerm`.
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Neumann) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("lug_free_edge_traction: domain missing");
         let (nx, ny) = d.normals.clone().expect("lug_free_edge_traction: normals must be Some");
@@ -340,6 +346,8 @@ impl LossTerm for PinDrivingTractionTerm {
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     // `neumann_loss` computes stress from strain via `compute_stress`.
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
+    // Prescribes stress·n (the driving traction) at the pin's loaded surface - Neumann.
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Neumann) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("pin_driving_traction: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("pin_driving_traction: strains must be Some");
@@ -389,6 +397,9 @@ impl LossTerm for InterfacePenetrationTerm {
     // Signorini KKT boundary/interface condition, not an interior PDE residual.
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     // Displacement-only (radial displacement gap) - no stress quantity involved.
+    // Couples TWO domains (pin and lug) at their shared contact boundary - the textbook
+    // Interface condition (see `domains()` above: both PIN_DOMAIN and LUG_DOMAIN).
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Interface) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let pin = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("interface_penetration: pin missing");
         let lug = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("interface_penetration: lug missing");
@@ -437,6 +448,11 @@ impl LossTerm for InterfaceNonTensionTerm {
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     // Reads `raw_out` cols 2..5 directly (the pin's own direct mDEM stress).
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Direct) }
+    // Same contact physics as `InterfacePenetrationTerm` (the other half of the Signorini KKT
+    // pair) - Interface, even though `domains()` names only PIN_DOMAIN (the contact pressure
+    // is evaluated from the pin's own stress state, but the condition it enforces is about the
+    // shared pin/lug contact boundary, not an interior property of the pin alone).
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Interface) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let pin = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("interface_non_tension: pin missing");
         let n = self.thetas.len();
@@ -1321,6 +1337,31 @@ mod tests {
                 .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
             assert_eq!(term.stress_source(), *expected_source,
                 "term '{}' has stress_source {:?}, expected {:?}", term.name(), term.stress_source(), expected_source);
+        }
+    }
+
+    #[test]
+    fn pinlug_loss_terms_have_expected_boundary_kind_classification() {
+        use crate::problem::BoundaryOperatorKind as Bok;
+
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
+        let terms = problem.loss_terms();
+
+        let expected: &[(&str, Option<Bok>)] = &[
+            ("pin_interior_energy", None),
+            ("lug_interior_energy", None),
+            ("lug_shank_anchor", Some(Bok::Dirichlet)),
+            ("lug_free_edge_traction", Some(Bok::Neumann)),
+            ("pin_driving_traction", Some(Bok::Neumann)),
+            ("interface_penetration", Some(Bok::Interface)),
+            ("interface_non_tension", Some(Bok::Interface)),
+        ];
+
+        for term in &terms {
+            let (_, expected_kind) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.boundary_kind(), *expected_kind,
+                "term '{}' has boundary_kind {:?}, expected {:?}", term.name(), term.boundary_kind(), expected_kind);
         }
     }
 }

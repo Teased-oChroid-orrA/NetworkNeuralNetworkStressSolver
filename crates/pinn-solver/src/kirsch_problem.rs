@@ -296,6 +296,8 @@ impl LossTerm for InteriorEnergyTerm {
     // Reads strain, computes strain-energy density - never produces/compares a stress value
     // as a term-level quantity, so genuinely has no stress source to report (`dem_energy_loss`
     // computes stress internally only as an intermediate of the energy formula).
+    // Interior PDE physics (energy minimization over the domain interior), not a boundary
+    // condition at all - correctly `None`, not a classical operator forced onto it.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("interior_energy: domain not present in inputs");
@@ -321,6 +323,9 @@ impl LossTerm for NeumannTractionTerm {
     // `neumann_loss` computes stress from strain via `compute_stress` before comparing it
     // against the traction target - derived, not direct.
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
+    // Prescribes stress·n (traction) at the loaded outer boundary - the textbook Neumann
+    // (flux) condition.
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Neumann) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("neumann_traction: domain not present in inputs");
@@ -355,6 +360,9 @@ impl LossTerm for HoleTractionTerm {
     fn stress_source(&self) -> Option<crate::problem::StressSource> {
         Some(if self.direct { crate::problem::StressSource::Direct } else { crate::problem::StressSource::Derived })
     }
+    // Traction-FREE is still a Neumann condition (zero-flux is a Neumann value, not a distinct
+    // category) - prescribes stress·n = 0 at the unloaded hole boundary.
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Neumann) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("hole_traction: domain not present in inputs");
@@ -387,6 +395,8 @@ impl LossTerm for DisplacementAnchorTerm {
     fn point_sets(&self) -> Vec<&'static str> { vec!["right_edge"] }
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Bc }
     // Displacement-only (reads `raw_out` column 0) - no stress quantity involved.
+    // Prescribes the displacement VALUE at the right edge - the textbook Dirichlet condition.
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Dirichlet) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("displacement_anchor: domain not present in inputs");
@@ -424,6 +434,8 @@ impl LossTerm for EquilibriumRingTerm {
     // of-displacement chain (see `EquilibriumTerm` in user_problem.rs for the contrasting
     // derived-stress version of this same physics).
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Direct) }
+    // Despite "Ring" in the name (an FD-stencil sampling detail), this enforces interior
+    // equilibrium (∇·σ=0) at those points, not a boundary condition - correctly `None`.
     fn compute(&self, _inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let [sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym] =
             self.components.clone().expect(
@@ -459,6 +471,9 @@ impl LossTerm for KirschStressTerm {
     fn stress_source(&self) -> Option<crate::problem::StressSource> {
         Some(if self.direct { crate::problem::StressSource::Direct } else { crate::problem::StressSource::Derived })
     }
+    // Soft supervision against Kirsch's known analytical solution at scattered interior probe
+    // points - a data-fit/manufactured-solution anchor, not a classical PDE boundary operator
+    // (no single boundary it's "on"), so correctly `None` rather than forced into a category.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("kirsch_stress: domain not present in inputs");
@@ -501,6 +516,8 @@ impl LossTerm for ConstitutiveConsistencyTerm {
     // Reads AND compares both representations - this term's entire purpose is policing the
     // gap between them (see `StressSource::Both`'s doc comment).
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Both) }
+    // Interior physics consistency (σ_direct vs σ_derived at the same interior points), not a
+    // boundary condition - same reasoning as `conflict_group`'s own `Physics` classification.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("constitutive_consistency: domain not present in inputs");
@@ -784,6 +801,31 @@ mod tests {
                 .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
             assert_eq!(term.stress_source(), *expected_source,
                 "term '{}' has stress_source {:?}, expected {:?}", term.name(), term.stress_source(), expected_source);
+        }
+    }
+
+    #[test]
+    fn kirsch_loss_terms_have_expected_boundary_kind_classification() {
+        use crate::problem::BoundaryOperatorKind as Bok;
+
+        let material = MaterialProps::al7075_t6();
+        let problem = KirschProblem::new(material, 5, 4000, 3.0);
+        let terms = problem.loss_terms();
+
+        let expected: &[(&str, Option<Bok>)] = &[
+            ("interior_energy", None),
+            ("neumann_traction", Some(Bok::Neumann)),
+            ("hole_traction", Some(Bok::Neumann)),
+            ("displacement_anchor", Some(Bok::Dirichlet)),
+            ("equilibrium_ring", None),
+            ("kirsch_stress", None),
+        ];
+
+        for term in &terms {
+            let (_, expected_kind) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.boundary_kind(), *expected_kind,
+                "term '{}' has boundary_kind {:?}, expected {:?}", term.name(), term.boundary_kind(), expected_kind);
         }
     }
 
