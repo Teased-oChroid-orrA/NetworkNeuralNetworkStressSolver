@@ -388,6 +388,18 @@ pub struct StepOutput {
     /// over data already computed - no new tensor ops, no new cost beyond that gate's
     /// existing one).
     pub gradient_share_report: Option<GradientShareReport>,
+    /// Pairwise cosine similarity between every two active terms' OWN gradients - General-PINN
+    /// architecture recommendations §17 ("measure cosine similarity between gradients... if
+    /// traction gradient · energy gradient < 0, the system should report these objectives are
+    /// actively competing"), generalized from `compute_gradient_conflict`/`compute_gradient_
+    /// conflict_multi`'s own pre-existing COARSE two-group (Physics vs Bc) cosine similarity
+    /// into genuine per-term pairs. `Some` under the exact same `probe_term_gradients` gate as
+    /// `term_grad_norms` - reuses the SAME fresh per-term backward pass that gate already pays
+    /// for (see that field's doc comment), just also keeping each term's flattened gradient
+    /// VECTOR (not only its norm) long enough to compute pairwise dot products before
+    /// discarding it - no additional backward passes beyond what `term_grad_norms` already
+    /// costs.
+    pub gradient_conflict_report: Option<GradientConflictReport>,
 }
 
 /// A term's gradient contributes less than 1% of the total gradient magnitude across all
@@ -444,6 +456,93 @@ pub fn gradient_share_report(
         .find(|(_, &s)| s > GRADIENT_SHARE_DOMINANT_THRESHOLD)
         .map(|(&name, _)| name);
     GradientShareReport { shares, inert, dominant }
+}
+
+/// Below this magnitude, cosine similarity between two gradient vectors is unreliable numerical
+/// noise rather than a genuine "orthogonal" reading (either vector could be near-zero-length -
+/// e.g. a term whose forward pass ran but whose backward pass produced a vanishing gradient).
+const GRADIENT_CONFLICT_MIN_NORM: f32 = 1e-12;
+
+/// One pair's gradient cosine similarity - General-PINN architecture recommendations §17:
+/// `c_ij = (∇L_i · ∇L_j) / (||∇L_i|| ||∇L_j||)`. Negative means the two terms' gradients point
+/// in opposing directions at this step - reducing one term's loss would, to first order,
+/// INCREASE the other's (the exact "traction gradient · energy gradient < 0 -> actively
+/// competing" case §17 names explicitly).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientConflictEntry {
+    pub term_a: &'static str,
+    pub term_b: &'static str,
+    pub cosine_similarity: f32,
+}
+
+impl GradientConflictEntry {
+    /// Strictly negative cosine similarity - the two terms' gradients disagree in direction,
+    /// not merely in magnitude. Matches §17's own `< 0` criterion literally (no extra margin -
+    /// a small negative reading is still a real, if mild, disagreement, not noise; noise is
+    /// already excluded upstream by `GRADIENT_CONFLICT_MIN_NORM`).
+    pub fn is_conflicting(&self) -> bool {
+        self.cosine_similarity < 0.0
+    }
+}
+
+/// Pure cosine similarity between two equal-length flattened gradient vectors. Returns `0.0`
+/// (treated as "no signal", not a real orthogonal reading) for a length mismatch or either
+/// vector having near-zero norm - same fail-safe convention `compute_gradient_conflict`'s own
+/// `same_len` branch already established for the coarse two-group case.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|&x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|&x| x * x).sum::<f32>().sqrt();
+    if norm_a < GRADIENT_CONFLICT_MIN_NORM || norm_b < GRADIENT_CONFLICT_MIN_NORM {
+        return 0.0;
+    }
+    (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
+}
+
+/// Every distinct pair's gradient cosine similarity, from each active term's own flattened
+/// gradient vector - General-PINN architecture recommendations §17, generalized from
+/// `compute_gradient_conflict`/`compute_gradient_conflict_multi`'s pre-existing COARSE
+/// two-group (Physics vs Bc) cosine similarity into genuine per-term pairs. Names are sorted
+/// before pairing so the output order is deterministic regardless of `HashMap` iteration order
+/// (needed for reproducible tests and stable GUI display, not for correctness of the math
+/// itself - `cosine_similarity(a,b) == cosine_similarity(b,a)`).
+pub fn pairwise_gradient_cosine_similarities(
+    term_grad_vectors: &std::collections::HashMap<&'static str, Vec<f32>>,
+) -> Vec<GradientConflictEntry> {
+    let mut names: Vec<&'static str> = term_grad_vectors.keys().copied().collect();
+    names.sort_unstable();
+    let mut out = Vec::with_capacity(names.len() * names.len().saturating_sub(1) / 2);
+    for i in 0..names.len() {
+        for j in (i + 1)..names.len() {
+            let cosine_similarity = cosine_similarity(&term_grad_vectors[names[i]], &term_grad_vectors[names[j]]);
+            out.push(GradientConflictEntry { term_a: names[i], term_b: names[j], cosine_similarity });
+        }
+    }
+    out
+}
+
+/// Generic (problem-agnostic) summary of inter-term gradient conflict - §17's own "the system
+/// should report: these objectives are actively competing" requirement. `most_conflicting` is
+/// the single most-negative pair (the strongest active competition this step), `None` when no
+/// pair is negative at all (every active term's gradient at least weakly agrees, the common
+/// case away from a real formulation defect).
+#[derive(Debug, Clone)]
+pub struct GradientConflictReport {
+    pub pairs: Vec<GradientConflictEntry>,
+    pub most_conflicting: Option<GradientConflictEntry>,
+}
+
+/// Builds a [`GradientConflictReport`] from already-computed pairwise entries - a pure
+/// post-processing step, same shape as `gradient_share_report`.
+pub fn build_gradient_conflict_report(pairs: Vec<GradientConflictEntry>) -> GradientConflictReport {
+    let most_conflicting = pairs.iter()
+        .filter(|p| p.is_conflicting())
+        .min_by(|a, b| a.cosine_similarity.partial_cmp(&b.cosine_similarity).unwrap())
+        .copied();
+    GradientConflictReport { pairs, most_conflicting }
 }
 
 /// General-PINN architecture recommendations §4's "every derived quantity must identify its
@@ -1022,6 +1121,7 @@ pub fn step_physics(
         raw_scalar_by_name: None,
         gradient_share_report: None,
         term_grad_norms: None,
+        gradient_conflict_report: None,
     })
 }
 
@@ -1662,25 +1762,40 @@ pub fn step_physics_multi(
     // pass per independent backward()" pattern (one fresh `compute_domain_forwards` call per
     // group) - this mirrors it, just per-term instead of per-group. Real cost (N extra forward
     // + backward passes per step) - never enabled on the hot training path.
+    // `gradient_conflict_report`'s per-term flattened gradient vectors - populated by the same
+    // `probe_term_gradients` block immediately below (Priority 4, General-PINN §17). Declared
+    // out here so the block can fill it without restructuring its existing control flow.
+    let mut term_grad_vectors: Option<std::collections::HashMap<&'static str, Vec<f32>>> = None;
     let term_grad_norms: Option<std::collections::HashMap<&'static str, f32>> = if ctx.probe_term_gradients {
         use crate::problem::DomainForwardOutputs as DFO;
         use pinn_core::problem::DomainId;
 
         let no_masks: Vec<Option<&[bool]>> = model_refs.iter().map(|_| None).collect();
-        let grad_norm_for = |t: Tensor<B, 1>| -> f32 {
+        // Returns both the term's gradient L2 norm AND its flattened gradient vector, computed
+        // from the SAME backward pass - Priority 4 (General-PINN §17, gradient conflict
+        // diagnostics) needs the full vector to compute pairwise cosine similarity between
+        // terms, not just each term's norm; reusing this backward pass avoids a second one.
+        let grad_norm_and_vec_for = |t: Tensor<B, 1>| -> (f32, Vec<f32>) {
             let mut g = t.backward();
             let mut sq = 0.0_f32;
+            let mut flat: Vec<f32> = Vec::new();
             for model in model_refs.iter().copied() {
                 let (weight_ids, bias_ids) = model.param_ids();
                 let gate_ids = model.gate_ids();
                 let wg = GradientsParams::from_params(&mut g, model, &weight_ids);
                 let bg = GradientsParams::from_params(&mut g, model, &bias_ids);
                 let gg = GradientsParams::from_params(&mut g, model, &gate_ids);
-                sq += flatten_grads(model, &wg).powf_scalar(2.0_f64).sum().into_scalar()
-                    + flatten_grads(model, &bg).powf_scalar(2.0_f64).sum().into_scalar()
-                    + flatten_grads(model, &gg).powf_scalar(2.0_f64).sum().into_scalar();
+                let wf = flatten_grads(model, &wg);
+                let bf = flatten_grads(model, &bg);
+                let gf = flatten_grads(model, &gg);
+                sq += wf.clone().powf_scalar(2.0_f64).sum().into_scalar()
+                    + bf.clone().powf_scalar(2.0_f64).sum().into_scalar()
+                    + gf.clone().powf_scalar(2.0_f64).sum().into_scalar();
+                flat.extend(wf.into_data().to_vec::<f32>().unwrap_or_default());
+                flat.extend(bf.into_data().to_vec::<f32>().unwrap_or_default());
+                flat.extend(gf.into_data().to_vec::<f32>().unwrap_or_default());
             }
-            sq.max(0.0).sqrt()
+            (sq.max(0.0).sqrt(), flat)
         };
         let fresh_term_loss = |term: &Box<dyn LossTerm>| -> Tensor<B, 1> {
             let computed = compute_domain_forwards(ctx, &model_refs, std::slice::from_ref(term), device, &no_masks);
@@ -1700,9 +1815,12 @@ pub fn step_physics_multi(
         };
 
         let mut norms = std::collections::HashMap::new();
+        let mut vectors = std::collections::HashMap::new();
         for term in &active_terms {
             let loss = fresh_term_loss(term);
-            norms.insert(term.name(), grad_norm_for(loss));
+            let (norm, vec) = grad_norm_and_vec_for(loss);
+            norms.insert(term.name(), norm);
+            vectors.insert(term.name(), vec);
         }
         // Constitutive-consistency: same ad-hoc construction the (b.5) block above uses,
         // restricted to each mDEM domain's "interior" point set (its own `point_sets()`
@@ -1721,9 +1839,12 @@ pub fn step_physics_multi(
                 combined = Some(match combined { Some(acc) => acc + loss, None => loss });
             }
             if let Some(combined) = combined {
-                norms.insert("constitutive_consistency", grad_norm_for(combined));
+                let (norm, vec) = grad_norm_and_vec_for(combined);
+                norms.insert("constitutive_consistency", norm);
+                vectors.insert("constitutive_consistency", vec);
             }
         }
+        term_grad_vectors = Some(vectors);
         Some(norms)
     } else {
         None
@@ -1804,6 +1925,8 @@ pub fn step_physics_multi(
         raw_scalar_by_name,
         gradient_share_report: term_grad_norms.as_ref().map(gradient_share_report),
         term_grad_norms,
+        gradient_conflict_report: term_grad_vectors.as_ref()
+            .map(|v| build_gradient_conflict_report(pairwise_gradient_cosine_similarities(v))),
     })
 }
 
@@ -3380,6 +3503,65 @@ mod tests {
         assert!(!report.shares.contains_key("nan_term"));
         assert!((report.shares["a"] - 0.5).abs() < 1e-6);
         assert!((report.shares["b"] - 0.5).abs() < 1e-6);
+    }
+
+    /// Hand-computed: a=[1,0], b=[0,1] -> orthogonal, cosine=0.0. c=[1,0] -> identical to a,
+    /// cosine=1.0. d=[-1,0] -> opposite to a, cosine=-1.0 (the §17 "actively competing" case).
+    #[test]
+    fn pairwise_gradient_cosine_similarities_matches_hand_computed_values() {
+        let vecs: std::collections::HashMap<&'static str, Vec<f32>> = [
+            ("a", vec![1.0, 0.0]),
+            ("b", vec![0.0, 1.0]),
+            ("c", vec![1.0, 0.0]),
+            ("d", vec![-1.0, 0.0]),
+        ].into_iter().collect();
+        let pairs = pairwise_gradient_cosine_similarities(&vecs);
+        // 4 names -> C(4,2) = 6 pairs, sorted-name order: (a,b) (a,c) (a,d) (b,c) (b,d) (c,d).
+        assert_eq!(pairs.len(), 6);
+        let find = |x: &str, y: &str| pairs.iter().find(|p| p.term_a == x && p.term_b == y).unwrap().cosine_similarity;
+        assert!((find("a", "b") - 0.0).abs() < 1e-6);
+        assert!((find("a", "c") - 1.0).abs() < 1e-6);
+        assert!((find("a", "d") - (-1.0)).abs() < 1e-6);
+        assert!((find("b", "c") - 0.0).abs() < 1e-6);
+        assert!((find("b", "d") - 0.0).abs() < 1e-6);
+        assert!((find("c", "d") - (-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pairwise_gradient_cosine_similarities_is_deterministically_ordered() {
+        let vecs: std::collections::HashMap<&'static str, Vec<f32>> =
+            [("z", vec![1.0]), ("a", vec![1.0]), ("m", vec![1.0])].into_iter().collect();
+        let pairs = pairwise_gradient_cosine_similarities(&vecs);
+        let order: Vec<(&str, &str)> = pairs.iter().map(|p| (p.term_a, p.term_b)).collect();
+        assert_eq!(order, vec![("a", "m"), ("a", "z"), ("m", "z")]);
+    }
+
+    #[test]
+    fn cosine_similarity_length_mismatch_or_zero_norm_returns_zero_not_nan() {
+        assert_eq!(cosine_similarity(&[1.0, 2.0], &[1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn build_gradient_conflict_report_picks_the_most_negative_pair() {
+        let pairs = vec![
+            GradientConflictEntry { term_a: "eq", term_b: "trac", cosine_similarity: -0.3 },
+            GradientConflictEntry { term_a: "eq", term_b: "energy", cosine_similarity: -0.8 },
+            GradientConflictEntry { term_a: "trac", term_b: "energy", cosine_similarity: 0.5 },
+        ];
+        let report = build_gradient_conflict_report(pairs);
+        assert_eq!(report.most_conflicting.unwrap().cosine_similarity, -0.8);
+    }
+
+    #[test]
+    fn build_gradient_conflict_report_all_non_negative_reports_no_conflict() {
+        let pairs = vec![
+            GradientConflictEntry { term_a: "a", term_b: "b", cosine_similarity: 0.2 },
+            GradientConflictEntry { term_a: "a", term_b: "c", cosine_similarity: 0.0 },
+        ];
+        let report = build_gradient_conflict_report(pairs);
+        assert!(report.most_conflicting.is_none());
     }
 
     #[test]
@@ -5237,6 +5419,7 @@ mod tests {
             raw_scalar_by_name: None,
             gradient_share_report: None,
             term_grad_norms: None,
+            gradient_conflict_report: None,
         })
     }
 

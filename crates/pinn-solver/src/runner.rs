@@ -458,6 +458,7 @@ pub fn run_training(
                 raw_scalar_by_name: None,
                 term_grad_norms: None,
                 gradient_share_report: None,
+                gradient_conflict_report: None,
             };
             (new_m, synthetic)
         } else {
@@ -624,6 +625,7 @@ pub fn run_training(
                 // `StepOutput::term_grad_norms`'s doc comment - it's a `step_physics_multi`-
                 // only diagnostic in this pass).
                 gradient_share_report: None,
+                gradient_conflict_report: None,
                 // Kirsch's per-step computation runs through the hardcoded `step_physics`
                 // path, never through a `&dyn BoundaryValueProblem` trait object -
                 // `stress_source_report` has nothing to iterate. Empty, not fabricated.
@@ -1588,6 +1590,13 @@ fn run_user_problem_training_from(
             inert: r.inert,
             dominant: r.dominant,
         });
+        // `training_core::GradientConflictReport` -> `pinn_core::messages::
+        // GradientConflictSummary` - same transport-split reasoning as `gradient_share_report`
+        // immediately above (Priority 4, General-PINN §17).
+        let gradient_conflict_report = out.gradient_conflict_report.map(|r| pinn_core::messages::GradientConflictSummary {
+            pairs: r.pairs.into_iter().map(|p| (p.term_a, p.term_b, p.cosine_similarity)).collect(),
+            most_conflicting: r.most_conflicting.map(|p| (p.term_a, p.term_b, p.cosine_similarity)),
+        });
         // Static per problem (doesn't change step to step) and genuinely free (pure `Vec`/
         // string logic over `problem.loss_terms()`, no tensor ops) - computed every update,
         // never gated, unlike `gradient_share_report` above.
@@ -1620,6 +1629,7 @@ fn run_user_problem_training_from(
             network_snapshot,
             architecture_event,
             gradient_share_report,
+            gradient_conflict_report,
             stress_source_report,
         };
         let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
@@ -1722,6 +1732,7 @@ pub fn serve_loaded_plate_checkpoint(
         network_snapshot: Some(network_snapshot),
         architecture_event: None, // loaded, not (re)trained this session - nothing happened
         gradient_share_report: None, // no training step ran, so no per-term gradient exists
+        gradient_conflict_report: None,
         stress_source_report,
     };
     let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));

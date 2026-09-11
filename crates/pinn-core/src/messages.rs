@@ -340,6 +340,18 @@ pub struct GradientShareSummary {
     pub dominant: Option<&'static str>,
 }
 
+/// Transport-side mirror of `pinn_solver::training_core::GradientConflictReport` — same
+/// "pinn-core never depends on pinn-solver" split `GradientShareSummary` already established.
+/// General-PINN architecture recommendations §17: pairwise gradient cosine similarity between
+/// every two active loss terms - `most_conflicting` is the strongest active disagreement this
+/// step (`None` when no pair is negative).
+#[derive(Debug, Clone)]
+pub struct GradientConflictSummary {
+    /// `(term_a, term_b, cosine_similarity)` triples, one per distinct pair of active terms.
+    pub pairs: Vec<(&'static str, &'static str, f32)>,
+    pub most_conflicting: Option<(&'static str, &'static str, f32)>,
+}
+
 pub struct TrainingUpdate {
     pub step: usize,
     pub total_loss:   f32,
@@ -386,6 +398,10 @@ pub struct TrainingUpdate {
     /// only on the same vis cadence `hole_analyses`/`bc_residual_rms` already use (an extra
     /// backward pass per active term is real cost, never paid every step).
     pub gradient_share_report: Option<GradientShareSummary>,
+    /// General-PINN architecture recommendations §17 (Priority 4, "gradient conflict
+    /// diagnostics") - see `GradientConflictSummary`'s doc comment. Same vis-cadence gate as
+    /// `gradient_share_report` (built from the SAME per-term backward pass, no extra cost).
+    pub gradient_conflict_report: Option<GradientConflictSummary>,
     /// General-PINN architecture recommendations §4 (Priority 1, "physics dependency graph"),
     /// narrowed to the one edge this codebase's own real bugs were about - see
     /// `pinn_solver::problem::StressSource`'s doc comment. `(term_name, "Direct"/"Derived"/
