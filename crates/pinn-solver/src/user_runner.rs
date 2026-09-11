@@ -127,6 +127,7 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
             // root-cause story. `net_cfg`'s `input_dim` (this function's model-construction
             // site) MUST use the same value.
             n_fourier: spec.geometry.n_fourier(),
+            probe_term_gradients: false,
             phase2_active: true,
             step,
         };
@@ -191,9 +192,12 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         // (user_problem.rs) for why that distinction matters.
         println!("  [diag] constitutive residual RMS={pde_rms:.4e}  max={pde_max:.4e} Pa");
         let nominal_stress = spec.load.px.abs().max(spec.load.py.abs());
+        // Derived-stress-at-margin, not direct σ at the exact boundary - see
+        // `probe_hole_boundary_profile_derived`'s doc comment.
+        let hole_margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
         for (i, hole) in spec.geometry.holes.iter().enumerate() {
-            let profile = crate::user_problem::probe_hole_boundary_profile(
-                &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &device,
+            let profile = crate::user_problem::probe_hole_boundary_profile_derived(
+                &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material, hole_margin, &device,
             );
             let sc = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
             println!("  [diag] hole {i}: max_von_mises={:.4e} Pa  nominal={:.4e} Pa  Kt={:.4}", sc.max_von_mises, sc.nominal_stress, sc.kt);

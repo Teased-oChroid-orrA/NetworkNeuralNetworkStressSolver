@@ -38,7 +38,7 @@ use pinn_core::{
 };
 
 use crate::{
-    energy::{dem_energy_loss, equilibrium_residual_loss, hole_traction_loss_direct, neumann_loss},
+    energy::{dem_energy_loss, equilibrium_from_displacement_hessian_loss, hole_traction_loss_direct, neumann_loss},
     pinlug_problem::IdentityAnsatz,
     problem::{BoundaryValueProblem, ConflictGroup, DomainForwardOutputs, DomainState, LossTerm, B},
 };
@@ -47,6 +47,20 @@ pub const USER_DOMAIN: DomainId = DomainId(0);
 
 const LAM_INTERIOR_ENERGY: f32 = 1.0;
 const LAM_OUTER_TRACTION: f32 = 10.0;
+/// Plate-specific base weight for `equilibrium` - deliberately NOT `kirsch_problem::LAM_EQ`
+/// (5.0) anymore. That value was calibrated for Kirsch's direct-σ-based `EquilibriumRingTerm`;
+/// this plate's `EquilibriumTerm` is a different quantity (derived-stress Hessian residual,
+/// bugSource-New #12) with a different natural gradient magnitude. The no-hole term-gradient
+/// diagnostic (post the `ref_div2` normalization fix) showed `equilibrium`'s gradient norm
+/// still 10-20x smaller than `interior_energy`'s/`outer_traction`'s by step 199, growing
+/// asymmetrically (interior_energy's gradient climbing while equilibrium's stays flat) -
+/// exactly bugSource-New #13's "does equilibrium exert enough pressure to overcome the
+/// energy term's low-strain shortcut" concern. SAW-BRDR's adaptive multiplier is driven by
+/// each term's OWN loss-value decay rate, not cross-term gradient comparison, so it doesn't
+/// automatically compensate for this gap - the base weight is the direct lever. `50.0`
+/// (~10x, matching the observed gap; also `constitutive_consistency`'s existing fixed weight,
+/// not a new magnitude in this codebase) is the first thing to test, not a final tuned value.
+const LAM_EQUILIBRIUM_PLATE: f32 = 50.0;
 const LAM_HOLE_FREE: f32 = 100.0;
 const LAM_HOLE_FIXED: f32 = 50.0;
 
@@ -56,8 +70,8 @@ const HOLE_RING_POINTS: usize = 64;
 const REJECTION_SAMPLE_ATTEMPTS_FACTOR: usize = 20;
 const SEED_INTERIOR: u64 = 90_210;
 
-/// Safety multiple applied to the FD stencil's physical reach when placing each hole's
-/// `"hole_i_anchor"` point set (see [`UserSamplingStrategy::new`]'s margin computation) —
+/// Safety multiple applied to the FD stencil's physical reach when computing the near-hole
+/// collocation-exclusion margin (see [`UserSamplingStrategy::new`]'s margin computation) —
 /// headroom above the bare minimum needed to keep every stencil arm outside the hole.
 const RING_ANCHOR_SAFETY_FACTOR: f64 = 4.0;
 
@@ -82,39 +96,38 @@ pub struct UserSamplingStrategy {
     /// [`Self::named_point_sets`] can return the same content-stable `&'static str` names
     /// every call without leaking memory continuously across a long training run.
     hole_names: Vec<&'static str>,
-    /// `"hole_0_anchor"`, `"hole_1_anchor"`, ... — same leaking convention as `hole_names`.
-    /// See [`Self::constitutive_anchor_point_sets`] and [`Self::new`]'s margin computation.
-    anchor_names: Vec<&'static str>,
-    /// Radial offset [m] applied outside each hole's radius when placing its `"hole_i_anchor"`
-    /// ring — see [`Self::new`] for the derivation. Same margin for every hole (the FD
-    /// stencil's physical reach is a per-domain, not per-hole, quantity).
+    /// Radial offset [m] applied outside each hole's radius when EXCLUDING collocation points
+    /// from the FD-unsafe near-hole annulus (see [`Self::contains_for_collocation`]) — see
+    /// [`Self::new`] for the derivation. No longer used to emit a training point-set/anchor
+    /// term (bugSource-New #12 removed `HoleAnchorEnergyTerm`/`"hole_i_anchor"` — equilibrium
+    /// is now enforced everywhere via the derived-stress Hessian, not just near the hole); the
+    /// geometric "just outside the hole" concept itself stays useful for Kt measurement (see
+    /// `probe_hole_boundary_profile`'s derived-stress-at-margin variant).
     anchor_margin_m: f64,
 }
 
 impl UserSamplingStrategy {
     /// `fd_h`: the training config's FD step in *normalized* coordinates
     /// (`ProblemSpec.training.fd_h`) — needed here (not just by the FD stencil itself) so the
-    /// `"hole_i_anchor"` ring can be placed far enough outside each hole that
-    /// `fd_stencil::assemble_stencil`'s axis-aligned `±hx`/`±hy` arms, evaluated at an anchor
-    /// point, never dip back inside the hole (which would silently evaluate the network on an
-    /// invalid, hole-interior point and produce a meaningless FD-derived strain there — the
-    /// same reason `"hole_i"`'s own ring, which sits exactly ON the hole boundary, is deliberately
-    /// never used for constitutive-consistency checks). Normalized-to-physical conversion:
-    /// `x_norm ∈ [-1,1]` maps to physical `[-half_w, half_w]`, so a stencil arm's physical
-    /// reach is `fd_h * half_w` in x / `fd_h * half_h` in y. The worst case for an anchor point
-    /// at `radius + margin` is a stencil arm pointing straight at the hole center, which stays
-    /// outside the hole iff `margin > fd_h * half_w` AND `margin > fd_h * half_h` — i.e.
+    /// near-hole collocation-exclusion annulus (`contains_for_collocation`) is wide enough
+    /// that `fd_stencil::assemble_stencil`'s axis-aligned `±hx`/`±hy` arms, evaluated at any
+    /// point just outside it, never dip back inside the hole (which would silently evaluate
+    /// the network on an invalid, hole-interior point and produce a meaningless FD-derived
+    /// strain there — the same reason `"hole_i"`'s own ring, which sits exactly ON the hole
+    /// boundary, is deliberately never used for constitutive-consistency checks).
+    /// Normalized-to-physical conversion: `x_norm ∈ [-1,1]` maps to physical
+    /// `[-half_w, half_w]`, so a stencil arm's physical reach is `fd_h * half_w` in x /
+    /// `fd_h * half_h` in y. The worst case for a point at `radius + margin` is a stencil arm
+    /// pointing straight at the hole center, which stays outside the hole iff
+    /// `margin > fd_h * half_w` AND `margin > fd_h * half_h` — i.e.
     /// `margin > fd_h * max(half_w, half_h)`. `RING_ANCHOR_SAFETY_FACTOR` adds headroom above
     /// that bare minimum.
     pub fn new(geometry: UserGeometry, fd_h: f32) -> Self {
         let hole_names = (0..geometry.holes.len())
             .map(|i| -> &'static str { Box::leak(format!("hole_{i}").into_boxed_str()) })
             .collect();
-        let anchor_names = (0..geometry.holes.len())
-            .map(|i| -> &'static str { Box::leak(format!("hole_{i}_anchor").into_boxed_str()) })
-            .collect();
         let anchor_margin_m = ring_anchor_margin_m(fd_h, &geometry);
-        Self { geometry, hole_names, anchor_names, anchor_margin_m }
+        Self { geometry, hole_names, anchor_margin_m }
     }
 
     /// Like `UserGeometry::contains`, but excludes a `self.anchor_margin_m`-wide annulus just
@@ -194,7 +207,7 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
     }
 
     fn named_point_sets(&self, _bnd_pts: &[BoundaryPoint]) -> Vec<NamedPointSet> {
-        let rings = self.geometry.holes.iter().zip(self.hole_names.iter()).map(|(hole, &name)| {
+        self.geometry.holes.iter().zip(self.hole_names.iter()).map(|(hole, &name)| {
             let points = (0..HOLE_RING_POINTS).map(|i| {
                 let theta = 2.0 * std::f64::consts::PI * i as f64 / HOLE_RING_POINTS as f64;
                 let (nx, ny) = (theta.cos(), theta.sin());
@@ -208,33 +221,14 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
                 }
             }).collect();
             NamedPointSet { name, points }
-        });
-        // "hole_i_anchor" — same angles, radius pushed out by `anchor_margin_m` so a
-        // constitutive-consistency FD stencil centered here never dips inside the hole. See
-        // `Self::new`'s doc comment for the margin's derivation and
-        // `Self::constitutive_anchor_point_sets` for how this gets wired into training.
-        let anchors = self.geometry.holes.iter().zip(self.anchor_names.iter()).map(|(hole, &name)| {
-            let r = hole.radius + self.anchor_margin_m;
-            let points = (0..HOLE_RING_POINTS).map(|i| {
-                let theta = 2.0 * std::f64::consts::PI * i as f64 / HOLE_RING_POINTS as f64;
-                let (nx, ny) = (theta.cos(), theta.sin());
-                BoundaryPoint {
-                    x: hole.center[0] + r * nx,
-                    y: hole.center[1] + r * ny,
-                    nx: -nx,
-                    ny: -ny,
-                    tx: 0.0, ty: 0.0,
-                    kind: BoundaryKind::NeumannFree,
-                }
-            }).collect();
-            NamedPointSet { name, points }
-        });
-        rings.chain(anchors).collect()
+        }).collect()
     }
 
-    fn constitutive_anchor_point_sets(&self) -> Vec<&'static str> {
-        self.anchor_names.clone()
-    }
+    // `constitutive_anchor_point_sets` intentionally NOT overridden here anymore (falls back
+    // to the trait default, `vec![]`, matching Kirsch/pin-lug) — bugSource-New #12 removed the
+    // near-ring anchor mechanism this fed (`HoleAnchorEnergyTerm`/`"hole_i_anchor"`): nothing
+    // reads direct σ outside the hole ring anymore, so there is no "keep it honest" gap left
+    // for an anchor to close. See `anchor_margin_m`'s doc comment for what's kept.
 }
 
 /// Mirrors `pinlug_problem::InteriorEnergyTerm` exactly (`dem_energy_loss`, generic, no new
@@ -254,22 +248,27 @@ impl LossTerm for InteriorEnergyTerm {
     }
 }
 
-/// Real strong-form equilibrium (`‖∇·σ‖²`) on the direct mDEM stress output - the piece this
-/// problem was missing entirely (see `powershell_tool/CLAUDE.md`'s Kt investigation: without
-/// this, `InteriorEnergyTerm` minimizes strain energy `U[u]` alone, not total potential energy
+/// Real strong-form equilibrium (`‖∇·σ‖²`), computed on the DERIVED stress `σ=C:ε(u)` via the
+/// displacement Hessian, not the network's direct mDEM stress output — the piece this problem
+/// was missing entirely (see `powershell_tool/CLAUDE.md`'s Kt investigation: without this,
+/// `InteriorEnergyTerm` minimizes strain energy `U[u]` alone, not total potential energy
 /// `Π=U-W_ext`, whose Euler-Lagrange equation IS equilibrium - nothing forced the stress state
-/// at the loaded edges to propagate consistently through the interior). Reuses `energy::
-/// equilibrium_residual_loss` and its exact physics VERBATIM - this is the same mechanism
-/// Kirsch's own `EquilibriumRingTerm` already uses to achieve real Kt convergence (confirmed
-/// by reading `training_core::step_physics`'s mDEM branch: it differentiates the network's
-/// DIRECT σ output via central difference at 4 points shifted ±hx/±hy, not a second-
-/// derivative-of-displacement chain) - not a new equilibrium formulation. `kirsch_problem.rs`
-/// is untouched; this is a separate, plate-scoped struct so Kirsch's own path/tests can never
-/// be affected by anything here.
+/// at the loaded edges to propagate consistently through the interior).
+///
+/// This term ORIGINALLY read direct mDEM σ (`d.shifted_stress`, matching Kirsch's own
+/// `EquilibriumRingTerm` mechanism) — but the term-by-term gradient-instrumentation diagnostic
+/// (bugSource-New #1) found that version's gradient 5-6 orders of magnitude smaller than every
+/// other term's throughout training, and never growing: the plate's direct-σ output never
+/// develops real spatial structure, so constraining `∇·σ_direct=0` was trivially already
+/// satisfied and supplied ~zero real gradient pressure. bugSource-New #12's fix: define
+/// equilibrium on the stress the network's own DISPLACEMENT field implies instead, where real
+/// spatial structure is actually forming during training. See `energy::
+/// equilibrium_from_displacement_hessian_loss`'s doc comment for the derivation.
+/// `kirsch_problem.rs` is untouched; this is a separate, plate-scoped struct so Kirsch's own
+/// path/tests can never be affected by anything here.
 struct EquilibriumTerm {
     point_set: &'static str,
-    cx: f64,
-    cy: f64,
+    material: MaterialProps,
     ref_div2: f64,
 }
 impl LossTerm for EquilibriumTerm {
@@ -277,13 +276,13 @@ impl LossTerm for EquilibriumTerm {
     fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
     fn point_sets(&self) -> Vec<&'static str> { vec![self.point_set] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
+    fn needs_hessian(&self) -> bool { true }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("equilibrium: domain missing");
-        let (sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym) = d.shifted_stress.clone()
-            .expect("equilibrium: shifted_stress must be Some (mDEM domain required)");
-        equilibrium_residual_loss(
-            sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym,
-            self.cx, self.cy, self.ref_div2,
+        let (u_xx, u_yy, u_xy, v_xx, v_yy, v_xy) = d.hessian.clone()
+            .expect("equilibrium: hessian must be Some (needs_hessian()==true)");
+        equilibrium_from_displacement_hessian_loss(
+            u_xx, u_yy, u_xy, v_xx, v_yy, v_xy, &self.material, self.ref_div2,
         )
     }
 }
@@ -315,6 +314,52 @@ impl LossTerm for OuterTractionTerm {
         let ty_target = ny.clone().mul_scalar(self.py);
         neumann_loss(exx, eyy, exy, nx, ny, tx_target, ty_target, &self.material)
             .mul_scalar(1.0 / self.ref_stress2 as f64)
+    }
+}
+
+/// External work `W_ext = ∫_{Γ_N} t̄·u dΓ` (applied traction dotted with displacement) at the
+/// outer boundary — the piece missing from this formulation that bugSource-New #3/#13
+/// specifically flagged: `InteriorEnergyTerm` minimizes strain energy `U[u]` ALONE, not total
+/// potential energy `Π=U-W_ext`. Minimizing pure `U[u]` with no `-W_ext` counterweight is
+/// trivially satisfied by `u≡0` (zero strain everywhere has zero energy) - only `OuterTractionTerm`'s
+/// separate traction-RESIDUAL penalty was providing any incentive against that shortcut, a
+/// fundamentally different mechanism (a boundary-condition penalty) than the genuine
+/// variational term the true minimization principle calls for. This term adds that missing
+/// piece ALONGSIDE (not replacing) `OuterTractionTerm` - the safest way to test the hypothesis
+/// without touching a term that already works.
+///
+/// For the true elasticity solution, `Π[u] = U[u] - W_ext[u]` is minimized over admissible `u`
+/// (mod rigid-body modes) by the exact equilibrium field, with the natural (traction) BC
+/// satisfied automatically - this is the Deep Energy Method's own founding principle, applied
+/// here for the first time to the OUTER boundary (the hole's traction-free BC already gets an
+/// equivalent "do nothing extra" treatment for free, since `t̄=0` there makes its own `W_ext`
+/// contribution identically zero).
+///
+/// `t̄=(px·nx, py·ny)` is the FIXED, APPLIED far-field traction (from `spec.load`), NOT a
+/// network-derived quantity - unlike `OuterTractionTerm`, which compares network-derived
+/// traction against this same target. Sign convention matches `OuterTractionTerm`'s own
+/// `tx_target`/`ty_target` exactly (`nx·px`, `ny·py`). Returns `-mean(t̄·u)/ref_energy` (negated
+/// so MINIMIZING this loss MAXIMIZES the actual external work, matching Π's own `-W_ext` sign);
+/// `ref_energy` is `InteriorEnergyTerm`'s own normalization constant, reused for direct,
+/// same-convention comparability against `U`, not a separately-derived scale.
+struct ExternalWorkTerm {
+    px: f64,
+    py: f64,
+    ref_energy: f32,
+}
+impl LossTerm for ExternalWorkTerm {
+    fn name(&self) -> &'static str { "external_work" }
+    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
+    fn point_sets(&self) -> Vec<&'static str> { vec!["outer_boundary"] }
+    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
+    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("external_work: domain missing");
+        let (nx, ny) = d.normals.clone().expect("external_work: normals must be Some");
+        let n = d.raw_out.dims()[0];
+        let u = d.raw_out.clone().slice([0..n, 0..1]).reshape([n]);
+        let v = d.raw_out.clone().slice([0..n, 1..2]).reshape([n]);
+        let work_density = nx.mul_scalar(self.px) * u + ny.mul_scalar(self.py) * v;
+        work_density.mean().mul_scalar(-1.0 / self.ref_energy as f64)
     }
 }
 
@@ -354,41 +399,11 @@ impl LossTerm for HoleBcTerm {
     }
 }
 
-/// Real equilibrium-via-energy-minimization signal (the SAME mechanism `InteriorEnergyTerm`
-/// applies domain-wide) on a hole's `"hole_i_anchor"` point set specifically — closes a gap
-/// `constitutive_consistency`'s own anchor-ring check can't: that term only verifies the
-/// network's direct σ output agrees with the σ implied by its OWN displacement field there,
-/// which is satisfied just as well by a degenerate near-zero-everything solution as by the
-/// true one. This term instead minimizes real strain energy at a point set guaranteed to be
-/// close enough to the hole (but outside the FD-unsafe annulus - see `UserSamplingStrategy::
-/// new`'s margin derivation) to force the DISPLACEMENT field itself to develop the curvature
-/// a real stress concentration requires, not just keep two representations mutually
-/// consistent. A genuine SAW-BRDR-adaptive term (unlike constitutive-consistency, which has
-/// its own specific, unrelated reason to stay static - see that mechanism's doc comment in
-/// `training_core.rs`): `InteriorEnergyTerm` itself is already SAW-adaptive, and this term is
-/// architecturally identical to it, just on a different point set, so there is no Kirsch/
-/// pin-lug parity risk in letting it adapt normally (neither of those problems' sampling
-/// strategies ever produce a `constitutive_anchor_point_sets()` entry, so they never see this
-/// term at all).
-struct HoleAnchorEnergyTerm {
-    /// One of `UserSamplingStrategy`'s leaked `"hole_i_anchor"` strings - reused directly as
-    /// both this term's `name()` and its `point_sets()` entry (already unique per hole, no
-    /// separate leak needed).
-    point_set: &'static str,
-    material: MaterialProps,
-    ref_energy: f32,
-}
-impl LossTerm for HoleAnchorEnergyTerm {
-    fn name(&self) -> &'static str { self.point_set }
-    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
-    fn point_sets(&self) -> Vec<&'static str> { vec![self.point_set] }
-    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
-    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
-        let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("hole_anchor_energy: domain missing");
-        let (exx, eyy, exy) = d.strains.clone().expect("hole_anchor_energy: strains must be Some");
-        dem_energy_loss(exx, eyy, exy, &self.material).mul_scalar(1.0 / self.ref_energy as f64)
-    }
-}
+// `HoleAnchorEnergyTerm` (a real-equilibrium-via-energy signal on the `"hole_i_anchor"` point
+// set) was removed here as part of bugSource-New #12: it existed to keep direct σ "honest"
+// near the hole ring against a degenerate near-zero-everything solution, a problem that no
+// longer exists once `EquilibriumTerm` reads the displacement-Hessian-derived stress
+// everywhere instead of direct σ (see `EquilibriumTerm`'s own updated doc comment).
 
 pub struct UserDefinedProblem {
     spec: ProblemSpec,
@@ -438,32 +453,44 @@ impl BoundaryValueProblem for UserDefinedProblem {
         let ref_energy = (0.5 * stress_ref * stress_ref / self.spec.material.e).max(1.0) as f32;
         let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
 
-        // Same cx/cy/ref_div2 formula every other `equilibrium_residual_loss` caller uses
-        // (Kirsch's `step_physics`, `headless.rs`, `runner.rs`'s own Kirsch path) - constant
-        // for the whole run, recomputed here each call since `loss_terms()` itself already is
-        // (see `step_physics_multi`'s per-step `ctx.problem.loss_terms()` call).
-        let fd = crate::fd_stencil::FdConfig::new(
-            self.spec.training.fd_h, 2.0 * self.spec.geometry.half_w, 2.0 * self.spec.geometry.half_h,
-        );
-        let eq_cx = fd.sx / (2.0 * fd.hx as f64);
-        let eq_cy = fd.sy / (2.0 * fd.hy as f64);
-        let eq_ref_div2 = (self.spec.load.px * eq_cx).powi(2).max(1.0);
+        // `ref_div2` normalizes `equilibrium`'s residual (units Pa/m - stress per length, from
+        // `factor·u_xx`-type terms in `equilibrium_from_displacement_hessian_loss`) to O(1).
+        //
+        // NOT the `(px*cx)^2` formula every OTHER `equilibrium_*_loss` caller uses (Kirsch's
+        // `step_physics`, `headless.rs`, `runner.rs`'s Kirsch path, and this term's own
+        // earlier direct-σ version) - that `cx = sx/(2·fd_h·domain_width)` was calibrated for
+        // a genuinely different quantity, the FIRST-derivative FD-divergence-of-stress
+        // residual, whose own natural scale really does grow as `1/fd_h`. Reusing it here was
+        // a real bug, found via the term-gradient diagnostic (bugSource-New #1/#12): at
+        // production's `fd_h=1e-3`, `cx ~ 1/(fd_h·domain_width)` is astronomically large
+        // (~1e23 once squared), so dividing by it crushed `equilibrium`'s reported loss AND
+        // gradient to near-zero regardless of the real underlying residual - on BOTH the
+        // no-hole case (genuinely near-zero curvature at the true solution, a red herring) AND
+        // the real single-hole case (where curvature is definitely NOT near-zero at
+        // convergence), the diagnostic showed the identical ~1e-7-1e-6 grad_norm, which is the
+        // signature of an `fd_h`-independent quantity being divided by an `fd_h`-DEPENDENT
+        // constant, not of a physically inert term.
+        //
+        // The correct scale has nothing to do with `fd_h` (the Hessian residual is a converged
+        // FD approximation of a smooth quantity, not itself proportional to `1/fd_h`) -
+        // `px / half_w` (Pa/m, matching the residual's own units) is the natural characteristic
+        // scale instead.
+        let char_length = self.spec.geometry.half_w.max(self.spec.geometry.half_h).max(1e-9);
+        let eq_ref_div2 = (self.spec.load.px / char_length).powi(2).max(1.0);
 
         let mut terms: Vec<Box<dyn LossTerm>> = vec![
             Box::new(InteriorEnergyTerm { material: self.spec.material.clone(), ref_energy }),
-            Box::new(EquilibriumTerm { point_set: "interior", cx: eq_cx, cy: eq_cy, ref_div2: eq_ref_div2 }),
+            Box::new(EquilibriumTerm { point_set: "interior", material: self.spec.material.clone(), ref_div2: eq_ref_div2 }),
             Box::new(OuterTractionTerm {
                 material: self.spec.material.clone(),
                 ref_stress2,
                 px: self.spec.load.px,
                 py: self.spec.load.py,
             }),
+            Box::new(ExternalWorkTerm { px: self.spec.load.px, py: self.spec.load.py, ref_energy }),
         ];
         for (hole, &name) in self.spec.geometry.holes.iter().zip(self.hole_names.iter()) {
             terms.push(Box::new(HoleBcTerm { point_set: name, bc: hole.bc, ref_stress2 }));
-        }
-        for &name in self.sampling.constitutive_anchor_point_sets().iter() {
-            terms.push(Box::new(HoleAnchorEnergyTerm { point_set: name, material: self.spec.material.clone(), ref_energy }));
         }
         terms
     }
@@ -471,15 +498,14 @@ impl BoundaryValueProblem for UserDefinedProblem {
     fn base_weight(&self, term_name: &str) -> f32 {
         match term_name {
             "interior_energy" => LAM_INTERIOR_ENERGY,
-            // Same base weight Kirsch's own EquilibriumRingTerm already uses - the same
-            // physics term, not a newly-tuned number.
-            "equilibrium" => crate::kirsch_problem::LAM_EQ,
+            "equilibrium" => LAM_EQUILIBRIUM_PLATE,
             "outer_traction" => LAM_OUTER_TRACTION,
+            // Same weight as `interior_energy` - approximates the TRUE Π=U-W_ext functional's
+            // own 1:1 ratio (see `ExternalWorkTerm`'s doc comment), not an arbitrarily tuned
+            // number.
+            "external_work" => LAM_INTERIOR_ENERGY,
             "hole_free" => LAM_HOLE_FREE,
             "hole_fixed" => LAM_HOLE_FIXED,
-            // `HoleAnchorEnergyTerm.name()` is a per-hole "hole_i_anchor" string, not a fixed
-            // literal - matched by suffix rather than an exact-string arm per hole.
-            name if name.ends_with("_anchor") => LAM_INTERIOR_ENERGY,
             other => panic!("UserDefinedProblem::base_weight: unknown loss term '{other}'"),
         }
     }
@@ -975,6 +1001,87 @@ pub fn probe_hole_boundary_profile(
     }).collect()
 }
 
+/// Same sampling/forward-pass machinery as [`probe_hole_boundary_profile`], but reads
+/// DERIVED stress (`σ=C:ε`, from FD strain via [`crate::energy::compute_stress`]) at
+/// `r = hole.radius + margin` instead of the network's direct mDEM σ output exactly at the
+/// hole boundary.
+///
+/// Required, not optional, once `EquilibriumTerm` stopped constraining direct σ (bugSource-New
+/// #12): with nothing left keeping the direct-σ output aligned to real elasticity away from
+/// the traction-free BC itself, a Kt computed from it would stay near-zero even if the
+/// underlying displacement field becomes physically correct - reading the wrong quantity, not
+/// a failed fix. `margin` (physical, e.g. [`ring_anchor_margin_m`]'s output) keeps the FD
+/// stencil's arms from crossing into the hole, the same FD-safety concern
+/// `contains_for_collocation` exists for. The exact-boundary, direct-σ variant stays available
+/// for a DIFFERENT, still-meaningful question — "is the traction-free condition satisfied" —
+/// not concentration.
+pub fn probe_hole_boundary_profile_derived(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    geometry: &UserGeometry,
+    hole: &HoleSpec,
+    n_theta: usize,
+    fd: &crate::fd_stencil::FdConfig,
+    u_ref: f32,
+    px_pa: f64,
+    material: &MaterialProps,
+    margin: f64,
+    device: &crate::training_core::BDevice,
+) -> Vec<HoleBoundaryPoint> {
+    use crate::energy::compute_stress;
+    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor};
+    use crate::network::fwd;
+    use crate::training_core::BInner;
+
+    let n = n_theta.max(1);
+    let half_w = geometry.half_w;
+    let half_h = geometry.half_h;
+    let r = hole.radius + margin;
+    let mut thetas = Vec::with_capacity(n);
+    let mut pts_phys = Vec::with_capacity(n);
+    let mut pts_norm = Vec::with_capacity(n);
+    for i in 0..n {
+        let theta_deg = 360.0 * i as f64 / n as f64;
+        let theta = theta_deg.to_radians();
+        let x = hole.center[0] + r * theta.cos();
+        let y = hole.center[1] + r * theta.sin();
+        thetas.push(theta_deg);
+        pts_phys.push((x, y));
+        pts_norm.push([(x / half_w) as f32, (y / half_h) as f32]);
+    }
+
+    let pts_t = norm_pts_to_tensor::<BInner>(&pts_norm, device);
+    let stencil = assemble_stencil::<BInner>(&pts_t, fd, device);
+    let raw_stencil = fwd::<BInner>(model, stencil, geometry.n_fourier(), device);
+
+    let m = 5 * n;
+    let scaled = Tensor::cat(vec![
+        raw_stencil.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
+        raw_stencil.slice([0..m, 2..5]).mul_scalar(px_pa),
+    ], 1);
+    let center_uv = scaled.clone().slice([0..n, 0..2]);
+    let (eps_xx, eps_yy, eps_xy) = compute_strains::<BInner>(scaled, n, fd);
+    let (sxx_t, syy_t, sxy_t) = compute_stress::<BInner>(eps_xx.clone(), eps_yy.clone(), eps_xy.clone(), material);
+
+    let uv_vals: Vec<f32> = center_uv.into_data().to_vec().unwrap_or_else(|_| vec![0.0; 2 * n]);
+    let exx_vals: Vec<f32> = eps_xx.into_data().to_vec().unwrap_or_else(|_| vec![0.0; n]);
+    let eyy_vals: Vec<f32> = eps_yy.into_data().to_vec().unwrap_or_else(|_| vec![0.0; n]);
+    let exy_vals: Vec<f32> = eps_xy.into_data().to_vec().unwrap_or_else(|_| vec![0.0; n]);
+    let sxx_vals: Vec<f32> = sxx_t.into_data().to_vec().unwrap_or_else(|_| vec![0.0; n]);
+    let syy_vals: Vec<f32> = syy_t.into_data().to_vec().unwrap_or_else(|_| vec![0.0; n]);
+    let sxy_vals: Vec<f32> = sxy_t.into_data().to_vec().unwrap_or_else(|_| vec![0.0; n]);
+
+    (0..n).map(|i| {
+        let (sxx, syy, sxy) = (sxx_vals[i], syy_vals[i], sxy_vals[i]);
+        let vm = ((sxx * sxx - sxx * syy + syy * syy + 3.0 * sxy * sxy) as f64).sqrt() as f32;
+        let (x, y) = pts_phys[i];
+        HoleBoundaryPoint {
+            theta_deg: thetas[i], x, y, ux: uv_vals[i * 2], uy: uv_vals[i * 2 + 1],
+            eps_xx: exx_vals[i], eps_yy: eyy_vals[i], eps_xy: exy_vals[i],
+            sxx, syy, sxy, von_mises: vm,
+        }
+    }).collect()
+}
+
 /// Stress-concentration summary derived from a hole-boundary profile. `nominal_stress` is
 /// the applied far-field traction magnitude - the standard Kt denominator for this problem
 /// class. Deliberately NOT compared against a hardcoded Kt=3: that is the closed-form
@@ -999,6 +1106,77 @@ mod tests {
     /// Representative `fd_h` for tests that don't otherwise have a `ProblemSpec.training.fd_h`
     /// in scope — matches the default most real TOML specs use (e.g. `single_hole_plate.toml`).
     const TEST_FD_H: f32 = 1e-3;
+
+    /// Zero-cost analytical check (no training, no network) for the newly added
+    /// `ExternalWorkTerm` (bugSource-New #3/#13's missing `-W_ext` piece of `Π=U-W_ext`) -
+    /// same established methodology as `energy::tests::analytical_uniform_uniaxial_tension_
+    /// satisfies_every_plate_loss_term`: feed the EXACT uniaxial-tension displacement field at
+    /// 4 outer-boundary points (one per edge) and confirm the term's output matches a
+    /// hand-computed value before ever wiring it into a real training run.
+    #[test]
+    fn external_work_term_matches_hand_computed_value_for_the_exact_uniaxial_tension_field() {
+        use burn::tensor::TensorData;
+
+        let device: crate::training_core::BDevice = Default::default();
+        let e = 71.7e9_f64;
+        let nu = 0.33_f64;
+        let sigma0 = 69e6_f64;
+        let half_w = 0.1_f64;
+        let half_h = 0.1_f64;
+        let px = sigma0;
+        let py = 0.0_f64;
+        let ref_energy = (0.5 * sigma0 * sigma0 / e) as f32;
+
+        let u = |x: f64| sigma0 / e * x;
+        let v = |y: f64| -nu * sigma0 / e * y;
+
+        // One point per outer edge: right (nx=1,ny=0), left (nx=-1,ny=0), top (nx=0,ny=1),
+        // bottom (nx=0,ny=-1) - matches `UserSamplingStrategy::sample_boundary`'s own 4-edge
+        // convention (nx/ny encode the outward normal exactly as `OuterTractionTerm` expects).
+        let pts: [(f64, f64, f32, f32); 4] = [
+            (half_w, 0.0, 1.0, 0.0),
+            (-half_w, 0.0, -1.0, 0.0),
+            (0.0, half_h, 0.0, 1.0),
+            (0.0, -half_h, 0.0, -1.0),
+        ];
+        let n = pts.len();
+        let mut raw_data = Vec::with_capacity(n * 2);
+        let mut nx_v = Vec::with_capacity(n);
+        let mut ny_v = Vec::with_capacity(n);
+        for &(x, y, nx, ny) in &pts {
+            raw_data.push(u(x) as f32);
+            raw_data.push(v(y) as f32);
+            nx_v.push(nx);
+            ny_v.push(ny);
+        }
+        let raw_out = Tensor::<B, 2>::from_data(TensorData::new(raw_data, vec![n, 2]), &device);
+        let nx_t = Tensor::<B, 1>::from_data(TensorData::new(nx_v, vec![n]), &device);
+        let ny_t = Tensor::<B, 1>::from_data(TensorData::new(ny_v, vec![n]), &device);
+
+        let d = DomainForwardOutputs {
+            domain: USER_DOMAIN,
+            raw_out: &raw_out,
+            strains: None,
+            normals: Some((nx_t, ny_t)),
+            shifted_stress: None,
+            hessian: None,
+        };
+
+        let term = ExternalWorkTerm { px, py, ref_energy };
+        let loss = term.compute(&[d]);
+        let loss_v = loss.into_data().to_vec::<f32>().unwrap()[0] as f64;
+
+        // Hand-computed: work_density = px*nx*u + py*ny*v (py=0, so top/bottom contribute 0).
+        // right: px*(+1)*u(+half_w) = px*(sigma0/e*half_w)
+        // left:  px*(-1)*u(-half_w) = px*(-1)*(-sigma0/e*half_w) = same as right, by symmetry.
+        let work_right = px * (sigma0 / e * half_w);
+        let work_left = px * (sigma0 / e * half_w);
+        let mean_work = (work_right + work_left) / n as f64;
+        let expected = -mean_work / ref_energy as f64;
+
+        assert!((loss_v - expected).abs() / expected.abs() < 1e-3,
+            "external_work {loss_v} vs hand-computed {expected}");
+    }
 
     fn two_hole_geometry() -> UserGeometry {
         UserGeometry {
@@ -1063,13 +1241,16 @@ mod tests {
     }
 
     #[test]
-    fn named_point_sets_returns_one_ring_plus_one_anchor_per_hole_with_expected_point_count() {
+    fn named_point_sets_returns_one_ring_per_hole_with_expected_point_count() {
+        // No more "_anchor" point sets since bugSource-New #12 removed the near-ring
+        // constitutive-anchor mechanism - only one ring per hole now, matching Kirsch/pin-lug's
+        // own hole/interface point-set shape.
         let geom = two_hole_geometry();
         let strategy = UserSamplingStrategy::new(geom.clone(), TEST_FD_H);
         let sets = strategy.named_point_sets(&[]);
-        assert_eq!(sets.len(), 4, "2 holes * (ring + anchor) = 4 named point sets");
+        assert_eq!(sets.len(), 2, "2 holes * 1 ring = 2 named point sets");
         let names: Vec<&str> = sets.iter().map(|s| s.name).collect();
-        for expected in ["hole_0", "hole_1", "hole_0_anchor", "hole_1_anchor"] {
+        for expected in ["hole_0", "hole_1"] {
             assert!(names.contains(&expected), "missing point set {expected:?}, got {names:?}");
         }
         for set in &sets {
@@ -1078,39 +1259,13 @@ mod tests {
     }
 
     #[test]
-    fn constitutive_anchor_point_sets_returns_the_anchor_name_per_hole() {
+    fn constitutive_anchor_point_sets_falls_back_to_the_trait_default() {
+        // bugSource-New #12: `UserSamplingStrategy` no longer overrides this - falls back to
+        // the trait default (`vec![]`), matching Kirsch/pin-lug parity exactly, since nothing
+        // reads direct σ outside the hole ring anymore.
         let geom = two_hole_geometry();
         let strategy = UserSamplingStrategy::new(geom.clone(), TEST_FD_H);
-        let anchors = strategy.constitutive_anchor_point_sets();
-        assert_eq!(anchors, vec!["hole_0_anchor", "hole_1_anchor"]);
-    }
-
-    #[test]
-    fn hole_anchor_points_sit_strictly_outside_the_hole_even_under_the_fd_stencil_reach() {
-        // Real evidence for the margin computation in `UserSamplingStrategy::new`'s doc
-        // comment, not just trusting the arithmetic: replicate `assemble_stencil`'s own
-        // axis-aligned ±hx/±hy offsets (physical, via `FdConfig`) against every anchor point
-        // and confirm every one of the 5 stencil rows (center + 4 arms) stays outside the
-        // hole's radius - the exact invariant the margin exists to guarantee.
-        let geom = two_hole_geometry();
-        let strategy = UserSamplingStrategy::new(geom.clone(), TEST_FD_H);
-        let fd = crate::fd_stencil::FdConfig::new(TEST_FD_H as f32, 2.0 * geom.half_w, 2.0 * geom.half_h);
-        let hx_phys = fd.hx as f64 * geom.half_w;
-        let hy_phys = fd.hy as f64 * geom.half_h;
-        let sets = strategy.named_point_sets(&[]);
-        for hole in &geom.holes {
-            let anchor = &sets.iter().find(|s| s.name.ends_with("_anchor")
-                && ((s.points[0].x - hole.center[0]).powi(2) + (s.points[0].y - hole.center[1]).powi(2)).sqrt() > hole.radius)
-                .expect("each hole must have a matching anchor set");
-            for p in &anchor.points {
-                for &(dx, dy) in &[(0.0, 0.0), (hx_phys, 0.0), (-hx_phys, 0.0), (0.0, hy_phys), (0.0, -hy_phys)] {
-                    let x = p.x + dx;
-                    let y = p.y + dy;
-                    let r = ((x - hole.center[0]).powi(2) + (y - hole.center[1]).powi(2)).sqrt();
-                    assert!(r > hole.radius, "stencil arm ({dx:+.6},{dy:+.6}) from anchor point ({x},{y}) landed inside hole radius {}: r={r}", hole.radius);
-                }
-            }
-        }
+        assert_eq!(strategy.constitutive_anchor_point_sets(), Vec::<&'static str>::new());
     }
 
     #[test]
@@ -1139,15 +1294,16 @@ mod tests {
         };
         let problem = UserDefinedProblem::new(spec);
         let terms = problem.loss_terms();
-        // interior_energy + equilibrium + outer_traction + 2 hole BC terms + 2 hole anchor-energy terms
-        assert_eq!(terms.len(), 7);
+        // interior_energy + equilibrium + outer_traction + external_work + 2 hole BC terms (no
+        // hole anchor-energy terms since bugSource-New #12 removed that mechanism).
+        assert_eq!(terms.len(), 6);
         let names: Vec<&str> = terms.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"interior_energy"));
         assert!(names.contains(&"equilibrium"));
         assert!(names.contains(&"outer_traction"));
+        assert!(names.contains(&"external_work"));
         assert_eq!(names.iter().filter(|&&n| n == "hole_free").count(), 1);
         assert_eq!(names.iter().filter(|&&n| n == "hole_fixed").count(), 1);
-        assert_eq!(names.iter().filter(|&&n| n.ends_with("_anchor")).count(), 2);
         crate::problem::validate_loss_terms(&problem);
     }
 

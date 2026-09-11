@@ -455,6 +455,8 @@ pub fn run_training(
                 lam_by_name: None,
                 timing: None,
                 grad_norm: None,
+                raw_scalar_by_name: None,
+                term_grad_norms: None,
             };
             (new_m, synthetic)
         } else {
@@ -894,6 +896,7 @@ pub fn run_training_pinlug(
                 dynamic_lam_non_tension_cap: 100.0,
                 constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                 n_fourier: 0,
+                probe_term_gradients: false,
                 phase2_active: false,
                 step,
             };
@@ -927,6 +930,7 @@ pub fn run_training_pinlug(
                         dynamic_lam_penetration_cap: 500.0, dynamic_lam_non_tension_cap: 100.0,
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                         n_fourier: 0,
+                        probe_term_gradients: false,
                         phase2_active: false, step,
                     };
                     let after_r = probe_interior_energy_residuals(&after_ctx, &[&model_pin, &model_lug], &device)
@@ -970,6 +974,7 @@ pub fn run_training_pinlug(
                         dynamic_lam_penetration_cap: 500.0, dynamic_lam_non_tension_cap: 100.0,
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                         n_fourier: 0,
+                        probe_term_gradients: false,
                         phase2_active: false, step,
                     };
                     let after_r = probe_interior_energy_residuals(&after_ctx, &[&model_pin, &model_lug], &device)
@@ -1015,6 +1020,7 @@ pub fn run_training_pinlug(
             // now-real `dynamic_lam_h_cap` cap.
             constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            probe_term_gradients: false,
             phase2_active: false,
             step,
         };
@@ -1350,6 +1356,7 @@ fn run_user_problem_training_from(
                 dynamic_lam_non_tension_cap: f64::MAX,
                 constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                 n_fourier: spec.geometry.n_fourier(),
+                probe_term_gradients: false,
                 phase2_active: true,
                 step,
             };
@@ -1385,6 +1392,7 @@ fn run_user_problem_training_from(
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                         n_fourier: spec.geometry.n_fourier(),
+                        probe_term_gradients: false,
                         phase2_active: true, step,
                     };
                     let after_residuals = probe_interior_energy_residuals(&after_ctx, &[&model], &device)
@@ -1447,6 +1455,7 @@ fn run_user_problem_training_from(
             // `input_dim` (below, at this function's model-construction site) MUST use the
             // SAME value - see that call site's own comment.
             n_fourier: spec.geometry.n_fourier(),
+            probe_term_gradients: false,
             phase2_active: true,
             step,
         };
@@ -1478,10 +1487,16 @@ fn run_user_problem_training_from(
             // hole is an extra small forward pass, cheap but not free). `nominal_stress` is
             // the applied far-field traction magnitude, the standard Kt denominator.
             let nominal_stress = spec.load.px.abs().max(spec.load.py.abs());
+            // Derived (Hooke, from FD strain) stress at r=hole.radius+margin, NOT direct mDEM
+            // σ exactly at the hole boundary - see `probe_hole_boundary_profile_derived`'s doc
+            // comment (bugSource-New #12: nothing keeps direct σ aligned to real elasticity
+            // away from the traction-free BC anymore, so Kt must read the derived field).
+            let hole_margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
             let hole_analyses: Vec<pinn_core::messages::HoleAnalysis> = spec.geometry.holes.iter().enumerate()
                 .map(|(hole_index, hole)| {
-                    let profile = crate::user_problem::probe_hole_boundary_profile(
-                        &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &device,
+                    let profile = crate::user_problem::probe_hole_boundary_profile_derived(
+                        &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
+                        &spec.material, hole_margin, &device,
                     );
                     let concentration = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
                     pinn_core::messages::HoleAnalysis { hole_index, profile, concentration }
@@ -1638,9 +1653,14 @@ pub fn serve_loaded_plate_checkpoint(
         &model, &spec.geometry, [nx_vis, ny_vis], u_ref, spec.load.px, &spec.material, &fd, &[], &device,
     );
     let nominal_stress = spec.load.px.abs().max(spec.load.py.abs());
+    // Derived-stress-at-margin, not direct σ at the exact boundary - see
+    // `probe_hole_boundary_profile_derived`'s doc comment.
+    let hole_margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
     let hole_analyses: Vec<pinn_core::messages::HoleAnalysis> = spec.geometry.holes.iter().enumerate()
         .map(|(hole_index, hole)| {
-            let profile = crate::user_problem::probe_hole_boundary_profile(&model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &device);
+            let profile = crate::user_problem::probe_hole_boundary_profile_derived(
+                &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material, hole_margin, &device,
+            );
             let concentration = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
             pinn_core::messages::HoleAnalysis { hole_index, profile, concentration }
         }).collect();
@@ -2176,6 +2196,7 @@ mod tests {
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                 constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                 n_fourier: 0,
+                probe_term_gradients: false,
                 phase2_active: true, step,
             };
             let (new_model, _out) = step_physics_multi(
@@ -2184,6 +2205,211 @@ mod tests {
             model = new_model.into_iter().next().unwrap();
         }
         model.valid()
+    }
+
+    /// Real term-by-term diagnostic recommended by the Kt investigation
+    /// (`powershell_tool/CLAUDE.md`, bugSource-New): "registered does not establish a term is
+    /// exerting enough optimization pressure" - this prints raw (unweighted) value, live
+    /// SAW-adapted lambda, weighted contribution, and the term's OWN gradient L2 norm
+    /// (`probe_term_gradients: true`) for every active term, at a few points across a short
+    /// no-hole run (no hole/AMR complexity - isolates the question to interior_energy vs.
+    /// equilibrium vs. outer_traction, not hole-specific terms). No real training run needed
+    /// to design/interpret this (per-step cost, not wall-clock training length, is what makes
+    /// it informative) - but `probe_term_gradients`'s fresh-forward-pass-per-term technique
+    /// (see `term_grad_norms`'s doc comment in `training_core.rs` for why that's required, not
+    /// optional) is itself real per-call cost, `#[ignore]`d per this project's fast-test/slow-
+    /// integration-test split (measured ~7 min in a debug build for 5 probe points).
+    #[test]
+    #[ignore]
+    fn term_by_term_raw_lambda_weighted_gradient_diagnostic_on_no_hole_plate() {
+        use crate::problem::{BoundaryValueProblem, DomainOptim, DomainStepCtx, DomainStepData, MultiStepCtx, PointSetData};
+        use crate::training_core::step_physics_multi;
+        use crate::user_problem::UserDefinedProblem;
+        use std::collections::HashMap;
+
+        let spec = no_hole_plate_spec(200);
+        let device = BDevice::default();
+        let half_w = spec.geometry.half_w;
+        let half_h = spec.geometry.half_h;
+        let problem = UserDefinedProblem::new(spec.clone());
+        validate_loss_terms(&problem);
+
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden)
+            .with_output_dim(5);
+        let mut model = net_cfg.init(&device);
+        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+        let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+        let mut saw = SawBrdr::with_base(base_weights, 0.95);
+        let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+        let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+
+        let sampling = problem.sampling_strategy(0);
+        let placeholder = pinn_core::geometry::GeometryConfig::kirsch_plate_inches();
+        let int_pts = sampling.sample_interior(&placeholder, spec.training.n_interior);
+        let bnd_pts = sampling.sample_boundary(&placeholder, &spec.load, spec.training.n_boundary);
+        let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / half_w) as f32, (y / half_h) as f32] };
+        let to_pointset = |pts: &[pinn_core::loading::BoundaryPoint]| -> PointSetData {
+            PointSetData {
+                norm: pts.iter().map(|p| norm_pt(p.x, p.y)).collect(),
+                nx: pts.iter().map(|p| p.nx as f32).collect(), ny: pts.iter().map(|p| p.ny as f32).collect(),
+                tx: pts.iter().map(|p| p.tx as f32).collect(), ty: pts.iter().map(|p| p.ty as f32).collect(),
+            }
+        };
+        let mut named = HashMap::new();
+        named.insert("outer_boundary", to_pointset(&bnd_pts));
+        for set in sampling.named_point_sets(&[]) { named.insert(set.name, to_pointset(&set.points)); }
+        let data = DomainStepData {
+            id: crate::user_problem::USER_DOMAIN,
+            int_norm: int_pts.iter().map(|&[x, y]| norm_pt(x, y)).collect(),
+            extra_ring_norm: Vec::new(), named,
+        };
+
+        let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
+        let u_ref = ((stress_ref / spec.material.e) * half_w) as f32;
+        let ref_energy = (0.5 * stress_ref * stress_ref / spec.material.e).max(1.0) as f32;
+        let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
+        let config = SolverConfig::default_kirsch();
+
+        let print_steps = [0usize, 10, 50, 100, 199];
+        for step in 0..200 {
+            let probe_now = print_steps.contains(&step);
+            let ctx = MultiStepCtx {
+                config: &config, problem: &problem, fd: &fd, k: 1.0,
+                domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
+                dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+                dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
+                constitutive_consistency_weight: 50.0,
+                n_fourier: 0,
+                probe_term_gradients: probe_now,
+                phase2_active: true, step,
+            };
+            let (new_model, out) = step_physics_multi(
+                vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+            );
+            model = new_model.into_iter().next().unwrap();
+
+            if probe_now {
+                let raw = out.raw_scalar_by_name.as_ref().expect("raw_scalar_by_name must be Some on step_physics_multi");
+                let lam = out.lam_by_name.as_ref().expect("lam_by_name must be Some on step_physics_multi");
+                let grad = out.term_grad_norms.as_ref().expect("term_grad_norms must be Some when probe_term_gradients=true");
+                println!("  [term-diag] step={step} total_loss={:.4e}", out.total_scalar);
+                println!("  [term-diag] {:>26} {:>14} {:>14} {:>14} {:>14}", "term", "raw", "lambda", "weighted", "grad_norm");
+                let mut names: Vec<&&str> = raw.keys().collect();
+                names.sort();
+                for name in names {
+                    let r = raw[name];
+                    let l = *lam.get(name).unwrap_or(&0.0);
+                    let g = grad.get(name).copied().unwrap_or(f32::NAN);
+                    println!("  [term-diag] {:>26} {:>14.4e} {:>14.4e} {:>14.4e} {:>14.4e}", name, r, l, r as f64 * l, g);
+                }
+            }
+        }
+    }
+
+    /// Same diagnostic as `term_by_term_raw_lambda_weighted_gradient_diagnostic_on_no_hole_
+    /// plate`, but on the actual hole geometry (`single_hole_like_spec`, matching
+    /// `single_hole_plate.toml`) instead of the no-hole sanity case.
+    ///
+    /// Required because the no-hole case's TRUE solution (uniform uniaxial tension) is
+    /// EXACTLY LINEAR (`u=σ0/E·x`, `v=-νσ0/E·y`) - its Hessian is identically zero everywhere
+    /// at the target. A correctly-working equilibrium-on-Hessian term is SUPPOSED to have
+    /// vanishing gradient as training approaches that curvature-free solution, which is
+    /// indistinguishable, on that test alone, from the term being inert/broken - confirmed by
+    /// running it after switching `EquilibriumTerm` to the Hessian (bugSource-New #12):
+    /// `equilibrium`'s gradient stayed ~1e-7-1e-6, still 5-6 orders smaller than every other
+    /// term's, exactly as it did with the old direct-σ version, even though the term is now
+    /// provably correct in isolation (analytical Hessian test) - because there's genuinely
+    /// almost no curvature for it to react to in that specific problem. The hole geometry's
+    /// true (Kirsch-like) solution has real, nonzero curvature near the hole, so this is the
+    /// test that can actually distinguish "equilibrium is providing real gradient pressure"
+    /// from "equilibrium is inert" for the Hessian-based term.
+    #[test]
+    #[ignore]
+    fn term_by_term_raw_lambda_weighted_gradient_diagnostic_on_single_hole_plate() {
+        use crate::problem::{BoundaryValueProblem, DomainOptim, DomainStepCtx, DomainStepData, MultiStepCtx, PointSetData};
+        use crate::training_core::step_physics_multi;
+        use crate::user_problem::UserDefinedProblem;
+        use std::collections::HashMap;
+
+        let spec = single_hole_like_spec(200);
+        let device = BDevice::default();
+        let half_w = spec.geometry.half_w;
+        let half_h = spec.geometry.half_h;
+        let problem = UserDefinedProblem::new(spec.clone());
+        validate_loss_terms(&problem);
+
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden)
+            .with_output_dim(5);
+        let mut model = net_cfg.init(&device);
+        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+        let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+        let mut saw = SawBrdr::with_base(base_weights, 0.95);
+        let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+        let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+
+        let sampling = problem.sampling_strategy(0);
+        let placeholder = pinn_core::geometry::GeometryConfig::kirsch_plate_inches();
+        let int_pts = sampling.sample_interior(&placeholder, spec.training.n_interior);
+        let bnd_pts = sampling.sample_boundary(&placeholder, &spec.load, spec.training.n_boundary);
+        let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / half_w) as f32, (y / half_h) as f32] };
+        let to_pointset = |pts: &[pinn_core::loading::BoundaryPoint]| -> PointSetData {
+            PointSetData {
+                norm: pts.iter().map(|p| norm_pt(p.x, p.y)).collect(),
+                nx: pts.iter().map(|p| p.nx as f32).collect(), ny: pts.iter().map(|p| p.ny as f32).collect(),
+                tx: pts.iter().map(|p| p.tx as f32).collect(), ty: pts.iter().map(|p| p.ty as f32).collect(),
+            }
+        };
+        let mut named = HashMap::new();
+        named.insert("outer_boundary", to_pointset(&bnd_pts));
+        for set in sampling.named_point_sets(&[]) { named.insert(set.name, to_pointset(&set.points)); }
+        let data = DomainStepData {
+            id: crate::user_problem::USER_DOMAIN,
+            int_norm: int_pts.iter().map(|&[x, y]| norm_pt(x, y)).collect(),
+            extra_ring_norm: Vec::new(), named,
+        };
+
+        let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
+        let u_ref = ((stress_ref / spec.material.e) * half_w) as f32;
+        let ref_energy = (0.5 * stress_ref * stress_ref / spec.material.e).max(1.0) as f32;
+        let ref_stress2 = (stress_ref * stress_ref).max(1.0) as f32;
+        let config = SolverConfig::default_kirsch();
+
+        let print_steps = [0usize, 10, 50, 100, 199];
+        for step in 0..200 {
+            let probe_now = print_steps.contains(&step);
+            let ctx = MultiStepCtx {
+                config: &config, problem: &problem, fd: &fd, k: 1.0,
+                domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
+                dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+                dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
+                constitutive_consistency_weight: 50.0,
+                n_fourier: 0,
+                probe_term_gradients: probe_now,
+                phase2_active: true, step,
+            };
+            let (new_model, out) = step_physics_multi(
+                vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+            );
+            model = new_model.into_iter().next().unwrap();
+
+            if probe_now {
+                let raw = out.raw_scalar_by_name.as_ref().expect("raw_scalar_by_name must be Some on step_physics_multi");
+                let lam = out.lam_by_name.as_ref().expect("lam_by_name must be Some on step_physics_multi");
+                let grad = out.term_grad_norms.as_ref().expect("term_grad_norms must be Some when probe_term_gradients=true");
+                println!("  [term-diag-hole] step={step} total_loss={:.4e}", out.total_scalar);
+                println!("  [term-diag-hole] {:>26} {:>14} {:>14} {:>14} {:>14}", "term", "raw", "lambda", "weighted", "grad_norm");
+                let mut names: Vec<&&str> = raw.keys().collect();
+                names.sort();
+                for name in names {
+                    let r = raw[name];
+                    let l = *lam.get(name).unwrap_or(&0.0);
+                    let g = grad.get(name).copied().unwrap_or(f32::NAN);
+                    println!("  [term-diag-hole] {:>26} {:>14.4e} {:>14.4e} {:>14.4e} {:>14.4e}", name, r, l, r as f64 * l, g);
+                }
+            }
+        }
     }
 
     /// Real training (300 steps, ~60s in a debug build - see CLAUDE.md's documented ~20-30x
@@ -2833,7 +3059,10 @@ mod tests {
         use crate::network::fwd;
         use crate::training_core::BInner;
 
-        let spec = no_hole_plate_spec(3000); // no hole/AMR complexity - converges much faster
+        // 9000 (3x the original 3000) - to distinguish "just needs more steps" from "plateaued"
+        // now that `equilibrium` has real gradient and genuinely competes with the other terms
+        // for optimization budget (see this test's own updated doc comment above).
+        let spec = no_hole_plate_spec(9000);
         let half_w = spec.geometry.half_w;
         let half_h = spec.geometry.half_h;
         let device = crate::training_core::BDevice::default();
@@ -2844,8 +3073,18 @@ mod tests {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
         let mut saw_done = false;
+        let mut last_logged_step = usize::MAX;
         while std::time::Instant::now() < deadline && !saw_done {
             match rx.try_recv() {
+                Ok(TrainingMsg::Update(u)) => {
+                    // Real convergence-trend evidence (plateaued vs. still improving), not just
+                    // a single final number - printed every 1000 steps.
+                    if u.step % 1000 == 0 && u.step != last_logged_step {
+                        last_logged_step = u.step;
+                        println!("  [no-hole] step={} total_loss={:.4e} energy_loss={:.4e} neumann_loss={:.4e}",
+                            u.step, u.total_loss, u.energy_loss, u.neumann_loss);
+                    }
+                }
                 Ok(TrainingMsg::Done) => saw_done = true,
                 Ok(_) => {}
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
@@ -2917,6 +3156,73 @@ mod tests {
             "sigma_xx mean {sxx_mean:.4e} too far from nominal {stress_ref:.4e}");
         assert!(syy_mean.abs() / stress_ref < 0.30, "sigma_yy mean {syy_mean:.4e} should be ~0");
         assert!(sxy_mean.abs() / stress_ref < 0.30, "sigma_xy mean {sxy_mean:.4e} should be ~0");
+    }
+
+    /// Real, `#[ignore]`d single-hole Kt check - the actual target metric the whole
+    /// investigation (bugSource.txt/bugSource-New) was chasing, run only after the no-hole
+    /// sanity test above passes (per the investigation's own standing discipline). Same
+    /// train->checkpoint->reload structure as the no-hole test, but measures Kt via
+    /// `probe_hole_boundary_profile_derived`/`stress_concentration_from_profile` (derived
+    /// stress at the FD-safe margin, NOT direct σ - see those functions' doc comments for why,
+    /// bugSource-New #12). Not compared against a hardcoded Kt=3 (finite plate, see
+    /// `stress_concentration_from_profile`'s own doc comment) - reported honestly either way.
+    #[test]
+    #[ignore]
+    fn run_training_user_problem_single_hole_plate_kt_after_hessian_equilibrium_fix() {
+        let spec = single_hole_like_spec(3000);
+        let device = crate::training_core::BDevice::default();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || run_training_user_problem(spec.clone(), tx, rx_ctrl));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline && !saw_done {
+            match rx.try_recv() {
+                Ok(TrainingMsg::Done) => saw_done = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+
+        let path = std::env::temp_dir().join(format!("pinn_solver_single_hole_kt_{}", std::process::id()));
+        tx_ctrl.send(ControlMsg::SaveCheckpoint { path: path.clone(), saved_at_unix: 0 }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut saved: Option<Result<String, String>> = None;
+        while std::time::Instant::now() < deadline && saved.is_none() {
+            if let Ok(TrainingMsg::CheckpointSaved(r)) = rx.try_recv() { saved = Some(r); }
+            else { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        }
+        let written = saved.expect("must receive a CheckpointSaved response").expect("save must succeed");
+        tx_ctrl.send(ControlMsg::Stop).unwrap();
+        handle.join().unwrap();
+
+        let (model, _meta) = crate::checkpoint::load_checkpoint(&path, &device)
+            .expect("must load the just-saved checkpoint");
+        let _ = std::fs::remove_file(&written);
+        let mut meta_path = path.clone();
+        meta_path.set_file_name(format!("{}.meta.json", path.file_stem().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_file(meta_path);
+
+        let spec = single_hole_like_spec(3000);
+        let half_w = spec.geometry.half_w;
+        let half_h = spec.geometry.half_h;
+        let stress_ref = spec.load.px.abs().max(spec.load.py.abs()).max(1.0);
+        let u_ref = ((stress_ref / spec.material.e) * half_w) as f32;
+        let fd = crate::fd_stencil::FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+        let margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+
+        let nominal_stress = spec.load.px.abs().max(spec.load.py.abs());
+        for (i, hole) in spec.geometry.holes.iter().enumerate() {
+            let profile = crate::user_problem::probe_hole_boundary_profile_derived(
+                &model, &spec.geometry, hole, 144, &fd, u_ref, spec.load.px, &spec.material, margin, &device,
+            );
+            let sc = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
+            println!("  [single-hole-kt] hole {i}: max_von_mises={:.4e} Pa (at theta={:.1} deg)  nominal={:.4e} Pa  Kt={:.4}",
+                sc.max_von_mises, sc.max_theta_deg, sc.nominal_stress, sc.kt);
+        }
     }
 
     // ─── Smart adaptive architecture: end-to-end wiring into run_training_user_problem ───────

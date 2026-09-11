@@ -326,6 +326,26 @@ pub struct StepOutput {
     /// produced). `Option` only for symmetry with `timing`/`cosine_sim` and to leave room for
     /// a future path that can't cheaply compute it.
     pub grad_norm: Option<f32>,
+    /// Every active term's RAW (unweighted) scalar value by name - the `lam_by_name` field's
+    /// missing other half. Cheap (the underlying `term_names`/`term_scalars` already exist by
+    /// the time this is populated), so always-on wherever `lam_by_name` is `Some` - same
+    /// convention, same `None`-on-Kirsch's-frozen-`step_physics`-path rule. Weighted
+    /// contribution is just `raw_scalar_by_name[name] * lam_by_name[name]`, trivially derived
+    /// by any caller - no separate field for that. Built for the Kt investigation's
+    /// term-by-term instrumentation (see `powershell_tool/CLAUDE.md`): "registered" in
+    /// `loss_terms()` doesn't establish a term is exerting real optimization pressure - this
+    /// (and `term_grad_norms` below) is what actually answers that.
+    pub raw_scalar_by_name: Option<std::collections::HashMap<&'static str, f32>>,
+    /// Every active term's OWN gradient L2 norm (an independent `.backward()` pass per term,
+    /// reusing the same `GradientsParams::from_params`/`flatten_grads` technique the aggregate
+    /// `grad_norm` above already uses) - answers whether a term is genuinely participating in
+    /// optimization or merely present in the computation graph with a near-zero gradient.
+    /// `None` unless `MultiStepCtx.probe_term_gradients` is true (the default everywhere except
+    /// dedicated diagnostics) - N extra backward passes per step is real cost, never paid on
+    /// the hot training path. Multiple independent backward passes over overlapping graph
+    /// regions is an already-proven pattern in this codebase (`compute_gradient_conflict_
+    /// multi`'s dual Physics/Bc-group backward split), not a new technique.
+    pub term_grad_norms: Option<std::collections::HashMap<&'static str, f32>>,
 }
 
 /// Extract (σ_xx, σ_yy, σ_xy) from rows `[row_start, row_end)` of an mDEM network output
@@ -436,6 +456,7 @@ pub fn step_physics(
         strains: Some((eps_xx, eps_yy, eps_xy)),
         normals: None,
         shifted_stress: None,
+        hessian: None,
     };
 
     // === Neumann traction forward pass ===
@@ -455,6 +476,7 @@ pub fn step_physics(
             strains: Some((ex, ey, exy)),
             normals: Some((ctx.gathered.trac_nx.clone(), ctx.gathered.trac_ny.clone())),
             shifted_stress: None,
+            hessian: None,
         };
         let term = crate::kirsch_problem::NeumannTractionTerm {
             domain: KIRSCH_DOMAIN,
@@ -486,6 +508,7 @@ pub fn step_physics(
             strains: None,
             normals: None,
             shifted_stress: None,
+            hessian: None,
         };
         let term = crate::kirsch_problem::DisplacementAnchorTerm {
             domain: KIRSCH_DOMAIN,
@@ -520,6 +543,7 @@ pub fn step_physics(
                 strains: None,
                 normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
                 shifted_stress: None,
+                hessian: None,
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -539,6 +563,7 @@ pub fn step_physics(
                 strains: Some((ex, ey, exy)),
                 normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
                 shifted_stress: None,
+                hessian: None,
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -631,6 +656,7 @@ pub fn step_physics(
                     let kirsch_forward = DomainForwardOutputs {
                         domain: KIRSCH_DOMAIN, raw_out: &out_pr, strains: None, normals: None,
                         shifted_stress: None,
+                        hessian: None,
                     };
                     let term = crate::kirsch_problem::KirschStressTerm {
                         domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: true,
@@ -652,6 +678,7 @@ pub fn step_physics(
                         domain: KIRSCH_DOMAIN, raw_out: &out_pr,
                         strains: Some((exx_pr, eyy_pr, exy_pr)), normals: None,
                         shifted_stress: None,
+                        hessian: None,
                     };
                     let term = crate::kirsch_problem::KirschStressTerm {
                         domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: false,
@@ -832,6 +859,8 @@ pub fn step_physics(
         lam_by_name: None,
         timing,
         grad_norm: Some(grad_norm),
+        raw_scalar_by_name: None,
+        term_grad_norms: None,
     })
 }
 
@@ -873,6 +902,10 @@ struct Computed {
     /// domains; populated from the SAME stencil rows already computed for `strains` below, no
     /// extra forward pass.
     shifted_stress: Option<crate::problem::ShiftedStress<B>>,
+    /// Displacement Hessian - see `crate::problem::HessianData`'s doc comment. `Some` ONLY
+    /// for `(domain, point_set)` pairs some active `LossTerm::needs_hessian()==true` term
+    /// requests - a genuinely new 9-point forward pass, NOT free like `shifted_stress`.
+    hessian: Option<crate::problem::HessianData<B>>,
 }
 
 /// Enumerate which `(DomainId, point_set_name)` pairs at least one of `active_terms` needs,
@@ -905,10 +938,17 @@ fn compute_domain_forwards(
     let n_fourier = ctx.n_fourier;
 
     let mut needed: Vec<(DomainId, &'static str)> = Vec::new();
+    // (domain, point_set) pairs at least one active term needs the Hessian for - see
+    // `LossTerm::needs_hessian`'s doc comment. Checked separately from `needed` (which only
+    // tracks WHICH pairs to forward-pass at all) since most terms don't need it.
+    let mut needs_hessian: Vec<(DomainId, &'static str)> = Vec::new();
     for term in active_terms {
         for (&id, &ps) in term.domains().iter().zip(term.point_sets().iter()) {
             if !needed.contains(&(id, ps)) {
                 needed.push((id, ps));
+            }
+            if term.needs_hessian() && !needs_hessian.contains(&(id, ps)) {
+                needs_hessian.push((id, ps));
             }
         }
     }
@@ -1037,6 +1077,44 @@ fn compute_domain_forwards(
         } else {
             None
         };
+
+        // Displacement Hessian for equilibrium-on-derived-stress (see `HessianData`'s doc
+        // comment) - a genuinely NEW 9-point forward pass, only run when some active term
+        // actually needs it for this (domain, point_set) pair (zero cost otherwise, matching
+        // `shifted_stress`'s and every other conditional field's precedent).
+        let hessian: Option<crate::problem::HessianData<B>> = if needs_hessian.contains(&(domain_id, ps_name)) {
+            // Wider FD step than `ctx.fd` - see `hessian_fd_config`'s doc comment for why the
+            // second-order stencil needs this (real, measured f32 cancellation noise at
+            // `ctx.fd`'s step, not a hypothetical concern).
+            let fd2 = crate::fd_stencil::hessian_fd_config(ctx.fd);
+            let m9 = 9 * n_pts;
+            let stencil2 = crate::fd_stencil::assemble_second_order_stencil::<B>(&pts_t, &fd2, device);
+            let raw_net2 = fwd_masked::<B>(model, stencil2, n_fourier, device, forward_masks[model_idx]);
+            debug_assert_eq!(raw_net2.dims()[0], m9, "second-order stencil row count must match 9*n_pts");
+
+            let mut dx2_v = Vec::with_capacity(m9);
+            let mut dy2_v = Vec::with_capacity(m9);
+            let offsets2: [(f32, f32); 9] = [
+                (0.0, 0.0), (fd2.hx, 0.0), (-fd2.hx, 0.0), (0.0, fd2.hy), (0.0, -fd2.hy),
+                (fd2.hx, fd2.hy), (fd2.hx, -fd2.hy), (-fd2.hx, fd2.hy), (-fd2.hx, -fd2.hy),
+            ];
+            for &(sx, sy) in &offsets2 {
+                for p in norm_pts {
+                    let (dx, dy) = ansatz.eval(p[0] + sx, p[1] + sy, ctx.k);
+                    dx2_v.push(dx);
+                    dy2_v.push(dy);
+                }
+            }
+            let dx2_t = Tensor::<B, 2>::from_data(TensorData::new(dx2_v, vec![m9, 1]), device);
+            let dy2_t = Tensor::<B, 2>::from_data(TensorData::new(dy2_v, vec![m9, 1]), device);
+            let u2_col = (raw_net2.clone().slice([0..m9, 0..1]) * dx2_t).mul_scalar(u_ref_f64);
+            let v2_col = (raw_net2.slice([0..m9, 1..2]) * dy2_t).mul_scalar(u_ref_f64);
+            let raw2 = Tensor::cat(vec![u2_col, v2_col], 1);
+            Some(crate::fd_stencil::compute_hessian::<B>(raw2, n_pts, &fd2))
+        } else {
+            None
+        };
+
         let (eps_xx, eps_yy, eps_xy) = compute_strains::<B>(raw, n_pts, ctx.fd);
 
         computed.push(Computed {
@@ -1045,6 +1123,7 @@ fn compute_domain_forwards(
             strains: Some((eps_xx, eps_yy, eps_xy)),
             normals,
             shifted_stress,
+            hessian,
         });
     }
 
@@ -1225,6 +1304,7 @@ pub fn step_physics_multi(
             strains: c.strains.clone(),
             normals: c.normals.clone(),
             shifted_stress: c.shifted_stress.clone(),
+            hessian: c.hessian.clone(),
         }))
         .collect();
 
@@ -1238,7 +1318,7 @@ pub fn step_physics_multi(
         let inputs: Vec<DFO<'_, B>> = term.domains().iter().zip(term.point_sets().iter())
             .filter_map(|(&id, &ps)| forwards.get(&(id, ps)).map(|f| DFO {
                 domain: f.domain, raw_out: f.raw_out,
-                strains: f.strains.clone(), normals: f.normals.clone(), shifted_stress: f.shifted_stress.clone(),
+                strains: f.strains.clone(), normals: f.normals.clone(), shifted_stress: f.shifted_stress.clone(), hessian: f.hessian.clone(),
             }))
             .collect();
         let t = term.compute(&inputs);
@@ -1392,6 +1472,102 @@ pub fn step_physics_multi(
         lam_by_name.insert("constitutive_consistency", effective_lam_const);
     }
 
+    // Term-by-term diagnostics (Kt investigation - see `powershell_tool/CLAUDE.md`): raw
+    // (unweighted) value per term, always cheap since `term_names`/`term_scalars` already
+    // exist. `weighted = raw * lam_by_name[name]`, trivially derived by any caller - not
+    // stored separately.
+    let raw_scalar_by_name: Option<std::collections::HashMap<&'static str, f32>> = Some({
+        let mut m: std::collections::HashMap<&'static str, f32> = term_names.iter().copied()
+            .zip(term_scalars.iter().copied())
+            .collect();
+        if any_mdem {
+            m.insert("constitutive_consistency", const_scalar_sum);
+        }
+        m
+    });
+
+    // Per-term gradient L2 norm - opt-in (`ctx.probe_term_gradients`, default false). Answers
+    // whether a term is genuinely participating in optimization or merely present in the loss
+    // graph with a near-zero gradient - see `StepOutput::term_grad_norms`'s doc comment.
+    //
+    // Each term gets its OWN FRESH forward pass (via `compute_domain_forwards`, restricted to
+    // just that term's own needs) rather than reusing `term_tensors`/the shared `forwards` map
+    // this step already built. This is NOT optional: burn's autodiff does not support an
+    // independent `.backward()` call on a tensor that shares upstream graph nodes with another
+    // tensor already (or about to be) backpropagated separately - confirmed via a real
+    // "Node should have a step registered, did you forget to call `Tensor::register_grad`"
+    // panic when this was first tried reusing `term_tensors` directly. `compute_gradient_
+    // conflict_multi`'s own `sum_group_loss` already establishes this exact "fresh forward
+    // pass per independent backward()" pattern (one fresh `compute_domain_forwards` call per
+    // group) - this mirrors it, just per-term instead of per-group. Real cost (N extra forward
+    // + backward passes per step) - never enabled on the hot training path.
+    let term_grad_norms: Option<std::collections::HashMap<&'static str, f32>> = if ctx.probe_term_gradients {
+        use crate::problem::DomainForwardOutputs as DFO;
+        use pinn_core::problem::DomainId;
+
+        let no_masks: Vec<Option<&[bool]>> = model_refs.iter().map(|_| None).collect();
+        let grad_norm_for = |t: Tensor<B, 1>| -> f32 {
+            let mut g = t.backward();
+            let mut sq = 0.0_f32;
+            for model in model_refs.iter().copied() {
+                let (weight_ids, bias_ids) = model.param_ids();
+                let gate_ids = model.gate_ids();
+                let wg = GradientsParams::from_params(&mut g, model, &weight_ids);
+                let bg = GradientsParams::from_params(&mut g, model, &bias_ids);
+                let gg = GradientsParams::from_params(&mut g, model, &gate_ids);
+                sq += flatten_grads(model, &wg).powf_scalar(2.0_f64).sum().into_scalar()
+                    + flatten_grads(model, &bg).powf_scalar(2.0_f64).sum().into_scalar()
+                    + flatten_grads(model, &gg).powf_scalar(2.0_f64).sum().into_scalar();
+            }
+            sq.max(0.0).sqrt()
+        };
+        let fresh_term_loss = |term: &Box<dyn LossTerm>| -> Tensor<B, 1> {
+            let computed = compute_domain_forwards(ctx, &model_refs, std::slice::from_ref(term), device, &no_masks);
+            let forwards: HashMap<(DomainId, &'static str), DFO<'_, B>> = computed.iter()
+                .map(|c| (c.key, DFO {
+                    domain: c.key.0, raw_out: &c.raw_out,
+                    strains: c.strains.clone(), normals: c.normals.clone(), shifted_stress: c.shifted_stress.clone(), hessian: c.hessian.clone(),
+                }))
+                .collect();
+            let inputs: Vec<DFO<'_, B>> = term.domains().iter().zip(term.point_sets().iter())
+                .filter_map(|(&id, &ps)| forwards.get(&(id, ps)).map(|f| DFO {
+                    domain: f.domain, raw_out: f.raw_out,
+                    strains: f.strains.clone(), normals: f.normals.clone(), shifted_stress: f.shifted_stress.clone(), hessian: f.hessian.clone(),
+                }))
+                .collect();
+            term.compute(&inputs)
+        };
+
+        let mut norms = std::collections::HashMap::new();
+        for term in &active_terms {
+            let loss = fresh_term_loss(term);
+            norms.insert(term.name(), grad_norm_for(loss));
+        }
+        // Constitutive-consistency: same ad-hoc construction the (b.5) block above uses,
+        // restricted to each mDEM domain's "interior" point set (its own `point_sets()`
+        // trait default) - anchor rings are intentionally NOT included here (a real, accepted
+        // simplification: anchors only exist for holed geometries, and the "interior" term
+        // dominates the constitutive-consistency signal either way).
+        if any_mdem {
+            let mut combined: Option<Tensor<B, 1>> = None;
+            for domain in ctx.problem.domains().iter().filter(|d| d.output_dim == 5) {
+                let term: Box<dyn LossTerm> = Box::new(crate::kirsch_problem::ConstitutiveConsistencyTerm {
+                    domain: domain.id,
+                    material: domain.material.clone(),
+                    ref_stress2: ctx.domains.iter().find(|d| d.data.id == domain.id).map(|d| d.ref_stress2).unwrap_or(1.0),
+                });
+                let loss = fresh_term_loss(&term);
+                combined = Some(match combined { Some(acc) => acc + loss, None => loss });
+            }
+            if let Some(combined) = combined {
+                norms.insert("constitutive_consistency", grad_norm_for(combined));
+            }
+        }
+        Some(norms)
+    } else {
+        None
+    };
+
     let lr = lr_sched.step(total_scalar.abs() as f64);
     let mut grads = total.backward();
 
@@ -1464,6 +1640,8 @@ pub fn step_physics_multi(
         // functions in one edit.
         timing: None,
         grad_norm: Some(grad_norm),
+        raw_scalar_by_name,
+        term_grad_norms,
     })
 }
 
@@ -1768,6 +1946,7 @@ pub fn compute_gradient_conflict(
             strains: Some((eps_xx, eps_yy, eps_xy)),
             normals: None,
             shifted_stress: None,
+            hessian: None,
         };
         let e_loss = {
             let term = crate::kirsch_problem::InteriorEnergyTerm {
@@ -1805,6 +1984,7 @@ pub fn compute_gradient_conflict(
             strains: Some((ex, ey, exy)),
             normals: Some((ctx.gathered.trac_nx.clone(), ctx.gathered.trac_ny.clone())),
             shifted_stress: None,
+            hessian: None,
         };
         let term = crate::kirsch_problem::NeumannTractionTerm {
             domain: KIRSCH_DOMAIN,
@@ -1841,6 +2021,7 @@ pub fn compute_gradient_conflict(
             strains: None,
             normals: None,
             shifted_stress: None,
+            hessian: None,
         };
         let term = crate::kirsch_problem::DisplacementAnchorTerm {
             domain: KIRSCH_DOMAIN,
@@ -1872,6 +2053,7 @@ pub fn compute_gradient_conflict(
                 strains: None,
                 normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
                 shifted_stress: None,
+                hessian: None,
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -1891,6 +2073,7 @@ pub fn compute_gradient_conflict(
                 strains: Some((ex, ey, exy)),
                 normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
                 shifted_stress: None,
+                hessian: None,
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -1976,6 +2159,7 @@ pub fn compute_gradient_conflict(
                 let kirsch_forward = DomainForwardOutputs {
                     domain: KIRSCH_DOMAIN, raw_out: &out_pr, strains: None, normals: None,
                     shifted_stress: None,
+                    hessian: None,
                 };
                 let term = crate::kirsch_problem::KirschStressTerm {
                     domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: true,
@@ -1997,6 +2181,7 @@ pub fn compute_gradient_conflict(
                     domain: KIRSCH_DOMAIN, raw_out: &out_pr,
                     strains: Some((exx_pr, eyy_pr, exy_pr)), normals: None,
                     shifted_stress: None,
+                    hessian: None,
                 };
                 let term = crate::kirsch_problem::KirschStressTerm {
                     domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: false,
@@ -2305,6 +2490,7 @@ fn compute_loss_for_lbfgs(
         strains: Some((exx, eyy, exy)),
         normals: None,
         shifted_stress: None,
+        hessian: None,
     };
     // `ctx.ref_energy` is threaded from `StepCtx::ref_energy` (via `LbfgsCtxScalars::from_ctx`),
     // NOT recomputed here — `compute_reference_scales` (the single source of truth) is the
@@ -2342,6 +2528,7 @@ fn compute_loss_for_lbfgs(
             strains: Some((ex, ey, exy_b)),
             normals: Some((ctx.gathered.trac_nx.clone(), ctx.gathered.trac_ny.clone())),
             shifted_stress: None,
+            hessian: None,
         };
         let term = crate::kirsch_problem::NeumannTractionTerm {
             domain: KIRSCH_DOMAIN,
@@ -2377,6 +2564,7 @@ fn compute_loss_for_lbfgs(
             strains: None,
             normals: None,
             shifted_stress: None,
+            hessian: None,
         };
         let term = crate::kirsch_problem::DisplacementAnchorTerm {
             domain: KIRSCH_DOMAIN,
@@ -2408,6 +2596,7 @@ fn compute_loss_for_lbfgs(
                 strains: None,
                 normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
                 shifted_stress: None,
+                hessian: None,
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -2427,6 +2616,7 @@ fn compute_loss_for_lbfgs(
                 strains: Some((ex, ey, exy_h)),
                 normals: Some((ctx.gathered.hole_nx.clone(), ctx.gathered.hole_ny.clone())),
                 shifted_stress: None,
+                hessian: None,
             };
             let term = crate::kirsch_problem::HoleTractionTerm {
                 domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(),
@@ -2512,6 +2702,7 @@ fn compute_loss_for_lbfgs(
                 let kirsch_forward = DomainForwardOutputs {
                     domain: KIRSCH_DOMAIN, raw_out: &out_pr, strains: None, normals: None,
                     shifted_stress: None,
+                    hessian: None,
                 };
                 let term = crate::kirsch_problem::KirschStressTerm {
                     domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: true,
@@ -2533,6 +2724,7 @@ fn compute_loss_for_lbfgs(
                     domain: KIRSCH_DOMAIN, raw_out: &out_pr,
                     strains: Some((exx_pr, eyy_pr, exy_pr)), normals: None,
                     shifted_stress: None,
+                    hessian: None,
                 };
                 let term = crate::kirsch_problem::KirschStressTerm {
                     domain: KIRSCH_DOMAIN, material: ctx.config.material.clone(), direct: false,
@@ -2736,6 +2928,7 @@ fn sum_group_loss(
             strains: c.strains.clone(),
             normals: c.normals.clone(),
             shifted_stress: c.shifted_stress.clone(),
+            hessian: c.hessian.clone(),
         }))
         .collect();
     let mut total: Option<Tensor<B, 1>> = None;
@@ -2743,7 +2936,7 @@ fn sum_group_loss(
         let inputs: Vec<DFO<'_, B>> = term.domains().iter().zip(term.point_sets().iter())
             .filter_map(|(&id, &ps)| forwards.get(&(id, ps)).map(|f| DFO {
                 domain: f.domain, raw_out: f.raw_out,
-                strains: f.strains.clone(), normals: f.normals.clone(), shifted_stress: f.shifted_stress.clone(),
+                strains: f.strains.clone(), normals: f.normals.clone(), shifted_stress: f.shifted_stress.clone(), hessian: f.hessian.clone(),
             }))
             .collect();
         let t = term.compute(&inputs);
@@ -2867,6 +3060,7 @@ fn compute_loss_for_lbfgs_multi(
             strains: c.strains.clone(),
             normals: c.normals.clone(),
             shifted_stress: c.shifted_stress.clone(),
+            hessian: c.hessian.clone(),
         }))
         .collect();
 
@@ -2877,7 +3071,7 @@ fn compute_loss_for_lbfgs_multi(
         let inputs: Vec<DFO<'_, B>> = term.domains().iter().zip(term.point_sets().iter())
             .filter_map(|(&id, &ps)| forwards.get(&(id, ps)).map(|f| DFO {
                 domain: f.domain, raw_out: f.raw_out,
-                strains: f.strains.clone(), normals: f.normals.clone(), shifted_stress: f.shifted_stress.clone(),
+                strains: f.strains.clone(), normals: f.normals.clone(), shifted_stress: f.shifted_stress.clone(), hessian: f.hessian.clone(),
             }))
             .collect();
         let t = term.compute(&inputs);
@@ -3300,6 +3494,7 @@ mod tests {
         let right_forward = DomainForwardOutputs {
             domain: KIRSCH_DOMAIN, raw_out: &out_r, strains: None, normals: None,
             shifted_stress: None,
+            hessian: None,
         };
         let term = crate::kirsch_problem::DisplacementAnchorTerm {
             domain: KIRSCH_DOMAIN, u_target: u_target_val,
@@ -4746,6 +4941,8 @@ mod tests {
             lam_by_name: None,
             timing: None,
             grad_norm: None,
+            raw_scalar_by_name: None,
+            term_grad_norms: None,
         })
     }
 
@@ -4948,6 +5145,7 @@ mod tests {
                 dynamic_lam_non_tension_cap: 100.0,
                 constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
                 n_fourier: 0,
+                probe_term_gradients: false,
                 phase2_active: false,
                 step,
             };
@@ -5249,6 +5447,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            probe_term_gradients: false,
             phase2_active: false,
             step: 0,
         };
@@ -5325,6 +5524,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            probe_term_gradients: false,
             phase2_active: false,
             step: 0,
         };
@@ -5443,6 +5643,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            probe_term_gradients: false,
             phase2_active: false,
             step: 0,
         };
@@ -5583,6 +5784,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            probe_term_gradients: false,
             phase2_active: false,
             step: 0,
         };
@@ -5634,6 +5836,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            probe_term_gradients: false,
             phase2_active: false,
             step: 0,
         };
@@ -5772,6 +5975,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            probe_term_gradients: false,
             phase2_active: false,
             step: 0,
         };
@@ -5856,6 +6060,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            probe_term_gradients: false,
             phase2_active: false,
             step: 0,
         };
@@ -5989,6 +6194,7 @@ mod tests {
             dynamic_lam_non_tension_cap,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            probe_term_gradients: false,
             phase2_active,
             step: 0,
         }

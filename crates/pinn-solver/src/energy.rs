@@ -94,6 +94,39 @@ pub fn equilibrium_residual_loss<B: Backend>(
         .mul_scalar(1.0 / ref_div2)
 }
 
+/// Equilibrium residual ‖∇·σ‖² computed from the DISPLACEMENT HESSIAN via σ=C:ε(u), not from
+/// the network's direct σ output (see `equilibrium_residual_loss` above, which does the latter
+/// and was found functionally inert - bugSource-New #12: the plate's direct-σ output never
+/// develops real spatial structure during training, so constraining ∇·σ_direct=0 is trivially
+/// already satisfied and provides no real gradient pressure). This is the derived-stress
+/// alternative: substitute σ=C:ε(u) into ∇·σ=0 for standard plane-stress elasticity to get,
+/// directly in terms of the Hessian of u,v:
+///   r_x = factor·(u_xx + ν·v_xy) + G·(u_yy + v_xy)
+///   r_y = factor·(v_yy + ν·u_xy) + G·(u_xy + v_xx)
+/// `factor = E/(1-ν²)`, `G = E/(2(1+ν))` - identical constants to `compute_stress`, reused not
+/// re-derived. `ref_div2`: normalisation so output is dimensionless O(1), same convention as
+/// `equilibrium_residual_loss`.
+pub fn equilibrium_from_displacement_hessian_loss<B: Backend>(
+    u_xx: Tensor<B, 1>, u_yy: Tensor<B, 1>, u_xy: Tensor<B, 1>,
+    v_xx: Tensor<B, 1>, v_yy: Tensor<B, 1>, v_xy: Tensor<B, 1>,
+    material: &MaterialProps,
+    ref_div2: f64,
+) -> Tensor<B, 1> {
+    let e  = material.e  as f64;
+    let nu = material.nu as f64;
+    let factor = e / (1.0 - nu * nu);
+    let g = e / (2.0 * (1.0 + nu));
+
+    let r_x = (u_xx + v_xy.clone().mul_scalar(nu)).mul_scalar(factor)
+            + (u_yy + v_xy.clone()).mul_scalar(g);
+    let r_y = (v_yy + u_xy.clone().mul_scalar(nu)).mul_scalar(factor)
+            + (u_xy + v_xx).mul_scalar(g);
+
+    (r_x.clone() * r_x + r_y.clone() * r_y)
+        .mean()
+        .mul_scalar(1.0 / ref_div2)
+}
+
 /// Neumann BC penalty: squared traction residual on the load boundary.
 pub fn neumann_loss<B: Backend>(
     eps_xx_b: Tensor<B, 1>,
@@ -182,6 +215,190 @@ mod tests {
 
     fn t1(v: f32) -> Tensor<TB, 1> {
         Tensor::<TB, 1>::from_floats([v], &Default::default())
+    }
+
+    /// Zero-cost analytical sanity check (no training, no network) - recommended as the
+    /// single highest-value diagnostic in the Kt investigation
+    /// (`powershell_tool/CLAUDE.md`): feed the EXACT uniform-uniaxial-tension elasticity
+    /// solution through every plate physics loss function and confirm each one reports
+    /// what it should. If this test fails, there's an implementation bug independent of
+    /// training/optimization; if it passes (it does), the loss math itself is confirmed
+    /// correct and the Kt/no-hole convergence problem is an optimization-dynamics question,
+    /// not an implementation bug in these functions.
+    ///
+    /// Exact plane-stress uniaxial tension solution (σ0 along x, free in y):
+    ///   u(x,y) = (σ0/E) x,  v(x,y) = -ν(σ0/E) y
+    ///   ε_xx = σ0/E,  ε_yy = -ν·σ0/E,  ε_xy = 0
+    ///   σ_xx = σ0,  σ_yy = 0,  σ_xy = 0  (uniform - zero divergence everywhere)
+    #[test]
+    fn analytical_uniform_uniaxial_tension_satisfies_every_plate_loss_term() {
+        use crate::fd_stencil::{compute_strains, FdConfig};
+        use burn::tensor::TensorData;
+
+        let device = Default::default();
+        let e = 71.7e9_f64;
+        let nu = 0.33_f64;
+        let sigma0 = 69e6_f64;
+        let half_w = 0.1_f64;
+        let half_h = 0.1_f64;
+        let fd_h = 1e-3_f32;
+        let mat = material(e, nu);
+
+        let hx_phys = fd_h as f64 * half_w;
+        let hy_phys = fd_h as f64 * half_h;
+        // Arbitrary non-origin interior point - catches any point-dependent bug an
+        // origin-only check (where linear terms vanish) would miss.
+        let (x0, y0) = (0.03_f64, 0.02_f64);
+        let u = |x: f64| sigma0 / e * x;
+        let v = |y: f64| -nu * sigma0 / e * y;
+        let (sxx_exact, syy_exact, sxy_exact) = (sigma0, 0.0_f64, 0.0_f64);
+
+        // [5,5] tensor matching `compute_domain_forwards`'s own row layout (center, x+hx,
+        // x-hx, y+hy, y-hy) - already-physical-unit values, exactly as `raw` is by the time
+        // it reaches `compute_strains` in production. Direct-σ columns are the exact constant
+        // stress (the ideal case: ideally the network's direct output IS the true field).
+        let mut data = Vec::with_capacity(25);
+        for &(dx, dy) in &[(0.0, 0.0), (hx_phys, 0.0), (-hx_phys, 0.0), (0.0, hy_phys), (0.0, -hy_phys)] {
+            let (x, y) = (x0 + dx, y0 + dy);
+            data.extend_from_slice(&[u(x) as f32, v(y) as f32, sxx_exact as f32, syy_exact as f32, sxy_exact as f32]);
+        }
+        let raw = Tensor::<TB, 2>::from_data(TensorData::new(data, vec![5, 5]), &device);
+
+        let fd = FdConfig::new(fd_h, 2.0 * half_w, 2.0 * half_h);
+        let (eps_xx, eps_yy, eps_xy) = compute_strains::<TB>(raw.clone(), 1, &fd);
+
+        let get = |t: Tensor<TB, 1>| -> f64 { t.into_data().to_vec::<f32>().unwrap()[0] as f64 };
+        let (exx, eyy, exy) = (get(eps_xx.clone()), get(eps_yy.clone()), get(eps_xy.clone()));
+        let (exx_expected, eyy_expected) = (sigma0 / e, -nu * sigma0 / e);
+        assert!((exx - exx_expected).abs() / exx_expected.abs() < 1e-3, "eps_xx {exx} vs expected {exx_expected}");
+        assert!((eyy - eyy_expected).abs() / eyy_expected.abs() < 1e-3, "eps_yy {eyy} vs expected {eyy_expected}");
+        assert!(exy.abs() < 1e-9, "eps_xy {exy} should be ~0");
+
+        let (sxx, syy, sxy) = compute_stress::<TB>(eps_xx.clone(), eps_yy.clone(), eps_xy.clone(), &mat);
+        let (sxx_v, syy_v, sxy_v) = (get(sxx), get(syy), get(sxy));
+        assert!((sxx_v - sigma0).abs() / sigma0 < 1e-3, "sigma_xx {sxx_v} vs {sigma0}");
+        assert!(syy_v.abs() / sigma0 < 1e-3, "sigma_yy {syy_v} should be ~0");
+        assert!(sxy_v.abs() / sigma0 < 1e-3, "sigma_xy {sxy_v} should be ~0");
+
+        // Interior energy: finite, matches 0.5*sigma:epsilon by hand (real, expected nonzero).
+        let energy_v = get(dem_energy_loss::<TB>(eps_xx.clone(), eps_yy.clone(), eps_xy.clone(), &mat));
+        let energy_expected = 0.5 * (sxx_exact * exx_expected + syy_exact * eyy_expected);
+        assert!((energy_v - energy_expected).abs() / energy_expected.abs() < 1e-2, "energy {energy_v} vs {energy_expected}");
+
+        // Outer traction at a right-edge-like point (normal=(1,0)): predicted traction must
+        // exactly match the target (sigma0, 0) - this is `OuterTractionTerm`'s exact math.
+        let t1v = |v: f32| Tensor::<TB, 1>::from_data(TensorData::new(vec![v], vec![1]), &device);
+        let outer_v = get(neumann_loss::<TB>(
+            eps_xx.clone(), eps_yy.clone(), eps_xy.clone(), t1v(1.0), t1v(0.0), t1v(sigma0 as f32), t1v(0.0), &mat,
+        ));
+        assert!(outer_v.abs() / (sigma0 * sigma0) < 1e-4, "outer_traction {outer_v} should be ~0 (normalized by sigma0^2)");
+
+        // Equilibrium: constant direct-sigma field everywhere -> exactly zero divergence.
+        // Same (sxx_xp,sxy_xp,sxx_xm,sxy_xm,sxy_yp,syy_yp,sxy_ym,syy_ym) argument order/row
+        // layout `EquilibriumTerm` uses in production (user_problem.rs).
+        let col = |r: usize, c: usize| -> Tensor<TB, 1> { raw.clone().slice([r..r + 1, c..c + 1]).reshape([1]) };
+        let cx = fd.sx / (2.0 * fd.hx as f64);
+        let cy = fd.sy / (2.0 * fd.hy as f64);
+        let ref_div2 = (sigma0 * cx).powi(2).max(1.0);
+        let eq_v = get(equilibrium_residual_loss::<TB>(
+            col(1, 2), col(1, 4), col(2, 2), col(2, 4), col(3, 4), col(3, 3), col(4, 4), col(4, 3), cx, cy, ref_div2,
+        ));
+        assert!(eq_v < 1e-6, "equilibrium residual {eq_v} should be ~machine-zero for a spatially constant stress field");
+
+        // Constitutive consistency: direct sigma exactly equals Hooke(epsilon) by construction.
+        let cc_v = get(constitutive_consistency_loss::<TB>(
+            col(0, 2), col(0, 3), col(0, 4), eps_xx, eps_yy, eps_xy, &mat,
+        ));
+        assert!(cc_v.abs() / (sigma0 * sigma0) < 1e-6, "constitutive_consistency {cc_v} should be ~0");
+    }
+
+    /// Zero-cost analytical Hessian check (no training, no network) - gate required by the
+    /// #12 plan before `compute_hessian` is trusted in any real loss term. The uniform-tension
+    /// field above has zero curvature everywhere and can't distinguish "correct second-
+    /// derivative code" from "always returns zero"; this uses a manufactured field with
+    /// nonzero, distinct curvature in every one of the 6 Hessian components instead:
+    ///   u(x,y) = a x² + c xy   ->  u_xx=2a, u_yy=0,  u_xy=c
+    ///   v(x,y) = b y² + d xy   ->  v_xx=0,  v_yy=2b, v_xy=d
+    /// Central FD is exact (no truncation error) for polynomials up to degree 2 in each
+    /// stencil direction, so this is checked to near machine precision, not just "close".
+    #[test]
+    fn hessian_recovers_exact_second_derivatives_of_a_manufactured_quadratic_field() {
+        use crate::fd_stencil::{compute_hessian, hessian_fd_config, FdConfig};
+        use burn::tensor::TensorData;
+
+        let device = Default::default();
+        let half_w = 0.1_f64;
+        let half_h = 0.1_f64;
+        // Second-order FD cancellation error scales ~1/h^2 in f32 (the true second-difference
+        // signal shrinks as h^2 while f32 rounding error on the raw values stays roughly
+        // constant) - production's fd_h=1e-3 is too small to resolve this analytically in
+        // f32 (confirmed: this test originally failed at fd_h=1e-3 directly). Rather than
+        // just widening the TEST's own step, this now goes through `hessian_fd_config` -
+        // production's ACTUAL fd_h widened by its real safety multiplier - so this test is a
+        // true regression guard for what `compute_domain_forwards` really does, not a
+        // separately-chosen value that could drift out of sync with it.
+        let base_fd_h = 1e-3_f32;
+        let fd_h = hessian_fd_config(&FdConfig::new(base_fd_h, 2.0 * half_w, 2.0 * half_h)).hx;
+        let hx_phys = fd_h as f64 * half_w;
+        let hy_phys = fd_h as f64 * half_h;
+        let (x0, y0) = (0.03_f64, 0.02_f64);
+
+        let (a, b, c, d) = (5.0_f64, -3.0_f64, 2.0_f64, -1.5_f64);
+        let u = |x: f64, y: f64| a * x * x + c * x * y;
+        let v = |x: f64, y: f64| b * y * y + d * x * y;
+
+        // Row order matches `assemble_second_order_stencil` exactly: centre, x+hx, x-hx,
+        // y+hy, y-hy, (x+hx,y+hy), (x+hx,y-hy), (x-hx,y+hy), (x-hx,y-hy).
+        let offsets = [
+            (0.0, 0.0), (hx_phys, 0.0), (-hx_phys, 0.0), (0.0, hy_phys), (0.0, -hy_phys),
+            (hx_phys, hy_phys), (hx_phys, -hy_phys), (-hx_phys, hy_phys), (-hx_phys, -hy_phys),
+        ];
+        let mut data = Vec::with_capacity(18);
+        for &(dx, dy) in &offsets {
+            let (x, y) = (x0 + dx, y0 + dy);
+            data.extend_from_slice(&[u(x, y) as f32, v(x, y) as f32]);
+        }
+        let raw = Tensor::<TB, 2>::from_data(TensorData::new(data, vec![9, 2]), &device);
+
+        let fd = FdConfig::new(fd_h, 2.0 * half_w, 2.0 * half_h);
+        let (u_xx, u_yy, u_xy, v_xx, v_yy, v_xy) = compute_hessian::<TB>(raw, 1, &fd);
+
+        let get = |t: Tensor<TB, 1>| -> f64 { t.into_data().to_vec::<f32>().unwrap()[0] as f64 };
+        let (u_xx_v, u_yy_v, u_xy_v) = (get(u_xx), get(u_yy), get(u_xy));
+        let (v_xx_v, v_yy_v, v_xy_v) = (get(v_xx), get(v_yy), get(v_xy));
+
+        let tol = 1e-3; // relative
+        assert!((u_xx_v - 2.0 * a).abs() / (2.0 * a).abs() < tol, "u_xx {u_xx_v} vs {}", 2.0 * a);
+        assert!(u_yy_v.abs() < 1e-6, "u_yy {u_yy_v} should be ~0");
+        assert!((u_xy_v - c).abs() / c.abs() < tol, "u_xy {u_xy_v} vs {c}");
+        assert!(v_xx_v.abs() < 1e-6, "v_xx {v_xx_v} should be ~0");
+        assert!((v_yy_v - 2.0 * b).abs() / (2.0 * b).abs() < tol, "v_yy {v_yy_v} vs {}", 2.0 * b);
+        assert!((v_xy_v - d).abs() / d.abs() < tol, "v_xy {v_xy_v} vs {d}");
+    }
+
+    #[test]
+    fn equilibrium_from_displacement_hessian_loss_matches_hand_derived_residual() {
+        // Pure arithmetic transcription check (mirrors compute_stress_matches_plane_stress_
+        // hookes_law below): arbitrary nonzero Hessian values, hand-computed r_x/r_y, verify
+        // the function's output matches - independent of whether the residual is physically
+        // zero for any real field (that's `hessian_recovers_exact_second_derivatives_...`'s
+        // and later the full-pipeline diagnostic's job).
+        let mat = material(100.0, 0.25); // factor = 106.666.., G = 100/2.5 = 40
+        let (u_xx, u_yy, u_xy) = (0.01_f64, 0.02_f64, 0.005_f64);
+        let (v_xx, v_yy, v_xy) = (-0.01_f64, 0.03_f64, -0.002_f64);
+        let factor = 100.0 / (1.0 - 0.25 * 0.25);
+        let g = 100.0 / (2.0 * 1.25);
+        let r_x_expected = factor * (u_xx + 0.25 * v_xy) + g * (u_yy + v_xy);
+        let r_y_expected = factor * (v_yy + 0.25 * u_xy) + g * (u_xy + v_xx);
+        let expected = r_x_expected * r_x_expected + r_y_expected * r_y_expected;
+
+        let loss = equilibrium_from_displacement_hessian_loss(
+            t1(u_xx as f32), t1(u_yy as f32), t1(u_xy as f32),
+            t1(v_xx as f32), t1(v_yy as f32), t1(v_xy as f32),
+            &mat, 1.0,
+        );
+        let loss_v = loss.into_data().to_vec::<f32>().unwrap()[0] as f64;
+        assert!((loss_v - expected).abs() / expected < 1e-4, "expected {expected}, got {loss_v}");
     }
 
     #[test]

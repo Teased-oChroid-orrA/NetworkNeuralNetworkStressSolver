@@ -432,6 +432,8 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                 // norm comparable to SGD-family steps' - genuinely not available here, not
                 // an oversight.
                 grad_norm: None,
+                raw_scalar_by_name: None,
+                term_grad_norms: None,
             };
             (new_m, synthetic_out)
         } else {
@@ -1083,6 +1085,7 @@ pub(crate) fn run_headless_pinlug_inner(
             // plate-path-only (a documented, deliberate scope cut, not an oversight).
             constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            probe_term_gradients: false,
             // NOTE: `MultiStepCtx::phase2_active` and the `PHASE2_ACTIVE` const below are two
             // INDEPENDENT booleans that happen to share a value by coincidence, not
             // architectural coupling. This one gates `step_physics_multi`'s h/d SAW-BRDR cap
@@ -1134,6 +1137,8 @@ pub(crate) fn run_headless_pinlug_inner(
                 lam_by_name: None,
                 timing: None,
                 grad_norm: None,
+                raw_scalar_by_name: None,
+                term_grad_norms: None,
             }
         } else {
             // tier_u8 is a pure logging passthrough (StepOutput.optimizer_tier) — never

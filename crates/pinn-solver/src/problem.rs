@@ -46,15 +46,29 @@ pub type ShiftedStress<Bk> = (
     Tensor<Bk, 1>, Tensor<Bk, 1>, Tensor<Bk, 1>, Tensor<Bk, 1>,
 );
 
+/// Displacement Hessian `(u_xx, u_yy, u_xy, v_xx, v_yy, v_xy)` from `fd_stencil::
+/// compute_hessian`'s 9-point stencil — the derived-stress equilibrium alternative to
+/// `ShiftedStress` (see `energy::equilibrium_from_displacement_hessian_loss`'s doc comment
+/// for why this exists: the plate's direct-σ-based equilibrium term was found functionally
+/// inert, bugSource-New #12). Unlike `shifted_stress`, this is NOT free to populate — it needs
+/// a genuinely new 9-point forward pass (the existing 5-point stencil for `strains`/
+/// `shifted_stress` doesn't include the 4 diagonal points a mixed partial needs) — see
+/// `LossTerm::needs_hessian`.
+pub type HessianData<Bk> = (
+    Tensor<Bk, 1>, Tensor<Bk, 1>, Tensor<Bk, 1>,
+    Tensor<Bk, 1>, Tensor<Bk, 1>, Tensor<Bk, 1>,
+);
+
 /// Per-domain forward-pass outputs handed to `LossTerm::compute`. `strains`/`normals`/
-/// `shifted_stress` are `None` when the term doesn't need them (e.g. a term operating purely
-/// on `raw_out`).
+/// `shifted_stress`/`hessian` are `None` when the term doesn't need them (e.g. a term
+/// operating purely on `raw_out`).
 pub struct DomainForwardOutputs<'a, Bk: Backend> {
     pub domain: DomainId,
     pub raw_out: &'a Tensor<Bk, 2>,
     pub strains: Option<(Tensor<Bk, 1>, Tensor<Bk, 1>, Tensor<Bk, 1>)>,
     pub normals: Option<(Tensor<Bk, 1>, Tensor<Bk, 1>)>,
     pub shifted_stress: Option<ShiftedStress<Bk>>,
+    pub hessian: Option<HessianData<Bk>>,
 }
 
 /// One additive term of the total physics loss. Implementations describe *which* domain(s)
@@ -99,6 +113,15 @@ pub trait LossTerm: Send + Sync {
     /// point-set lookup).
     fn point_sets(&self) -> Vec<&'static str> {
         self.domains().iter().map(|_| "interior").collect()
+    }
+
+    /// True if this term needs `DomainForwardOutputs::hessian` populated. Defaults to `false`
+    /// (zero behavior/cost change for every existing term — Kirsch/pin-lug never override
+    /// this). `compute_domain_forwards` runs the additional 9-point Hessian stencil forward
+    /// pass ONLY for `(domain, point_set)` pairs whose active term(s) include one that
+    /// returns `true` here — see that function's doc comment.
+    fn needs_hessian(&self) -> bool {
+        false
     }
 
     /// Classifies this term as either enforcing interior PDE/equilibrium physics or a
@@ -262,6 +285,12 @@ pub struct MultiStepCtx<'a> {
     /// single-domain; every other caller keeps this `0`, byte-identical to before this field
     /// existed.
     pub n_fourier: usize,
+    /// Diagnostic-only, opt-in (default `false` everywhere except dedicated diagnostics): when
+    /// true, `step_physics_multi` computes each active term's OWN gradient L2 norm (an extra
+    /// `.backward()` pass per term) and populates `StepOutput.term_grad_norms`. Real cost (N
+    /// extra backward passes per step) - never set true on a hot training path. See
+    /// `StepOutput::term_grad_norms`'s doc comment.
+    pub probe_term_gradients: bool,
     pub phase2_active: bool,
     pub step: usize,
 }
@@ -341,6 +370,10 @@ impl FrozenMultiStepCtx {
             dynamic_lam_non_tension_cap: self.dynamic_lam_non_tension_cap,
             constitutive_consistency_weight: self.constitutive_consistency_weight,
             n_fourier: self.n_fourier,
+            // Not tracked by `FrozenMultiStepCtx` (same rationale as `step` above) - term-
+            // gradient probing is a dedicated-diagnostic-only concern, never needed on the
+            // L-BFGS/Converge path this reconstructs for.
+            probe_term_gradients: false,
             phase2_active: self.phase2_active,
             step: 0,
         }
@@ -486,6 +519,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            probe_term_gradients: false,
             phase2_active: true,
             step: 0,
         };
