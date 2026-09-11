@@ -1,0 +1,73 @@
+{
+  "amr": {
+    "last_sweep": {
+      "points_after": 769,
+      "points_before": 481,
+      "residual_rms_after": 130107.73257866513,
+      "residual_rms_before": 128696.32596571922,
+      "step": 1200
+    },
+    "sweep_count": 2
+  },
+  "engineering_results": {
+    "avg_von_mises_pa": 69053080.0,
+    "max_displacement_m": 0.0001294422836508602,
+    "max_principal_stress_pa": 70736336.0,
+    "max_von_mises_pa": 71022216.0,
+    "min_displacement_m": 8.821706956041453e-7
+  },
+  "generated_at_unix": 1789153077,
+  "hole_analyses": [],
+  "model_validity": null,
+  "physics_validation": {
+    "bc_residual_max": 1364162.875,
+    "bc_residual_rms": 699075.9346067366,
+    "energy_balance": {
+      "energy_balance_error": 0.00012503732923774228,
+      "external_work_j": 6.63538734434516,
+      "internal_energy_j": 6.636217015457155
+    },
+    "pde_residual_max": 406394.09375,
+    "pde_residual_p95": 268286.0,
+    "pde_residual_rms": 181639.59375,
+    "reaction_force": {
+      "equilibrium_error": 0.0013941649448813611,
+      "net_fx_n": 68.0322389556168,
+      "net_fy_n": 68.0114006017446,
+      "reference_force_n": 69000.0
+    }
+  },
+  "problem": {
+    "geometry": {
+      "half_h_m": 0.1,
+      "half_w_m": 0.1,
+      "holes": [],
+      "thickness_m": 0.005
+    },
+    "kind": "Plate",
+    "load": {
+      "px_pa": 69000000.0,
+      "py_pa": 0.0
+    },
+    "material": {
+      "density_kg_m3": 2810.0,
+      "e_pa": 71700000000.0,
+      "nu": 0.33,
+      "ultimate_strength_pa": 503000000.0
+    },
+    "network": {
+      "hidden_dim": 64,
+      "n_hidden": 8
+    }
+  },
+  "spec_path": "C:\\Users\\xo180e\\Documents\\C17\\TOOLS\\no_hole_plate.toml",
+  "training": {
+    "elapsed_secs": 853.5872192382812,
+    "final_grad_norm": 2.2035863399505615,
+    "final_optimization_loss_energy_term": 0.9952726364135742,
+    "final_total_loss": -0.9641557931900024,
+    "max_steps": 2000,
+    "step": 1999
+  },
+  "unit_system": "USCS"
+}
