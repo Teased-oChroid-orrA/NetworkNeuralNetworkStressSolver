@@ -342,49 +342,25 @@ mod tests {
     /// stencil direction, so this is checked to near machine precision, not just "close".
     #[test]
     fn hessian_recovers_exact_second_derivatives_of_a_manufactured_quadratic_field() {
-        use crate::fd_stencil::{compute_hessian, hessian_fd_config, FdConfig};
-        use burn::tensor::TensorData;
+        // Priority 7 (General-PINN §23, manufactured-solution framework): this test previously
+        // hand-built the quadratic field, its exact derivatives, and the 9-point stencil-offset
+        // tensor inline - all of that is now `crate::manufactured`'s job (a reusable module,
+        // not a one-off), used here as its first real consumer via a straight refactor (same
+        // field, same tolerances, same assertions - zero behavior change).
+        use crate::manufactured::{verify_hessian, ManufacturedField};
 
         let device = Default::default();
         let half_w = 0.1_f64;
         let half_h = 0.1_f64;
-        // Second-order FD cancellation error scales ~1/h^2 in f32 (the true second-difference
-        // signal shrinks as h^2 while f32 rounding error on the raw values stays roughly
-        // constant) - production's fd_h=1e-3 is too small to resolve this analytically in
-        // f32 (confirmed: this test originally failed at fd_h=1e-3 directly). Rather than
-        // just widening the TEST's own step, this now goes through `hessian_fd_config` -
-        // production's ACTUAL fd_h widened by its real safety multiplier - so this test is a
-        // true regression guard for what `compute_domain_forwards` really does, not a
-        // separately-chosen value that could drift out of sync with it.
+        // See `verify_hessian`'s own doc comment for why this goes through `hessian_fd_config`
+        // rather than production's raw `fd_h` directly (f32 second-order FD cancellation error).
         let base_fd_h = 1e-3_f32;
-        let fd_h = hessian_fd_config(&FdConfig::new(base_fd_h, 2.0 * half_w, 2.0 * half_h)).hx;
-        let hx_phys = fd_h as f64 * half_w;
-        let hy_phys = fd_h as f64 * half_h;
         let (x0, y0) = (0.03_f64, 0.02_f64);
-
         let (a, b, c, d) = (5.0_f64, -3.0_f64, 2.0_f64, -1.5_f64);
-        let u = |x: f64, y: f64| a * x * x + c * x * y;
-        let v = |x: f64, y: f64| b * y * y + d * x * y;
+        let field = ManufacturedField::quadratic(a, b, c, d);
 
-        // Row order matches `assemble_second_order_stencil` exactly: centre, x+hx, x-hx,
-        // y+hy, y-hy, (x+hx,y+hy), (x+hx,y-hy), (x-hx,y+hy), (x-hx,y-hy).
-        let offsets = [
-            (0.0, 0.0), (hx_phys, 0.0), (-hx_phys, 0.0), (0.0, hy_phys), (0.0, -hy_phys),
-            (hx_phys, hy_phys), (hx_phys, -hy_phys), (-hx_phys, hy_phys), (-hx_phys, -hy_phys),
-        ];
-        let mut data = Vec::with_capacity(18);
-        for &(dx, dy) in &offsets {
-            let (x, y) = (x0 + dx, y0 + dy);
-            data.extend_from_slice(&[u(x, y) as f32, v(x, y) as f32]);
-        }
-        let raw = Tensor::<TB, 2>::from_data(TensorData::new(data, vec![9, 2]), &device);
-
-        let fd = FdConfig::new(fd_h, 2.0 * half_w, 2.0 * half_h);
-        let (u_xx, u_yy, u_xy, v_xx, v_yy, v_xy) = compute_hessian::<TB>(raw, 1, &fd);
-
-        let get = |t: Tensor<TB, 1>| -> f64 { t.into_data().to_vec::<f32>().unwrap()[0] as f64 };
-        let (u_xx_v, u_yy_v, u_xy_v) = (get(u_xx), get(u_yy), get(u_xy));
-        let (v_xx_v, v_yy_v, v_xy_v) = (get(v_xx), get(v_yy), get(v_xy));
+        let (u_xx_v, u_yy_v, u_xy_v, v_xx_v, v_yy_v, v_xy_v) =
+            verify_hessian::<TB>(&field, half_w, half_h, base_fd_h, x0, y0, &device);
 
         let tol = 1e-3; // relative
         assert!((u_xx_v - 2.0 * a).abs() / (2.0 * a).abs() < tol, "u_xx {u_xx_v} vs {}", 2.0 * a);
