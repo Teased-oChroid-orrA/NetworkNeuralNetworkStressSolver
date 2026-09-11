@@ -254,6 +254,8 @@ impl LossTerm for InteriorEnergyTerm {
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
     // Strain-energy only - no stress quantity at the term level.
     // Interior PDE physics, not a boundary condition - correctly `None`.
+    // Reads `d.strains` - first-order spatial derivative.
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("interior_energy: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("interior_energy: strains must be Some");
@@ -295,6 +297,8 @@ impl LossTerm for EquilibriumTerm {
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
     // Interior equilibrium (∇·σ=0), evaluated at interior collocation points, not a boundary
     // condition - same reasoning as Kirsch's `EquilibriumRingTerm`.
+    // Reads `d.hessian` (`needs_hessian()==true` above) - second-order spatial derivative.
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::Second) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("equilibrium: domain missing");
         let (u_xx, u_yy, u_xy, v_xx, v_yy, v_xy) = d.hessian.clone()
@@ -328,6 +332,8 @@ impl LossTerm for OuterTractionTerm {
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
     // Prescribes stress·n (the applied far-field traction) at the outer boundary - Neumann.
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Neumann) }
+    // Reads `d.strains` - first-order spatial derivative.
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("outer_traction: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("outer_traction: strains must be Some");
@@ -1420,6 +1426,36 @@ mod tests {
         assert_eq!(report.len(), 3, "report: {report:?}");
         for absent in ["interior_energy", "external_work", "equilibrium"] {
             assert!(!report.iter().any(|(n, _)| *n == absent), "{absent} is not a boundary condition, must be absent from {report:?}");
+        }
+    }
+
+    #[test]
+    fn derivative_order_report_classifies_every_term_correctly() {
+        use crate::problem::DerivativeOrder as Do;
+
+        let spec = ProblemSpec {
+            geometry: two_hole_geometry(),
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+        };
+        let problem = UserDefinedProblem::new(spec);
+        let report = crate::training_core::derivative_order_report(&problem);
+
+        // `equilibrium` needs the Hessian (second-order); `interior_energy`/`outer_traction`
+        // need strain (first-order); `external_work`/`hole_free`/`hole_fixed` read `raw_out`
+        // only, so are absent - same shape as `boundary_operator_report`'s own regression test.
+        for &(name, order) in &[
+            ("equilibrium", Do::Second),
+            ("interior_energy", Do::First),
+            ("outer_traction", Do::First),
+        ] {
+            assert!(report.contains(&(name, order)), "expected ({name}, {order:?}) in {report:?}");
+        }
+        assert_eq!(report.len(), 3, "report: {report:?}");
+        for absent in ["external_work", "hole_free", "hole_fixed"] {
+            assert!(!report.iter().any(|(n, _)| *n == absent), "{absent} needs no spatial derivative, must be absent from {report:?}");
         }
     }
 

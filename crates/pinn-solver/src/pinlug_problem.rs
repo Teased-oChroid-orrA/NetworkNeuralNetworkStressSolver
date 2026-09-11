@@ -277,6 +277,8 @@ impl LossTerm for InteriorEnergyTerm {
     fn conflict_group(&self) -> crate::problem::ConflictGroup { crate::problem::ConflictGroup::Physics }
     // Strain-energy only - no stress quantity at the term level.
     // Interior PDE physics, not a boundary condition - correctly `None`.
+    // Reads `d.strains` - first-order spatial derivative.
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain).expect("interior_energy: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("interior_energy: strains must be Some");
@@ -348,6 +350,8 @@ impl LossTerm for PinDrivingTractionTerm {
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
     // Prescribes stress·n (the driving traction) at the pin's loaded surface - Neumann.
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Neumann) }
+    // Reads `d.strains` - first-order spatial derivative.
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("pin_driving_traction: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("pin_driving_traction: strains must be Some");
@@ -1362,6 +1366,31 @@ mod tests {
                 .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
             assert_eq!(term.boundary_kind(), *expected_kind,
                 "term '{}' has boundary_kind {:?}, expected {:?}", term.name(), term.boundary_kind(), expected_kind);
+        }
+    }
+
+    #[test]
+    fn pinlug_loss_terms_have_expected_derivative_order_classification() {
+        use crate::problem::DerivativeOrder as Do;
+
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
+        let terms = problem.loss_terms();
+
+        let expected: &[(&str, Option<Do>)] = &[
+            ("pin_interior_energy", Some(Do::First)),
+            ("lug_interior_energy", Some(Do::First)),
+            ("lug_shank_anchor", None),
+            ("lug_free_edge_traction", None),
+            ("pin_driving_traction", Some(Do::First)),
+            ("interface_penetration", None),
+            ("interface_non_tension", None),
+        ];
+
+        for term in &terms {
+            let (_, expected_order) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.derivative_order(), *expected_order,
+                "term '{}' has derivative_order {:?}, expected {:?}", term.name(), term.derivative_order(), expected_order);
         }
     }
 }

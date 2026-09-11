@@ -298,6 +298,8 @@ impl LossTerm for InteriorEnergyTerm {
     // computes stress internally only as an intermediate of the energy formula).
     // Interior PDE physics (energy minimization over the domain interior), not a boundary
     // condition at all - correctly `None`, not a classical operator forced onto it.
+    // Reads `d.strains` - first-order spatial derivative.
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("interior_energy: domain not present in inputs");
@@ -326,6 +328,8 @@ impl LossTerm for NeumannTractionTerm {
     // Prescribes stress·n (traction) at the loaded outer boundary - the textbook Neumann
     // (flux) condition.
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Neumann) }
+    // Reads `d.strains` - first-order spatial derivative.
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("neumann_traction: domain not present in inputs");
@@ -363,6 +367,11 @@ impl LossTerm for HoleTractionTerm {
     // Traction-FREE is still a Neumann condition (zero-flux is a Neumann value, not a distinct
     // category) - prescribes stress·n = 0 at the unloaded hole boundary.
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Neumann) }
+    // Runtime-dependent, mirroring `compute()`'s own `self.direct` branch: `direct` reads
+    // `raw_out` only (no derivative); the FD path reads `d.strains` (first-order).
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> {
+        if self.direct { None } else { Some(crate::problem::DerivativeOrder::First) }
+    }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("hole_traction: domain not present in inputs");
@@ -436,6 +445,10 @@ impl LossTerm for EquilibriumRingTerm {
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Direct) }
     // Despite "Ring" in the name (an FD-stencil sampling detail), this enforces interior
     // equilibrium (∇·σ=0) at those points, not a boundary condition - correctly `None`.
+    // `compute()` ignores `inputs` entirely - `self.components` is populated from a SEPARATE
+    // 4-shift stencil `step_physics` builds itself, not `DomainForwardOutputs::strains`/
+    // `hessian`. Correctly `None` (this method reports what `inputs` supplies, not every
+    // stencil that exists anywhere in the call chain).
     fn compute(&self, _inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let [sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym] =
             self.components.clone().expect(
@@ -474,6 +487,11 @@ impl LossTerm for KirschStressTerm {
     // Soft supervision against Kirsch's known analytical solution at scattered interior probe
     // points - a data-fit/manufactured-solution anchor, not a classical PDE boundary operator
     // (no single boundary it's "on"), so correctly `None` rather than forced into a category.
+    // Runtime-dependent, mirroring `compute()`'s own `self.direct` branch: `direct` reads
+    // `raw_out` only (no derivative); the FD path reads `d.strains` (first-order).
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> {
+        if self.direct { None } else { Some(crate::problem::DerivativeOrder::First) }
+    }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("kirsch_stress: domain not present in inputs");
@@ -518,6 +536,8 @@ impl LossTerm for ConstitutiveConsistencyTerm {
     fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Both) }
     // Interior physics consistency (σ_direct vs σ_derived at the same interior points), not a
     // boundary condition - same reasoning as `conflict_group`'s own `Physics` classification.
+    // Reads `d.strains` - first-order spatial derivative.
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("constitutive_consistency: domain not present in inputs");
@@ -826,6 +846,31 @@ mod tests {
                 .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
             assert_eq!(term.boundary_kind(), *expected_kind,
                 "term '{}' has boundary_kind {:?}, expected {:?}", term.name(), term.boundary_kind(), expected_kind);
+        }
+    }
+
+    #[test]
+    fn kirsch_loss_terms_have_expected_derivative_order_classification() {
+        use crate::problem::DerivativeOrder as Do;
+
+        let material = MaterialProps::al7075_t6();
+        let problem = KirschProblem::new(material, 5, 4000, 3.0);
+        let terms = problem.loss_terms();
+
+        let expected: &[(&str, Option<Do>)] = &[
+            ("interior_energy", Some(Do::First)),
+            ("neumann_traction", Some(Do::First)),
+            ("hole_traction", None), // constructed with direct=true by loss_terms()
+            ("displacement_anchor", None),
+            ("equilibrium_ring", None),
+            ("kirsch_stress", None), // constructed with direct=true by loss_terms()
+        ];
+
+        for term in &terms {
+            let (_, expected_order) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.derivative_order(), *expected_order,
+                "term '{}' has derivative_order {:?}, expected {:?}", term.name(), term.derivative_order(), expected_order);
         }
     }
 

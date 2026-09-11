@@ -631,6 +631,7 @@ pub fn run_training(
                 // `stress_source_report` has nothing to iterate. Empty, not fabricated.
                 stress_source_report: Vec::new(),
                 boundary_operator_report: Vec::new(),
+                derivative_order_report: Vec::new(),
             };
             let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         }
@@ -1622,6 +1623,15 @@ fn run_user_problem_training_from(
                     crate::problem::BoundaryOperatorKind::Interface => "Interface",
                 }))
                 .collect();
+        // Same "static per problem, never gated" treatment as `boundary_operator_report` above
+        // - Priority 6, General-PINN §10.
+        let derivative_order_report: Vec<(&'static str, &'static str)> =
+            crate::training_core::derivative_order_report(&problem).into_iter()
+                .map(|(name, order)| (name, match order {
+                    crate::problem::DerivativeOrder::First => "First",
+                    crate::problem::DerivativeOrder::Second => "Second",
+                }))
+                .collect();
         let update = TrainingUpdate {
             step,
             total_loss: out.total_scalar,
@@ -1646,6 +1656,7 @@ fn run_user_problem_training_from(
             gradient_conflict_report,
             stress_source_report,
             boundary_operator_report,
+            derivative_order_report,
         };
         let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         if auto_stopped {
@@ -1749,6 +1760,14 @@ pub fn serve_loaded_plate_checkpoint(
                 crate::problem::BoundaryOperatorKind::Interface => "Interface",
             }))
             .collect();
+    let derivative_order_report: Vec<(&'static str, &'static str)> =
+        crate::training_core::derivative_order_report(&crate::user_problem::UserDefinedProblem::new(spec.clone()))
+            .into_iter()
+            .map(|(name, order)| (name, match order {
+                crate::problem::DerivativeOrder::First => "First",
+                crate::problem::DerivativeOrder::Second => "Second",
+            }))
+            .collect();
 
     let update = TrainingUpdate {
         step: 0, total_loss: 0.0, energy_loss: 0.0, neumann_loss: 0.0, lr: 0.0,
@@ -1762,6 +1781,7 @@ pub fn serve_loaded_plate_checkpoint(
         gradient_conflict_report: None,
         stress_source_report,
         boundary_operator_report,
+        derivative_order_report,
     };
     let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
     let _ = tx.send(TrainingMsg::Done);

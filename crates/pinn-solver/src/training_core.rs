@@ -573,6 +573,19 @@ pub fn boundary_operator_report(
         .collect()
 }
 
+/// General-PINN architecture recommendations §10 (Priority 6, "generic derivative backend") -
+/// which order of spatial derivative each active term needs, if any. Mirrors `stress_source_
+/// report`/`boundary_operator_report`'s exact shape/purpose. See [`crate::problem::
+/// DerivativeOrder`]'s doc comment for why this reports ORDER rather than a swappable-backend
+/// choice (only one numerical method - central-difference FD - exists in this codebase today).
+pub fn derivative_order_report(
+    problem: &dyn crate::problem::BoundaryValueProblem,
+) -> Vec<(&'static str, crate::problem::DerivativeOrder)> {
+    problem.loss_terms().iter()
+        .filter_map(|term| term.derivative_order().map(|order| (term.name(), order)))
+        .collect()
+}
+
 /// General-PINN architecture recommendations §6/§29 (Priority 3, "loss instrumentation" /
 /// "loss ledger"): one structured record per active term instead of separate `raw_scalar_by_
 /// name`/`lam_by_name`/`term_grad_norms`/`GradientShareReport::shares` hashmaps a caller has

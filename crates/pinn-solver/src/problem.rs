@@ -165,6 +165,25 @@ pub trait LossTerm: Send + Sync {
     fn boundary_kind(&self) -> Option<BoundaryOperatorKind> {
         None
     }
+
+    /// Order of spatial derivative this term's `compute()` reads from `DomainForwardOutputs`,
+    /// if any - General-PINN architecture recommendations §10's "generic derivative backend /
+    /// `DifferentialOperator` abstraction", narrowed to what this codebase actually has: EVERY
+    /// spatial derivative here (`d.strains`, `d.hessian`) is computed by ONE numerical method
+    /// (central-difference FD, `fd_stencil::assemble_stencil`/`compute_hessian`) - there is no
+    /// second, swappable backend (forward-mode AD spatial differentiation, spectral, etc.)
+    /// implemented, so this reports which ORDER a term needs rather than pretending multiple
+    /// interchangeable backends exist today (see [`DerivativeOrder`]'s own doc comment for the
+    /// full reasoning). Defaults to `None` - a term reading only `raw_out` (direct network
+    /// columns, no `d.strains`/`d.hessian`) genuinely needs no spatial derivative, and should
+    /// leave this at the default rather than being forced into a category. Every concrete
+    /// `LossTerm` impl that DOES read `d.strains` or `d.hessian` must override this explicitly,
+    /// classified by actually reading that term's `compute()` body - same "no silent default"
+    /// discipline `conflict_group`/`stress_source`/`boundary_kind` already established. See
+    /// [`crate::training_core::derivative_order_report`] for the generic consumer.
+    fn derivative_order(&self) -> Option<DerivativeOrder> {
+        None
+    }
 }
 
 /// Classifies a [`LossTerm`] as either enforcing interior PDE/equilibrium physics or a
@@ -215,6 +234,23 @@ pub enum BoundaryOperatorKind {
     /// A condition coupling two DIFFERENT domains at a shared boundary (e.g. pin-in-lug contact:
     /// non-penetration/non-tension between the pin and lug domains).
     Interface,
+}
+
+/// Order of spatial derivative a [`LossTerm`] needs from `DomainForwardOutputs`. See
+/// [`LossTerm::derivative_order`]. Both variants here are, today, computed by the SAME single
+/// numerical method (central-difference finite differences - `fd_stencil::assemble_stencil` for
+/// `First`, `fd_stencil::compute_hessian` for `Second`) - this enum reports the order a term
+/// needs, not a choice between interchangeable backends, since no second backend exists in this
+/// codebase yet. A future backend (e.g. exact forward-mode AD through the FD-free coordinate
+/// input) would extend this classification's USE (which order does a term need, so a future
+/// per-order backend selector can dispatch on it) without changing the terms' own declarations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DerivativeOrder {
+    /// First-order spatial derivative (`∂u/∂x`, `∂u/∂y`) - strain, read via `d.strains`.
+    First,
+    /// Second-order spatial derivative (`∂²u/∂x²`, etc.) - the displacement Hessian, read via
+    /// `d.hessian`. Implies `needs_hessian() == true`.
+    Second,
 }
 
 /// A complete boundary-value problem: its domain(s), their sampling/ansatz strategies, loss
