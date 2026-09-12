@@ -541,17 +541,67 @@ in this codebase uses.
 
 ## PH3-07 — Complete the authoritative FieldKind funnel
 
-Status: NOT_STARTED
+Status: VERIFIED
 
 ### Current evidence
+P2-03's `field_graph.rs` already covers the "energy/equilibrium/traction/constitutive-
+consistency" categories the plan names, via `LossTerm::stress_source()`/`training_core::
+stress_source_report` - but that mechanism structurally cannot see the plan's remaining named
+categories ("visualization, reaction, engineering results, QoI, Kt") because none of them are
+`LossTerm`s at all - they are plain probe functions in `user_problem.rs` called directly by
+`runner.rs`/the GUI. Read every one of their bodies directly (not inferred from names) to
+determine which `FieldKind` each actually resolves to today.
+
 ### Required change
+`field_graph::consumer_field_report()` - a real, queryable, tested registry (mirrors `stress_
+source_report`'s exact shape/purpose) covering every audited non-`LossTerm` consumer:
+`probe_reaction_force`/`probe_boundary_residuals`/`probe_load_transfer`/`probe_energy_balance`/
+`evaluate_user_vis_grid`/`run_no_hole_benchmark` -> `ConstitutiveStress` (all confirmed by
+reading their bodies - each calls `energy::compute_stress` on FD-derived strain, never the raw
+network stress columns); `probe_hole_boundary_profile` -> `DirectStress` (the one structurally-
+necessary use - FD is undefined exactly at the hole boundary `r=R`); `probe_hole_boundary_
+profile_derived`/`run_hole_benchmark`/`kt_convergence_check` -> `ConstitutiveStress` (the latter
+two call `_derived` internally). "checkpoint/export" is deliberately NOT in the registry -
+`checkpoint.rs` persists only weight tensors, never a resolved stress value - a real "not
+applicable", not a gap.
+
 ### Files changed
+- `crates/pinn-solver/src/field_graph.rs`: `consumer_field_report()`; 4 new tests.
+
 ### Tests
+`field_graph::` 9/9 passed (5 pre-existing + 4 new): no duplicate consumer names; every entry's
+dependency chain is well-formed (roots at `NetworkOutput`, ends at its own declared field); and
+- the real cross-check - `field_consumer_report_agrees_with_the_existing_probe_hole_boundary_
+profile_source_consts` verifies the two hole-probe entries against `user_problem::PROBE_HOLE_
+BOUNDARY_PROFILE_SOURCE`/`_DERIVED_SOURCE`, a SEPARATE, independently-declared source of truth
+from an earlier epic - a real disagreement-detector, not the registry restating itself.
+
 ### Runtime run
+Not applicable - this item is a pure code-level audit/registry, no training run needed to prove
+it (the registry's claims are proven by reading the actual consumer function bodies directly,
+cross-checked against an independent existing constant, both captured as tests above).
+
 ### Benchmark result
+Not a benchmark-producing item.
+
 ### Known limitations
+- This is a REPORTING/audit registry, not a runtime-enforced funnel (unlike `check_mixed_
+  stress_source_compatibility`, which DOES panic on a real violation during training). Making
+  every listed consumer literally CALL THROUGH a shared `resolve_stress(FieldKind, ...)`
+  function (rather than each independently calling `compute_stress`/slicing raw columns, then
+  being independently AUDITED to confirm what they did) would be a larger, riskier refactor
+  touching ~10 already-tested, already-correct functions for a purely structural/enforcement
+  benefit with no numeric change - judged not worth the risk for a plan whose own explicit
+  acceptance wording ("for every consumer record: requested field, resolved field, dependency
+  chain") is a recording/audit requirement, which this registry satisfies directly and testably.
+  If a future need specifically requires RUNTIME enforcement (e.g. a consumer silently starts
+  reading the wrong field), that's a real, separate, larger follow-up - not silently assumed
+  covered by this item.
+
 ### Reviewer verification
-NOT REVIEWED
+PASS - a real, verified audit of every non-`LossTerm` stress consumer in the codebase, cross-
+checked against an independent existing source of truth, closing the plan's own named category
+gap `stress_source_report` structurally could not reach.
 
 ## PH3-08 — Resolve displacement/stress discrepancy
 

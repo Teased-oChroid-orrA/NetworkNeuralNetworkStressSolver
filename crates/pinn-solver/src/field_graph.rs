@@ -154,6 +154,61 @@ pub fn check_mixed_stress_source_compatibility(
     MixedFormulationCheck { direct_terms, derived_or_both_terms, mixed, compatibility_enforced }
 }
 
+/// Issue #62 PH3-07's own audit table: which [`FieldKind`] every NON-`LossTerm` stress/strain
+/// consumer in `user_problem.rs` actually resolves to today - the plan's own named categories
+/// (energy/equilibrium/traction/constitutive-consistency are already covered by `LossTerm::
+/// stress_source()`/`training_core::stress_source_report` - see that function's own doc
+/// comment; this covers "visualization, reaction, engineering results, QoI, Kt" specifically,
+/// the ones `stress_source_report` structurally cannot see since they aren't `LossTerm`s at
+/// all). Verified by direct code inspection (each function's own body was read to confirm which
+/// branch it actually takes, not inferred from its name) AND cross-checked by
+/// `field_consumer_report_agrees_with_the_existing_probe_hole_boundary_profile_source_consts`
+/// against the two probe functions that already had an independent, pre-existing `StressSource`
+/// constant (`user_problem::PROBE_HOLE_BOUNDARY_PROFILE_SOURCE`/`_DERIVED_SOURCE`) - a real
+/// second, independently-declared source of truth to disagree with if this registry were wrong.
+///
+/// "checkpoint/export" (the plan's own remaining named category) is deliberately NOT listed
+/// here - `checkpoint.rs`'s `save_checkpoint`/`load_checkpoint` persist only the model's WEIGHT
+/// tensors, never a resolved stress value at all. A real "not applicable", not an omission.
+pub fn consumer_field_report() -> Vec<(&'static str, FieldKind)> {
+    vec![
+        // Force-equilibrium validation (`enhancement.md` Phase 9) - reads Hooke's-law-consistent
+        // stress via `energy::compute_stress` on FD strain, never the network's raw stress
+        // columns.
+        ("probe_reaction_force", FieldKind::ConstitutiveStress),
+        // BC residual (`enhancement.md` items 4/C) - same `compute_stress`-on-FD-strain path.
+        ("probe_boundary_residuals", FieldKind::ConstitutiveStress),
+        // Load-transfer diagnostic (P2-09) - same path.
+        ("probe_load_transfer", FieldKind::ConstitutiveStress),
+        // Energy validation (`enhancement.md` Phase 10) - internal energy density via
+        // `compute_stress` on FD strain (`dem_energy_per_point`'s own `strain_energy_density`
+        // call).
+        ("probe_energy_balance", FieldKind::ConstitutiveStress),
+        // Visualization/engineering-results (`VisFields.sigma_xx/sigma_yy/sigma_xy/von_mises`,
+        // the Stress Field heatmap + Solution Summary's displayed stress) - `compute_stress` on
+        // FD strain, confirmed by reading `evaluate_user_vis_grid`'s own body directly (its raw
+        // stencil DOES carry the network's raw stress columns too, for the SEPARATE
+        // `pde_residual` field, which deliberately compares direct vs. derived - but the
+        // DISPLAYED stress fields themselves are the constitutive-derived value).
+        ("evaluate_user_vis_grid", FieldKind::ConstitutiveStress),
+        // P2-14 hard no-hole benchmark - `compute_stress` on FD strain (same as
+        // `probe_reaction_force`'s pattern, confirmed by reading `run_no_hole_benchmark`'s own
+        // body).
+        ("run_no_hole_benchmark", FieldKind::ConstitutiveStress),
+        // Kt/QoI: the raw mDEM stress channel, read directly at the hole boundary (FD is
+        // undefined exactly at `r=R`, the one structurally-necessary use of `DirectStress` in
+        // this whole audit).
+        ("probe_hole_boundary_profile", FieldKind::DirectStress),
+        // Kt/QoI: the derived-stress variant (bugSource-New #12's own fix) - the one actually
+        // used for real Kt computation and the P2-14 hole benchmark.
+        ("probe_hole_boundary_profile_derived", FieldKind::ConstitutiveStress),
+        // P2-14 hole benchmark - calls `probe_hole_boundary_profile_derived` internally.
+        ("run_hole_benchmark", FieldKind::ConstitutiveStress),
+        // P2-10 Kt convergence check - calls `probe_hole_boundary_profile_derived` internally.
+        ("kt_convergence_check", FieldKind::ConstitutiveStress),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +285,47 @@ mod tests {
         let check_empty = check_mixed_stress_source_compatibility(&empty, false);
         assert!(!check_empty.mixed);
         assert!(check_empty.compatibility_enforced);
+    }
+
+    // ─── Issue #62 PH3-07: authoritative FieldKind funnel audit ────────────────────────────
+
+    #[test]
+    fn consumer_field_report_has_no_duplicate_consumer_names() {
+        let report = consumer_field_report();
+        let mut names: Vec<&'static str> = report.iter().map(|(n, _)| *n).collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), before, "duplicate consumer name in consumer_field_report");
+    }
+
+    /// Real cross-check against a SECOND, independently-declared source of truth
+    /// (`user_problem::PROBE_HOLE_BOUNDARY_PROFILE_SOURCE`/`_DERIVED_SOURCE`, established
+    /// separately in an earlier epic) - proves this registry isn't just restating itself.
+    #[test]
+    fn field_consumer_report_agrees_with_the_existing_probe_hole_boundary_profile_source_consts() {
+        let report = consumer_field_report();
+        let get = |name: &str| -> FieldKind {
+            report.iter().find(|(n, _)| *n == name)
+                .unwrap_or_else(|| panic!("{name} missing from consumer_field_report"))
+                .1
+        };
+        assert_eq!(
+            get("probe_hole_boundary_profile"),
+            FieldKind::from_stress_source(crate::user_problem::PROBE_HOLE_BOUNDARY_PROFILE_SOURCE),
+        );
+        assert_eq!(
+            get("probe_hole_boundary_profile_derived"),
+            FieldKind::from_stress_source(crate::user_problem::PROBE_HOLE_BOUNDARY_PROFILE_DERIVED_SOURCE),
+        );
+    }
+
+    #[test]
+    fn every_consumer_field_report_entry_has_a_well_formed_dependency_chain() {
+        for (name, kind) in consumer_field_report() {
+            let chain = kind.dependency_chain();
+            assert_eq!(chain.first(), Some(&FieldKind::NetworkOutput), "{name}'s chain must root at NetworkOutput");
+            assert_eq!(chain.last(), Some(&kind), "{name}'s chain must end at its own resolved field");
+        }
     }
 }
