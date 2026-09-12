@@ -282,6 +282,27 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
                     check.failure_reason.unwrap_or("unknown"), check.energy_balance_error, check.max_abs_displacement,
                 );
             }
+
+            // Issue #61 EPIC P2-14: the FINAL, hard-numeric-threshold no-hole gate (as opposed
+            // to P2-08's looser sanity check above). This is the gate a hole run's Kt would
+            // need a PASSING companion run of to be accepted - see the hole-side message below.
+            let benchmark = crate::user_problem::run_no_hole_benchmark(&model_val, &spec, &device);
+            if benchmark.passed {
+                println!("  [diag] P2-14 no-hole BENCHMARK PASSED (all hard thresholds met)");
+            } else {
+                println!("  [!] P2-14 no-hole BENCHMARK FAILED: {:?}", benchmark.failures);
+            }
+            println!(
+                "  [diag] P2-14 no-hole benchmark: sigma_xx_err={:.4}  sigma_yy/ref={:.4}  sigma_xy/ref={:.4}  traction_rms/ref={:.4}  load_transfer={:.4}",
+                benchmark.sigma_xx_relative_error, benchmark.sigma_yy_over_ref, benchmark.sigma_xy_over_ref,
+                benchmark.traction_rms_over_ref, benchmark.load_transfer_ratio,
+            );
+        } else {
+            // Issue #61 EPIC P2-14: a hole run's Kt is only accepted after a companion no-hole
+            // run PASSES the benchmark above - this single CLI invocation trains only the holed
+            // geometry, so no such companion result is available here. Honestly reported as
+            // unavailable (matching P2-13's own discipline), NOT silently skipped or assumed.
+            println!("  [!] P2-14 hole benchmark gate: NOT EVALUATED - run the companion no-hole config and check its P2-14 benchmark PASSES before accepting this run's Kt value(s).");
         }
     }
 
