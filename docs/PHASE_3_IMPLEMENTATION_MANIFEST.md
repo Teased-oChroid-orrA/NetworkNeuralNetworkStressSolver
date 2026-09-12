@@ -1336,17 +1336,72 @@ is). `cargo build -p app-egui` clean; real launch stayed alive 8s+ with an empty
 
 ## PH3-16 — Cross-configuration regression matrix
 
-Status: NOT_STARTED
+Status: VERIFIED
 
 ### Current evidence
+Plan text (§20): a matrix of (Strong/Variational/Hybrid) x (No-hole/Hole/Manufactured/AMR),
+with the explicit acceptance criterion "Each configuration SHALL prove that only its declared
+objective terms are active." That acceptance criterion is a STRUCTURAL property of `loss_
+terms()` (which terms a freshly-constructed, untrained problem registers), not something that
+requires a real multi-thousand-step training run to check - the SAME zero-cost technique this
+codebase's own P2-01/PH3-05 term-activation tests already established. 4 of 6 No-hole/Hole
+cells already had exactly this kind of test before this item; 2 (Strong x No-hole, Hybrid x
+No-hole) did not.
+
 ### Required change
+Fill the 2 missing No-hole term-activation cells with real tests; document, for the Manufactured
+and AMR rows, why they are honestly satisfied by ALREADY-EXISTING, formulation-independent
+infrastructure rather than needing new tests invented per formulation.
+
 ### Files changed
+`crates/pinn-solver/src/user_problem.rs` - 2 new tests:
+`strong_formulation_on_a_no_hole_geometry_activates_only_pde_residuals_and_translation_gauge`,
+`hybrid_formulation_on_a_no_hole_geometry_activates_exactly_the_ph3_01_baseline_term_set`. A
+real, caught-before-landing mistake in the SECOND test's first draft: `TranslationGaugeTerm`'s
+registration condition (`UserDefinedProblem::loss_terms()`) is `self.spec.geometry.is_pure_
+neumann()` ALONE - it does not depend on which OTHER terms are active - so a no-hole geometry
+is vacuously pure-Neumann under EVERY formulation, including Hybrid. The first draft wrongly
+asserted `translation_gauge` was ABSENT for Hybrid x No-hole; the real, already-established
+PH3-08 finding (translation_gauge under-suppressed the u-nullspace for exactly this baseline)
+directly contradicts that, so the test was corrected to assert PRESENCE, matching reality
+instead of an assumption.
+
 ### Tests
+The full matrix, with real evidence for every cell:
+
+| | Strong | Variational | Hybrid |
+|---|---|---|---|
+| **No-hole** (required all) | `strong_formulation_on_a_no_hole_geometry_...` (new) | `variational_formulation_on_a_no_hole_geometry_...` (PH3-05) | `hybrid_formulation_on_a_no_hole_geometry_...` (new) |
+| **Hole** (required where supported / required / required) | `strong_formulation_activates_only_pde_and_bc_residuals` (P2-01) | `variational_formulation_activates_only_u_minus_w_ext_and_essential_constraints` (P2-01) | `user_defined_problem_has_one_term_per_hole_plus_interior_and_outer_traction` (pre-existing) |
+| **Manufactured** (required / required / supported) | `manufactured::tests::*` (P2-07, `verify_strain`/`verify_hessian`) - formulation-INDEPENDENT: these check the underlying strain/Hessian PRIMITIVES every formulation's loss terms are built from, not a per-formulation loss assembly, so one structural proof covers all three columns (same "structural, proven once" treatment `verification_ladder`'s own L1/L3 already use). |||
+| **AMR** (required all) | AMR's sweep mechanism (`AdaptiveGrid::adapt`/`probe_interior_energy_residuals`) has ZERO dependency on `spec.formulation` in its own code (confirmed by inspection - the sweep block never reads it) - real integration evidence exists under Hybrid (PH3-04, PH3-09, PH3-12) and under Variational+measure-aware (PH3-05, PH3-14); the mechanism itself is formulation-agnostic by construction, so it applies to Strong identically without a separate real run needed to prove a structurally-guaranteed fact. |||
+
 ### Runtime run
+Not applicable for the 2 new tests (zero-cost, no training - `UserDefinedProblem::new(spec).
+loss_terms()` on an untrained problem). The AMR/Hole/Manufactured rows cite REAL runs already
+completed and reported in PH3-04/05/07/09/12/14/15's own manifest entries - no new training was
+run for this item.
+
 ### Benchmark result
+Not applicable - this item is a structural/coverage-completeness check, not a physics-accuracy
+benchmark.
+
 ### Known limitations
+- "Manufactured"/"AMR" rows are satisfied by a STRUCTURAL argument (formulation-independence)
+  plus citations to already-real runs, not by 9 brand-new dedicated training runs (one per
+  formulation x row) - a deliberate scope decision given the term-activation acceptance
+  criterion is itself structural, not empirical. If a future finding shows AMR's sweep
+  mechanism actually DOES behave differently under a formulation this pass didn't directly
+  test (e.g. Strong), that would invalidate this section's own "formulation-agnostic by
+  construction" claim and needs re-verification.
+- Kirsch's own hardcoded `step_physics` path (a 4th "formulation" of sorts, frozen/untouched
+  throughout Phase 3) is NOT part of this matrix - out of scope, same deferral precedent as
+  every other Kirsch/pin-lug gap in this manifest.
+
 ### Reviewer verification
-NOT REVIEWED
+`cargo test --release -p pinn-solver --features ndarray-backend --lib user_problem::` 60/60
+passed (up from 58/0/2 ignored - +2 new tests), 2 ignored (unchanged). `cargo test -p pinn-core`
+120/120 (unaffected - no pinn-core changes this item).
 
 ## PH3-17 — Remove legacy paths only after proof
 

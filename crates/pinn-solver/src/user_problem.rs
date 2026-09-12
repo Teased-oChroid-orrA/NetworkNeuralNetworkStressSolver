@@ -2399,6 +2399,67 @@ mod tests {
         assert!(!names.contains(&"external_work"), "{names:?} - energy functional must be OMITTED under Strong");
     }
 
+    /// Issue #62 PH3-16's own "cross-configuration regression matrix" - the Strong x No-hole
+    /// cell (marked "required"), not previously an explicit standalone test (only exercised
+    /// implicitly by real training runs elsewhere). `EquilibriumTerm` still activates on a
+    /// no-hole geometry (it registers on the "interior" point set regardless of holes) but
+    /// `hole_free`/`hole_fixed` cannot (zero holes) - `TranslationGaugeTerm` (P2-07) DOES fire
+    /// under Strong too, since a Strong-form residual set still has no essential BC to pin the
+    /// rigid-body nullspace on a pure-Neumann (no-hole) geometry, exactly the same reasoning
+    /// `variational_formulation_on_a_no_hole_geometry_...` already established for Variational.
+    #[test]
+    fn strong_formulation_on_a_no_hole_geometry_activates_only_pde_residuals_and_translation_gauge() {
+        use pinn_core::problem_spec::FormulationSelection;
+        let mut spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        spec.formulation = FormulationSelection::Strong;
+        let problem = UserDefinedProblem::new(spec);
+        let names: Vec<&str> = problem.loss_terms().iter().map(|t| t.name()).collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names.contains(&"equilibrium"), "{names:?}");
+        assert!(names.contains(&"outer_traction"), "{names:?}");
+        assert!(names.contains(&"translation_gauge"), "{names:?} - no essential constraint exists on a no-hole geometry under ANY formulation");
+        assert!(!names.contains(&"interior_energy"), "{names:?} - energy functional must be OMITTED under Strong");
+        assert!(!names.contains(&"external_work"), "{names:?} - energy functional must be OMITTED under Strong");
+        assert!(!names.contains(&"hole_free") && !names.contains(&"hole_fixed"), "{names:?} - zero holes");
+    }
+
+    /// Issue #62 PH3-16's own "cross-configuration regression matrix" - the Hybrid x No-hole
+    /// cell (marked "required"). This is the EXACT term set the real PH3-01 baseline
+    /// (`Debug_run/baseline_legacy_no_hole/`) and every subsequent PH3-08/09 investigation
+    /// trained against - never previously asserted as its own explicit, standalone term-
+    /// activation regression test (only exercised implicitly by those real training runs).
+    /// `translation_gauge` IS active here (registration depends ONLY on `is_pure_neumann()` -
+    /// zero holes means vacuously pure-Neumann regardless of formulation) - this is the SAME
+    /// under-suppressed gauge PH3-08's own real investigation found and PH3-09 then closed by
+    /// training longer, not evidence this test got the term set wrong.
+    #[test]
+    fn hybrid_formulation_on_a_no_hole_geometry_activates_exactly_the_ph3_01_baseline_term_set() {
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(), // Hybrid
+        };
+        let problem = UserDefinedProblem::new(spec);
+        let names: Vec<&str> = problem.loss_terms().iter().map(|t| t.name()).collect();
+        assert_eq!(names.len(), 5, "{names:?}");
+        assert!(names.contains(&"interior_energy"), "{names:?}");
+        assert!(names.contains(&"equilibrium"), "{names:?}");
+        assert!(names.contains(&"outer_traction"), "{names:?}");
+        assert!(names.contains(&"external_work"), "{names:?}");
+        assert!(names.contains(&"translation_gauge"), "{names:?} - zero holes is vacuously pure-Neumann under `is_pure_neumann()`, regardless of formulation");
+        assert!(!names.contains(&"hole_free") && !names.contains(&"hole_fixed"), "{names:?} - zero holes");
+    }
+
     /// Issue #61 P2-01 acceptance: "Hybrid requires an explicit term list" - an empty list
     /// activates zero base terms (still real, not a fallback to "everything"); a named subset
     /// activates exactly that subset; an unknown name panics rather than being silently
