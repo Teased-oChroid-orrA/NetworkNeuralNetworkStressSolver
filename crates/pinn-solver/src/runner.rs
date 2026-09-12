@@ -2440,7 +2440,7 @@ mod tests {
                 let lam = out.lam_by_name.as_ref().expect("lam_by_name must be Some on step_physics_multi");
                 let grad = out.term_grad_norms.as_ref().expect("term_grad_norms must be Some when probe_term_gradients=true");
                 let shares = out.gradient_share_report.as_ref().map(|r| &r.shares);
-                let mut ledger = crate::training_core::build_loss_ledger(raw, lam, Some(grad), shares);
+                let mut ledger = crate::training_core::build_loss_ledger(raw, lam, Some(grad), shares, None);
                 ledger.sort_by_key(|e| e.name);
                 println!("  [term-diag] step={step} total_loss={:.4e}", out.total_scalar);
                 println!("  [term-diag] {:>26} {:>14} {:>14} {:>14} {:>14}", "term", "raw", "lambda", "weighted", "grad_norm");

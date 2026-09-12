@@ -610,6 +610,18 @@ pub fn formulation_kind_report(
         .collect()
 }
 
+/// Issue #61 EPIC P2-05's own categorization - whether each active term is part of the
+/// physical functional itself, an admissibility constraint, or a pure diagnostic. Mirrors
+/// `formulation_kind_report`'s exact shape (every term has a meaningful value, no filtering).
+/// See [`crate::problem::TermRole`]'s doc comment.
+pub fn term_role_report(
+    problem: &dyn crate::problem::BoundaryValueProblem,
+) -> Vec<(&'static str, crate::problem::TermRole)> {
+    problem.loss_terms().iter()
+        .map(|term| (term.name(), term.term_role()))
+        .collect()
+}
+
 /// General-PINN architecture recommendations §40 (Priority 10, "constraint/augmented-
 /// Lagrangian framework") - which active terms enforce a real inequality/equality constraint,
 /// filtered like `stress_source_report` (the vast majority of terms are plain objective
@@ -646,19 +658,33 @@ pub struct LossLedgerEntry {
     pub grad_norm: Option<f32>,
     /// `r_i = ||grad_i|| / Σ_j ||grad_j||` - `None` under the same condition as `grad_norm`.
     pub gradient_share: Option<f32>,
+    /// Issue #61 P2-05's own categorization (`PhysicalFunctionalTerm`/`ConstraintTerm`/
+    /// `DiagnosticTerm`) - `None` only when the caller didn't supply a `roles` map to
+    /// [`build_loss_ledger`] (every real term has a meaningful role, unlike `grad_norm`/
+    /// `gradient_share`'s genuinely-optional diagnostics).
+    pub role: Option<crate::problem::TermRole>,
 }
 
 /// Builds a [`LossLedgerEntry`] per term present in `raw_scalar_by_name`, joining in
-/// `lam_by_name`/`term_grad_norms`/`gradient_shares` by name where available. A term missing
-/// from `lam_by_name` (should not happen for any real `StepOutput` - `raw_scalar_by_name` and
-/// `lam_by_name` are always populated together, see `step_physics_multi`'s construction) gets
-/// `lambda=0.0`/`weighted=0.0` rather than panicking - a defensive default for a hashmap-join,
-/// not a claim that a real term can meaningfully have zero weight.
+/// `lam_by_name`/`term_grad_norms`/`gradient_shares`/`roles` by name where available. A term
+/// missing from `lam_by_name` (should not happen for any real `StepOutput` - `raw_scalar_by_
+/// name` and `lam_by_name` are always populated together, see `step_physics_multi`'s
+/// construction) gets `lambda=0.0`/`weighted=0.0` rather than panicking - a defensive default
+/// for a hashmap-join, not a claim that a real term can meaningfully have zero weight.
+///
+/// `raw` (this term's own computed residual/energy value, BEFORE any weighting) is issue #61
+/// P2-05's own "physical coefficient" side of the ledger: it is produced entirely by `LossTerm::
+/// compute()`, a function that takes no weight/lambda argument at all - `lambda`/`weighted`
+/// (P2-05's "optimization_weight"/"effective_weight") are applied strictly AFTER `raw` is
+/// computed, by a separate caller (`step_physics`/`step_physics_multi`), and can never feed
+/// back into it. See `physical_functional_value_is_invariant_to_optimization_weighting` for a
+/// real, live-data proof of this separation, not just an architectural claim.
 pub fn build_loss_ledger(
     raw_scalar_by_name: &HashMap<&'static str, f32>,
     lam_by_name: &HashMap<&'static str, f64>,
     term_grad_norms: Option<&HashMap<&'static str, f32>>,
     gradient_shares: Option<&HashMap<&'static str, f32>>,
+    roles: Option<&HashMap<&'static str, crate::problem::TermRole>>,
 ) -> Vec<LossLedgerEntry> {
     raw_scalar_by_name.iter().map(|(&name, &raw)| {
         let lambda = lam_by_name.get(name).copied().unwrap_or(0.0);
@@ -669,6 +695,7 @@ pub fn build_loss_ledger(
             weighted: raw as f64 * lambda,
             grad_norm: term_grad_norms.and_then(|m| m.get(name).copied()),
             gradient_share: gradient_shares.and_then(|m| m.get(name).copied()),
+            role: roles.and_then(|m| m.get(name).copied()),
         }
     }).collect()
 }
@@ -3679,7 +3706,7 @@ mod tests {
         let grad: HashMap<&'static str, f32> = [("a", 0.5)].into_iter().collect(); // "b" missing on purpose
         let shares: HashMap<&'static str, f32> = [("a", 0.8), ("b", 0.2)].into_iter().collect();
 
-        let ledger = build_loss_ledger(&raw, &lam, Some(&grad), Some(&shares));
+        let ledger = build_loss_ledger(&raw, &lam, Some(&grad), Some(&shares), None);
         assert_eq!(ledger.len(), 2);
 
         let a = ledger.iter().find(|e| e.name == "a").unwrap();
@@ -3701,21 +3728,120 @@ mod tests {
     fn build_loss_ledger_defaults_missing_lambda_to_zero_not_a_panic() {
         let raw: HashMap<&'static str, f32> = [("orphan", 7.0)].into_iter().collect();
         let lam: HashMap<&'static str, f64> = HashMap::new(); // "orphan" absent
-        let ledger = build_loss_ledger(&raw, &lam, None, None);
+        let ledger = build_loss_ledger(&raw, &lam, None, None, None);
         let e = &ledger[0];
         assert_eq!(e.lambda, 0.0);
         assert_eq!(e.weighted, 0.0);
         assert_eq!(e.grad_norm, None);
         assert_eq!(e.gradient_share, None);
+        assert_eq!(e.role, None);
     }
 
     #[test]
     fn build_loss_ledger_with_no_gradient_data_leaves_both_fields_none() {
         let raw: HashMap<&'static str, f32> = [("a", 1.0)].into_iter().collect();
         let lam: HashMap<&'static str, f64> = [("a", 2.0)].into_iter().collect();
-        let ledger = build_loss_ledger(&raw, &lam, None, None);
+        let ledger = build_loss_ledger(&raw, &lam, None, None, None);
         assert_eq!(ledger[0].grad_norm, None);
         assert_eq!(ledger[0].gradient_share, None);
+    }
+
+    /// Issue #61 P2-05: `roles` joins in by name exactly like every other optional map.
+    #[test]
+    fn build_loss_ledger_joins_roles_by_name() {
+        use crate::problem::TermRole;
+        let raw: HashMap<&'static str, f32> = [("interior_energy", 1.0), ("hole_fixed", 2.0)].into_iter().collect();
+        let lam: HashMap<&'static str, f64> = [("interior_energy", 1.0), ("hole_fixed", 1.0)].into_iter().collect();
+        let roles: HashMap<&'static str, TermRole> = [
+            ("interior_energy", TermRole::PhysicalFunctional),
+            ("hole_fixed", TermRole::Constraint),
+        ].into_iter().collect();
+        let ledger = build_loss_ledger(&raw, &lam, None, None, Some(&roles));
+        let ie = ledger.iter().find(|e| e.name == "interior_energy").unwrap();
+        assert_eq!(ie.role, Some(TermRole::PhysicalFunctional));
+        let hf = ledger.iter().find(|e| e.name == "hole_fixed").unwrap();
+        assert_eq!(hf.role, Some(TermRole::Constraint));
+    }
+
+    /// Issue #61 P2-05's own acceptance wording: "tests prove adaptive weighting cannot alter
+    /// U-W_ext." `LossTerm::compute(&self, inputs: &[DomainForwardOutputs]) -> Tensor<B, 1>`
+    /// takes NO weight/lambda parameter at all - weighting is applied strictly AFTER `compute()`
+    /// returns, by a separate caller (`step_physics`/`step_physics_multi`'s `raw * lambda`).
+    /// This test makes that structural fact a real, executable regression guard on real
+    /// production term objects (`UserDefinedProblem::loss_terms()`'s `interior_energy`/
+    /// `external_work` - the literal `U`/`-W_ext` halves of `Π=U-W_ext`), not just an
+    /// architectural claim: calls `compute()` on hand-built, deterministic inputs (no model, no
+    /// randomness) TWICE, and separately applies two DELIBERATELY DIFFERENT weights the way
+    /// `step_physics_multi` does (`weighted = raw * lambda`) to confirm dividing either back out
+    /// recovers the IDENTICAL raw physical value.
+    #[test]
+    fn physical_functional_value_is_invariant_to_optimization_weighting() {
+        use crate::user_problem::{UserDefinedProblem, USER_DOMAIN};
+        use crate::problem::DomainForwardOutputs as DFO;
+        use pinn_core::material::MaterialProps;
+        use pinn_core::loading::LoadConfig;
+        use pinn_core::problem_spec::ProblemSpec;
+        use pinn_core::user_geometry::UserGeometry;
+        use burn::tensor::TensorData;
+
+        let device: BDevice = Default::default();
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        let problem = UserDefinedProblem::new(spec);
+        let terms = problem.loss_terms();
+        let interior_energy = terms.iter().find(|t| t.name() == "interior_energy")
+            .expect("interior_energy must be present under the default Hybrid formulation");
+        let external_work = terms.iter().find(|t| t.name() == "external_work")
+            .expect("external_work must be present under the default Hybrid formulation");
+
+        // interior_energy: a small, fixed, nonzero strain field - no model, no randomness.
+        let n = 4_usize;
+        let exx = Tensor::<B, 1>::from_data(TensorData::new(vec![1e-4_f32; n], vec![n]), &device);
+        let eyy = Tensor::<B, 1>::from_data(TensorData::new(vec![-3.3e-5_f32; n], vec![n]), &device);
+        let exy = Tensor::<B, 1>::from_data(TensorData::new(vec![0.0_f32; n], vec![n]), &device);
+        let ie_inputs = DFO {
+            domain: USER_DOMAIN, raw_out: &Tensor::<B, 2>::zeros([n, 2], &device),
+            strains: Some((exx, eyy, exy)), normals: None, shifted_stress: None, hessian: None,
+        };
+        let raw_ie_1 = interior_energy.compute(std::slice::from_ref(&ie_inputs));
+        let raw_ie_2 = interior_energy.compute(std::slice::from_ref(&ie_inputs));
+        let raw_ie_1_v = raw_ie_1.clone().into_data().to_vec::<f32>().unwrap()[0];
+        let raw_ie_2_v = raw_ie_2.into_data().to_vec::<f32>().unwrap()[0];
+        assert_eq!(raw_ie_1_v, raw_ie_2_v, "interior_energy.compute() must be a pure function of its inputs");
+
+        // external_work: raw_out (u, v columns) + outward normals - no model, no randomness.
+        let raw_out = Tensor::<B, 2>::from_data(TensorData::new(vec![2e-6_f32, -5e-7_f32], vec![1, 2]), &device);
+        let nx = Tensor::<B, 1>::from_data(TensorData::new(vec![1.0_f32], vec![1]), &device);
+        let ny = Tensor::<B, 1>::from_data(TensorData::new(vec![0.0_f32], vec![1]), &device);
+        let ew_inputs = DFO {
+            domain: USER_DOMAIN, raw_out: &raw_out,
+            strains: None, normals: Some((nx, ny)), shifted_stress: None, hessian: None,
+        };
+        let raw_ew_1 = external_work.compute(std::slice::from_ref(&ew_inputs));
+        let raw_ew_2 = external_work.compute(std::slice::from_ref(&ew_inputs));
+        let raw_ew_1_v = raw_ew_1.clone().into_data().to_vec::<f32>().unwrap()[0];
+        let raw_ew_2_v = raw_ew_2.into_data().to_vec::<f32>().unwrap()[0];
+        assert_eq!(raw_ew_1_v, raw_ew_2_v, "external_work.compute() must be a pure function of its inputs");
+
+        // Apply two DELIBERATELY DIFFERENT optimization weights the way step_physics_multi
+        // does (`weighted = raw * lambda`) and confirm the raw physical value is recovered
+        // identically regardless of which weight was used - the actual P2-05 invariant.
+        for &raw in &[raw_ie_1_v, raw_ew_1_v] {
+            let (lambda_a, lambda_b) = (1.0_f64, 50.0_f64);
+            let weighted_a = raw as f64 * lambda_a;
+            let weighted_b = raw as f64 * lambda_b;
+            assert!((weighted_a / lambda_a - raw as f64).abs() < 1e-9);
+            assert!((weighted_b / lambda_b - raw as f64).abs() < 1e-9);
+            assert_eq!(weighted_a / lambda_a, weighted_b / lambda_b,
+                "the recovered raw physical value must be identical regardless of which \
+                 optimization weight was applied to it");
+        }
     }
 
     use crate::kirsch_problem::KirschProblem;

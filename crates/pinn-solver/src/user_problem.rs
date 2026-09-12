@@ -257,6 +257,8 @@ impl LossTerm for InteriorEnergyTerm {
     // Interior PDE physics, not a boundary condition - correctly `None`.
     // Reads `d.strains` - first-order spatial derivative.
     fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
+    // `U` itself - the literal physical functional term issue #61 P2-05 names.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("interior_energy: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("interior_energy: strains must be Some");
@@ -301,6 +303,9 @@ impl LossTerm for EquilibriumTerm {
     // condition - same reasoning as Kirsch's `EquilibriumRingTerm`.
     // Reads `d.hessian` (`needs_hessian()==true` above) - second-order spatial derivative.
     fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::Second) }
+    // The governing PDE itself (Strong formulation's counterpart to `interior_energy`'s `U`) -
+    // physics, not an admissibility constraint or a diagnostic.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("equilibrium: domain missing");
         let (u_xx, u_yy, u_xy, v_xx, v_yy, v_xy) = d.hessian.clone()
@@ -337,6 +342,9 @@ impl LossTerm for OuterTractionTerm {
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Neumann) }
     // Reads `d.strains` - first-order spatial derivative.
     fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
+    // The applied far-field traction BC is part of the governing BVP itself, not an
+    // admissibility constraint layered on top of it (unlike an essential/Dirichlet condition).
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("outer_traction: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("outer_traction: strains must be Some");
@@ -389,6 +397,9 @@ impl LossTerm for ExternalWorkTerm {
     // residual, not itself a pointwise boundary-operator residual - `Π=U-W_ext`'s natural BC
     // is satisfied automatically by minimizing this energy, not by a per-point condition it
     // enforces directly. Correctly `None` rather than mislabeled `Neumann`.
+    // `-W_ext` itself - the other literal physical functional term issue #61 P2-05 names
+    // (`Π = U - W_ext`, `interior_energy` being the `U` half).
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("external_work: domain missing");
         let (nx, ny) = d.normals.clone().expect("external_work: normals must be Some");
@@ -431,6 +442,17 @@ impl LossTerm for HoleBcTerm {
         match self.bc {
             HoleBc::Free => Some(crate::problem::BoundaryOperatorKind::Neumann),
             HoleBc::Fixed => Some(crate::problem::BoundaryOperatorKind::Dirichlet),
+        }
+    }
+    // `Free` (traction-free hole boundary) is part of the governing BVP's own physics, same
+    // reasoning as `OuterTractionTerm`; `Fixed` is an essential/Dirichlet admissibility
+    // constraint on the solution space, issue #61 §1.1's own "essential constraints" - not
+    // itself part of the physical functional (an anchor doesn't change under a different
+    // formulation the way a natural BC term does - it's always active, see `loss_terms()`).
+    fn term_role(&self) -> crate::problem::TermRole {
+        match self.bc {
+            HoleBc::Free => crate::problem::TermRole::PhysicalFunctional,
+            HoleBc::Fixed => crate::problem::TermRole::Constraint,
         }
     }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
@@ -1755,6 +1777,41 @@ mod tests {
                 .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
             assert_eq!(term.formulation_kind(), *expected_kind,
                 "term '{}' has formulation_kind {:?}, expected {:?}", term.name(), term.formulation_kind(), expected_kind);
+        }
+    }
+
+    /// Issue #61 P2-05's own categorization, same shape as `formulation_kind`'s classification
+    /// test above. `hole_fixed` is the plate's one essential/Dirichlet Constraint term;
+    /// everything else here is part of the governing BVP's own physics.
+    #[test]
+    fn user_problem_loss_terms_have_expected_term_role_classification() {
+        use crate::problem::TermRole as Tr;
+
+        let spec = ProblemSpec {
+            geometry: two_hole_geometry(),
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        let problem = UserDefinedProblem::new(spec);
+        let terms = problem.loss_terms();
+
+        let expected: &[(&str, Tr)] = &[
+            ("interior_energy", Tr::PhysicalFunctional),
+            ("equilibrium", Tr::PhysicalFunctional),
+            ("outer_traction", Tr::PhysicalFunctional),
+            ("external_work", Tr::PhysicalFunctional),
+            ("hole_free", Tr::PhysicalFunctional),
+            ("hole_fixed", Tr::Constraint),
+        ];
+
+        for term in &terms {
+            let (_, expected_role) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.term_role(), *expected_role,
+                "term '{}' has term_role {:?}, expected {:?}", term.name(), term.term_role(), expected_role);
         }
     }
 

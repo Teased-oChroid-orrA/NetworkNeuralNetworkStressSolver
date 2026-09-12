@@ -221,6 +221,38 @@ pub trait LossTerm: Send + Sync {
     fn constraint_kind(&self) -> ConstraintKind {
         ConstraintKind::Unconstrained
     }
+
+    /// Issue #61 EPIC P2-05's own categorization: whether this term is part of the actual
+    /// PHYSICAL FUNCTIONAL being minimized (the governing PDE/energy itself - e.g. `U`,
+    /// `-W_ext`, an equilibrium/traction residual), a CONSTRAINT on the admissible solution
+    /// space that is not itself part of that functional (an essential/Dirichlet condition, a
+    /// gauge/anchor, an inequality penalty), or a pure DIAGNOSTIC/consistency check that
+    /// verifies an internal representation without encoding new physics (this codebase's one
+    /// real example: `constitutive_consistency`, which polices `σ_net ≈ C:ε(u)` for mDEM
+    /// domains rather than solving anything). No meaningful default (every term is one of the
+    /// three) - same forced-choice convention as [`Self::formulation_kind`], NOT the
+    /// "None means not applicable" convention `stress_source`/`boundary_kind`/`derivative_
+    /// order` use. Defaults to `PhysicalFunctional` only for trait backwards-compatibility;
+    /// relying on it is exactly what the "must override" tests in each problem module are for.
+    /// See [`crate::training_core::term_role_report`] for the generic consumer, and this
+    /// method's role in enforcing that adaptive optimization weighting can never alter the
+    /// physical functional `U - W_ext` itself (only how much each term's ALREADY-COMPUTED
+    /// residual contributes to the total scalar loss - see `training_core`'s own P2-05 test).
+    fn term_role(&self) -> TermRole {
+        TermRole::PhysicalFunctional
+    }
+}
+
+/// See [`LossTerm::term_role`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TermRole {
+    /// Directly encodes the governing PDE/energy functional itself.
+    PhysicalFunctional,
+    /// Enforces admissibility (essential/Dirichlet BC, gauge/anchor, inequality penalty) -
+    /// necessary for a well-posed problem, but not itself part of the physical functional.
+    Constraint,
+    /// A pure internal-consistency check with no physics of its own to solve.
+    Diagnostic,
 }
 
 /// Classifies a [`LossTerm`] as either enforcing interior PDE/equilibrium physics or a

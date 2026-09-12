@@ -302,6 +302,8 @@ impl LossTerm for InteriorEnergyTerm {
     fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
     // The strain-energy half of the DEM functional `Π=U-W_ext` - Weak/variational.
     fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Weak }
+    // `U` itself - the literal physical functional term issue #61 P2-05 names.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("interior_energy: domain not present in inputs");
@@ -333,6 +335,8 @@ impl LossTerm for NeumannTractionTerm {
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Neumann) }
     // Reads `d.strains` - first-order spatial derivative.
     fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
+    // The applied far-field traction BC is part of the governing BVP itself.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("neumann_traction: domain not present in inputs");
@@ -376,6 +380,9 @@ impl LossTerm for HoleTractionTerm {
     fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> {
         if self.direct { None } else { Some(crate::problem::DerivativeOrder::First) }
     }
+    // Traction-free at the hole is part of the governing BVP's own physics (same reasoning as
+    // `NeumannTractionTerm`), not an admissibility constraint layered on top of it.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("hole_traction: domain not present in inputs");
@@ -411,6 +418,9 @@ impl LossTerm for DisplacementAnchorTerm {
     // Displacement-only (reads `raw_out` column 0) - no stress quantity involved.
     // Prescribes the displacement VALUE at the right edge - the textbook Dirichlet condition.
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Dirichlet) }
+    // Essential/Dirichlet admissibility anchor (prevents rigid-body translation) - not itself
+    // part of the physical functional `Π=U-W_ext`, issue #61 §1.1's "essential constraints".
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("displacement_anchor: domain not present in inputs");
@@ -455,6 +465,8 @@ impl LossTerm for EquilibriumRingTerm {
     // 4-shift stencil `step_physics` builds itself, not `DomainForwardOutputs::strains`/
     // `hessian`. Correctly `None` (this method reports what `inputs` supplies, not every
     // stencil that exists anywhere in the call chain).
+    // The governing PDE itself (∇·σ=0) - physics, not an admissibility constraint.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, _inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let [sxx_xp, sxy_xp, sxx_xm, sxy_xm, sxy_yp, syy_yp, sxy_ym, syy_ym] =
             self.components.clone().expect(
@@ -499,6 +511,11 @@ impl LossTerm for KirschStressTerm {
     fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> {
         if self.direct { None } else { Some(crate::problem::DerivativeOrder::First) }
     }
+    // A data-fit anchor to the known Kirsch analytical solution, not itself the governing
+    // functional/PDE of the trained problem (same reasoning as `DisplacementAnchorTerm`) nor a
+    // pure internal-consistency check (unlike `constitutive_consistency`, it supplies real
+    // external physics information - the exact stress field - not a representation check).
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("kirsch_stress: domain not present in inputs");
@@ -546,6 +563,9 @@ impl LossTerm for ConstitutiveConsistencyTerm {
     // boundary condition - same reasoning as `conflict_group`'s own `Physics` classification.
     // Reads `d.strains` - first-order spatial derivative.
     fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
+    // The literal named example in issue #61 P2-05's own `TermRole::Diagnostic` doc comment -
+    // polices representation consistency (σ_direct vs σ_derived), solves no new physics.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Diagnostic }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("constitutive_consistency: domain not present in inputs");
@@ -904,6 +924,33 @@ mod tests {
                 .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
             assert_eq!(term.formulation_kind(), *expected_kind,
                 "term '{}' has formulation_kind {:?}, expected {:?}", term.name(), term.formulation_kind(), expected_kind);
+        }
+    }
+
+    /// Issue #61 P2-05's own categorization, same shape as `formulation_kind`'s classification
+    /// test above.
+    #[test]
+    fn kirsch_loss_terms_have_expected_term_role_classification() {
+        use crate::problem::TermRole as Tr;
+
+        let material = MaterialProps::al7075_t6();
+        let problem = KirschProblem::new(material, 5, 4000, 3.0);
+        let terms = problem.loss_terms();
+
+        let expected: &[(&str, Tr)] = &[
+            ("interior_energy", Tr::PhysicalFunctional),
+            ("neumann_traction", Tr::PhysicalFunctional),
+            ("hole_traction", Tr::PhysicalFunctional),
+            ("displacement_anchor", Tr::Constraint),
+            ("equilibrium_ring", Tr::PhysicalFunctional),
+            ("kirsch_stress", Tr::Constraint),
+        ];
+
+        for term in &terms {
+            let (_, expected_role) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.term_role(), *expected_role,
+                "term '{}' has term_role {:?}, expected {:?}", term.name(), term.term_role(), expected_role);
         }
     }
 

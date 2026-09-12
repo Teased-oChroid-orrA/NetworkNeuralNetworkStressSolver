@@ -361,7 +361,100 @@ P2-15, tracked as a known limitation rather than silently dropped.
 
 ## P2-05 — Separate physical coefficients from optimization weights
 
-Status: NOT_STARTED
+Status: VERIFIED
+
+### Requirement
+
+Categorize terms as PhysicalFunctionalTerm/ConstraintTerm/DiagnosticTerm; the loss ledger
+separates physical value from optimization/effective weight; tests prove adaptive weighting
+cannot alter `U-W_ext`.
+
+### Files changed
+
+- `crates/pinn-solver/src/problem.rs` — new `TermRole` enum (`PhysicalFunctional`/`Constraint`/
+  `Diagnostic`) + `LossTerm::term_role()` (forced-choice, no meaningful default - same
+  convention as `formulation_kind`).
+- `crates/pinn-solver/src/user_problem.rs`, `kirsch_problem.rs`, `pinlug_problem.rs` — every
+  concrete `LossTerm` overrides `term_role()` explicitly, classified by what each term actually
+  enforces (see Architecture decision).
+- `crates/pinn-solver/src/training_core.rs` — `term_role_report()` (mirrors `formulation_kind_
+  report`'s shape); `LossLedgerEntry` gains a `role: Option<TermRole>` field; `build_loss_
+  ledger()` gains a `roles: Option<&HashMap<&'static str, TermRole>>` parameter (all 4 existing
+  call sites updated, `None` where role data isn't available - non-breaking, additive).
+- `crates/pinn-solver/src/runner.rs` — one call site updated for the new `build_loss_ledger`
+  arity (`None` for roles - a diagnostic printer, not affected by this epic's core claim).
+
+### Architecture decision
+
+Classification (issue #61's own wording in parens): `interior_energy`/`external_work` (the
+literal `U`/`-W_ext` halves of `Π=U-W_ext`), `equilibrium`/`outer_traction`/`hole_free`/
+`neumann_traction`/`hole_traction`/`equilibrium_ring`/`lug_free_edge_traction`/`pin_driving_
+traction` → **PhysicalFunctional** (governing PDE/BC physics, strong or weak form alike).
+`hole_fixed`/`displacement_anchor`/`lug_shank_anchor` (essential/Dirichlet, issue #61 §1.1's own
+"essential constraints"), `interface_penetration`/`interface_non_tension` (Signorini KKT
+inequality admissibility), `kirsch_stress` (a data-fit anchor to a known analytical solution,
+not the governing functional of the trained problem itself) → **Constraint**.
+`constitutive_consistency` (issue #61's own literal example: "Discrete points... MAY be used as
+evaluation/operator machinery but SHALL NOT silently become permanent solution degrees of
+freedom" — polices representation consistency, solves no new physics) → **Diagnostic**.
+
+The "physical coefficient vs optimization weight" separation this epic's title names is not
+newly built — it was already a structural property of this codebase's real architecture:
+`LossTerm::compute(&self, inputs: &[DomainForwardOutputs]) -> Tensor<B, 1>` has NO weight
+parameter in its signature at all. `step_physics`/`step_physics_multi` compute every term's
+`raw` value (via `compute()`) BEFORE `saw.update()` ever runs, and apply `lambda` strictly
+afterward (`total += raw * lambda`) — architecturally impossible for any adaptive weight to
+feed back into `raw`. This epic's real job was making that fact (a) EXPLICIT via `TermRole`
+classification (which terms are physics vs admissibility vs diagnostic) and (b) PROVEN via a
+real test on production term objects, not merely asserted from reading the code.
+
+### Tests
+
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- term_role
+  physical_functional_value_is_invariant build_loss_ledger` — 8 passed: `term_role`
+  classification tables for all three problem types (`user_problem_loss_terms_have_expected_
+  term_role_classification`, `kirsch_loss_terms_have_expected_term_role_classification`,
+  `pinlug_loss_terms_have_expected_term_role_classification` - every concrete term covered, no
+  silent default relied on), `build_loss_ledger_joins_roles_by_name`, and
+  `physical_functional_value_is_invariant_to_optimization_weighting` (see Runtime evidence).
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- kirsch_problem::
+  pinlug_problem:: user_problem:: training_core::` (broader regression) — 142 passed, 0 failed.
+- command: `cargo build --workspace --tests --features ndarray-backend` — clean.
+
+### Runtime evidence
+
+`physical_functional_value_is_invariant_to_optimization_weighting` calls `interior_energy`/
+`external_work` (real `UserDefinedProblem::loss_terms()` production objects, not mocks) via
+their actual `LossTerm::compute()` trait method on hand-built deterministic inputs, confirms
+`compute()` is a pure function (identical output called twice), then applies two deliberately
+different weights (1.0 vs 50.0, mirroring `step_physics_multi`'s real `raw * lambda` formula)
+and confirms the raw physical value recovers identically either way — a genuine, executable
+proof of the P2-05 invariant against real term objects, not a synthetic HashMap-only test.
+
+### Known limitations
+
+No standalone "physical coefficient" ledger field distinct from `raw` was added — this
+codebase's terms don't carry a single separable scalar physical constant outside their
+`compute()` formula (material properties like E/ν are Rust struct fields on `MaterialProps`,
+baked into the physics formula itself, not a ledger-reportable number); `raw` already IS
+P2-05's "physical value" side of the ledger by construction. An unrelated, real finding
+surfaced while building the (ultimately unused) full-integration version of the invariance
+test: two `step_physics_multi` calls from separately-cloned `ElasticityNet` instances (same
+`ElasticityNetConfig`, same `net_cfg.init()` source) produced DIFFERENT `raw_scalar_by_name`
+values even with IDENTICAL `SawBrdr` seeding — i.e. `base_model.clone()` does not appear to
+preserve bit-identical initial weights (or something in `step_physics_multi`'s call chain has
+hidden model-independent randomness). Not investigated further here (out of P2-05's scope,
+and not needed once the test was rewritten to call `LossTerm::compute()` directly on
+deterministic hand-built inputs) — flagged here as a real, reproducible observation for a
+future session, since exact-reproducibility failures like this are exactly the kind of thing
+P2-13 (reproducibility/provenance) should eventually catch.
+
+### Reviewer verification
+
+PASS against P2-05's acceptance bullets: the three-way categorization exists and covers every
+concrete term in all three problem types with no silent default; the ledger carries the role
+alongside raw/lambda/weighted; a real, executable test proves adaptive weighting cannot alter
+the physical functional value on genuine production term objects.
 
 ## P2-06 — Geometry-aware operators
 

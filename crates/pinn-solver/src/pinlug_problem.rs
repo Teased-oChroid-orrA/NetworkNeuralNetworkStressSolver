@@ -280,6 +280,8 @@ impl LossTerm for InteriorEnergyTerm {
     // Interior PDE physics, not a boundary condition - correctly `None`.
     // Reads `d.strains` - first-order spatial derivative.
     fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
+    // `U` itself - the literal physical functional term issue #61 P2-05 names.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == self.domain).expect("interior_energy: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("interior_energy: strains must be Some");
@@ -300,6 +302,8 @@ impl LossTerm for LugShankAnchorTerm {
     // Displacement-only - no stress quantity involved.
     // Prescribes the displacement VALUE (zero) at the gripped shank edge - Dirichlet.
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Dirichlet) }
+    // Essential/Dirichlet admissibility anchor, not part of the governing physical functional.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("lug_shank_anchor: domain missing");
         let n = d.raw_out.dims()[0];
@@ -326,6 +330,8 @@ impl LossTerm for LugFreeEdgeTractionTerm {
     // Traction-free is a Neumann condition (zero flux) - same reasoning as Kirsch's
     // `HoleTractionTerm`.
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Neumann) }
+    // Traction-free lug edge is part of the governing BVP's own physics.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("lug_free_edge_traction: domain missing");
         let (nx, ny) = d.normals.clone().expect("lug_free_edge_traction: normals must be Some");
@@ -356,6 +362,8 @@ impl LossTerm for PinDrivingTractionTerm {
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Neumann) }
     // Reads `d.strains` - first-order spatial derivative.
     fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
+    // The applied driving traction BC is part of the governing BVP itself.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("pin_driving_traction: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("pin_driving_traction: strains must be Some");
@@ -412,6 +420,8 @@ impl LossTerm for InterfacePenetrationTerm {
     // Signorini non-penetration (gap >= 0) - a real inequality constraint, currently enforced
     // via the squared-hinge penalty `gap.neg().clamp_min(0.0).powf_scalar(2.0)` below.
     fn constraint_kind(&self) -> crate::problem::ConstraintKind { crate::problem::ConstraintKind::PenaltyInequality }
+    // Signorini KKT admissibility condition, not part of the governing physical functional.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let pin = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("interface_penetration: pin missing");
         let lug = inputs.iter().find(|i| i.domain == LUG_DOMAIN).expect("interface_penetration: lug missing");
@@ -469,6 +479,8 @@ impl LossTerm for InterfaceNonTensionTerm {
     // is evaluated from the pin's own stress state, but the condition it enforces is about the
     // shared pin/lug contact boundary, not an interior property of the pin alone).
     fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Interface) }
+    // The other half of the same Signorini KKT admissibility pair as `InterfacePenetrationTerm`.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let pin = inputs.iter().find(|i| i.domain == PIN_DOMAIN).expect("interface_non_tension: pin missing");
         let n = self.thetas.len();
@@ -1428,6 +1440,33 @@ mod tests {
                 .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
             assert_eq!(term.formulation_kind(), *expected_kind,
                 "term '{}' has formulation_kind {:?}, expected {:?}", term.name(), term.formulation_kind(), expected_kind);
+        }
+    }
+
+    /// Issue #61 P2-05's own categorization, same shape as `formulation_kind`'s classification
+    /// test above.
+    #[test]
+    fn pinlug_loss_terms_have_expected_term_role_classification() {
+        use crate::problem::TermRole as Tr;
+
+        let problem = PinLugProblem::new(MaterialProps::steel_4340(), 5, 2000, 16, PinLugScalingMode::AppliedLoad);
+        let terms = problem.loss_terms();
+
+        let expected: &[(&str, Tr)] = &[
+            ("pin_interior_energy", Tr::PhysicalFunctional),
+            ("lug_interior_energy", Tr::PhysicalFunctional),
+            ("lug_shank_anchor", Tr::Constraint),
+            ("lug_free_edge_traction", Tr::PhysicalFunctional),
+            ("pin_driving_traction", Tr::PhysicalFunctional),
+            ("interface_penetration", Tr::Constraint),
+            ("interface_non_tension", Tr::Constraint),
+        ];
+
+        for term in &terms {
+            let (_, expected_role) = expected.iter().find(|(name, _)| *name == term.name())
+                .unwrap_or_else(|| panic!("unexpected loss term '{}' not in expected table", term.name()));
+            assert_eq!(term.term_role(), *expected_role,
+                "term '{}' has term_role {:?}, expected {:?}", term.name(), term.term_role(), expected_role);
         }
     }
 
