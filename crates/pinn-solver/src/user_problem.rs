@@ -994,6 +994,128 @@ pub fn probe_reaction_force(
     pinn_core::messages::ReactionForce { net_fx, net_fy, reference_force, equilibrium_error }
 }
 
+/// Issue #61 EPIC P2-09: predicted-vs-prescribed resultant load and a generic trivial-solution
+/// warning - directly motivated by the real `Debug_runs/stress_solver_report-with-hole.json`
+/// evidence this remediation plan was opened against (`bc_residual_max≈` the load itself,
+/// `avg_von_mises` ~50x smaller than nominal - a collapsed solution that STILL had nonzero
+/// displacement, so a bare `max|displacement|` check alone would have missed it). Distinct
+/// from [`probe_reaction_force`] (which checks the FULL closed boundary's resultant against
+/// zero, since far-field loading is self-canceling around a whole rectangle): this checks the
+/// LOADED edges specifically against their real PRESCRIBED nominal load, which is the direct
+/// question "did the network actually transfer the applied load into its own stress state, or
+/// did it converge on a near-zero-stress shortcut instead."
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoadTransferReport {
+    /// Predicted resultant force integrated over the right edge (x-loaded) [N].
+    pub predicted_load_x: f64,
+    /// Predicted resultant force integrated over the top edge (y-loaded) [N].
+    pub predicted_load_y: f64,
+    pub prescribed_load_x: f64,
+    pub prescribed_load_y: f64,
+    /// `|predicted resultant| / |prescribed resultant|` - 1.0 is perfect load transfer, ~0 is
+    /// the literal trivial/collapsed-solution symptom.
+    pub load_transfer_ratio: f64,
+    /// `probe_boundary_residuals`'s own (rms, max) - reused, not recomputed (issue #61 P2-08's
+    /// own "no duplicated verification machinery" discipline).
+    pub traction_residual_rms: f64,
+    pub traction_residual_max: f64,
+    /// True iff `load_transfer_ratio` is below a generous sanity floor - a genuine, physically-
+    /// direct trivial-solution warning (catches the real Debug_runs case: nonzero but far-too-
+    /// small stress, which a bare displacement check misses).
+    pub trivial_solution_warning: bool,
+}
+
+pub fn probe_load_transfer(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    spec: &ProblemSpec,
+    device: &crate::training_core::BDevice,
+) -> LoadTransferReport {
+    use crate::energy::compute_stress;
+    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig};
+    use crate::network::fwd;
+    use crate::training_core::BInner;
+    use burn::tensor::TensorData;
+
+    let geometry = &spec.geometry;
+    let sampling = UserSamplingStrategy::new(geometry.clone(), spec.training.fd_h);
+    let placeholder = geometry.to_placeholder();
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+    let scales = crate::training_core::compute_reference_scales_for_plate(spec);
+    let (stress_ref, u_ref) = (scales.stress_ref, scales.u_ref);
+    let px_pa = stress_ref;
+    let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / geometry.half_w) as f32, (y / geometry.half_h) as f32] };
+
+    let prescribed_load_x = spec.load.px * 2.0 * geometry.half_h * geometry.thickness;
+    let prescribed_load_y = spec.load.py * 2.0 * geometry.half_w * geometry.thickness;
+
+    let (traction_residual_rms, traction_residual_max) = probe_boundary_residuals(model, spec, device);
+
+    let bnd_pts_phys = sampling.sample_boundary(&placeholder, &spec.load, spec.training.n_boundary);
+    if bnd_pts_phys.is_empty() {
+        return LoadTransferReport {
+            predicted_load_x: 0.0, predicted_load_y: 0.0, prescribed_load_x, prescribed_load_y,
+            load_transfer_ratio: 1.0, traction_residual_rms, traction_residual_max,
+            trivial_solution_warning: false,
+        };
+    }
+    let n_bnd = bnd_pts_phys.len();
+    // `sample_boundary` pushes exactly (right, left, top, bottom) per iteration - see its own
+    // doc comment - so every 4th point starting at offset 0/2 is the right/top edge.
+    let per_edge = (n_bnd / 4).max(1);
+    let ds_x_normal = 2.0 * geometry.half_h / per_edge as f64;
+    let ds_y_normal = 2.0 * geometry.half_w / per_edge as f64;
+
+    let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
+    let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
+    let raw = fwd::<BInner>(model, stencil, geometry.n_fourier(), device);
+    let m = 5 * n_bnd;
+    let scaled = Tensor::cat(vec![
+        raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
+        raw.slice([0..m, 2..5]).mul_scalar(px_pa),
+    ], 1);
+    let (exx, eyy, exy) = compute_strains::<BInner>(scaled, n_bnd, &fd);
+    let (sxx, syy, sxy) = compute_stress::<BInner>(exx, eyy, exy, &spec.material);
+    let nx: Vec<f32> = bnd_pts_phys.iter().map(|p| p.nx as f32).collect();
+    let ny: Vec<f32> = bnd_pts_phys.iter().map(|p| p.ny as f32).collect();
+    let nx_t = Tensor::<BInner, 1>::from_data(TensorData::new(nx.clone(), vec![n_bnd]), device);
+    let ny_t = Tensor::<BInner, 1>::from_data(TensorData::new(ny.clone(), vec![n_bnd]), device);
+    let tx_pred: Vec<f32> = (sxx.clone() * nx_t.clone() + sxy.clone() * ny_t.clone())
+        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
+    let ty_pred: Vec<f32> = (sxy * nx_t + syy * ny_t)
+        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
+
+    // Issue #61 P2-04: measure-aware integration, via the shared abstraction - the right/top
+    // edges' predicted traction integrated with their own real arc-length measure.
+    let right_tx: Vec<f32> = (0..per_edge).map(|i| tx_pred[4 * i]).collect();
+    let top_ty: Vec<f32> = (0..per_edge).map(|i| ty_pred[4 * i + 2]).collect();
+    let right_ds = vec![ds_x_normal; per_edge];
+    let top_ds = vec![ds_y_normal; per_edge];
+    let predicted_load_x = crate::measure_integral::boundary_integral(&right_tx, &right_ds, geometry.thickness);
+    let predicted_load_y = crate::measure_integral::boundary_integral(&top_ty, &top_ds, geometry.thickness);
+    let (load_transfer_ratio, trivial_solution_warning) =
+        compute_load_transfer_ratio(predicted_load_x, predicted_load_y, prescribed_load_x, prescribed_load_y);
+
+    LoadTransferReport {
+        predicted_load_x, predicted_load_y, prescribed_load_x, prescribed_load_y,
+        load_transfer_ratio, traction_residual_rms, traction_residual_max, trivial_solution_warning,
+    }
+}
+
+/// Pure logic half of [`probe_load_transfer`] - separated so it can be hand-verified directly
+/// without needing a real network forward pass (see this function's own tests). `ratio = 1.0`
+/// (trivially "fully transferred") when nothing is prescribed (`prescribed_magnitude ~ 0`) -
+/// there is nothing to fail to transfer. The 10% floor is a generous sanity bound (matches
+/// P2-08's own "sanity bound, not a calibrated P2-14 acceptance threshold" convention).
+fn compute_load_transfer_ratio(predicted_x: f64, predicted_y: f64, prescribed_x: f64, prescribed_y: f64) -> (f64, bool) {
+    let prescribed_magnitude = (prescribed_x * prescribed_x + prescribed_y * prescribed_y).sqrt();
+    let predicted_magnitude = (predicted_x * predicted_x + predicted_y * predicted_y).sqrt();
+    if prescribed_magnitude <= 1e-30 {
+        return (1.0, false);
+    }
+    let ratio = predicted_magnitude / prescribed_magnitude;
+    (ratio, ratio < 0.10)
+}
+
 /// `enhancement.md` Phase 10 ("Energy Validation") - a real domain-integrated internal-energy-
 /// vs-external-work comparison. See `pinn_core::messages::EnergyBalance`'s doc comment for why
 /// this is DISTINCT from the optimizer's own `energy_loss` field. Internal energy is a
@@ -2277,6 +2399,96 @@ mod tests {
         };
         let rf = probe_reaction_force(&model, &spec, &device);
         assert!(rf.equilibrium_error.is_finite(), "equilibrium_error must stay finite at zero applied load, got {}", rf.equilibrium_error);
+    }
+
+    // ─── Issue #61 EPIC P2-09: load-transfer / trivial-solution diagnostics ────────────────
+
+    #[test]
+    fn compute_load_transfer_ratio_hand_computed_cases() {
+        // Perfect transfer: predicted exactly matches prescribed.
+        let (ratio, warn) = compute_load_transfer_ratio(100.0, 0.0, 100.0, 0.0);
+        assert!((ratio - 1.0).abs() < 1e-12);
+        assert!(!warn);
+
+        // The literal collapsed-solution symptom: near-zero predicted vs a real prescribed load.
+        let (ratio, warn) = compute_load_transfer_ratio(0.5, 0.0, 100.0, 0.0);
+        assert!((ratio - 0.005).abs() < 1e-12, "ratio={ratio}");
+        assert!(warn, "0.5% transferred load must trigger the trivial-solution warning");
+
+        // Half-transferred: below the 10% floor is a warning, above is not - boundary check.
+        let (ratio_low, warn_low) = compute_load_transfer_ratio(9.0, 0.0, 100.0, 0.0);
+        assert!((ratio_low - 0.09).abs() < 1e-12);
+        assert!(warn_low);
+        let (ratio_high, warn_high) = compute_load_transfer_ratio(11.0, 0.0, 100.0, 0.0);
+        assert!((ratio_high - 0.11).abs() < 1e-12);
+        assert!(!warn_high);
+
+        // Nothing prescribed - trivially "fully transferred", never a warning.
+        let (ratio_zero, warn_zero) = compute_load_transfer_ratio(0.0, 0.0, 0.0, 0.0);
+        assert_eq!(ratio_zero, 1.0);
+        assert!(!warn_zero);
+
+        // Combined x/y magnitude, not just the x component.
+        let (ratio_xy, _) = compute_load_transfer_ratio(3.0, 4.0, 3.0, 4.0); // both (3,4), magnitude 5/5=1
+        assert!((ratio_xy - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn probe_load_transfer_matches_hand_computed_prescribed_load_and_is_finite() {
+        let model = tiny_model(0);
+        let device = crate::training_core::BDevice::default();
+        let px = 6.9e7;
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.1, half_h: 0.05, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: pinn_core::loading::LoadConfig::uniaxial_x(px),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        let report = probe_load_transfer(&model, &spec, &device);
+        let expected_prescribed_x = px * 2.0 * spec.geometry.half_h * spec.geometry.thickness;
+        assert!((report.prescribed_load_x - expected_prescribed_x).abs() / expected_prescribed_x.abs() < 1e-9);
+        assert_eq!(report.prescribed_load_y, 0.0);
+        assert!(report.predicted_load_x.is_finite());
+        assert!(report.load_transfer_ratio.is_finite());
+        assert!(report.load_transfer_ratio >= 0.0);
+        assert!(report.traction_residual_rms.is_finite());
+        assert!(report.traction_residual_max.is_finite());
+    }
+
+    #[test]
+    fn probe_load_transfer_zero_load_gives_ratio_one_and_no_warning() {
+        let model = tiny_model(0);
+        let device = crate::training_core::BDevice::default();
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: pinn_core::loading::LoadConfig::uniaxial_x(0.0),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        let report = probe_load_transfer(&model, &spec, &device);
+        assert_eq!(report.load_transfer_ratio, 1.0);
+        assert!(!report.trivial_solution_warning);
+    }
+
+    #[test]
+    fn probe_load_transfer_handles_a_geometry_with_holes() {
+        let model = tiny_model(0);
+        let device = crate::training_core::BDevice::default();
+        let spec = ProblemSpec {
+            geometry: two_hole_geometry(),
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        let report = probe_load_transfer(&model, &spec, &device);
+        assert!(report.load_transfer_ratio.is_finite());
+        assert!(report.predicted_load_x.is_finite());
     }
 
     // ─── enhancement.md Phase 10: energy balance ────────────────────────────────────────────

@@ -227,6 +227,21 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         // "Constitutive residual" - not "PDE residual" - see `EquilibriumTerm`'s doc comment
         // (user_problem.rs) for why that distinction matters.
         println!("  [diag] constitutive residual RMS={pde_rms:.4e}  max={pde_max:.4e} Pa");
+
+        // Issue #61 EPIC P2-09: predicted-vs-prescribed load transfer + generic trivial-
+        // solution warning - directly motivated by the real Debug_runs evidence (a collapsed
+        // solution with nonzero-but-far-too-small stress, which a bare displacement check
+        // alone would have missed).
+        let load_transfer = crate::user_problem::probe_load_transfer(&model_val, &spec, &device);
+        println!(
+            "  [diag] load transfer ratio={:.4}  predicted=({:.3e},{:.3e}) N  prescribed=({:.3e},{:.3e}) N",
+            load_transfer.load_transfer_ratio, load_transfer.predicted_load_x, load_transfer.predicted_load_y,
+            load_transfer.prescribed_load_x, load_transfer.prescribed_load_y,
+        );
+        if load_transfer.trivial_solution_warning {
+            println!("  [!] P2-09 trivial-solution warning: only {:.1}% of the prescribed load is being transferred - likely a collapsed/trivial solution.", load_transfer.load_transfer_ratio * 100.0);
+        }
+
         let nominal_stress = spec.load.px.abs().max(spec.load.py.abs());
         // Derived-stress-at-margin, not direct σ at the exact boundary - see
         // `probe_hole_boundary_profile_derived`'s doc comment.

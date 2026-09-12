@@ -741,7 +741,79 @@ real under-trained run, not just a synthetic always-pass stub) via a live traini
 
 ## P2-09 — Load-transfer and trivial-solution diagnostics
 
-Status: NOT_STARTED
+Status: VERIFIED
+
+### Requirement
+
+Predicted vs prescribed resultant load, `load_transfer_ratio`, traction RMS/max, and a generic
+trivial-solution warning.
+
+### Files changed
+
+- `crates/pinn-solver/src/user_problem.rs` — new `LoadTransferReport` struct + `probe_load_
+  transfer()` function, plus a pure `compute_load_transfer_ratio()` helper (hand-verifiable
+  logic, separated from the network-forward-pass machinery). Reuses `probe_boundary_residuals`
+  for `traction_residual_rms`/`traction_residual_max` (no duplicated verification machinery,
+  matching P2-08's own discipline) and `measure_integral::boundary_integral` (P2-04) for the
+  real arc-length-weighted predicted-load integral.
+- `crates/pinn-solver/src/user_runner.rs` — `run_headless_user_problem` prints the load-transfer
+  ratio and predicted/prescribed resultants every run, and a loud `[!]` warning line when the
+  trivial-solution threshold fires.
+
+### Architecture decision
+
+Distinct from the pre-existing `probe_reaction_force` (which checks the FULL closed boundary's
+resultant against zero — correct, since far-field loading is analytically self-canceling around
+a whole rectangle): `probe_load_transfer` checks the LOADED edges (right/top) specifically
+against their real PRESCRIBED nominal load (`px * 2*half_h * thickness`, etc.) — the direct
+question "did the network actually transfer the applied load into its own stress state, or did
+it converge on a near-zero-stress shortcut instead." This is a materially different, and more
+diagnostic, question than the existing equilibrium check answers.
+
+`trivial_solution_warning` (a <10% load-transfer-ratio sanity floor, matching P2-08's own
+"sanity bound, not a calibrated P2-14 threshold" convention) is deliberately MORE sensitive than
+the pre-existing bare `max|displacement|` check: the real motivating `Debug_runs/stress_solver_
+report-with-hole.json` evidence had NONZERO displacement (`avg_von_mises=1.38e6 Pa`) that was
+still a collapsed solution (`nominal=6.9e7 Pa`, a ~50x gap) — a bare displacement-magnitude
+check would have missed it entirely; `load_transfer_ratio` catches exactly this pattern by
+comparing against the real physical scale of the prescribed load, not just "is it nonzero."
+
+### Tests
+
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- probe_load_transfer
+  compute_load_transfer_ratio` — 4 passed: hand-computed cases for `compute_load_transfer_ratio`
+  (perfect transfer, the literal collapsed-solution case at 0.5% transfer, the 10%-floor
+  boundary on both sides, zero-prescribed-load, and combined x/y magnitude), plus `probe_load_
+  transfer` matching the hand-computed prescribed load exactly, handling zero load, and handling
+  a holed geometry.
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- user_problem::`
+  (broader regression) — 44 passed, 0 failed.
+- command: `cargo build --workspace --tests --features ndarray-backend` — clean.
+
+### Runtime evidence
+
+Real headless training run (`single_hole_plate.toml`, `max_steps=60`, release build) produced
+striking, genuine evidence: `[diag] load transfer ratio=0.0044  predicted=(1.946e2,-2.338e2) N
+prescribed=(6.900e4,0.000e0) N` followed by `[!] P2-09 trivial-solution warning: only 0.4% of
+the prescribed load is being transferred - likely a collapsed/trivial solution.` This is a
+CORRECT, discriminating result for a 60-step (far from converged) run — the same real signal
+class the motivating `Debug_runs` evidence showed, now surfaced automatically and immediately
+rather than requiring a manual JSON-report audit to discover.
+
+### Known limitations
+
+The 10% trivial-solution floor and the traction-residual reuse are diagnostic-only (printed,
+not enforced/blocking) - P2-14 owns turning any of this into a hard, calibrated acceptance gate.
+`probe_load_transfer` checks only the right/top edges (the loaded ones for this codebase's
+uniaxial-load convention) - a plate with load applied on a different edge pairing would need a
+small generalization, not built here since no current example needs it.
+
+### Reviewer verification
+
+PASS against P2-09's acceptance bullets: predicted-vs-prescribed resultant load, load_transfer_
+ratio, traction RMS/max (reused), and a generic trivial-solution warning are all real,
+executable, and demonstrated live to correctly flag a genuinely under-trained run - the exact
+symptom class the issue's own motivating evidence described.
 
 ## P2-10 — QoI and Kt architecture
 
