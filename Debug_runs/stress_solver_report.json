@@ -1,0 +1,91 @@
+{
+  "amr": {
+    "last_sweep": {
+      "points_after": 3982,
+      "points_before": 3889,
+      "residual_rms_after": 3773173.797905578,
+      "residual_rms_before": 3776453.2009551656,
+      "step": 5200
+    },
+    "sweep_count": 6
+  },
+  "engineering_results": {
+    "avg_von_mises_pa": 72641688.0,
+    "max_displacement_m": 0.00026088306913152337,
+    "max_principal_stress_pa": 108431632.0,
+    "max_von_mises_pa": 105547424.0,
+    "min_displacement_m": 1.7373243963447749e-6
+  },
+  "generated_at_unix": 1789151420,
+  "hole_analyses": [
+    {
+      "hole_index": 0,
+      "kt": 1.2355104927536231,
+      "max_von_mises_pa": 85250224.0,
+      "nominal_stress_pa": 69000000.0,
+      "peak_theta_deg": 270.0
+    }
+  ],
+  "model_validity": null,
+  "physics_validation": {
+    "bc_residual_max": 13918253.0,
+    "bc_residual_rms": 8060840.174806437,
+    "energy_balance": {
+      "energy_balance_error": 0.005202595882216665,
+      "external_work_j": 7.302876461088767,
+      "internal_energy_j": 7.264882546083969
+    },
+    "pde_residual_max": 31684400.0,
+    "pde_residual_p95": 3861291.5,
+    "pde_residual_rms": 3138906.0,
+    "reaction_force": {
+      "equilibrium_error": 0.00882676735162863,
+      "net_fx_n": -85.41675115966703,
+      "net_fy_n": -603.0274973754897,
+      "reference_force_n": 69000.0
+    }
+  },
+  "problem": {
+    "geometry": {
+      "half_h_m": 0.1,
+      "half_w_m": 0.1,
+      "holes": [
+        {
+          "bc": "Free",
+          "center_m": [
+            0.0,
+            0.0
+          ],
+          "index": 0,
+          "radius_m": 0.02
+        }
+      ],
+      "thickness_m": 0.005
+    },
+    "kind": "Plate",
+    "load": {
+      "px_pa": 69000000.0,
+      "py_pa": 0.0
+    },
+    "material": {
+      "density_kg_m3": 2810.0,
+      "e_pa": 71700000000.0,
+      "nu": 0.33,
+      "ultimate_strength_pa": 503000000.0
+    },
+    "network": {
+      "hidden_dim": 64,
+      "n_hidden": 16
+    }
+  },
+  "spec_path": "C:\\Users\\xo180e\\Documents\\C17\\TOOLS\\single_hole_plate.toml",
+  "training": {
+    "elapsed_secs": 16928.978515625,
+    "final_grad_norm": 15.25663948059082,
+    "final_optimization_loss_energy_term": 0.8478201627731323,
+    "final_total_loss": -0.845799446105957,
+    "max_steps": 20000,
+    "step": 5330
+  },
+  "unit_system": "USCS"
+}
