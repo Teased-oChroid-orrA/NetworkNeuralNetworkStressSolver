@@ -59,11 +59,21 @@ pub struct TrainingSpec {
     /// Finite-difference step in normalized [-1,1]^2 coordinates.
     pub fd_h: f32,
     pub lr: f64,
+    /// Issue #62 PH3-04: opt-in switch for the AMR-density-compensated, measure-aware
+    /// variational functional (`measure_integral::domain_integral_weighted_tensor`/
+    /// `boundary_integral_tensor`, already proven by L0/L3) in place of the legacy plain
+    /// `.mean()` `InteriorEnergyTerm`/`ExternalWorkTerm` computation. `#[serde(default)]` so
+    /// every existing TOML spec (which predates this field) keeps parsing unchanged and keeps
+    /// training on the EXACT legacy path - per issue #62 §3.3's "legacy paths SHALL remain
+    /// available behind an explicit compatibility switch until validated" rule, this defaults
+    /// to `false`, never silently opting a pre-existing config into different training math.
+    #[serde(default)]
+    pub measure_aware_training: bool,
 }
 
 impl Default for TrainingSpec {
     fn default() -> Self {
-        Self { max_steps: 2000, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3 }
+        Self { max_steps: 2000, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false }
     }
 }
 

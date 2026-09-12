@@ -250,9 +250,33 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
 
 /// Mirrors `pinlug_problem::InteriorEnergyTerm` exactly (`dem_energy_loss`, generic, no new
 /// math) — the default `point_sets()` ("interior") applies unchanged.
+///
+/// Issue #62 PH3-04: `measure_aware`/`domain_area`/`thickness`/`ref_energy_absolute`/`weights`
+/// are ALL inert when `measure_aware==false` (the default - `compute` takes the exact legacy
+/// `dem_energy_loss(...).mean()/ref_energy` path, byte-identical to before this epic). When
+/// `true`, `compute` instead calls `measure_integral::domain_integral_weighted_tensor` (falling
+/// back to the unweighted `domain_integral_tensor` when `weights` is `None`, i.e. before the
+/// first AMR sweep) - see `measure_integral.rs`'s own top-level doc comment for exactly why this
+/// (not `dem_energy_loss`'s plain, AMR-density-biased `.mean()`) is the correct estimator once
+/// sampling becomes nonuniform.
 struct InteriorEnergyTerm {
     material: MaterialProps,
     ref_energy: f32,
+    measure_aware: bool,
+    domain_area: f64,
+    thickness: f64,
+    /// `ref_energy` (a per-unit-volume energy DENSITY scale) times `domain_area*thickness` -
+    /// the matching ABSOLUTE-Joules reference scale `domain_integral_weighted_tensor`'s output
+    /// needs to be normalized against, so the measure-aware term stays on the SAME dimensionless
+    /// scale `ExternalWorkTerm` and the legacy `.mean()/ref_energy` path both use (algebraically
+    /// this reduces to exactly `mean(density)/ref_energy` in the unweighted case - the area and
+    /// thickness factors cancel - which is WHY the legacy path was never numerically wrong for
+    /// uniform sampling, only for AMR-nonuniform sampling; see the PH3-04 manifest entry for the
+    /// full derivation).
+    ref_energy_absolute: f64,
+    /// Snapshot of `UserDefinedProblem::current_interior_weights` at the moment `loss_terms()`
+    /// built this term - see that field's own doc comment.
+    weights: Option<Vec<f64>>,
 }
 impl LossTerm for InteriorEnergyTerm {
     fn name(&self) -> &'static str { "interior_energy" }
@@ -268,7 +292,15 @@ impl LossTerm for InteriorEnergyTerm {
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
         let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("interior_energy: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("interior_energy: strains must be Some");
-        dem_energy_loss(exx, eyy, exy, &self.material).mul_scalar(1.0 / self.ref_energy as f64)
+        if !self.measure_aware {
+            return dem_energy_loss(exx, eyy, exy, &self.material).mul_scalar(1.0 / self.ref_energy as f64);
+        }
+        let density = crate::energy::dem_energy_per_point(exx, eyy, exy, &self.material);
+        let energy = match &self.weights {
+            Some(w) => crate::measure_integral::domain_integral_weighted_tensor::<B>(self.domain_area, self.thickness, density, w),
+            None => crate::measure_integral::domain_integral_tensor::<B>(self.domain_area, self.thickness, density),
+        };
+        energy.mul_scalar(1.0 / self.ref_energy_absolute)
     }
 }
 
@@ -387,10 +419,28 @@ impl LossTerm for OuterTractionTerm {
 /// so MINIMIZING this loss MAXIMIZES the actual external work, matching Π's own `-W_ext` sign);
 /// `ref_energy` is `InteriorEnergyTerm`'s own normalization constant, reused for direct,
 /// same-convention comparability against `U`, not a separately-derived scale.
+///
+/// Issue #62 PH3-04: when `measure_aware` is set, `compute` instead uses `measure_integral::
+/// boundary_integral_tensor` with the REAL per-point arc-length `ds` (`ds_per_point`, precomputed
+/// once in `loss_terms()` from `UserSamplingStrategy::sample_boundary`'s own exact point-
+/// generation order/spacing) instead of assuming every point carries equal weight via `.mean()`.
+/// For a SQUARE plate (`half_w==half_h`, true of every shipped example) every edge's `ds` is
+/// identical and this is numerically byte-identical to the legacy path; for a NON-square plate
+/// the right/left edges (spanning `half_h`) and top/bottom edges (spanning `half_w`) have
+/// genuinely different `ds`, which `.mean()` silently ignored - a real, previously-latent
+/// correctness gap this migration also closes generally, not only under AMR (this point set is
+/// never AMR-refined - `AdaptiveGrid` only ever touches the interior quadtree - so the gap here
+/// is purely about non-square aspect ratios, not sampling density).
 struct ExternalWorkTerm {
     px: f64,
     py: f64,
     ref_energy: f32,
+    measure_aware: bool,
+    thickness: f64,
+    ref_energy_absolute: f64,
+    /// Real per-point arc-length spacing, in `sample_boundary`'s own point order (right, left,
+    /// top, bottom, repeated `per_edge` times) - only read when `measure_aware`.
+    ds_per_point: Vec<f64>,
 }
 impl LossTerm for ExternalWorkTerm {
     fn name(&self) -> &'static str { "external_work" }
@@ -413,7 +463,11 @@ impl LossTerm for ExternalWorkTerm {
         let u = d.raw_out.clone().slice([0..n, 0..1]).reshape([n]);
         let v = d.raw_out.clone().slice([0..n, 1..2]).reshape([n]);
         let work_density = nx.mul_scalar(self.px) * u + ny.mul_scalar(self.py) * v;
-        work_density.mean().mul_scalar(-1.0 / self.ref_energy as f64)
+        if !self.measure_aware {
+            return work_density.mean().mul_scalar(-1.0 / self.ref_energy as f64);
+        }
+        let w_ext = crate::measure_integral::boundary_integral_tensor::<B>(work_density, &self.ds_per_point, self.thickness);
+        w_ext.mul_scalar(-1.0 / self.ref_energy_absolute)
     }
 }
 
@@ -524,6 +578,20 @@ pub struct UserDefinedProblem {
     /// `&'static str`s independently leaked here are fine (`HashMap<&'static str, _>`
     /// lookups compare by string content, not pointer identity).
     hole_names: Vec<&'static str>,
+    /// Issue #62 PH3-04: the CURRENT step's per-interior-point AMR density-compensation
+    /// weights (`pinn_core::amr::compensation_weights`), when `spec.training.measure_aware_
+    /// training` is enabled - `None` before the first AMR sweep (uniform sampling, no
+    /// compensation needed - see `set_interior_weights`'s own doc comment) or when the
+    /// switch is off. Interior-mutable (`&self`, not `&mut self`) because `loss_terms()` -
+    /// the only place this is read - is itself a `&self` method on the shared `BoundaryValue
+    /// Problem` trait, called fresh every step; there is no owning `&mut self` call site to
+    /// thread a per-step value through otherwise, matching this codebase's existing "cheap
+    /// interior mutability for a value that changes every step but the trait signature can't
+    /// carry" pattern (`training_case_snapshot`'s equivalent in `app-egui` is the same shape).
+    /// `Mutex`, not `RefCell` - `BoundaryValueProblem: Send + Sync` requires `UserDefinedProblem:
+    /// Sync`, which `RefCell` (single-threaded interior mutability) cannot provide; the lock is
+    /// held only for the instant of a clone/replace, never across a training step.
+    current_interior_weights: std::sync::Mutex<Option<Vec<f64>>>,
 }
 
 impl UserDefinedProblem {
@@ -539,10 +607,28 @@ impl UserDefinedProblem {
             .map(|i| -> &'static str { Box::leak(format!("hole_{i}").into_boxed_str()) })
             .collect();
         let sampling = UserSamplingStrategy::new(spec.geometry.clone(), spec.training.fd_h);
-        UserDefinedProblem { spec, domains, sampling, ansatz: IdentityAnsatz, hole_names }
+        UserDefinedProblem {
+            spec, domains, sampling, ansatz: IdentityAnsatz, hole_names,
+            current_interior_weights: std::sync::Mutex::new(None),
+        }
     }
 
     pub fn spec(&self) -> &ProblemSpec { &self.spec }
+
+    /// Issue #62 PH3-04: sets the per-interior-point AMR density-compensation weights the NEXT
+    /// `loss_terms()` call's `InteriorEnergyTerm` will use (only when `spec.training.measure_
+    /// aware_training` is also true - `InteriorEnergyTerm::compute` ignores this entirely
+    /// otherwise, matching the "legacy path unaffected unless the switch is on" rule). The
+    /// caller (`runner::run_user_problem_training_from`) is responsible for calling this with
+    /// `Some(weights)` computed via `pinn_core::amr::compensation_weights` from the SAME point
+    /// set that produced this step's `data.int_norm` (same order, same length) whenever that
+    /// point set changes (an AMR sweep), and leaving it at the default `None` before the first
+    /// sweep - plain uniform-random interior sampling is ALREADY an unbiased Monte-Carlo
+    /// estimator of the domain integral (no compensation needed), so `None` here is a genuine
+    /// "not needed yet", not a missing-data placeholder.
+    pub fn set_interior_weights(&self, weights: Option<Vec<f64>>) {
+        *self.current_interior_weights.lock().unwrap() = weights;
+    }
 }
 
 impl BoundaryValueProblem for UserDefinedProblem {
@@ -567,6 +653,36 @@ impl BoundaryValueProblem for UserDefinedProblem {
         let scales = crate::training_core::compute_reference_scales_for_plate(&self.spec);
         let (ref_energy, ref_stress2) = (scales.ref_energy, scales.ref_stress2);
         let eq_ref_div2 = scales.stress_per_length2;
+
+        // Issue #62 PH3-04: precompute the measure-aware machinery's inputs ONCE per
+        // `loss_terms()` call (geometry/training config are fixed for the whole run - only
+        // `current_interior_weights` genuinely varies step to step, snapshotted below). `false`
+        // (the default) makes every one of these dead weight - `InteriorEnergyTerm`/
+        // `ExternalWorkTerm::compute()` never read them, taking the exact legacy path.
+        let measure_aware = self.spec.training.measure_aware_training;
+        let thickness = self.spec.geometry.thickness;
+        let domain_area = crate::measure_integral::plate_domain_area(
+            self.spec.geometry.half_w, self.spec.geometry.half_h,
+            &self.spec.geometry.holes.iter().map(|h| h.radius).collect::<Vec<_>>(),
+        );
+        // See `InteriorEnergyTerm::ref_energy_absolute`'s own doc comment for why this is the
+        // correct normalizer for BOTH `InteriorEnergyTerm` and `ExternalWorkTerm`'s
+        // measure-aware paths (a shared total-energy reference scale for this one problem).
+        let ref_energy_absolute = ref_energy as f64 * domain_area * thickness;
+        // Real per-point arc-length spacing, matching `UserSamplingStrategy::sample_boundary`'s
+        // own point-generation order EXACTLY (right, left, top, bottom, repeated `per_edge`
+        // times) - see `ExternalWorkTerm::ds_per_point`'s own doc comment.
+        let per_edge = (self.spec.training.n_boundary / 4).max(1);
+        let ds_right_left = 2.0 * self.spec.geometry.half_h / per_edge as f64;
+        let ds_top_bottom = 2.0 * self.spec.geometry.half_w / per_edge as f64;
+        let mut ds_per_point = Vec::with_capacity(per_edge * 4);
+        for _ in 0..per_edge {
+            ds_per_point.push(ds_right_left);
+            ds_per_point.push(ds_right_left);
+            ds_per_point.push(ds_top_bottom);
+            ds_per_point.push(ds_top_bottom);
+        }
+        let interior_weights = self.current_interior_weights.lock().unwrap().clone();
 
         // Issue #61 P2-01 ("Explicit formulation model") - `self.spec.formulation` is a REAL
         // gate on which base terms exist below, not a label applied after the fact. See
@@ -600,7 +716,11 @@ impl BoundaryValueProblem for UserDefinedProblem {
 
         let mut terms: Vec<Box<dyn LossTerm>> = Vec::new();
         if active_base.contains("interior_energy") {
-            terms.push(Box::new(InteriorEnergyTerm { material: self.spec.material.clone(), ref_energy }));
+            terms.push(Box::new(InteriorEnergyTerm {
+                material: self.spec.material.clone(), ref_energy,
+                measure_aware, domain_area, thickness, ref_energy_absolute,
+                weights: interior_weights,
+            }));
         }
         if active_base.contains("equilibrium") {
             terms.push(Box::new(EquilibriumTerm { point_set: "interior", material: self.spec.material.clone(), ref_div2: eq_ref_div2 }));
@@ -614,7 +734,10 @@ impl BoundaryValueProblem for UserDefinedProblem {
             }));
         }
         if active_base.contains("external_work") {
-            terms.push(Box::new(ExternalWorkTerm { px: self.spec.load.px, py: self.spec.load.py, ref_energy }));
+            terms.push(Box::new(ExternalWorkTerm {
+                px: self.spec.load.px, py: self.spec.load.py, ref_energy,
+                measure_aware, thickness, ref_energy_absolute, ds_per_point,
+            }));
         }
         for (hole, &name) in self.spec.geometry.holes.iter().zip(self.hole_names.iter()) {
             if hole.bc == HoleBc::Fixed || hole_free_active {
@@ -1834,7 +1957,12 @@ mod tests {
             hessian: None,
         };
 
-        let term = ExternalWorkTerm { px, py, ref_energy };
+        let term = ExternalWorkTerm {
+            px, py, ref_energy,
+            // Legacy `.mean()` path - the exact behavior this test verifies - so the
+            // measure-aware-only fields are dead weight (never read by `compute()`).
+            measure_aware: false, thickness: 1.0, ref_energy_absolute: 1.0, ds_per_point: Vec::new(),
+        };
         let loss = term.compute(&[d]);
         let loss_v = loss.into_data().to_vec::<f32>().unwrap()[0] as f64;
 
@@ -1848,6 +1976,119 @@ mod tests {
 
         assert!((loss_v - expected).abs() / expected.abs() < 1e-3,
             "external_work {loss_v} vs hand-computed {expected}");
+    }
+
+    // ─── Issue #62 PH3-04: measure-aware InteriorEnergyTerm/ExternalWorkTerm ───────────────
+
+    #[test]
+    fn interior_energy_term_measure_aware_with_no_weights_matches_domain_integral_tensor_directly() {
+        use burn::tensor::TensorData;
+        let material = MaterialProps::al7075_t6();
+        let device: crate::training_core::BDevice = Default::default();
+        let n = 3;
+        let exx = Tensor::<B, 1>::from_data(TensorData::new(vec![0.001_f32, 0.002, 0.0015], vec![n]), &device);
+        let eyy = Tensor::<B, 1>::from_data(TensorData::new(vec![-0.0003_f32, -0.0006, -0.0005], vec![n]), &device);
+        let exy = Tensor::<B, 1>::from_data(TensorData::new(vec![0.0_f32, 0.0001, -0.0001], vec![n]), &device);
+        let raw_out = Tensor::<B, 2>::zeros([n, 5], &device);
+        let d = DomainForwardOutputs {
+            domain: USER_DOMAIN, raw_out: &raw_out,
+            strains: Some((exx.clone(), eyy.clone(), exy.clone())),
+            normals: None, shifted_stress: None, hessian: None,
+        };
+        let domain_area = 2.0_f64;
+        let thickness = 0.01_f64;
+        let ref_energy_absolute = 5.0_f64;
+        let term = InteriorEnergyTerm {
+            material: material.clone(), ref_energy: 1.0,
+            measure_aware: true, domain_area, thickness, ref_energy_absolute, weights: None,
+        };
+        let loss = term.compute(&[d]);
+        let loss_v = loss.into_data().to_vec::<f32>().unwrap()[0] as f64;
+
+        let density = crate::energy::dem_energy_per_point::<B>(exx, eyy, exy, &material);
+        let expected = crate::measure_integral::domain_integral_tensor::<B>(domain_area, thickness, density)
+            .into_data().to_vec::<f32>().unwrap()[0] as f64 / ref_energy_absolute;
+        assert!((loss_v - expected).abs() / expected.abs() < 1e-6, "loss={loss_v} expected={expected}");
+    }
+
+    #[test]
+    fn interior_energy_term_measure_aware_with_weights_matches_domain_integral_weighted_tensor_and_differs_from_unweighted() {
+        use burn::tensor::TensorData;
+        let material = MaterialProps::al7075_t6();
+        let device: crate::training_core::BDevice = Default::default();
+        let n = 3;
+        let exx = Tensor::<B, 1>::from_data(TensorData::new(vec![0.001_f32, 0.005, 0.0015], vec![n]), &device);
+        let eyy = Tensor::<B, 1>::from_data(TensorData::new(vec![-0.0003_f32, -0.0015, -0.0005], vec![n]), &device);
+        let exy = Tensor::<B, 1>::from_data(TensorData::new(vec![0.0_f32, 0.0002, -0.0001], vec![n]), &device);
+        let raw_out = Tensor::<B, 2>::zeros([n, 5], &device);
+        let d = DomainForwardOutputs {
+            domain: USER_DOMAIN, raw_out: &raw_out,
+            strains: Some((exx.clone(), eyy.clone(), exy.clone())),
+            normals: None, shifted_stress: None, hessian: None,
+        };
+        let domain_area = 2.0_f64;
+        let thickness = 0.01_f64;
+        let ref_energy_absolute = 5.0_f64;
+        // Deliberately non-uniform (mean == 1.0, per `compensation_weights`'s own contract).
+        let weights = vec![0.2_f64, 2.5, 0.3];
+        let term_weighted = InteriorEnergyTerm {
+            material: material.clone(), ref_energy: 1.0,
+            measure_aware: true, domain_area, thickness, ref_energy_absolute, weights: Some(weights.clone()),
+        };
+        let term_unweighted = InteriorEnergyTerm {
+            material: material.clone(), ref_energy: 1.0,
+            measure_aware: true, domain_area, thickness, ref_energy_absolute, weights: None,
+        };
+        let loss_weighted = term_weighted.compute(&[DomainForwardOutputs {
+            domain: USER_DOMAIN, raw_out: &raw_out, strains: Some((exx.clone(), eyy.clone(), exy.clone())),
+            normals: None, shifted_stress: None, hessian: None,
+        }]);
+        let loss_unweighted = term_unweighted.compute(&[d]);
+        let weighted_v = loss_weighted.into_data().to_vec::<f32>().unwrap()[0] as f64;
+        let unweighted_v = loss_unweighted.into_data().to_vec::<f32>().unwrap()[0] as f64;
+
+        let density = crate::energy::dem_energy_per_point::<B>(exx, eyy, exy, &material);
+        let expected = crate::measure_integral::domain_integral_weighted_tensor::<B>(domain_area, thickness, density, &weights)
+            .into_data().to_vec::<f32>().unwrap()[0] as f64 / ref_energy_absolute;
+        assert!((weighted_v - expected).abs() / expected.abs() < 1e-6, "weighted={weighted_v} expected={expected}");
+        assert!(
+            (weighted_v - unweighted_v).abs() / unweighted_v.abs() > 0.05,
+            "nonuniform weights must produce a MEASURABLY different result than the plain mean \
+             for this to be a real regression guard: weighted={weighted_v} unweighted={unweighted_v}",
+        );
+    }
+
+    #[test]
+    fn external_work_term_measure_aware_matches_boundary_integral_tensor_directly() {
+        use burn::tensor::TensorData;
+        let device: crate::training_core::BDevice = Default::default();
+        let px = 6.9e7_f64;
+        let py = 0.0_f64;
+        let n = 2;
+        // Point 0: right edge (nx=1, ny=0), u=1e-4, v=0. Point 1: top edge (nx=0, ny=1), u=0, v=2e-4.
+        let raw_data = vec![1e-4_f32, 0.0, 0.0, 2e-4];
+        let raw_out = Tensor::<B, 2>::from_data(TensorData::new(raw_data, vec![n, 2]), &device);
+        let nx = Tensor::<B, 1>::from_data(TensorData::new(vec![1.0_f32, 0.0], vec![n]), &device);
+        let ny = Tensor::<B, 1>::from_data(TensorData::new(vec![0.0_f32, 1.0], vec![n]), &device);
+        let d = DomainForwardOutputs {
+            domain: USER_DOMAIN, raw_out: &raw_out, strains: None,
+            normals: Some((nx, ny)), shifted_stress: None, hessian: None,
+        };
+        let ds_per_point = vec![1.0_f64, 2.0];
+        let thickness = 0.5_f64;
+        let ref_energy_absolute = 3.0_f64;
+        let term = ExternalWorkTerm {
+            px, py, ref_energy: 1.0, measure_aware: true, thickness, ref_energy_absolute,
+            ds_per_point: ds_per_point.clone(),
+        };
+        let loss = term.compute(&[d]);
+        let loss_v = loss.into_data().to_vec::<f32>().unwrap()[0] as f64;
+
+        // work_density = px*nx*u + py*ny*v = [px*1e-4, 0.0] (py=0 zeroes the second point's v term)
+        let work_density: Vec<f64> = vec![px * 1e-4, 0.0];
+        let w_ext: f64 = work_density.iter().zip(ds_per_point.iter()).map(|(&v, &ds)| v * ds * thickness).sum();
+        let expected = -w_ext / ref_energy_absolute;
+        assert!((loss_v - expected).abs() / expected.abs() < 1e-3, "loss={loss_v} expected={expected}");
     }
 
     fn two_hole_geometry() -> UserGeometry {

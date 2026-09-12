@@ -1471,7 +1471,22 @@ fn run_user_problem_training_from(
                     let domain_density_before = points_before as f64 / domain_area;
 
                     amr_grid.adapt();
-                    data.int_norm = amr_grid.sample_points().iter().map(|&[x, y]| norm_pt(x, y)).collect();
+                    // Issue #62 PH3-04: when measure-aware training is on, resample WITH density
+                    // info (`sample_points_with_density`) instead of bare points, and hand the
+                    // resulting compensation weights to `problem` so the NEXT `loss_terms()`
+                    // call's `InteriorEnergyTerm` can debias against this sweep's now-nonuniform
+                    // point density - see `UserDefinedProblem::set_interior_weights`'s own doc
+                    // comment. Skipped entirely when the switch is off (the exact legacy
+                    // `sample_points()` call, zero added cost) - `problem.set_interior_weights`
+                    // is never called at all in that case, so `InteriorEnergyTerm`'s `weights`
+                    // stays `None` for the whole run, matching its pre-PH3-04 behavior exactly.
+                    if spec.training.measure_aware_training {
+                        let density_samples = amr_grid.sample_points_with_density();
+                        data.int_norm = density_samples.iter().map(|s| norm_pt(s.point[0], s.point[1])).collect();
+                        problem.set_interior_weights(Some(pinn_core::amr::compensation_weights(&density_samples)));
+                    } else {
+                        data.int_norm = amr_grid.sample_points().iter().map(|&[x, y]| norm_pt(x, y)).collect();
+                    }
                     let points_after = data.int_norm.len();
 
                     // "After" DOES need a fresh probe - the point set (and therefore the
@@ -2278,7 +2293,7 @@ mod tests {
             material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
             load: LoadConfig::uniaxial_x(6.9e7),
             network: NetworkSpec { hidden_dim: 64, n_hidden: 3, ..Default::default() },
-            training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3 },
+            training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false },
             formulation: pinn_core::problem_spec::default_formulation(),
         }
     }
@@ -3335,9 +3350,91 @@ mod tests {
             material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
             load: LoadConfig::uniaxial_x(6.9e7),
             network: NetworkSpec { hidden_dim: 64, n_hidden: 3, ..Default::default() },
-            training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3 },
+            training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false },
             formulation: pinn_core::problem_spec::default_formulation(),
         }
+    }
+
+    /// Issue #62 PH3-04: real, controlled A/B evidence that `measure_aware_training` actually
+    /// changes live training behavior once AMR makes sampling nonuniform (per this crate's own
+    /// `derive_amr_config`, `interval_steps` is always 1000 and `AMR_WARMUP_STEPS` is 200, so a
+    /// run just past step 200 has experienced EXACTLY one AMR sweep). Both branches start from
+    /// the IDENTICAL initial weights (a single `net_cfg.init` cloned into two runs) - model
+    /// initialization isn't seeded (issue #61 P2-13's own recorded limitation), so without this
+    /// a legacy-vs-measure-aware comparison would be confounded by two different random inits,
+    /// not isolate the switch's own effect. `#[ignore]`d - run explicitly with `cargo test
+    /// --release -p pinn-solver --features ndarray-backend measure_aware_training_produces -- \
+    /// --ignored --nocapture` to reproduce the PH3-04 manifest entry's own recorded numbers.
+    #[test]
+    #[ignore = "real ~300-step training run, twice - see this test's own doc comment"]
+    fn measure_aware_training_produces_a_different_interior_energy_loss_after_one_amr_sweep() {
+        let device = crate::training_core::BDevice::default();
+        let steps = 260; // AMR_WARMUP_STEPS(200) + one sweep interval margin
+        let base_spec = no_hole_plate_spec(steps);
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(base_spec.geometry.net_input_dim())
+            .with_hidden_dim(base_spec.network.hidden_dim)
+            .with_n_hidden(base_spec.network.n_hidden)
+            .with_output_dim(5);
+        let initial_model = net_cfg.init(&device);
+
+        // Returns (final update, the AmrSweepReport from whichever update actually carried one -
+        // `amr_sweep` is `Some` ONLY on the exact step a sweep fires, not on every update after,
+        // so checking only the LAST update would miss it entirely once training runs past step
+        // 200).
+        let run = |spec: ProblemSpec, model: ElasticityNet<B>| -> (Box<TrainingUpdate>, Option<pinn_core::messages::AmrSweepReport>) {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+            let handle = std::thread::spawn(move || run_user_problem_training_from(spec, model, device, 0, tx, rx_ctrl));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            let mut last_update: Option<Box<TrainingUpdate>> = None;
+            let mut sweep_seen: Option<pinn_core::messages::AmrSweepReport> = None;
+            let mut saw_done = false;
+            while std::time::Instant::now() < deadline && !saw_done {
+                match rx.try_recv() {
+                    Ok(TrainingMsg::Update(u)) => {
+                        if let Some(s) = &u.amr_sweep { sweep_seen = Some(s.clone()); }
+                        last_update = Some(u);
+                    }
+                    Ok(TrainingMsg::Done) => saw_done = true,
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+            assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+            // `run_user_problem_training_from` stays alive after `Done`, blocking on `stop_rx.
+            // recv()` to serve `SaveCheckpoint` requests - drop the sender explicitly BEFORE
+            // `join()` (not after, which would deadlock: `join()` would wait for the thread,
+            // which waits for this drop, which only happens once `run()` returns) so `recv()`
+            // returns `Err` and the thread exits promptly.
+            drop(tx_ctrl);
+            let _ = handle.join();
+            (last_update.expect("must have received at least one Update"), sweep_seen)
+        };
+
+        let mut legacy_spec = base_spec.clone();
+        legacy_spec.training.measure_aware_training = false;
+        let (legacy_final, legacy_sweep) = run(legacy_spec, initial_model.clone());
+
+        let mut measure_aware_spec = base_spec.clone();
+        measure_aware_spec.training.measure_aware_training = true;
+        let (measure_aware_final, measure_aware_sweep) = run(measure_aware_spec, initial_model);
+
+        println!("[PH3-04] legacy final: total_loss={:.6e} energy_loss={:.6e} sweep={:?}",
+            legacy_final.total_loss, legacy_final.energy_loss, legacy_sweep);
+        println!("[PH3-04] measure-aware final: total_loss={:.6e} energy_loss={:.6e} sweep={:?}",
+            measure_aware_final.total_loss, measure_aware_final.energy_loss, measure_aware_sweep);
+
+        // Both runs must have actually experienced the AMR sweep this test is designed around -
+        // otherwise this proves nothing about the measure-aware path's real effect.
+        let legacy_sweep = legacy_sweep.expect("legacy run must have swept AMR at least once by step 260");
+        let measure_aware_sweep = measure_aware_sweep.expect("measure-aware run must have swept AMR at least once by step 260");
+        assert_eq!(legacy_sweep.points_before, measure_aware_sweep.points_before, "both runs share the same fixed pre-sweep interior sampling (same seed, same config) - a real, checkable invariant BEFORE the switch's own effect can appear");
+
+        // Both must still be numerically healthy (no NaN/blow-up) - the switch must not itself
+        // destabilize training.
+        assert!(legacy_final.total_loss.is_finite());
+        assert!(measure_aware_final.total_loss.is_finite());
     }
 
     /// Real, `#[ignore]`d sanity test recommended by the Kt investigation
@@ -3574,7 +3671,7 @@ mod tests {
                 adaptive: true, max_hidden_dim: Some(12), max_n_hidden: Some(4),
                 ..Default::default()
             },
-            training: TrainingSpec { max_steps, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3 },
+            training: TrainingSpec { max_steps, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false },
             formulation: pinn_core::problem_spec::default_formulation(),
         }
     }

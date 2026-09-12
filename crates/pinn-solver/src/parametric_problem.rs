@@ -992,7 +992,7 @@ mod tests {
             density: 2810.0,
             ultimate_strength_pa: 503e6,
             network: NetworkSpec { hidden_dim: 16, n_hidden: 2, ..Default::default() },
-            training: TrainingSpec { max_steps, n_interior: 128, n_boundary: 32, fd_h: 1e-3, lr: 1e-3 },
+            training: TrainingSpec { max_steps, n_interior: 128, n_boundary: 32, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false },
         }
     }
 
@@ -1062,7 +1062,7 @@ mod tests {
                 adaptive: true, max_hidden_dim: Some(12), max_n_hidden: Some(4),
                 ..Default::default()
             },
-            training: TrainingSpec { max_steps, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3 },
+            training: TrainingSpec { max_steps, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false },
         }
     }
 

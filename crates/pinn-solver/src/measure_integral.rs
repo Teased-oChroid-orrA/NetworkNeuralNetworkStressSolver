@@ -98,6 +98,34 @@ pub fn domain_integral_tensor<B: burn::tensor::backend::Backend>(
     values.mean().mul_scalar(measure * thickness)
 }
 
+/// Issue #62 PH3-04: differentiable (tensor-valued) counterpart of [`domain_integral_weighted`]
+/// — applies Priority 8's AMR density-compensation weights (`mean(w_i) == 1.0` by construction,
+/// same contract as [`domain_integral_weighted`]) BEFORE the mean, so the estimate stays correct
+/// under nonuniform/AMR-refined sampling instead of only uniform sampling — this is the first
+/// live-training consumer of that machinery (see this module's own top-level doc comment for
+/// the gap P2-04 itself deliberately left open: "migrating `InteriorEnergyTerm`/
+/// `ExternalWorkTerm`... onto this abstraction" was explicitly deferred, first to P2-15, then to
+/// this Phase 3 epic). `weights` is a plain `&[f64]` (the compensation weight is a fixed
+/// property of WHERE a point was sampled from, never a network output, so it never needs a
+/// gradient - same convention `boundary_integral_tensor`'s `ds_per_point` already established).
+pub fn domain_integral_weighted_tensor<B: burn::tensor::backend::Backend>(
+    measure: f64,
+    thickness: f64,
+    values: burn::tensor::Tensor<B, 1>,
+    weights: &[f64],
+) -> burn::tensor::Tensor<B, 1> {
+    let device = values.device();
+    let n = weights.len();
+    assert_eq!(
+        values.dims()[0], n,
+        "domain_integral_weighted_tensor: values ({}) and weights ({n}) must be the same length",
+        values.dims()[0],
+    );
+    let w: Vec<f32> = weights.iter().map(|&w| w as f32).collect();
+    let w_t = burn::tensor::Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(w, vec![n]), &device);
+    (values * w_t).mean().mul_scalar(measure * thickness)
+}
+
 /// Differentiable counterpart of [`boundary_integral`] — `Σ f_i * ds_i * thickness`, computed
 /// via elementwise multiply + sum so gradients flow through `values`. `ds_per_point` is a
 /// plain `&[f64]` (the geometric measure itself is never a network output, so it never needs
@@ -268,6 +296,57 @@ mod tests {
         let result = domain_integral_tensor::<TB>(10.0, 0.5, values);
         let result_v = result.into_data().to_vec::<f32>().unwrap()[0] as f64;
         assert!((result_v - expected).abs() < 1e-6, "result={result_v} expected={expected}");
+    }
+
+    /// Issue #62 PH3-04: the tensor-valued sibling of `domain_integral_weighted_recovers_the_
+    /// true_average_under_amr_biased_nonuniform_sampling` above - same exact scenario (big
+    /// sparsely-sampled leaf vs. small oversampled leaf), proving the DIFFERENTIABLE weighted
+    /// integral recovers the same true area-weighted mean a live training consumer would need.
+    #[test]
+    fn domain_integral_weighted_tensor_recovers_the_true_average_under_amr_biased_nonuniform_sampling() {
+        use burn::tensor::{Tensor, TensorData};
+        type TB = crate::training_core::BInner;
+        let device = crate::training_core::BDevice::default();
+
+        let mut samples: Vec<f32> = Vec::new();
+        let mut density_samples: Vec<DensitySample> = Vec::new();
+        for _ in 0..5 {
+            samples.push(-0.75);
+            density_samples.push(DensitySample { point: [-0.75, 0.0], leaf_area: 1.0 / 5.0 });
+        }
+        for _ in 0..45 {
+            samples.push(0.95);
+            density_samples.push(DensitySample { point: [0.95, 0.0], leaf_area: 0.2 / 45.0 });
+        }
+        let expected = domain_integral_weighted(1.0, 1.0, &samples, &density_samples);
+        let weights = compensation_weights(&density_samples);
+
+        let n = samples.len();
+        let values = Tensor::<TB, 1>::from_data(TensorData::new(samples, vec![n]), &device);
+        let result = domain_integral_weighted_tensor::<TB>(1.0, 1.0, values, &weights);
+        let result_v = result.into_data().to_vec::<f32>().unwrap()[0] as f64;
+        assert!((result_v - expected).abs() < 1e-6, "result={result_v} expected={expected}");
+
+        let true_area_weighted_mean = ((-0.75_f64) * 1.0 + 0.95 * 0.2) / (1.0 + 0.2);
+        assert!((result_v - true_area_weighted_mean).abs() < 1e-6);
+    }
+
+    #[test]
+    fn domain_integral_weighted_tensor_matches_unweighted_tensor_when_weights_are_uniform() {
+        use burn::tensor::{Tensor, TensorData};
+        type TB = crate::training_core::BInner;
+        let device = crate::training_core::BDevice::default();
+        let samples = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let weights = vec![1.0_f64; 4];
+        let unweighted = domain_integral_tensor::<TB>(
+            10.0, 0.5, Tensor::<TB, 1>::from_data(TensorData::new(samples.clone(), vec![4]), &device),
+        );
+        let weighted = domain_integral_weighted_tensor::<TB>(
+            10.0, 0.5, Tensor::<TB, 1>::from_data(TensorData::new(samples, vec![4]), &device), &weights,
+        );
+        let u = unweighted.into_data().to_vec::<f32>().unwrap()[0];
+        let w = weighted.into_data().to_vec::<f32>().unwrap()[0];
+        assert!((u - w).abs() < 1e-6, "unweighted={u} weighted={w}");
     }
 
     #[test]

@@ -3644,7 +3644,7 @@ mod tests {
             material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
             load: LoadConfig::uniaxial_x(6.9e7),
             network: NetworkSpec::default(),
-            training: TrainingSpec { max_steps: 1, n_interior: 1, n_boundary: 1, fd_h, lr: 1e-3 },
+            training: TrainingSpec { max_steps: 1, n_interior: 1, n_boundary: 1, fd_h, lr: 1e-3, measure_aware_training: false },
             formulation: pinn_core::problem_spec::default_formulation(),
         }
     }
