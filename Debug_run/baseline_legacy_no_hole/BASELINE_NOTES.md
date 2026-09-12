@@ -10,14 +10,16 @@ directories per the plan's own §22.
 - **Baseline frozen at main SHA**: `21a0e730634251f7d7a564d3f78550390bda69f8` (the commit that
   merged this real run's uploaded artifacts and PH3-00's scaffolding into `main`).
 - **The run's own recorded `git_sha`** (in `model.meta.json`'s `provenance` block) is
-  `af92d02c908444415ecb514a8685b5e55ef68506` — this predates the freeze SHA above and reflects
-  whatever checkout state existed on the machine that produced this run (the GUI run's `git_sha`
-  is captured by shelling out to `git rev-parse HEAD` at save time in the GUI's own working
-  directory, per `provenance.rs`'s own doc comment — it is NOT necessarily this repository's
-  `NeuralNetwork-Stress-Solver` checkout, since the GUI binary lives in the separate
-  `powershell_tool/app-egui` crate/repo). This is a real, honest provenance limitation, not
-  fabricated: the exact solver-crate commit that produced these exact weights is not otherwise
-  recoverable from the artifact alone. Both are recorded here rather than picking one.
+  `af92d02c908444415ecb514a8685b5e55ef68506` — CONFIRMED (during PH3-02) to be the `powershell_
+  tool` repo's own commit SHA immediately before this pass's PH3-02 commit (`git log` there
+  showed `af92d02..ccd59e1` on push) — i.e. it's `git rev-parse HEAD` run inside the GUI's own
+  `powershell_tool` working directory at save time (per `provenance.rs`'s own doc comment), NOT
+  this `NeuralNetwork-Stress-Solver` repository's SHA. This is a real, structural provenance gap
+  (not a bug in this specific run): a checkpoint saved by the GUI records the WRONG repo's
+  commit for "which solver code produced these weights" whenever the two repos' histories
+  diverge, since `NeuralNetwork-Stress-Solver` is consumed as a path dependency, not vendored.
+  Not fixed in this pass (out of PH3-02's scope) - worth revisiting in a future provenance
+  epic if exact solver-commit traceability from a checkpoint ever becomes load-bearing.
 - **Formulation**: `Hybrid(interior_energy, equilibrium, outer_traction, external_work)` —
   confirmed directly from `model.meta.json`. This is the "legacy" path issue #62 §2.1.B
   identifies (not pure Variational DEM).
