@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use burn::{
     module::AutodiffModule,
-    tensor::Tensor,
+    tensor::{backend::Backend, Tensor},
 };
 use crossbeam_channel::{Receiver, Sender};
 use ndarray::Array2;
@@ -1159,6 +1159,13 @@ pub fn run_training_user_problem(
         // doc comment) - there is no separate user-facing "use_piratenet" toggle, `adaptive`
         // forces it internally.
         .with_use_piratenet(spec.network.adaptive);
+    // Issue #62 PH3-11: model weight initialization was NEVER seeded anywhere in this codebase
+    // before this line (see `provenance::RunProvenance::model_init_seeded`'s doc comment for
+    // the real, previously-negative finding this closes) - `B::seed` immediately before
+    // `net_cfg.init` makes the SAME `spec.network.model_init_seed` reproduce byte-identical
+    // initial weights across runs (verified in `network::tests::
+    // seeding_before_init_produces_byte_identical_initial_weights`).
+    B::seed(&device, spec.network.model_init_seed);
     let model = net_cfg.init(&device);
     run_user_problem_training_from(spec, model, device, 0, tx, stop_rx);
 }
@@ -1900,7 +1907,7 @@ fn run_user_problem_training_from(
                 let mut live_spec = spec.clone();
                 live_spec.network.hidden_dim = current_hidden_dim;
                 live_spec.network.n_hidden = current_n_hidden;
-                let provenance = crate::provenance::compute_run_provenance(&live_spec, Some(format!("{:?}", live_spec.formulation)));
+                let provenance = crate::provenance::compute_run_provenance(&live_spec, Some(format!("{:?}", live_spec.formulation)), Some(live_spec.network.model_init_seed));
                 let meta = crate::checkpoint::CheckpointMeta {
                     spec: crate::checkpoint::CheckpointSpec::Plate(live_spec),
                     steps_completed: last_step + 1,
@@ -2041,7 +2048,12 @@ pub fn serve_loaded_plate_checkpoint(
         match stop_rx.recv() {
             Ok(ControlMsg::Stop) | Err(_) => return,
             Ok(ControlMsg::SaveCheckpoint { path, saved_at_unix }) => {
-                let provenance = crate::provenance::compute_run_provenance(&spec, Some(format!("{:?}", spec.formulation)));
+                // `None` for `model_init_seed`, not `Some(spec.network.model_init_seed)` - no
+                // training ran THIS session (this is the loaded/served-checkpoint path, see
+                // this function's own doc comment), so nothing here actually called
+                // `Backend::seed` - honestly distinct from the checkpoint's OWN historical seed
+                // (still recoverable from `CheckpointMeta.spec.network.model_init_seed`).
+                let provenance = crate::provenance::compute_run_provenance(&spec, Some(format!("{:?}", spec.formulation)), None);
                 let meta = crate::checkpoint::CheckpointMeta {
                     spec: crate::checkpoint::CheckpointSpec::Plate(spec.clone()),
                     // Loaded, not (re)trained this session - honestly 0, not fabricated from
@@ -3548,6 +3560,72 @@ mod tests {
             matches!(evidence.bc_residual_trend, "Improving" | "Plateaued" | "Worsening"),
             "{evidence:?}"
         );
+    }
+
+    /// Issue #62 PH3-11: real, end-to-end evidence that the SAME `model_init_seed` reproduces
+    /// a numerically identical initial state across two independent, full-process training
+    /// runs through the actual public entry point - not just `network::`'s own isolated
+    /// weight-comparison unit tests. Compares the very first `TrainingUpdate` (step 0, sent
+    /// before any optimizer step - see this function's own doc comment for why this specific
+    /// tick isolates "did initialization reproduce" from "did the whole training trajectory
+    /// reproduce", which is a separately harder claim this item does not make - see this
+    /// test's own doc comment below).
+    ///
+    /// `#[ignore]`d for a real, confirmed reason distinct from every other `#[ignore]` in this
+    /// file (those are ignored for SPEED - this one is ignored for CORRECTNESS of the test
+    /// itself under parallelism): `Backend::seed` mutates burn-ndarray's own `SEED` static,
+    /// which is PROCESS-GLOBAL, not per-test/per-thread. `cargo test` runs `#[test]` fns
+    /// concurrently across OS threads by default - burn's own `Backend::seed` doc comment
+    /// explicitly scopes its determinism guarantee to "a single-threaded program", which a
+    /// `cargo test` run of this whole module is not. Confirmed directly: this test passes
+    /// cleanly every time run alone (`--lib runner::tests::same_model_init_seed_...`), but
+    /// failed once when run as part of the full `runner::` module (another test's own
+    /// concurrently-running training thread reseeded/drew from the same global RNG between
+    /// this test's two sequential runs, producing `left: 1.480344 right: 3.332661` - a genuine,
+    /// reproducible cross-test interference artifact, not a flaw in the PH3-11 fix itself,
+    /// which the isolated run and `network::`'s own two unit tests both independently confirm
+    /// works). Run this test alone (or with `--test-threads=1`) to verify it directly.
+    #[test]
+    #[ignore]
+    fn same_model_init_seed_reproduces_an_identical_step_zero_update_across_two_independent_runs() {
+        fn run_and_capture_step_zero(spec: ProblemSpec) -> pinn_core::messages::TrainingUpdate {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+            let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, rx_ctrl));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let mut step_zero: Option<pinn_core::messages::TrainingUpdate> = None;
+            let mut saw_done = false;
+            while std::time::Instant::now() < deadline && !saw_done {
+                match rx.try_recv() {
+                    Ok(TrainingMsg::Update(u)) => { if u.step == 0 && step_zero.is_none() { step_zero = Some(*u); } }
+                    Ok(TrainingMsg::Done) => saw_done = true,
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+            assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+            drop(tx_ctrl);
+            let _ = handle.join();
+            step_zero.expect("must have received the step-0 update")
+        }
+
+        let mut spec = no_hole_plate_spec(5);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational; // cheap
+        assert_eq!(spec.network.model_init_seed, pinn_core::problem_spec::NetworkSpec::default().model_init_seed, "test relies on the real shipped default seed, not a hand-picked one");
+
+        let update_a = run_and_capture_step_zero(spec.clone());
+        let update_b = run_and_capture_step_zero(spec);
+
+        assert_eq!(update_a.total_loss, update_b.total_loss, "same model_init_seed must reproduce an identical step-0 total_loss");
+        assert_eq!(update_a.energy_loss, update_b.energy_loss);
+        // NOT tested here (an honestly separate, harder claim - issue #62 §15's own "if exact
+        // determinism is impossible... state the source of nondeterminism" clause): whether
+        // the FULL multi-step trajectory stays bit-identical past step 0. This codebase's
+        // `burn-ndarray` backend has its `multi-threads` (rayon) Cargo feature enabled (see
+        // `powershell_tool/CLAUDE.md`'s own documented `width_growth`-test flake finding) -
+        // float-summation order under thread scheduling is a real, already-known, pre-existing
+        // source of run-to-run divergence for anything beyond a single deterministic forward
+        // pass, unrelated to model initialization and out of this item's scope to fix.
     }
 
     /// Issue #62 PH3-05: real, full-length (2000-step, matching PH3-01's own frozen legacy

@@ -32,10 +32,28 @@ pub struct NetworkSpec {
     /// clicking Stop already takes - not a restart.
     #[serde(default = "default_auto_stop_on_plateau")]
     pub auto_stop_on_plateau: bool,
+    /// Issue #62 PH3-11: the seed passed to `Backend::seed` immediately before network weight
+    /// initialization - see `pinn_solver::network::ElasticityNetConfig::init`'s call site for
+    /// where this is actually consumed, and `provenance::RunProvenance::model_init_seeded`'s
+    /// doc comment for the real, previously-negative finding this closes (model init was
+    /// NEVER seeded anywhere in this codebase before this field existed). Every existing TOML
+    /// spec keeps parsing (this is `#[serde(default)]`), but note this IS a real, deliberate
+    /// behavior change versus every run before this field existed: those runs' initial weights
+    /// were drawn from whatever RNG state the process happened to be in at that point (already
+    /// effectively random, never reproducible) - defaulting to a fixed constant here makes
+    /// runs reproducible by default rather than "randomly random, and now differently random".
+    #[serde(default = "default_model_init_seed")]
+    pub model_init_seed: u64,
 }
 
 fn default_auto_stop_on_plateau() -> bool {
     true
+}
+
+/// Arbitrary but fixed - one more than `user_problem::SEED_INTERIOR` (90_210) purely as a
+/// naming convention tying the two seeds together, not a derived/meaningful value.
+fn default_model_init_seed() -> u64 {
+    90_211
 }
 
 impl Default for NetworkSpec {
@@ -47,6 +65,7 @@ impl Default for NetworkSpec {
             max_hidden_dim: None,
             max_n_hidden: None,
             auto_stop_on_plateau: true,
+            model_init_seed: default_model_init_seed(),
         }
     }
 }

@@ -697,6 +697,69 @@ mod tests {
     type TB = Autodiff<Wgpu>;
     type TBInner = Wgpu;
 
+    /// Issue #62 PH3-11: real, verified evidence that `Backend::seed` immediately before
+    /// `ElasticityNetConfig::init` makes weight initialization reproducible - this codebase's
+    /// own previously-documented negative finding (`provenance::RunProvenance::
+    /// model_init_seeded`'s old doc comment) is now closed for real, not just claimed.
+    ///
+    /// Deliberately uses `training_core::BInner` (the SHIPPED backend - `NdArray` under
+    /// `--features ndarray-backend`, the only configuration `app-egui`/the headless CLI
+    /// actually build with, per `powershell_tool/CLAUDE.md`'s own "Debug vs release" section),
+    /// not this file's own hardcoded `Wgpu` test backend used everywhere else in this module.
+    /// A first version of this test used `Wgpu` and found genuine, deterministic-but-different
+    /// weights across two identically-seeded runs, even after adding `Backend::sync` calls -
+    /// traced to burn-wgpu's fusion/cubecl execution layer, where `Backend::seed`'s global
+    /// mutable state mutation isn't tracked by the lazy op-fusion graph, so its ordering
+    /// relative to queued `float_random` kernel dispatches isn't guaranteed by program order
+    /// alone. `NdArray` has no such concern (eager, single-threaded CPU execution, its own
+    /// separate `SEED` static in `burn-ndarray`) - and is the only backend this reproducibility
+    /// claim needs to hold for, since it's the only one real runs ever use.
+    #[test]
+    fn seeding_before_init_produces_byte_identical_initial_weights() {
+        use crate::training_core::{BDevice, BInner};
+        let device = BDevice::default();
+        let config = plain_mlp_config(6, 3);
+
+        BInner::seed(&device, 12345);
+        let model_a: ElasticityNet<BInner> = config.init(&device);
+        // Force every lazily-initialized `Param` to materialize its actual random draw NOW,
+        // before `seed` is called again - `Param` values in this burn version are lazily
+        // computed on first access, so reading them only AFTER building both models would let
+        // the two models' random draws interleave against a single shared RNG stream in
+        // whatever order the reads happen to occur, not the order each model was built in
+        // (confirmed the hard way: an earlier version of this test read both models' weights
+        // only at the end and got real, deterministic-but-wrong divergence from exactly this).
+        let wa: Vec<Vec<f32>> = model_a.layers.iter().map(|l| l.weight.val().into_data().to_vec().unwrap()).collect();
+        let oa: Vec<f32> = model_a.out.weight.val().into_data().to_vec().unwrap();
+
+        BInner::seed(&device, 12345);
+        let model_b: ElasticityNet<BInner> = config.init(&device);
+        let wb: Vec<Vec<f32>> = model_b.layers.iter().map(|l| l.weight.val().into_data().to_vec().unwrap()).collect();
+        let ob: Vec<f32> = model_b.out.weight.val().into_data().to_vec().unwrap();
+
+        assert_eq!(wa, wb, "same seed must reproduce byte-identical layer weights");
+        assert_eq!(oa, ob, "same seed must reproduce byte-identical output-layer weights");
+    }
+
+    /// Sanity check that seeding actually has an effect (not a silent no-op that happens to
+    /// produce identical weights regardless of seed) - same `BInner` rationale as the test
+    /// immediately above.
+    #[test]
+    fn different_seeds_before_init_produce_different_initial_weights() {
+        use crate::training_core::{BDevice, BInner};
+        let device = BDevice::default();
+        let config = plain_mlp_config(6, 3);
+
+        BInner::seed(&device, 111);
+        let model_a: ElasticityNet<BInner> = config.init(&device);
+        BInner::seed(&device, 222);
+        let model_b: ElasticityNet<BInner> = config.init(&device);
+
+        let wa: Vec<f32> = model_a.layers[0].weight.val().into_data().to_vec().unwrap();
+        let wb: Vec<f32> = model_b.layers[0].weight.val().into_data().to_vec().unwrap();
+        assert_ne!(wa, wb, "different seeds should (overwhelmingly likely) produce different weights");
+    }
+
     fn piratenet_config() -> ElasticityNetConfig {
         ElasticityNetConfig::new()
             .with_input_dim(2)

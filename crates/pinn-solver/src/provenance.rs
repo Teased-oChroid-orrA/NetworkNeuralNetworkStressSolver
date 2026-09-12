@@ -1,12 +1,13 @@
 //! Issue #61 EPIC P2-13: reproducibility and provenance metadata per saved run.
 //!
 //! Every field is either a REAL, verified value or an explicit `None`/`false` with a doc
-//! comment explaining WHY - never invented or guessed. Two fields in particular are real,
-//! honest NEGATIVE findings rather than gaps papered over: `model_init_seeded` is always
-//! `false` (confirmed by reading `network::ElasticityNetConfig::init` - it calls burn's
-//! `LinearConfig::init(device)` with no explicit seed anywhere in the call chain, so model
-//! weight initialization is genuinely NOT reproducible in this codebase today), and
-//! `derivative_backend` always reports `"FD"` - and, per issue #62 PH3-06's own real finding,
+//! comment explaining WHY - never invented or guessed. `model_init_seeded` used to be a real,
+//! permanent negative finding (model weight initialization was never seeded anywhere in this
+//! codebase) - issue #62 PH3-11 closed it for the real training entry points by calling
+//! `Backend::seed(&device, spec.network.model_init_seed)` immediately before
+//! `ElasticityNetConfig::init` (see `RunProvenance::model_init_seeded`'s own doc comment for
+//! exactly which entry points). `derivative_backend` always reports `"FD"` - and, per issue #62
+//! PH3-06's own real finding,
 //! always WILL: FD is the only backend that can ever supply a live TRAINING-loss derivative in
 //! this codebase, a structural fact, not a temporary gap. `differential_operator::ad_strain`
 //! retrieves its gradient via burn's `.grad()` API, which returns a value on `B::InnerBackend` -
@@ -47,11 +48,20 @@ pub struct RunProvenance {
     /// `90_210`) - `UserSamplingStrategy::sample_interior` always re-seeds with this exact
     /// constant, so interior point SAMPLING is deterministic and reproducible.
     pub interior_sampling_seed: u64,
-    /// Always `false` - see this module's own doc comment for the confirmed reason (no
-    /// explicit seed anywhere in `ElasticityNetConfig::init`'s call chain). A real, verified
-    /// negative finding: MODEL WEIGHT INITIALIZATION is not currently reproducible, even
-    /// though interior sampling is.
+    /// Issue #62 PH3-11: now `true` for every real training entry point (`runner::
+    /// run_training_user_problem`, `user_runner::run_headless_user_problem`,
+    /// `parametric_problem::run_training_parametric`) - each calls `Backend::seed(&device,
+    /// spec.network.model_init_seed)` immediately before `ElasticityNetConfig::init`, closing
+    /// the real negative finding this module's own doc comment used to describe. Kirsch's own
+    /// `runner::run_training`/pin-lug's `run_training_pinlug` are NOT covered (out of scope,
+    /// same deferral precedent as `bc_residual_rms`/`reaction_force` for those paths) - this
+    /// field is computed per-spec-type by the caller, so it's honestly `false` there rather
+    /// than guessed.
     pub model_init_seeded: bool,
+    /// The actual seed value used when `model_init_seeded` is `true` (`spec.network.
+    /// model_init_seed`) - `None` when `model_init_seeded` is `false` (nothing meaningful to
+    /// report).
+    pub model_init_seed: Option<u64>,
     /// Which burn backend this binary was compiled with (`Wgpu` or `NdArray` - see `training_
     /// core::BInner`'s own `#[cfg(feature = "ndarray-backend")]` gate).
     pub backend: String,
@@ -70,16 +80,22 @@ pub struct RunProvenance {
 /// Computes [`RunProvenance`] for `spec` (generic over `ProblemSpec`/`ParametricProblemSpec` -
 /// both are `Serialize`, which is all `problem_hash` needs). `formulation` is `Some(...)` for
 /// plate specs (`format!("{:?}", spec.formulation)`) and `None` for parametric specs (no such
-/// field exists there). `git_sha`/`git_dirty` shell out to the real `git` binary in the current
-/// working directory - see those fields' own doc comments for the honest unavailability
-/// behavior.
-pub fn compute_run_provenance<S: Serialize>(spec: &S, formulation: Option<String>) -> RunProvenance {
+/// field exists there). `model_init_seed` is `Some(spec.network.model_init_seed)` from a real
+/// training entry point that actually calls `Backend::seed` before model init (`runner::
+/// run_training_user_problem`/`user_runner::run_headless_user_problem`/`parametric_problem::
+/// run_training_parametric` all pass `Some(..)` - Kirsch/pin-lug's own callers, which don't
+/// seed, correctly pass `None`, since generic `S: Serialize` gives this function no way to
+/// read `spec.network.model_init_seed` itself). `git_sha`/`git_dirty` shell out to the real
+/// `git` binary in the current working directory - see those fields' own doc comments for the
+/// honest unavailability behavior.
+pub fn compute_run_provenance<S: Serialize>(spec: &S, formulation: Option<String>, model_init_seed: Option<u64>) -> RunProvenance {
     RunProvenance {
         git_sha: git_sha(),
         git_dirty: git_dirty(),
         problem_hash: problem_hash(spec),
         interior_sampling_seed: crate::user_problem::SEED_INTERIOR,
-        model_init_seeded: false,
+        model_init_seeded: model_init_seed.is_some(),
+        model_init_seed,
         backend: backend_name().to_string(),
         dtype: "f32".to_string(),
         derivative_backend: "FD".to_string(),
@@ -138,9 +154,10 @@ mod tests {
     #[test]
     fn compute_run_provenance_reports_known_real_values() {
         let spec = sample_spec();
-        let prov = compute_run_provenance(&spec, Some(format!("{:?}", spec.formulation)));
+        let prov = compute_run_provenance(&spec, Some(format!("{:?}", spec.formulation)), Some(spec.network.model_init_seed));
         assert_eq!(prov.interior_sampling_seed, crate::user_problem::SEED_INTERIOR);
-        assert!(!prov.model_init_seeded, "model init is genuinely not seeded in this codebase - a real, verified negative finding");
+        assert!(prov.model_init_seeded, "issue #62 PH3-11: real training entry points now seed model init");
+        assert_eq!(prov.model_init_seed, Some(spec.network.model_init_seed));
         assert_eq!(prov.derivative_backend, "FD");
         assert_eq!(prov.dtype, "f32");
         assert!(!prov.problem_hash.is_empty());
@@ -148,9 +165,17 @@ mod tests {
     }
 
     #[test]
+    fn compute_run_provenance_reports_none_model_init_seed_when_not_seeded_this_session() {
+        let spec = sample_spec();
+        let prov = compute_run_provenance(&spec, None, None);
+        assert!(!prov.model_init_seeded);
+        assert_eq!(prov.model_init_seed, None, "e.g. a loaded/served checkpoint - no Backend::seed call happened this session");
+    }
+
+    #[test]
     fn compute_run_provenance_reports_none_formulation_when_not_applicable() {
         let spec = sample_spec();
-        let prov = compute_run_provenance(&spec, None);
+        let prov = compute_run_provenance(&spec, None, None);
         assert_eq!(prov.formulation, None, "e.g. ParametricProblemSpec has no formulation field");
     }
 
@@ -160,11 +185,11 @@ mod tests {
         let mut spec_b = sample_spec();
         spec_b.load = LoadConfig::uniaxial_x(2e7); // different load
 
-        let prov_a1 = compute_run_provenance(&spec_a, None);
-        let prov_a2 = compute_run_provenance(&spec_a, None);
+        let prov_a1 = compute_run_provenance(&spec_a, None, None);
+        let prov_a2 = compute_run_provenance(&spec_a, None, None);
         assert_eq!(prov_a1.problem_hash, prov_a2.problem_hash, "same spec must hash identically");
 
-        let prov_b = compute_run_provenance(&spec_b, None);
+        let prov_b = compute_run_provenance(&spec_b, None, None);
         assert_ne!(prov_a1.problem_hash, prov_b.problem_hash, "different specs must hash differently");
     }
 

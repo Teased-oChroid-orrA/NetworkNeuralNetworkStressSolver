@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use burn::tensor::backend::Backend;
 use pinn_core::messages::SolverConfig;
 use pinn_core::problem_spec::ProblemSpec;
 
@@ -90,6 +91,9 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         .with_hidden_dim(spec.network.hidden_dim)
         .with_n_hidden(spec.network.n_hidden)
         .with_output_dim(5); // mDEM: u, v, sigma_xx, sigma_yy, sigma_xy
+    // Issue #62 PH3-11 - same fix as `runner::run_training_user_problem`, see that call site's
+    // own comment.
+    B::seed(&device, spec.network.model_init_seed);
     let mut model = net_cfg.init(&device);
     let mut optim = DomainOptim {
         weight: WeightOptim::new(config.use_soap_muon),

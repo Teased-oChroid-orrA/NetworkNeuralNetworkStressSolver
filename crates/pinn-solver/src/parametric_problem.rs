@@ -750,6 +750,9 @@ pub fn run_training_parametric(spec: ParametricProblemSpec, tx: Sender<TrainingM
         // internally whenever `adaptive` - see `runner::run_training_user_problem`'s own
         // `net_cfg` for the identical rationale (no separate user-facing toggle exists).
         .with_use_piratenet(spec.network.adaptive);
+    // Issue #62 PH3-11 - same fix as `runner::run_training_user_problem`, see that call site's
+    // own comment.
+    B::seed(&device, spec.network.model_init_seed);
     let mut model = net_cfg.init(&device);
     let mut weight_optim = WeightOptim::new(true);
     let mut bias_optim = make_bias_optim();
@@ -912,7 +915,7 @@ fn serve_parametric_inference(
                 let mut live_spec = spec.clone();
                 live_spec.network.hidden_dim = current_hidden_dim;
                 live_spec.network.n_hidden = current_n_hidden;
-                let provenance = crate::provenance::compute_run_provenance(&live_spec, None);
+                let provenance = crate::provenance::compute_run_provenance(&live_spec, None, Some(live_spec.network.model_init_seed));
                 let meta = crate::checkpoint::CheckpointMeta {
                     spec: crate::checkpoint::CheckpointSpec::Parametric(live_spec),
                     steps_completed: last_step + 1,

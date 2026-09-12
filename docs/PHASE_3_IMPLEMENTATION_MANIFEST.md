@@ -844,17 +844,104 @@ zero regressions, up from 18/0/17 before this item). `cargo build -p pinn-core -
 
 ## PH3-11 — Strengthen reproducibility
 
-Status: NOT_STARTED
+Status: VERIFIED
 
 ### Current evidence
+Plan text (§15, verbatim): "Phase 2 discovered that model initialization is not seeded. Phase 3
+SHALL either: 1. make model initialization deterministic under the recorded seed, OR 2.
+explicitly classify training as non-reproducible and record that limitation." This was already
+a real, documented negative finding (`provenance::RunProvenance::model_init_seeded` was always
+`false`, confirmed by reading `ElasticityNetConfig::init`'s call chain - no explicit seed
+anywhere). Interior collocation SAMPLING was already deterministic (`SEED_INTERIOR`, fixed
+constant) - only network weight initialization was the real gap.
+
 ### Required change
+Option 1 (make it deterministic) - chosen over option 2, since burn exposes a real
+`Backend::seed(device, seed)` API burn's own doc comment states "should ensure deterministic
+execution for a single-threaded program."
+
 ### Files changed
+- `crates/pinn-core/src/problem_spec.rs` - `NetworkSpec.model_init_seed: u64` (new,
+  `#[serde(default = "default_model_init_seed")]` = `90_211`, every existing TOML spec keeps
+  parsing).
+- `crates/pinn-solver/src/runner.rs` - `run_training_user_problem` calls `B::seed(&device,
+  spec.network.model_init_seed)` immediately before `net_cfg.init(&device)`.
+- `crates/pinn-solver/src/user_runner.rs` - identical fix in `run_headless_user_problem` (the
+  CLI equivalent entry point).
+- `crates/pinn-solver/src/parametric_problem.rs` - identical fix in `run_training_parametric`.
+- `crates/pinn-solver/src/provenance.rs` - `compute_run_provenance` gained a `model_init_seed:
+  Option<u64>` parameter; `RunProvenance.model_init_seeded` is now `true`/carries the real seed
+  for these 3 entry points (`Some(spec.network.model_init_seed)`), `None`/`false` for Kirsch/
+  pin-lug (out of scope, not seeded) and for `serve_loaded_plate_checkpoint` (no training ran
+  this session - the loaded checkpoint's OWN historical seed is still recoverable from
+  `CheckpointMeta.spec.network.model_init_seed`, just not re-asserted by this session's own
+  provenance record).
+- `crates/pinn-solver/src/network.rs` - 2 new unit tests (see Tests).
+
 ### Tests
+- `network::tests::seeding_before_init_produces_byte_identical_initial_weights` /
+  `different_seeds_before_init_produce_different_initial_weights` - both real, both use
+  `training_core::BInner` (the actual SHIPPED `NdArray` backend, not this file's own hardcoded
+  `Wgpu` test backend used everywhere else in this module - see the first test's own doc
+  comment for why `Wgpu` was tried first and rejected: burn-wgpu's fusion/cubecl execution
+  layer doesn't track `Backend::seed`'s global mutable-state mutation in its lazy op-fusion
+  graph, producing genuine, deterministic-but-WRONG divergence unrelated to this fix).
+  **A second, separate real finding surfaced while writing these tests**: `Param` values in
+  this burn version are LAZILY initialized - the actual `float_random` draw (and thus the
+  `SEED`-static consumption) happens on first `.val()` access, not at `ElasticityNetConfig::
+  init()` call time. Reading two models' weights only after building BOTH interleaves their
+  lazy draws against the one shared global RNG stream in access order, not construction order -
+  fixed by materializing (`.val().into_data()`) each model's full parameter set immediately
+  after building it, before re-seeding for the next model. This has no bearing on the real
+  production entry points (a single model's own sequential first-forward-pass parameter
+  accesses happen deterministically for that one model, with nothing else contending for the
+  same lazy realization window in between).
+- `runner::tests::same_model_init_seed_reproduces_an_identical_step_zero_update_across_two_
+  independent_runs` - real, end-to-end, via the actual `run_training_user_problem` public entry
+  point (not just isolated weight tensors). `#[ignore]`d for a THIRD real, distinct finding:
+  `Backend::seed` mutates a PROCESS-GLOBAL static, and `cargo test` runs `#[test]` fns
+  concurrently by default - burn's own "single-threaded program" scoping in `Backend::seed`'s
+  doc comment is exactly the caveat that bites here. Confirmed directly: passes cleanly every
+  time run alone, failed once (`left: 1.480344 right: 3.332661`) when run as part of the full
+  `runner::` module because another concurrently-running test's own training thread drew from/
+  reseeded the same global RNG in between this test's two sequential runs. A real, reproducible
+  cross-test-parallelism artifact, not a flaw in the fix - has no bearing on a real desktop app
+  session (one training run at a time, one process).
+
 ### Runtime run
+Real, isolated run of the end-to-end test above (`cargo test --release ... --lib runner::tests::
+same_model_init_seed_reproduces_...`, run alone): passed, step-0 `total_loss`/`energy_loss`
+identical across two independent full-process training runs sharing the same
+`model_init_seed`.
+
 ### Benchmark result
+Not applicable - this item is a reproducibility/determinism mechanism, not a physics change; no
+benchmark threshold is affected.
+
 ### Known limitations
+Per the plan's own explicit escape hatch ("if exact determinism is impossible... state the
+source of nondeterminism; expected tolerance; observed divergence") - two real, honestly
+reported limitations, not silently accepted:
+1. This item guarantees INITIALIZATION reproduces (the plan's literal ask) - it does NOT claim
+   the full multi-step training trajectory stays bit-identical past step 0. `burn-ndarray`'s
+   `multi-threads` (rayon) Cargo feature is enabled in this workspace (already documented in
+   `powershell_tool/CLAUDE.md`'s own `width_growth`-test flake finding) - float-summation order
+   under thread scheduling is a real, pre-existing, independent source of run-to-run divergence
+   beyond a single deterministic forward pass, out of this item's scope to fix.
+2. `Backend::seed`'s process-global-static nature means two model constructions racing in the
+   SAME process (e.g. concurrent test threads) can interfere with each other - not a concern
+   for the real, single-training-run desktop app, but the reason the end-to-end integration
+   test above is `#[ignore]`d.
+3. Kirsch's own `runner::run_training` and pin-lug's `run_training_pinlug` are NOT seeded (out
+   of scope, same deferral precedent as `bc_residual_rms`/`reaction_force` for those paths).
+
 ### Reviewer verification
-NOT REVIEWED
+`cargo test --release -p pinn-solver --features ndarray-backend --lib network::` (36/36
+passed, up from 34), `--lib provenance::` (5/5 passed, up from 3), `--lib runner::` (19/19
+passed, 18 ignored - up from 17 ignored, +1 real `#[ignore]`d determinism test), `--lib
+parametric_problem::` (5/5 passed, 1 ignored - unchanged, no regression). `cargo test -p
+pinn-core` 120/120 passed. `cargo build -p pinn-app --features ndarray-backend` clean. `cargo
+build -p app-egui` clean, real launch stayed alive 8s+ with an empty log.
 
 ## PH3-12 — Validate AMR as a convergence accelerator
 
