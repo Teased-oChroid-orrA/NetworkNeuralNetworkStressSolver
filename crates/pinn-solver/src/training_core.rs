@@ -700,6 +700,96 @@ pub fn build_loss_ledger(
     }).collect()
 }
 
+/// Issue #61 EPIC P2-12: one consolidated row per term, joining EVERY classification/metadata
+/// axis built across the prior General-PINN pass and P2-01/P2-03/P2-05 (`term_role`,
+/// `formulation_kind`, `stress_source`, `boundary_kind`, `derivative_order`, `constraint_kind`)
+/// with the weighting/gradient data [`LossLedgerEntry`] already carries - instead of a caller
+/// separately calling `stress_source_report`/`boundary_operator_report`/`derivative_order_
+/// report`/`formulation_kind_report`/`constraint_report`/`term_role_report` and manually
+/// joining them by name (exactly the manual, error-prone reconstruction issue #61's own
+/// generalization epics exist to eliminate).
+#[derive(Debug, Clone)]
+pub struct CompleteLossLedgerEntry {
+    pub name: &'static str,
+    /// The physical value `LossTerm::compute()` produced, BEFORE any weighting (P2-05's own
+    /// "physical coefficient" side of the ledger - see that epic's manifest entry for why this
+    /// codebase has no further-separable scalar physical constant beyond this).
+    pub raw_value: f32,
+    /// The weight actually multiplied into the total loss this step (post any dynamic cap -
+    /// P2-05's "effective_weight"). See Known Limitations (P2-12 manifest entry) for why the
+    /// PRE-cap SAW output ("optimization_weight" before capping) is not separately captured.
+    pub effective_weight: f64,
+    pub weighted_value: f64,
+    pub gradient_norm: Option<f32>,
+    pub gradient_share: Option<f32>,
+    /// `None` only for a term present in the raw/lambda maps but NOT in `problem.loss_terms()`
+    /// (e.g. `constitutive_consistency`, injected outside the declared term list by `step_
+    /// physics`/`step_physics_multi`'s own "(b.5)" block) - genuinely no classification data
+    /// available via this generic path for such a term, not an oversight.
+    pub term_role: Option<crate::problem::TermRole>,
+    pub formulation_kind: Option<crate::problem::FormulationKind>,
+    pub stress_source: Option<crate::problem::StressSource>,
+    pub boundary_kind: Option<crate::problem::BoundaryOperatorKind>,
+    pub derivative_order: Option<crate::problem::DerivativeOrder>,
+    pub constraint_kind: Option<crate::problem::ConstraintKind>,
+}
+
+/// Builds the P2-12 complete ledger. Iterates `problem.loss_terms()` directly (calling each
+/// term's own classification methods, not re-deriving them) for every DECLARED term present in
+/// `raw_scalar_by_name`, then appends any remaining `raw_scalar_by_name` entries not covered by
+/// `loss_terms()` (the `constitutive_consistency` case) with `None` classification fields -
+/// real values, honestly incomplete metadata, not a silently wrong guess.
+pub fn build_complete_loss_ledger(
+    problem: &dyn crate::problem::BoundaryValueProblem,
+    raw_scalar_by_name: &HashMap<&'static str, f32>,
+    lam_by_name: &HashMap<&'static str, f64>,
+    term_grad_norms: Option<&HashMap<&'static str, f32>>,
+    gradient_shares: Option<&HashMap<&'static str, f32>>,
+) -> Vec<CompleteLossLedgerEntry> {
+    let terms = problem.loss_terms();
+    let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(raw_scalar_by_name.len());
+
+    for term in &terms {
+        let name = term.name();
+        let Some(&raw) = raw_scalar_by_name.get(name) else { continue };
+        seen.insert(name);
+        let lambda = lam_by_name.get(name).copied().unwrap_or(0.0);
+        out.push(CompleteLossLedgerEntry {
+            name,
+            raw_value: raw,
+            effective_weight: lambda,
+            weighted_value: raw as f64 * lambda,
+            gradient_norm: term_grad_norms.and_then(|m| m.get(name).copied()),
+            gradient_share: gradient_shares.and_then(|m| m.get(name).copied()),
+            term_role: Some(term.term_role()),
+            formulation_kind: Some(term.formulation_kind()),
+            stress_source: term.stress_source(),
+            boundary_kind: term.boundary_kind(),
+            derivative_order: term.derivative_order(),
+            constraint_kind: Some(term.constraint_kind()),
+        });
+    }
+
+    for (&name, &raw) in raw_scalar_by_name {
+        if seen.contains(name) {
+            continue;
+        }
+        let lambda = lam_by_name.get(name).copied().unwrap_or(0.0);
+        out.push(CompleteLossLedgerEntry {
+            name,
+            raw_value: raw,
+            effective_weight: lambda,
+            weighted_value: raw as f64 * lambda,
+            gradient_norm: term_grad_norms.and_then(|m| m.get(name).copied()),
+            gradient_share: gradient_shares.and_then(|m| m.get(name).copied()),
+            term_role: None, formulation_kind: None, stress_source: None,
+            boundary_kind: None, derivative_order: None, constraint_kind: None,
+        });
+    }
+    out
+}
+
 /// Extract (σ_xx, σ_yy, σ_xy) from rows `[row_start, row_end)` of an mDEM network output
 /// tensor (cols 2, 3, 4 — already scaled to Pa by `scale_out`). Shared by every mDEM call
 /// site that reads stress directly off the network rather than via the FD stencil.
@@ -3761,6 +3851,70 @@ mod tests {
         assert_eq!(ie.role, Some(TermRole::PhysicalFunctional));
         let hf = ledger.iter().find(|e| e.name == "hole_fixed").unwrap();
         assert_eq!(hf.role, Some(TermRole::Constraint));
+    }
+
+    /// Issue #61 P2-12: every DECLARED term (present in `problem.loss_terms()`) gets full
+    /// classification metadata; the synthetic `constitutive_consistency` entry (present in the
+    /// raw/lambda maps but never returned by `loss_terms()` - injected outside the declared
+    /// term list by `step_physics_multi`'s own "(b.5)" block) gets `None` for every
+    /// classification field, honestly, not a silently wrong guess.
+    #[test]
+    fn build_complete_loss_ledger_joins_every_classification_axis_and_handles_the_synthetic_constitutive_consistency_entry() {
+        use crate::problem::{BoundaryOperatorKind, FormulationKind, TermRole};
+        use crate::user_problem::UserDefinedProblem;
+        use pinn_core::problem_spec::ProblemSpec;
+        use pinn_core::user_geometry::UserGeometry;
+        use pinn_core::material::MaterialProps;
+        use pinn_core::loading::LoadConfig;
+
+        let spec = ProblemSpec {
+            geometry: UserGeometry {
+                half_w: 0.1, half_h: 0.05, thickness: 0.005,
+                holes: vec![pinn_core::user_geometry::HoleSpec {
+                    center: [0.0, 0.0], radius: 0.01, bc: pinn_core::user_geometry::HoleBc::Free,
+                }],
+            },
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        let problem = UserDefinedProblem::new(spec);
+
+        let mut raw: HashMap<&'static str, f32> = problem.loss_terms().iter()
+            .map(|t| (t.name(), 1.0_f32)).collect();
+        let mut lam: HashMap<&'static str, f64> = problem.loss_terms().iter()
+            .map(|t| (t.name(), 2.0_f64)).collect();
+        // The synthetic entry `step_physics_multi` injects outside `loss_terms()`.
+        raw.insert("constitutive_consistency", 3.0);
+        lam.insert("constitutive_consistency", 5.0);
+
+        let ledger = build_complete_loss_ledger(&problem, &raw, &lam, None, None);
+        assert_eq!(ledger.len(), raw.len());
+
+        let ie = ledger.iter().find(|e| e.name == "interior_energy").unwrap();
+        assert_eq!(ie.term_role, Some(TermRole::PhysicalFunctional));
+        assert_eq!(ie.formulation_kind, Some(FormulationKind::Weak));
+        assert_eq!(ie.stress_source, None); // interior_energy has no stress quantity
+        assert_eq!(ie.raw_value, 1.0);
+        assert_eq!(ie.effective_weight, 2.0);
+        assert_eq!(ie.weighted_value, 2.0);
+
+        let hf = ledger.iter().find(|e| e.name == "hole_free").unwrap();
+        assert_eq!(hf.boundary_kind, Some(BoundaryOperatorKind::Neumann));
+        assert_eq!(hf.term_role, Some(TermRole::PhysicalFunctional));
+
+        let cc = ledger.iter().find(|e| e.name == "constitutive_consistency").unwrap();
+        assert_eq!(cc.term_role, None, "constitutive_consistency is not in loss_terms(), no classification data is available");
+        assert_eq!(cc.formulation_kind, None);
+        assert_eq!(cc.stress_source, None);
+        assert_eq!(cc.boundary_kind, None);
+        assert_eq!(cc.derivative_order, None);
+        assert_eq!(cc.constraint_kind, None);
+        assert_eq!(cc.raw_value, 3.0, "the synthetic entry still gets its real raw/weighted values");
+        assert_eq!(cc.effective_weight, 5.0);
+        assert_eq!(cc.weighted_value, 15.0);
     }
 
     /// Issue #61 P2-05's own acceptance wording: "tests prove adaptive weighting cannot alter

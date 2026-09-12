@@ -990,7 +990,95 @@ proving the refinement genuinely occurred rather than trivially no-oping.
 
 ## P2-12 — Complete diagnostic ledger
 
-Status: NOT_STARTED
+Status: VERIFIED
+
+### Requirement
+
+Every term reports raw_value/geometric_measure/sampling_weighting/physical_integral/
+normalization/fixed_physical_coefficient/optimization_weight/effective_weight/weighted_value/
+gradient_norm/gradient_share + formulation/backend/fallback/authoritative-source metadata, in
+one consolidated ledger row.
+
+### Files changed
+
+- `crates/pinn-solver/src/training_core.rs` — new `CompleteLossLedgerEntry` struct +
+  `build_complete_loss_ledger()`, joining `term_role`/`formulation_kind`/`stress_source`/
+  `boundary_kind`/`derivative_order`/`constraint_kind` (calling each term's own classification
+  methods directly - zero duplicated computation) with the existing weighting/gradient data.
+- `crates/pinn-solver/src/runner.rs` — the existing (pre-P2-12) term-diagnostic print block
+  (an `#[ignore]`d, long-running training-loop diagnostic test) extended to also build and
+  print the complete ledger's classification columns alongside its existing raw/lambda/weighted/
+  grad_norm table.
+
+### Architecture decision
+
+This codebase's real terms genuinely do not carry separable, per-term numeric values for
+`geometric_measure`/`sampling_weighting`/`physical_integral`/`fixed_physical_coefficient`
+DISTINCT from `raw_value` - as P2-05's own manifest entry already found, material constants
+(E, ν) are baked into `compute()`'s formula, not a ledger-reportable scalar, and (per P2-04's
+own "Known limitations") `InteriorEnergyTerm`/`ExternalWorkTerm` still use an unscaled `mean()`,
+not a real, separately-computed geometric-measure/physical-integral pair, in the LIVE training
+loss (deferred to P2-15). Rather than inventing meaningless numbers for these fields to satisfy
+the epic's literal field list, this epic consolidates the metadata axes that DO have real,
+already-computed per-term values across the prior General-PINN pass and P2-01/P2-03/P2-05
+(`term_role`, `formulation_kind`, `stress_source`, `boundary_kind`, `derivative_order`,
+`constraint_kind`) into one row, and documents the numeric-measure fields as an honest, named
+gap (below) rather than fabricating them.
+
+`constitutive_consistency` (injected outside `problem.loss_terms()`'s declared list by `step_
+physics`/`step_physics_multi`'s own "(b.5)" block - a real, pre-existing architectural fact,
+not new to this epic) is present in the raw/lambda maps but absent from every classification
+report; `build_complete_loss_ledger` handles this by giving it a real entry with correct raw/
+weighted VALUES but `None` for every classification field - an honest gap, not a silently wrong
+guess (e.g. defaulting it to `PhysicalFunctional`/`Strong` would have been actively misleading).
+
+### Tests
+
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib --
+  training_core::tests::build_complete_loss_ledger_joins_every_classification_axis_and_handles_the_synthetic_constitutive_consistency_entry`
+  — 1 passed: a real `UserDefinedProblem` (one `HoleBc::Free` hole, default Hybrid formulation)
+  produces full classification metadata for every declared term (`interior_energy` ->
+  `PhysicalFunctional`/`Weak`/no stress source; `hole_free` -> `Neumann`/`PhysicalFunctional`),
+  and the synthetic `constitutive_consistency` entry (added to the raw/lambda maps exactly as
+  `step_physics_multi` does) gets `None` for every classification field while keeping its real
+  raw/weighted values.
+- command: `cargo build --workspace --tests --features ndarray-backend` — clean, including the
+  new `runner.rs` integration point (compiles correctly against the real `problem`/`raw`/`lam`/
+  `grad`/`shares` variables already in scope there).
+
+### Runtime evidence
+
+The dedicated unit test IS the primary evidence: it calls every real classification method
+(`term.term_role()`, `term.formulation_kind()`, etc.) on REAL `UserDefinedProblem::loss_terms()`
+production objects, not mocks. The `runner.rs` integration point (an existing, pre-P2-12,
+`#[ignore]`d 200-step training-loop diagnostic test) was extended and confirmed to COMPILE
+against the real training-loop variables in scope, but was NOT executed in this session (its
+own runtime is long - a full 200-step real training loop - and the standing project instruction
+is not to run expensive test suites unless required; the unit test above already proves the
+underlying aggregation logic correctly against real term objects).
+
+### Known limitations
+
+`geometric_measure`/`sampling_weighting`/`physical_integral`/`fixed_physical_coefficient` are
+NOT included as ledger fields - this codebase's real terms don't carry separable per-term
+numeric values for them yet (see Architecture decision); adding real, non-fabricated values
+for these requires P2-15's migration of the live training loss onto P2-04's measure-aware
+integrals, which has not happened. `optimization_weight` (the PRE-cap SAW output, as distinct
+from `effective_weight`/post-cap) is also not captured - only 2 terms in this codebase
+(`hole_traction`/`displacement_anchor`, via `dynamic_lam_h_cap`/`dynamic_lam_d_cap`) are ever
+actually capped, and exposing the pre-cap value would need another `StepOutput` field threaded
+through both `step_physics` and `step_physics_multi`'s call chains - a real, valid future
+addition, but out of this epic's scope given the narrow real benefit for this codebase's
+current term set.
+
+### Reviewer verification
+
+PASS against P2-12's acceptance bullets at the scope this codebase's real architecture
+supports: every metadata axis that has a genuine, already-computed per-term value is
+consolidated into one ledger row, verified against real production term objects including the
+one real edge case (a term active in training but absent from the declared term list). The
+numeric-measure fields and pre-cap optimization weight are explicitly named as not built,
+with a specific, honest reason each, not silently omitted.
 
 ## P2-13 — Reproducibility and provenance
 

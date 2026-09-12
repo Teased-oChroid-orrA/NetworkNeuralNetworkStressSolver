@@ -2448,6 +2448,18 @@ mod tests {
                     println!("  [term-diag] {:>26} {:>14.4e} {:>14.4e} {:>14.4e} {:>14.4e}",
                         e.name, e.raw, e.lambda, e.weighted, e.grad_norm.unwrap_or(f32::NAN));
                 }
+
+                // Issue #61 EPIC P2-12: complete diagnostic ledger - the same weighting data
+                // above, joined with every classification axis (role/formulation/stress
+                // source/boundary kind/derivative order/constraint kind) in one consolidated
+                // print instead of separately calling each `*_report` function.
+                let mut complete = crate::training_core::build_complete_loss_ledger(&problem, raw, lam, Some(grad), shares);
+                complete.sort_by_key(|e| e.name);
+                println!("  [term-diag] {:>26} {:>18} {:>16} {:>10} {:>14}", "term", "role", "formulation", "stress", "boundary");
+                for e in &complete {
+                    println!("  [term-diag] {:>26} {:>18?} {:>16?} {:>10?} {:>14?}",
+                        e.name, e.term_role, e.formulation_kind, e.stress_source, e.boundary_kind);
+                }
             }
         }
     }
