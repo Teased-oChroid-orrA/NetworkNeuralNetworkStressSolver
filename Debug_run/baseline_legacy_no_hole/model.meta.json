@@ -1,0 +1,59 @@
+{
+  "spec": {
+    "Plate": {
+      "geometry": {
+        "half_w": 0.1,
+        "half_h": 0.1,
+        "thickness": 0.005,
+        "holes": []
+      },
+      "material": {
+        "e": 71700000000.0,
+        "nu": 0.33,
+        "density": 2810.0,
+        "ultimate_strength_pa": 503000000.0
+      },
+      "load": {
+        "px": 69000000.0,
+        "py": 0.0
+      },
+      "network": {
+        "hidden_dim": 64,
+        "n_hidden": 8,
+        "adaptive": true,
+        "max_hidden_dim": null,
+        "max_n_hidden": null,
+        "auto_stop_on_plateau": true
+      },
+      "training": {
+        "max_steps": 2000,
+        "n_interior": 2048,
+        "n_boundary": 512,
+        "fd_h": 0.001,
+        "lr": 0.001
+      },
+      "formulation": {
+        "Hybrid": [
+          "interior_energy",
+          "equilibrium",
+          "outer_traction",
+          "external_work"
+        ]
+      }
+    }
+  },
+  "steps_completed": 2000,
+  "final_loss": -0.97494626,
+  "saved_at_unix": 1789211087,
+  "provenance": {
+    "git_sha": "af92d02c908444415ecb514a8685b5e55ef68506",
+    "git_dirty": false,
+    "problem_hash": "04434347dde8bc97",
+    "interior_sampling_seed": 90210,
+    "model_init_seeded": false,
+    "backend": "NdArray",
+    "dtype": "f32",
+    "derivative_backend": "FD",
+    "formulation": "Hybrid([\"interior_energy\", \"equilibrium\", \"outer_traction\", \"external_work\"])"
+  }
+}

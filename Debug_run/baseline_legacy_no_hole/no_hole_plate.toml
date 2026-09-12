@@ -1,0 +1,45 @@
+# Example user-defined problem: a plain square plate under uniaxial far-field tension,
+# with NO hole at all — the base-case sanity check for the generic UserDefinedProblem
+# formulation (InteriorEnergyTerm + EquilibriumTerm + OuterTractionTerm + ExternalWorkTerm),
+# with zero geometric feature to complicate the result. The exact solution is trivial and
+# closed-form (uniform sigma_xx = px, sigma_yy = 0 everywhere, zero shear) - this is the
+# formulation's own "does the base physics converge at all before trusting it on a harder
+# geometry" gate, matching this project's own no-hole regression test
+# (user_problem.rs::tests::run_training_user_problem_no_hole_plate_recovers_uniform_uniaxial_tension).
+#
+# Same material/load/network/training parameters as single_hole_plate.toml so the two are
+# directly comparable - this file differs ONLY in setting holes = [] (single_hole_plate.toml's
+# one [[geometry.holes]] block, empty here). `holes` has no #[serde(default)] on
+# UserGeometry, so it must be present explicitly - omitting the key entirely fails to parse
+# ("missing field `holes`"), it does not silently default to empty.
+#
+# Run with: cargo run -p pinn-app --release -- --headless --problem-spec examples/problems/no_hole_plate.toml
+#
+# All lengths in meters [m], all stresses/moduli in pascals [Pa].
+
+[geometry]
+half_w = 0.10   # full width  = 0.20 m
+half_h = 0.10   # full height = 0.20 m (square plate)
+thickness = 0.005
+holes = []      # a plain, feature-less plate - no [[geometry.holes]] entries.
+
+[material]
+e = 71.7e9               # Al 7075-T6
+nu = 0.33
+density = 2810.0
+ultimate_strength_pa = 503e6
+
+[load]
+px = 6.9e7                # far-field traction in x, ~10 ksi
+py = 0.0
+
+[network]
+hidden_dim = 64
+n_hidden = 8
+
+[training]
+max_steps = 2000
+n_interior = 2048
+n_boundary = 512
+fd_h = 1e-3
+lr = 1e-3

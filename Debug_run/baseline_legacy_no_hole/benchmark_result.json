@@ -1,0 +1,35 @@
+{
+  "_provenance": "Captured by running crates/pinn-solver/src/user_problem.rs::tests::ph3_01_baseline_legacy_no_hole_checkpoint_benchmark_result against the checkpoint in this directory (cargo test --release -p pinn-solver --features ndarray-backend --lib ph3_01_baseline_legacy_no_hole -- --ignored --nocapture), issue #62 PH3-01.",
+  "level": "L4",
+  "name": "no_hole",
+  "passed": false,
+  "sigma_xx_relative_error": 0.019238057970042754,
+  "sigma_yy_over_reference": 0.008142509555433572,
+  "sigma_xy_over_reference": 0.004616288049931893,
+  "traction_rms_over_reference": 0.014040773330894896,
+  "load_transfer_ratio": 1.0027142837981733,
+  "thresholds": {
+    "sigma_xx_relative_error_max": 0.01,
+    "sigma_yy_over_reference_max": 0.01,
+    "sigma_xy_over_reference_max": 0.01,
+    "traction_rms_over_reference_max": 0.01,
+    "load_transfer_ratio_min": 0.99,
+    "load_transfer_ratio_max": 1.01
+  },
+  "failure_reasons": [
+    "sigma_xx_relative_error",
+    "traction_rms_over_ref"
+  ],
+  "provenance": {
+    "git_sha": "af92d02c908444415ecb514a8685b5e55ef68506",
+    "git_dirty": false,
+    "problem_hash": "04434347dde8bc97",
+    "interior_sampling_seed": 90210,
+    "model_init_seeded": false,
+    "backend": "NdArray",
+    "dtype": "f32",
+    "derivative_backend": "FD",
+    "formulation": "Hybrid([\"interior_energy\", \"equilibrium\", \"outer_traction\", \"external_work\"])"
+  },
+  "baseline_frozen_at_main_sha": "21a0e730634251f7d7a564d3f78550390bda69f8"
+}
