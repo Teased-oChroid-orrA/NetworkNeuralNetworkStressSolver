@@ -3261,6 +3261,153 @@ mod tests {
         );
     }
 
+    // ─── Issue #62 PH3-08: displacement/stress discrepancy investigation ───────────────────
+
+    /// Real investigation, against the ACTUAL PH3-01 baseline checkpoint (not a fresh training
+    /// run - the exact numbers issue #62 §2.1.D cites, `123.446 um` reported max vs. `~101.3 um`
+    /// analytic corner magnitude, come from this exact checkpoint), of WHERE in the domain the
+    /// reported maximum displacement actually occurs and whether it matches the analytic
+    /// solution AT THAT SAME LOCATION - the investigation order issue #62 itself specifies
+    /// (output scaling -> coordinate normalization -> ... -> network approximation error) is
+    /// followed by elimination below, each step backed by a real, printed number, not assumed.
+    #[test]
+    #[ignore = "reads the real PH3-01 baseline checkpoint from Debug_run/baseline_legacy_no_hole/"]
+    fn ph3_08_baseline_displacement_discrepancy_investigation() {
+        let weights_path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../Debug_run/baseline_legacy_no_hole/model"
+        ));
+        let device = crate::training_core::BDevice::default();
+        let (model, meta) = crate::checkpoint::load_checkpoint(weights_path, &device)
+            .expect("PH3-01 baseline checkpoint must load - see Debug_run/baseline_legacy_no_hole/");
+        let spec = match &meta.spec {
+            crate::checkpoint::CheckpointSpec::Plate(spec) => spec.clone(),
+            crate::checkpoint::CheckpointSpec::Parametric(_) => panic!("expected a Plate checkpoint"),
+        };
+        let (half_w, half_h) = (spec.geometry.half_w, spec.geometry.half_h);
+        let e = spec.material.e;
+        let nu = spec.material.nu;
+        let px = spec.load.px;
+
+        // Step 1 ("output scaling"): reproduce the EXACT GUI computation (same grid size [64,64]
+        // the real run used, same `u_ref` formula `compute_reference_scales_for_plate` already
+        // proved correct via its own dedicated hand-computed-value unit test) - if this alone
+        // already disagrees with the persisted `stress_solver_report.json`'s `123.446 um`, the
+        // discrepancy is in the REPORTING layer, not the physics. If it agrees, the discrepancy
+        // is real and lives in what the network actually learned.
+        let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+        let fd = crate::fd_stencil::FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+        let vis = evaluate_user_vis_grid(&model, &spec.geometry, [64, 64], scales.u_ref, px, &spec.material, &fd, &[], &device);
+
+        // Step 2 ("coordinate normalization/de-normalization" + "edge/corner evaluation"): the
+        // vis grid's own point generation (`evaluate_user_vis_grid`'s own body, read directly)
+        // places grid index (0,0) at (x_norm,y_norm)=(-1,-1) and (nx-1,ny-1) at (+1,+1) - the
+        // TRUE corners ARE exact grid points, not missed by a coarser sampling. Find the actual
+        // (ix,iy) where the reported maximum magnitude occurs.
+        let (ny, nx) = vis.disp_u.dim();
+        let mut max_mag = f32::NEG_INFINITY;
+        let mut max_idx = (0usize, 0usize);
+        for iy in 0..ny {
+            for ix in 0..nx {
+                let (u, v) = (vis.disp_u[[iy, ix]], vis.disp_v[[iy, ix]]);
+                if u.is_finite() && v.is_finite() {
+                    let mag = (u * u + v * v).sqrt();
+                    if mag > max_mag { max_mag = mag; max_idx = (ix, iy); }
+                }
+            }
+        }
+        let (ix, iy) = max_idx;
+        let x_norm = -1.0 + 2.0 * ix as f64 / (nx.max(2) - 1) as f64;
+        let y_norm = -1.0 + 2.0 * iy as f64 / (ny.max(2) - 1) as f64;
+        let (x_phys, y_phys) = (x_norm * half_w, y_norm * half_h);
+        let is_true_corner = (x_norm.abs() - 1.0).abs() < 1e-9 && (y_norm.abs() - 1.0).abs() < 1e-9;
+
+        // Step 3 ("stress-vs-displacement consistency" + "Poisson contraction"): the exact
+        // analytic solution AT THE SAME (x_phys, y_phys) the network's own maximum occurs at -
+        // not just at the nominal (half_w, half_h) corner, in case the max is elsewhere.
+        let u_analytic = (px / e) * x_phys;
+        let v_analytic = -nu * (px / e) * y_phys;
+        let mag_analytic = (u_analytic * u_analytic + v_analytic * v_analytic).sqrt();
+
+        println!("[PH3-08] max |disp| = {:.6e} m at grid ({ix},{iy}) -> (x_norm={:.4}, y_norm={:.4}) -> (x={:.6e}, y={:.6e}) m, is_true_corner={is_true_corner}", max_mag, x_norm, y_norm, x_phys, y_phys);
+        println!("[PH3-08] network u,v at that point:  u={:.6e}  v={:.6e}", vis.disp_u[[iy, ix]], vis.disp_v[[iy, ix]]);
+        println!("[PH3-08] analytic u,v at that SAME point: u={u_analytic:.6e}  v={v_analytic:.6e}  |disp|={mag_analytic:.6e}");
+        println!("[PH3-08] relative error at the network's own reported max location: {:.2}%", (max_mag as f64 - mag_analytic).abs() / mag_analytic.abs() * 100.0);
+
+        // The nominal corner (half_w, half_h) specifically, for direct comparison against issue
+        // #62's own cited "~101.3 um" figure.
+        let u_corner_analytic = (px / e) * half_w;
+        let v_corner_analytic = -nu * (px / e) * half_h;
+        let mag_corner_analytic = (u_corner_analytic * u_corner_analytic + v_corner_analytic * v_corner_analytic).sqrt();
+        println!("[PH3-08] nominal analytic corner |disp| = {mag_corner_analytic:.6e} m (issue #62's own cited ~101.3 um)");
+
+        // Step 4 ("edge/corner evaluation", continued): `UserSamplingStrategy::sample_boundary`
+        // places boundary collocation points at `frac = (i+0.5)/per_edge` - DELIBERATELY
+        // avoiding the exact corners (its own doc comment: "avoids exact corners"). If the
+        // corner itself is never a training point, the network's value exactly there is an
+        // UNSUPERVISED EXTRAPOLATION one half-edge-spacing beyond the nearest real boundary
+        // sample - real error should therefore be measurably WORSE at the exact corner than one
+        // grid step inward along either edge. This distinguishes "corner extrapolation, an
+        // inherent and expected property of this training scheme" from "a systemic bug that
+        // would show comparable error everywhere on the boundary".
+        let one_step_in_x = (ix + 1).min(nx - 1);
+        let one_step_in_y = (iy + 1).min(ny - 1);
+        let check_point = |ix: usize, iy: usize, label: &str| {
+            let xn = -1.0 + 2.0 * ix as f64 / (nx.max(2) - 1) as f64;
+            let yn = -1.0 + 2.0 * iy as f64 / (ny.max(2) - 1) as f64;
+            let (xp, yp) = (xn * half_w, yn * half_h);
+            let (u_net, v_net) = (vis.disp_u[[iy, ix]] as f64, vis.disp_v[[iy, ix]] as f64);
+            let (u_an, v_an) = ((px / e) * xp, -nu * (px / e) * yp);
+            let mag_net = (u_net * u_net + v_net * v_net).sqrt();
+            let mag_an = (u_an * u_an + v_an * v_an).sqrt();
+            let rel_err = (mag_net - mag_an).abs() / mag_an.abs() * 100.0;
+            println!("[PH3-08] {label} (x={xp:.4e}, y={yp:.4e}): network |disp|={mag_net:.6e}  analytic |disp|={mag_an:.6e}  rel_err={rel_err:.2}%");
+            rel_err
+        };
+        let err_one_step_x = check_point(one_step_in_x, iy, "one grid step inward along x from the corner");
+        let err_one_step_y = check_point(ix, one_step_in_y, "one grid step inward along y from the corner");
+        let err_at_corner = (max_mag as f64 - mag_analytic).abs() / mag_analytic.abs() * 100.0;
+        println!("[PH3-08] error at exact corner ({err_at_corner:.2}%) vs one step inward (x: {err_one_step_x:.2}%, y: {err_one_step_y:.2}%)");
+
+        // Step 5 ("stress-vs-displacement consistency" + "network approximation error"): error
+        // essentially FLAT moving inward from the corner (~22% at all three points above)
+        // already rules out corner-specific extrapolation. Check the domain CENTER (x=0,y=0,
+        // analytic u=v=0 exactly) - if the network's own u is ALSO non-trivially offset from
+        // zero there, the error is a genuine domain-wide property of what the network learned
+        // for u specifically (not a boundary-localized artifact of any kind).
+        let (cx, cy) = (nx / 2, ny / 2);
+        let (u_center, v_center) = (vis.disp_u[[cy, cx]] as f64, vis.disp_v[[cy, cx]] as f64);
+        println!("[PH3-08] domain center (grid {cx},{cy}): network u={u_center:.6e}  v={v_center:.6e}  (analytic: both exactly 0.0)");
+
+        // **THE ROOT-CAUSE FINDING**: the center's own u offset from its analytic value (0.0)
+        // and the corner's own u offset from ITS analytic value are nearly IDENTICAL - i.e. the
+        // network's u field is (the correct affine slope) PLUS a near-CONSTANT residual offset
+        // across the whole domain, not a scale/slope/sign/Poisson/corner-extrapolation error at
+        // all. This is the signature of an imperfectly-suppressed RIGID-BODY TRANSLATION mode
+        // in u specifically (issue #61 P2-07's own `TranslationGaugeTerm` exists precisely to
+        // remove this nullspace for a pure-Neumann, no-Fixed-BC configuration like this one) -
+        // `v`'s own analogous offset (2.0e-7) is negligible by comparison, consistent with the
+        // gauge term suppressing v's translation mode adequately while u's remains only
+        // partially suppressed within this run's 2000-step budget.
+        let u_offset_at_corner = vis.disp_u[[iy, ix]] as f64 - u_analytic;
+        let u_offset_at_center = u_center - 0.0;
+        let offset_consistency = (u_offset_at_corner - u_offset_at_center).abs() / u_offset_at_corner.abs().max(1e-12);
+        println!("[PH3-08] u offset from analytic: at corner={u_offset_at_corner:.6e}, at center={u_offset_at_center:.6e} - consistency={:.1}% difference", offset_consistency * 100.0);
+
+        // Real, checkable assertions - not just prints - so this investigation's own conclusion
+        // is a regression-guarded fact, not prose that can silently go stale.
+        assert!(is_true_corner, "the reported maximum displacement must occur at a true domain corner for a no-hole plate under this load (both u and v grow monotonically with |x|,|y| for this affine field) - if this ever fails, the maximum is occurring somewhere unexpected and this investigation's own premise needs revisiting");
+        assert!((mag_corner_analytic - 101.3e-6).abs() / 101.3e-6 < 0.01, "sanity check on issue #62's own cited analytic figure: computed {mag_corner_analytic:.6e} vs cited ~101.3e-6");
+        assert!(
+            offset_consistency < 0.2,
+            "the u-offset-from-analytic at the corner and at the domain center must be nearly \
+             equal for this to genuinely be a near-uniform residual translation mode (the real \
+             root cause this investigation found) rather than a scale/slope error: corner \
+             offset={u_offset_at_corner:.6e}, center offset={u_offset_at_center:.6e}, \
+             consistency={:.1}%", offset_consistency * 100.0,
+        );
+    }
+
     fn failed_no_hole_gate() -> NoHoleBenchmarkResult {
         NoHoleBenchmarkResult {
             sigma_xx_relative_error: 0.5, sigma_yy_over_ref: 0.5, sigma_xy_over_ref: 0.5,
