@@ -252,6 +252,18 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
             );
             let sc = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
             println!("  [diag] hole {i}: max_von_mises={:.4e} Pa  nominal={:.4e} Pa  Kt={:.4}", sc.max_von_mises, sc.nominal_stress, sc.kt);
+
+            // Issue #61 EPIC P2-10: angular/radial convergence support - is this Kt value
+            // actually converged, or still drifting with resolution/margin?
+            let convergence = crate::user_problem::kt_convergence_check(
+                &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material,
+                hole_margin, nominal_stress, 0.1, &device,
+            );
+            if convergence.converged {
+                println!("  [diag] hole {i}: Kt convergence OK (angular Δ={:.3}, radial Δ={:.3})", convergence.angular_relative_change, convergence.radial_relative_change);
+            } else {
+                println!("  [!] hole {i}: Kt NOT converged (angular Δ={:.3}, radial Δ={:.3}) - Kt value may not be trustworthy yet", convergence.angular_relative_change, convergence.radial_relative_change);
+            }
         }
 
         // Issue #61 EPIC P2-08: L4 no-hole neural training health gate. Only meaningful for a

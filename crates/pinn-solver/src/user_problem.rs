@@ -1431,12 +1431,142 @@ pub fn probe_hole_boundary_profile_derived(
 /// field, so a real discrepancy from 3.0 is expected, not itself evidence of a bug (see this
 /// epic's own explicit instruction: "Do not hard-code Kt = 3 as a required answer").
 pub fn stress_concentration_from_profile(profile: &[HoleBoundaryPoint], nominal_stress: f64) -> pinn_core::messages::StressConcentration {
+    stress_concentration_from_profile_generic(profile, nominal_stress, StressProjection::VonMises, ReductionOp::Max)
+}
+
+/// Issue #61 EPIC P2-10: which scalar field the Kt reduction operates on - a real, declared,
+/// swappable "projection" stage (issue #61 §3's own pipeline: "authoritative stress ->
+/// projection -> boundary selection -> boundary-limit eval -> reduction -> reference
+/// normalization"), instead of von Mises being implicitly hardcoded inside the reduction step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StressProjection {
+    VonMises,
+    /// Hoop (tangential) stress at the hole boundary - the classical Kirsch-problem Kt
+    /// definition for uniaxial far-field tension. Computed by projecting `(sxx, syy, sxy)`
+    /// onto the local tangential direction `(-sin(theta), cos(theta))` implied by each point's
+    /// own `theta_deg`: `sigma_tt = sxx*sin^2(theta) - 2*sxy*sin(theta)*cos(theta) +
+    /// syy*cos^2(theta)`.
+    HoopStress,
+}
+
+impl StressProjection {
+    pub fn project(self, p: &HoleBoundaryPoint) -> f64 {
+        match self {
+            StressProjection::VonMises => p.von_mises as f64,
+            StressProjection::HoopStress => {
+                let theta = p.theta_deg.to_radians();
+                let (s, c) = (theta.sin(), theta.cos());
+                (p.sxx as f64) * s * s - 2.0 * (p.sxy as f64) * s * c + (p.syy as f64) * c * c
+            }
+        }
+    }
+}
+
+/// Issue #61 EPIC P2-10's own "reduction" stage - a real, declared, swappable scalar reduction
+/// over the projected per-point values, instead of `max` being implicitly hardcoded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReductionOp {
+    Max,
+    Mean,
+    /// `p` in `[0, 100]` (e.g. `Percentile(95.0)` for the 95th percentile) - a robust
+    /// alternative to `Max` when a single outlier point shouldn't dominate the QoI.
+    Percentile(f64),
+}
+
+impl ReductionOp {
+    pub fn reduce(self, values: &[f64]) -> f64 {
+        if values.is_empty() {
+            return f64::NAN;
+        }
+        match self {
+            ReductionOp::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            ReductionOp::Mean => values.iter().sum::<f64>() / values.len() as f64,
+            ReductionOp::Percentile(p) => {
+                let mut sorted = values.to_vec();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let idx = ((p / 100.0) * (sorted.len() - 1) as f64).round().clamp(0.0, (sorted.len() - 1) as f64) as usize;
+                sorted[idx]
+            }
+        }
+    }
+}
+
+/// Generalized form of [`stress_concentration_from_profile`]: `projection`/`reduction` are
+/// real, caller-selectable stages, matching issue #61 §3's own architecture pipeline instead of
+/// hardcoding `max(von_mises)`. `stress_concentration_from_profile` itself is a thin default
+/// wrapper (`VonMises`/`Max`) preserved for every existing caller - byte-identical behavior,
+/// zero migration needed for code that doesn't care about this generalization.
+pub fn stress_concentration_from_profile_generic(
+    profile: &[HoleBoundaryPoint],
+    nominal_stress: f64,
+    projection: StressProjection,
+    reduction: ReductionOp,
+) -> pinn_core::messages::StressConcentration {
     use pinn_core::messages::StressConcentration;
-    let (max_theta_deg, max_von_mises) = profile.iter()
-        .map(|p| (p.theta_deg, p.von_mises as f64))
-        .fold((0.0, f64::NEG_INFINITY), |acc, x| if x.1 > acc.1 { x } else { acc });
-    let kt = if nominal_stress.abs() > 1e-300 { max_von_mises / nominal_stress.abs() } else { f64::NAN };
-    StressConcentration { nominal_stress, max_von_mises, max_theta_deg, kt }
+    let values: Vec<f64> = profile.iter().map(|p| projection.project(p)).collect();
+    let reduced = reduction.reduce(&values);
+    // Representative theta: the point whose OWN projected value is closest to the reduced
+    // value - exact for `Max` (the maximizing point itself), a genuine "nearest representative"
+    // for `Mean`/`Percentile`, which have no single defining point.
+    let max_theta_deg = profile.iter().zip(values.iter())
+        .min_by(|(_, a), (_, b)| (*a - reduced).abs().partial_cmp(&(*b - reduced).abs()).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(p, _)| p.theta_deg)
+        .unwrap_or(0.0);
+    let kt = if nominal_stress.abs() > 1e-300 { reduced / nominal_stress.abs() } else { f64::NAN };
+    StressConcentration { nominal_stress, max_von_mises: reduced, max_theta_deg, kt }
+}
+
+/// Issue #61 EPIC P2-10's own "angular/radial convergence support" - runs the SAME Kt QoI
+/// pipeline at a coarser and a finer angular resolution (same radial margin), and at the
+/// coarse resolution with a LARGER radial margin (1.5x - never smaller, so this never risks
+/// crossing into `valid_stencil`-unsafe territory near the hole boundary), reporting whether
+/// Kt is actually converging rather than drifting. Directly answers issue #61 §3's own concern
+/// (echoed for domain integrals in P2-11): a single point-count/margin choice proves nothing
+/// about convergence on its own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KtConvergenceReport {
+    pub kt_coarse: f64,
+    pub kt_fine_angular: f64,
+    pub kt_coarse_margin_1_5x: f64,
+    pub angular_relative_change: f64,
+    pub radial_relative_change: f64,
+    pub converged: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn kt_convergence_check(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    geometry: &UserGeometry,
+    hole: &HoleSpec,
+    n_theta_coarse: usize,
+    fd: &crate::fd_stencil::FdConfig,
+    u_ref: f32,
+    px_pa: f64,
+    material: &MaterialProps,
+    margin_coarse: f64,
+    nominal_stress: f64,
+    tolerance: f64,
+    device: &crate::training_core::BDevice,
+) -> KtConvergenceReport {
+    let kt_of = |n_theta: usize, margin: f64| -> f64 {
+        let profile = probe_hole_boundary_profile_derived(model, geometry, hole, n_theta, fd, u_ref, px_pa, material, margin, device);
+        stress_concentration_from_profile(&profile, nominal_stress).kt
+    };
+
+    let kt_coarse = kt_of(n_theta_coarse, margin_coarse);
+    let kt_fine_angular = kt_of(n_theta_coarse * 2, margin_coarse);
+    let kt_coarse_margin_1_5x = kt_of(n_theta_coarse, margin_coarse * 1.5);
+
+    let rel = |a: f64, b: f64| if b.abs() > 1e-30 { (a - b).abs() / b.abs() } else { (a - b).abs() };
+    let angular_relative_change = rel(kt_fine_angular, kt_coarse);
+    let radial_relative_change = rel(kt_coarse_margin_1_5x, kt_coarse);
+    let converged = angular_relative_change.is_finite() && radial_relative_change.is_finite()
+        && angular_relative_change < tolerance && radial_relative_change < tolerance;
+
+    KtConvergenceReport {
+        kt_coarse, kt_fine_angular, kt_coarse_margin_1_5x,
+        angular_relative_change, radial_relative_change, converged,
+    }
 }
 
 #[cfg(test)]
@@ -2168,6 +2298,80 @@ mod tests {
         };
         let sc = stress_concentration_from_profile(&[mk(4.7)], 1.0);
         assert!((sc.kt - 4.7).abs() < 1e-6, "Kt must be reported honestly, not coerced toward 3.0");
+    }
+
+    // ─── Issue #61 EPIC P2-10: generic QoI/Kt architecture ─────────────────────────────────
+
+    #[test]
+    fn hoop_stress_projection_matches_hand_computed_values_at_cardinal_angles() {
+        let mk = |theta_deg: f64, sxx: f32, syy: f32, sxy: f32| HoleBoundaryPoint {
+            theta_deg, x: 0.0, y: 0.0, ux: 0.0, uy: 0.0,
+            eps_xx: 0.0, eps_yy: 0.0, eps_xy: 0.0, sxx, syy, sxy, von_mises: 0.0,
+        };
+        // theta=0: tangent=(0,1) - sigma_tt = syy exactly.
+        let p0 = mk(0.0, 10.0, 20.0, 5.0);
+        assert!((StressProjection::HoopStress.project(&p0) - 20.0).abs() < 1e-6);
+        // theta=90: tangent=(-1,0) - sigma_tt = sxx exactly.
+        let p90 = mk(90.0, 10.0, 20.0, 5.0);
+        assert!((StressProjection::HoopStress.project(&p90) - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reduction_op_matches_hand_computed_values() {
+        let values = vec![1.0, 5.0, 3.0, 9.0, 2.0];
+        assert_eq!(ReductionOp::Max.reduce(&values), 9.0);
+        assert!((ReductionOp::Mean.reduce(&values) - 4.0).abs() < 1e-9);
+        // Sorted: [1,2,3,5,9] - 50th percentile (median) is index round(0.5*4)=2 -> 3.0.
+        assert_eq!(ReductionOp::Percentile(50.0).reduce(&values), 3.0);
+        // 100th percentile is the max.
+        assert_eq!(ReductionOp::Percentile(100.0).reduce(&values), 9.0);
+        assert!(ReductionOp::Max.reduce(&[]).is_nan());
+    }
+
+    #[test]
+    fn stress_concentration_from_profile_generic_defaults_match_the_von_mises_max_wrapper() {
+        let mk = |theta_deg: f64, von_mises: f32| HoleBoundaryPoint {
+            theta_deg, x: 0.0, y: 0.0, ux: 0.0, uy: 0.0,
+            eps_xx: 0.0, eps_yy: 0.0, eps_xy: 0.0, sxx: 0.0, syy: 0.0, sxy: 0.0, von_mises,
+        };
+        let profile = vec![mk(0.0, 1.0), mk(90.0, 3.0), mk(180.0, 2.0)];
+        let default_sc = stress_concentration_from_profile(&profile, 1.0);
+        let generic_sc = stress_concentration_from_profile_generic(&profile, 1.0, StressProjection::VonMises, ReductionOp::Max);
+        assert_eq!(default_sc.max_theta_deg, generic_sc.max_theta_deg);
+        assert_eq!(default_sc.max_von_mises, generic_sc.max_von_mises);
+        assert_eq!(default_sc.kt, generic_sc.kt);
+        assert_eq!(default_sc.nominal_stress, generic_sc.nominal_stress);
+    }
+
+    #[test]
+    fn stress_concentration_from_profile_generic_with_mean_reduction_differs_from_max() {
+        let mk = |theta_deg: f64, von_mises: f32| HoleBoundaryPoint {
+            theta_deg, x: 0.0, y: 0.0, ux: 0.0, uy: 0.0,
+            eps_xx: 0.0, eps_yy: 0.0, eps_xy: 0.0, sxx: 0.0, syy: 0.0, sxy: 0.0, von_mises,
+        };
+        let profile = vec![mk(0.0, 1.0), mk(90.0, 3.0), mk(180.0, 2.0)];
+        let sc_mean = stress_concentration_from_profile_generic(&profile, 1.0, StressProjection::VonMises, ReductionOp::Mean);
+        assert!((sc_mean.max_von_mises - 2.0).abs() < 1e-9, "mean of [1,3,2] = 2.0");
+        assert!((sc_mean.kt - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kt_convergence_check_runs_end_to_end_and_returns_finite_values() {
+        let device = crate::training_core::BDevice::default();
+        let geometry = two_hole_geometry();
+        let model = tiny_model(geometry.n_fourier());
+        let fd = crate::fd_stencil::FdConfig::new(TEST_FD_H, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+        let material = MaterialProps::al7075_t6();
+        let hole = geometry.holes[0];
+        let margin = ring_anchor_margin_m(TEST_FD_H, &geometry);
+        let report = kt_convergence_check(
+            &model, &geometry, &hole, 32, &fd, 1.0, 1e7, &material, margin, 1e7, 0.5, &device,
+        );
+        assert!(report.kt_coarse.is_finite(), "{report:?}");
+        assert!(report.kt_fine_angular.is_finite(), "{report:?}");
+        assert!(report.kt_coarse_margin_1_5x.is_finite(), "{report:?}");
+        assert!(report.angular_relative_change.is_finite(), "{report:?}");
+        assert!(report.radial_relative_change.is_finite(), "{report:?}");
     }
 
     // ─── Phase 14 (Neural-Network-Wide Adaptive Collocation epic): spatial diagnostic fields ──
