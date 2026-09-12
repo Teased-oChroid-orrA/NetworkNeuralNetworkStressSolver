@@ -147,6 +147,22 @@ pub struct AdFdStrainAgreementSummary {
     pub eps_xy_rms_relative_diff: f64,
 }
 
+/// Issue #62 PH3-10 — transport-side mirror of `pinn_solver::verification_ladder::
+/// RunConvergenceEvidence` (plain strings for the enum fields, same "pinn-core never depends
+/// on pinn-solver" rule `stress_source_report`/every other `*_report` field already
+/// established). Answers the plan's own explicit demand: "A run SHALL NOT be declared
+/// converged merely because step == max_steps" — this is the real, multi-signal (loss/
+/// gradient-norm/boundary-residual trend) verdict computed from the run's OWN collected
+/// history, sent once, at the final update before `Done`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConvergenceEvidenceSummary {
+    pub n_samples: usize,
+    pub loss_trend: &'static str,
+    pub grad_norm_trend: &'static str,
+    pub bc_residual_trend: &'static str,
+    pub plausibly_converged: bool,
+}
+
 /// Stage I ("live network-evolution visualization", the user's own explicit follow-up ask) —
 /// a per-layer snapshot of `pinn_solver::network::ElasticityNet`'s weight tensors, read at the
 /// same vis cadence `VisFields` already uses (never inside the per-step hot loop — see
@@ -522,6 +538,11 @@ pub struct TrainingUpdate {
     /// Kirsch/pin-lug's non-identity ansatzes, where AD would also need to differentiate
     /// through the ansatz's own `eval` function, which is not a tensor operation today).
     pub ad_fd_strain_diagnostic: Option<AdFdStrainAgreementSummary>,
+    /// Issue #62 PH3-10 — see `ConvergenceEvidenceSummary`'s doc comment. `Some` only on the
+    /// FINAL update of a run (the same tick `step + 1 == spec.training.max_steps` fires on) —
+    /// this is a whole-run verdict, not a per-tick one, so it has nothing meaningful to report
+    /// before the run's history has actually been collected.
+    pub convergence_evidence: Option<ConvergenceEvidenceSummary>,
 }
 
 /// Pin-in-lug analogue of `TrainingUpdate` — one entry per domain's visualization fields,

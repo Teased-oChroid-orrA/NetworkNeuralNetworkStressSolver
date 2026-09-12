@@ -225,6 +225,94 @@ pub fn evaluate_no_hole_operational_gate(
     OperationalGateResult { status, failed_rung, l0_passed: l0.passed, l4_passed: l4.passed }
 }
 
+/// Issue #62 PH3-10: convergence evidence beyond `step == max_steps`.
+///
+/// Plan text (verbatim): "The current run reached: 1999 / 2000 steps, final gradient norm ~
+/// 0.484. This does not by itself prove optimization convergence... A run SHALL NOT be
+/// declared converged merely because step == max_steps or because a loss plateau detector
+/// stopped it." This module is the machine-readable answer: given the real per-tick trend of
+/// three independent signals collected over a run (loss, gradient norm, boundary-condition
+/// residual - the same `bc_residual_rms` already computed at the vis cadence), classify each
+/// signal's own trajectory and combine them into one verdict, instead of relying on step count
+/// alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrendDirection {
+    /// Second half of the series meaningfully better than the first half.
+    Improving,
+    /// No meaningful change between halves (within `TREND_RELATIVE_THRESHOLD`).
+    Plateaued,
+    /// Second half meaningfully WORSE than the first half - the exact signature PH3-08's own
+    /// investigation would have caught immediately had this existed at the time.
+    Worsening,
+    /// Fewer than `MIN_TREND_SAMPLES` points were collected - too little evidence to classify
+    /// either way. Distinct from `Plateaued` (which is a real, evidenced verdict) so a caller
+    /// can never mistake "we didn't look" for "we looked and it's flat".
+    InsufficientData,
+}
+
+/// Below this many samples, `classify_trend` refuses to guess - see `TrendDirection::
+/// InsufficientData`.
+const MIN_TREND_SAMPLES: usize = 4;
+
+/// Relative change between the first-half and second-half mean needed to call a real trend
+/// rather than noise. 5% is a deliberately loose bar - this is a coarse, always-available
+/// convergence SIGNAL, not a precision statistical test.
+const TREND_RELATIVE_THRESHOLD: f64 = 0.05;
+
+/// Classifies a real time series (in collection order - NOT sorted) by comparing the mean of
+/// its first half against its second half. `lower_is_better` is `true` for loss/gradient-norm/
+/// residual-style metrics (smaller = better) and `false` for a metric where growth is the good
+/// direction.
+pub fn classify_trend(values: &[f64], lower_is_better: bool) -> TrendDirection {
+    if values.len() < MIN_TREND_SAMPLES {
+        return TrendDirection::InsufficientData;
+    }
+    let half = values.len() / 2;
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let first_half_mean = mean(&values[..half]);
+    let second_half_mean = mean(&values[half..]);
+    let denom = first_half_mean.abs().max(1e-300);
+    let relative_change = (second_half_mean - first_half_mean) / denom;
+    let improved = if lower_is_better { relative_change < -TREND_RELATIVE_THRESHOLD }
+                    else { relative_change > TREND_RELATIVE_THRESHOLD };
+    let worsened = if lower_is_better { relative_change > TREND_RELATIVE_THRESHOLD }
+                   else { relative_change < -TREND_RELATIVE_THRESHOLD };
+    if improved { TrendDirection::Improving }
+    else if worsened { TrendDirection::Worsening }
+    else { TrendDirection::Plateaued }
+}
+
+/// The combined, multi-signal convergence verdict for one run - PH3-10's own deliverable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunConvergenceEvidence {
+    pub n_samples: usize,
+    pub loss_trend: TrendDirection,
+    pub grad_norm_trend: TrendDirection,
+    pub bc_residual_trend: TrendDirection,
+    /// `true` iff NEITHER `loss_trend` NOR `bc_residual_trend` is `Worsening` - the two
+    /// signals that directly reflect physical solution quality. `grad_norm_trend` is
+    /// deliberately excluded from this gate: gradient norm can legitimately oscillate/rise
+    /// near a saddle or during a SAW-BRDR reweighting event without the solution itself
+    /// getting worse (see PH3-08/PH3-09's own real evidence of exactly this kind of
+    /// non-monotonic-loss-but-improving-benchmark behavior), so treating it as a hard veto
+    /// would produce false negatives on runs this project has already proven are fine.
+    pub plausibly_converged: bool,
+}
+
+/// Combines three real per-tick series (loss, gradient norm, BC residual RMS - all "lower is
+/// better") into one `RunConvergenceEvidence`. This is what a caller runs INSTEAD of trusting
+/// `step == max_steps` alone.
+pub fn assess_convergence(loss: &[f64], grad_norm: &[f64], bc_residual: &[f64]) -> RunConvergenceEvidence {
+    let loss_trend = classify_trend(loss, true);
+    let grad_norm_trend = classify_trend(grad_norm, true);
+    let bc_residual_trend = classify_trend(bc_residual, true);
+    let plausibly_converged = loss_trend != TrendDirection::Worsening && bc_residual_trend != TrendDirection::Worsening;
+    RunConvergenceEvidence {
+        n_samples: loss.len().min(grad_norm.len()).min(bc_residual.len()),
+        loss_trend, grad_norm_trend, bc_residual_trend, plausibly_converged,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +411,65 @@ mod tests {
         assert_eq!(g.status, OperationalStatus::Fail);
         assert_eq!(g.failed_rung, Some("L4"));
         assert!(g.l0_passed && !g.l4_passed);
+    }
+
+    #[test]
+    fn classify_trend_reports_insufficient_data_below_the_minimum_sample_count() {
+        assert_eq!(classify_trend(&[1.0, 0.5, 0.1], true), TrendDirection::InsufficientData);
+        assert_eq!(classify_trend(&[], true), TrendDirection::InsufficientData);
+    }
+
+    #[test]
+    fn classify_trend_detects_improving_when_lower_is_better_and_values_drop() {
+        assert_eq!(classify_trend(&[1.0, 1.0, 0.1, 0.1], true), TrendDirection::Improving);
+    }
+
+    #[test]
+    fn classify_trend_detects_worsening_when_lower_is_better_and_values_rise() {
+        assert_eq!(classify_trend(&[0.1, 0.1, 1.0, 1.0], true), TrendDirection::Worsening);
+    }
+
+    #[test]
+    fn classify_trend_reports_plateaued_when_the_two_halves_are_nearly_equal() {
+        assert_eq!(classify_trend(&[1.0, 1.01, 0.99, 1.0], true), TrendDirection::Plateaued);
+    }
+
+    #[test]
+    fn classify_trend_direction_flips_correctly_when_higher_is_better() {
+        assert_eq!(classify_trend(&[0.1, 0.1, 1.0, 1.0], false), TrendDirection::Improving);
+        assert_eq!(classify_trend(&[1.0, 1.0, 0.1, 0.1], false), TrendDirection::Worsening);
+    }
+
+    #[test]
+    fn assess_convergence_is_plausibly_converged_when_loss_and_bc_residual_both_improve_even_if_grad_norm_is_noisy() {
+        // Real PH3-08/PH3-09 evidence shape: loss/BC residual genuinely improve while gradient
+        // norm itself doesn't monotonically fall - `plausibly_converged` must not be vetoed by
+        // grad_norm alone (see `RunConvergenceEvidence::plausibly_converged`'s own doc comment).
+        let loss = vec![1.0, 0.8, 0.3, 0.2];
+        let grad_norm = vec![0.5, 0.9, 0.4, 0.8]; // noisy, no clean trend either way
+        let bc_residual = vec![0.02, 0.018, 0.008, 0.007];
+        let evidence = assess_convergence(&loss, &grad_norm, &bc_residual);
+        assert_eq!(evidence.loss_trend, TrendDirection::Improving);
+        assert_eq!(evidence.bc_residual_trend, TrendDirection::Improving);
+        assert!(evidence.plausibly_converged, "{evidence:?}");
+    }
+
+    #[test]
+    fn assess_convergence_is_not_plausibly_converged_when_bc_residual_worsens_even_though_loss_improves() {
+        // The exact failure mode PH3-10's own plan text warns against: a run that merely
+        // reached `step == max_steps` with a falling loss can still be physically diverging at
+        // the boundary - this must be caught, not hidden behind a falling loss curve.
+        let loss = vec![1.0, 0.8, 0.5, 0.3];
+        let grad_norm = vec![0.5, 0.4, 0.3, 0.2];
+        let bc_residual = vec![0.01, 0.012, 0.05, 0.09];
+        let evidence = assess_convergence(&loss, &grad_norm, &bc_residual);
+        assert_eq!(evidence.bc_residual_trend, TrendDirection::Worsening);
+        assert!(!evidence.plausibly_converged, "{evidence:?}");
+    }
+
+    #[test]
+    fn assess_convergence_reports_the_true_min_sample_count_across_uneven_length_series() {
+        let evidence = assess_convergence(&[1.0, 1.0, 1.0, 1.0, 1.0], &[1.0, 1.0, 1.0, 1.0], &[1.0, 1.0, 1.0]);
+        assert_eq!(evidence.n_samples, 3);
     }
 }

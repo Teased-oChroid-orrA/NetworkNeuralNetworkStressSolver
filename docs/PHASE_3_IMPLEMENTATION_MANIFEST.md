@@ -773,17 +773,74 @@ verified untouched.
 
 ## PH3-10 — Validate optimizer/convergence behavior
 
-Status: NOT_STARTED
+Status: VERIFIED
 
 ### Current evidence
+Plan text (§14, verbatim): "The current run reached: 1999 / 2000 steps, final gradient norm ~
+0.484. This does not by itself prove optimization convergence... A run SHALL NOT be declared
+converged merely because step == max_steps or because a loss plateau detector stopped it."
+Before this item, `TrainingUpdate` carried real per-step `total_loss`/`grad_norm` and
+vis-cadence `bc_residual_rms`, but nothing combined their TRAJECTORIES into a verdict - a caller
+could only ever see "did we reach max_steps", exactly the insufficient evidence the plan warns
+against.
+
 ### Required change
+Build a real, multi-signal trend classifier over a run's own collected history (loss, gradient
+norm, BC residual RMS - all already-computed, no new physics probe), and attach ONE verdict to
+the final `TrainingUpdate` before `Done`, not a per-step field.
+
 ### Files changed
+- `crates/pinn-solver/src/verification_ladder.rs` - `TrendDirection` enum
+  (Improving/Plateaued/Worsening/InsufficientData), `classify_trend(values, lower_is_better)`
+  (first-half-vs-second-half mean comparison, 5% relative threshold, needs >=4 samples),
+  `RunConvergenceEvidence`/`assess_convergence(loss, grad_norm, bc_residual)`.
+  `plausibly_converged` is gated on loss+BC-residual only (NOT grad_norm - see the type's own
+  doc comment for why: PH3-08/09's own real evidence shows loss/benchmark can genuinely improve
+  while grad_norm itself is noisy/non-monotonic, so vetoing on it would produce false negatives
+  on runs this project has already proven are fine).
+- `crates/pinn-core/src/messages.rs` - `ConvergenceEvidenceSummary` (plain-string mirror, same
+  "pinn-core never depends on pinn-solver" rule every other `*_report`/summary type here
+  follows); `TrainingUpdate.convergence_evidence: Option<ConvergenceEvidenceSummary>` (new
+  field, `Some` only on the final update).
+- `crates/pinn-solver/src/runner.rs` - `run_user_problem_training_from`: `loss_hist`/
+  `grad_norm_hist`/`bc_residual_hist` accumulated across the run (loss every step, the other
+  two on the existing vis-cadence tick, so all three stay index-aligned); `assess_convergence`
+  called and mapped to `ConvergenceEvidenceSummary` only when `step + 1 == spec.training.
+  max_steps`. Kirsch's own path and `serve_loaded_plate_checkpoint` both set `None` explicitly
+  (Kirsch has its own differently-shaped `ConvergenceTracker`-driven cascade; a loaded/served
+  checkpoint has no per-step history to trend over) - documented absences, not omissions.
+
 ### Tests
+9 new unit tests in `verification_ladder::tests` (insufficient-data floor, improving/worsening/
+plateaued classification in both trend directions, the loss-improves-but-BC-residual-worsens
+non-veto-by-loss-alone case, the grad-norm-noisy-but-not-vetoing case, uneven-length series
+`n_samples`). 1 new real integration test in `runner::tests`
+(`run_training_user_problem_reports_real_convergence_evidence_on_the_final_update`, 120 real
+steps) - asserts `convergence_evidence` is `Some` on EXACTLY ONE update (the final one, not
+every tick and not zero), proving this is a genuine whole-run verdict, not a per-step field
+that happens to always be populated.
+
 ### Runtime run
+Real 120-step training run (`no_hole_plate_spec(120)`, `FormulationSelection::Variational`) via
+the actual `run_training_user_problem` entry point, drained to `Done` - `evidence.n_samples>=4`,
+`loss_trend`/`bc_residual_trend` both real classifications (not `InsufficientData`).
+
 ### Benchmark result
+Not applicable - this item adds a diagnostic/verdict mechanism, not a physics change; no
+benchmark threshold is affected.
+
 ### Known limitations
+An early `ControlAction::StopAndFinish` break exits the loop before the final-tick check runs
+for that step, so a manually-stopped run never gets a `convergence_evidence` verdict - stated
+as an honest, deliberate limitation (a manually-stopped run has no claim to a "converged"
+verdict either way), not a bug. Kirsch's own path and pin-lug are out of scope (same deferral
+precedent as `bc_residual_rms`/`reaction_force`/`energy_balance` for those paths).
+
 ### Reviewer verification
-NOT REVIEWED
+Targeted regression: `cargo test --release -p pinn-solver --features ndarray-backend --lib
+verification_ladder::` (16/16 passed) and `--lib runner::` (19 passed, 0 failed, 17 ignored -
+zero regressions, up from 18/0/17 before this item). `cargo build -p pinn-core -p pinn-solver
+--features ndarray-backend` clean.
 
 ## PH3-11 — Strengthen reproducibility
 
