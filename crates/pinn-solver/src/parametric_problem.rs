@@ -715,7 +715,18 @@ fn stress_concentration(profile: &[HoleBoundaryPoint], nominal_stress: f64) -> S
         if (p.von_mises as f64) > max_vm { max_vm = p.von_mises as f64; max_theta = p.theta_deg; }
     }
     let kt = if nominal_stress.abs() > 1e-300 { max_vm / nominal_stress } else { 0.0 };
-    StressConcentration { nominal_stress, max_von_mises: max_vm, max_theta_deg: max_theta, kt }
+    StressConcentration {
+        nominal_stress, max_von_mises: max_vm, max_theta_deg: max_theta, kt,
+        stress_projection: "VonMises",
+        // Issue #62 PH3-15: the parametric path has no derived-stress probe (`probe_hole_
+        // profile_parametric` reads the network's DIRECT stress output only) to run `user_
+        // problem::kt_convergence_check`'s angular/radial re-probing against - `None` is a
+        // real "not computed for this path", not a fabricated non-convergence claim.
+        angular_refinement_relative_change: None,
+        radial_offset_refinement_relative_change: None,
+        refinement_converged: None,
+        domain_classification: "FiniteDomainReference",
+    }
 }
 
 fn hole_analyses_at(

@@ -1654,7 +1654,22 @@ fn run_user_problem_training_from(
                         &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
                         &spec.material, hole_margin, &device,
                     );
-                    let concentration = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
+                    let mut concentration = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
+                    // Issue #62 PH3-15 ("Kt SHALL report... angular refinement, radial offset
+                    // refinement") - `kt_convergence_check` (P2-10, already built and tested)
+                    // re-probes at 2x angular resolution and 1.5x radial margin - a real extra
+                    // cost (2 additional `probe_hole_boundary_profile_derived` calls per hole),
+                    // accepted at this same vis-cadence-only cadence hole analysis already runs
+                    // at (never on the per-step hot path). 5% is a documented, fixed default
+                    // tolerance - purely informational (feeds `refinement_converged`, which
+                    // gates nothing), not a threshold tuned to force any particular outcome.
+                    let kt_convergence = crate::user_problem::kt_convergence_check(
+                        &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
+                        &spec.material, hole_margin, nominal_stress, 0.05, &device,
+                    );
+                    concentration.angular_refinement_relative_change = Some(kt_convergence.angular_relative_change);
+                    concentration.radial_offset_refinement_relative_change = Some(kt_convergence.radial_relative_change);
+                    concentration.refinement_converged = Some(kt_convergence.converged);
                     pinn_core::messages::HoleAnalysis { hole_index, profile, concentration }
                 })
                 .collect();
@@ -2008,7 +2023,18 @@ pub fn serve_loaded_plate_checkpoint(
             let profile = crate::user_problem::probe_hole_boundary_profile_derived(
                 &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material, hole_margin, &device,
             );
-            let concentration = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
+            let mut concentration = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
+            // Issue #62 PH3-15 - same real angular/radial refinement check as the live
+            // training path (see that call site's own comment) - a one-shot evaluation here
+            // (a loaded checkpoint, not a per-step/per-tick cost), so the extra probe calls
+            // are negligible.
+            let kt_convergence = crate::user_problem::kt_convergence_check(
+                &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material,
+                hole_margin, nominal_stress, 0.05, &device,
+            );
+            concentration.angular_refinement_relative_change = Some(kt_convergence.angular_relative_change);
+            concentration.radial_offset_refinement_relative_change = Some(kt_convergence.radial_relative_change);
+            concentration.refinement_converged = Some(kt_convergence.converged);
             pinn_core::messages::HoleAnalysis { hole_index, profile, concentration }
         }).collect();
     let (bc_residual_rms, bc_residual_max) = crate::user_problem::probe_boundary_residuals(&model, &spec, &device);
@@ -3959,6 +3985,88 @@ mod tests {
         let mut meta_path = path_ck.clone();
         meta_path.set_file_name(format!("{}.meta.json", path_ck.file_stem().unwrap().to_string_lossy()));
         let _ = std::fs::remove_file(meta_path);
+    }
+
+    /// Issue #62 PH3-15's own gate needs a real answer to "does measure-aware training = PASS"
+    /// independent of PH3-14's Variational-specific divergence finding - the only measure-
+    /// aware run on record before this test (PH3-05's `variational_no_hole_plate.toml`) also
+    /// used pure Variational, so a failure there couldn't distinguish "measure-aware training
+    /// is broken" from "pure Variational is broken". This test isolates the axis: SAME no-hole
+    /// baseline config/formulation PH3-09 already proved converges (`default_formulation()` -
+    /// Hybrid, matching PH3-01's own baseline) but with `measure_aware_training = true`, run
+    /// for PH3-09's own proven-sufficient step count (2800). `#[ignore]`d - real ~7 min run.
+    #[test]
+    #[ignore = "real ~2800-step training run - see this test's own doc comment"]
+    fn ph3_15_measure_aware_training_under_the_hybrid_formulation_tests_whether_it_passes_independent_of_variational() {
+        let mut spec = no_hole_plate_spec(2800);
+        spec.training.measure_aware_training = true;
+        assert_eq!(spec.formulation, pinn_core::problem_spec::default_formulation(), "must isolate the measure-aware axis alone - keep the SAME Hybrid formulation PH3-09 already proved converges, not Variational");
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, rx_ctrl));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        let mut saw_done = false;
+        let mut last_update: Option<Box<TrainingUpdate>> = None;
+        while std::time::Instant::now() < deadline && !saw_done {
+            match rx.try_recv() {
+                Ok(TrainingMsg::Update(u)) => last_update = Some(u),
+                Ok(TrainingMsg::Done) => saw_done = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+        let final_update = last_update.expect("must have received at least one Update");
+        tx_ctrl.send(ControlMsg::Stop).unwrap();
+        handle.join().unwrap();
+
+        println!("[PH3-15] measure-aware+Hybrid final step={} total_loss={:.6e}", final_update.step, final_update.total_loss);
+        println!("[PH3-15] benchmark: {:?}", final_update.no_hole_benchmark);
+        assert!(final_update.total_loss.is_finite());
+        // Real result at the time this test was written (2800 steps, matching PH3-09's own
+        // proven-sufficient budget for the LEGACY/non-measure-aware config): FAILS all 5 hard
+        // thresholds (`sigma_xx_relative_error=32.1%`, `traction_rms_over_ref=22.1%`, `load_
+        // transfer_ratio=1.137` vs `[0.99,1.01]`) - a clean, isolated finding that measure-
+        // aware training itself (not just PH3-14's Variational-specific divergence) fails to
+        // reach the same passing state the identical formulation reaches WITHOUT it. This
+        // assertion is intentionally NOT a hard `assert!` on the benchmark's own `passed` field
+        // (a future fix to measure-aware training SHOULD flip this without failing a test) -
+        // it's recorded here as a comment/manifest fact, not a code-enforced regression guard,
+        // since guarding "this must keep failing" would be exactly the wrong kind of test.
+    }
+
+    /// Issue #62 PH3-15: the hole/Kt activation gate, evaluated against this project's own
+    /// REAL, dated Phase 3 evidence - not a hypothetical example (see `verification_ladder::
+    /// evaluate_hole_activation_gate`'s own doc comment for the pure function this wraps).
+    /// Every input below cites the manifest entry that established it:
+    /// - `no_hole_benchmark_passed = true` - PH3-09 (`Debug_run/baseline_legacy_no_hole/`
+    ///   resumed to 2800 steps, `traction_rms_over_ref` dropped under 1%, full benchmark PASS).
+    /// - `variational_path_passed = false` - PH3-14 (16000-step run of the shipped Variational
+    ///   config DIVERGES past step ~7000, `sigma_xx_relative_error` reaching 539%).
+    /// - `measure_aware_path_passed = false` - PH3-15's own isolating test immediately above
+    ///   this one (measure-aware training under the SAME Hybrid formulation PH3-09 proved
+    ///   converges still FAILS all 5 thresholds at the same 2800-step budget).
+    /// - `authoritative_field_audit_passed = true` - PH3-07 (`field_graph::consumer_field_
+    ///   report`, a real, tested registry cross-validated against the Kt investigation's own
+    ///   written findings).
+    /// - `derivative_path_audit_passed = true` - PH3-06 (`differential_operator::ad_fd_strain_
+    ///   agreement`, real, live AD-vs-FD cross-validation during actual training, agreement
+    ///   well within tolerance).
+    ///
+    /// This is a REGRESSION GUARD in the opposite direction from usual: if this test starts
+    /// failing because `evaluate_hole_activation_gate` now reports `eligible: true`, that is
+    /// GOOD news requiring a manifest update (re-verify which condition(s) flipped and why),
+    /// not a bug to silently fix by adjusting this test's own hardcoded inputs.
+    #[test]
+    fn real_ph3_15_hole_activation_gate_reflects_the_actual_current_phase_3_evidence() {
+        // Single source of truth for these 5 booleans lives in `verification_ladder::
+        // current_phase_3_evidence` (shared with `app-egui`'s own Hole Stress Analysis card) -
+        // see this test's own doc comment above for the manifest entry behind each one.
+        let gate = crate::verification_ladder::evaluate_hole_activation_gate_for_this_project();
+        assert!(!gate.eligible, "the hole/Kt path is NOT yet eligible - see this test's own doc comment for the real evidence behind each input");
+        assert_eq!(gate.failed_conditions(), vec!["variational_path", "measure_aware_path"]);
     }
 
     /// Issue #62 PH3-09: tests the "optimizer convergence issue" candidate cause directly - the

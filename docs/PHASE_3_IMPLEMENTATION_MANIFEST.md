@@ -1230,17 +1230,109 @@ result, not a crash.
 
 ## PH3-15 — Hole/Kt activation gate
 
-Status: NOT_STARTED
+Status: VERIFIED (gate built and evaluated - currently reports NOT ELIGIBLE, correctly)
 
 ### Current evidence
+Plan text (§19, verbatim): "The hole benchmark SHALL NOT be considered operational merely
+because Kt can be computed. It becomes eligible only after: no-hole hard benchmark = PASS AND
+variational path = PASS AND measure-aware path = PASS AND authoritative field audit = PASS AND
+derivative-path audit = PASS. Then run the hole case. Kt SHALL report: stress projection,
+reference stress, peak angle, angular refinement, radial offset refinement, finite/infinite-
+domain reference classification." Before this item, no combined eligibility check existed at
+all, and 2 of the 5 listed conditions (variational path, measure-aware path) had never been
+independently tested with a PASSING result.
+
 ### Required change
+1. A real, pure gate function combining the 5 named preconditions (AND, no partial credit).
+2. Evaluate it honestly against this project's ACTUAL Phase 3 evidence.
+3. Since "measure-aware path = PASS" had never been tested independent of PH3-14's Variational-
+   specific divergence, run that isolating experiment before answering.
+4. Extend Kt reporting with the fields the plan explicitly lists that weren't yet surfaced
+   (stress projection, angular/radial refinement, domain classification) using ALREADY-BUILT,
+   tested machinery (P2-10's `StressProjection`/`kt_convergence_check`), not new physics.
+
 ### Files changed
+- `crates/pinn-solver/src/verification_ladder.rs` - `HoleActivationGateResult`/
+  `evaluate_hole_activation_gate` (pure, 5-input AND, `failed_conditions()` names every unmet
+  precondition). `current_phase_3_evidence` module - 5 named, documented, dated `bool`
+  constants (one per manifest entry that established it) - the SINGLE source of truth both the
+  `pinn-solver` regression test and `app-egui`'s own Hole Stress Analysis card read, so they
+  cannot silently diverge. `evaluate_hole_activation_gate_for_this_project()` convenience
+  wrapper.
+- `crates/pinn-core/src/messages.rs` - `StressConcentration` gains `stress_projection: &'static
+  str`, `angular_refinement_relative_change: Option<f64>`, `radial_offset_refinement_relative_
+  change: Option<f64>`, `refinement_converged: Option<bool>`, `domain_classification: &'static
+  str` - closing the plan's own explicit Kt-reporting list.
+- `crates/pinn-solver/src/user_problem.rs` - `stress_concentration_from_profile_generic` now
+  populates `stress_projection`/`domain_classification` for every caller automatically;
+  `angular_refinement_relative_change`/`radial_offset_refinement_relative_change`/`refinement_
+  converged` default to `None` there (this bare function has no model/geometry access to re-
+  probe at a different resolution) - real callers with that context overwrite them.
+- `crates/pinn-solver/src/parametric_problem.rs` - its own separate `stress_concentration`
+  function updated the same way (`None` for the 3 refinement fields - no derived-stress probe
+  exists on this path to run the check against, a real absence).
+- `crates/pinn-solver/src/runner.rs` - BOTH real plate-path hole-analysis call sites
+  (`run_user_problem_training_from`'s vis-cadence block, `serve_loaded_plate_checkpoint`) now
+  also call `kt_convergence_check` (P2-10, pre-existing, now wired for the first time) and fill
+  in the 3 refinement fields with real values - a real, accepted extra cost (2 additional
+  `probe_hole_boundary_profile_derived` calls per hole) at the SAME vis-cadence/one-shot
+  cadence hole analysis already runs at, using a fixed, purely-informational 5% tolerance
+  (feeds `refinement_converged`, which gates nothing).
+- `powershell_tool/app-egui/src/stress_solver.rs` - Hole Stress Analysis card now shows an
+  honest "Not yet operational (issue #62 PH3-15)" banner (reading the SAME shared gate/
+  constants) whenever the gate is ineligible, plus the new stress-projection/domain-
+  classification/refinement-convergence fields per hole.
+
 ### Tests
+3 new unit tests in `verification_ladder::tests` (all-pass eligibility, multi-condition failure
+naming, single-condition failure still blocks entirely - "no partial credit"). 1 new real
+integration test in `runner::tests`
+(`ph3_15_measure_aware_training_under_the_hybrid_formulation_tests_whether_it_passes_independent
+_of_variational`, `#[ignore]`d, real ~2800-step run) isolating the measure-aware axis. 1 new
+regression-guard test in `runner::tests`
+(`real_ph3_15_hole_activation_gate_reflects_the_actual_current_phase_3_evidence`) asserting THIS
+project's actual gate result - deliberately a regression guard in the OPPOSITE direction from
+usual: if it starts failing because the gate now reports `eligible: true`, that's GOOD news
+requiring a manifest update, not a bug to silently fix.
+
 ### Runtime run
+Real ~2800-step run (`no_hole_plate_spec(2800)` + `measure_aware_training = true`, default
+Hybrid formulation - the SAME formulation/step-count PH3-09 already proved converges WITHOUT
+measure-aware training): **FAILS all 5 hard thresholds** (`sigma_xx_relative_error=32.1%`,
+`traction_rms_over_ref=22.1%`, `load_transfer_ratio=1.137` vs `[0.99,1.01]`) - a clean, isolated
+finding that measure-aware training itself (not merely PH3-14's Variational-specific
+divergence) fails to reach the passing state the identical formulation reaches without it.
+
 ### Benchmark result
+**Gate evaluates to NOT ELIGIBLE** - `failed_conditions() == ["variational_path",
+"measure_aware_path"]`. Per §19's own explicit rule, the hole/Kt path is therefore NOT run as
+an "operational" benchmark in this pass (no new hole-geometry training was performed to produce
+a Kt "result") - the gate correctly blocks exactly the outcome the plan warns against ("SHALL
+NOT be considered operational merely because Kt can be computed"). This is itself the complete,
+correct answer for this item, not a partial result awaiting more work.
+
 ### Known limitations
+- Neither `variational_path` nor `measure_aware_path` was root-caused mechanistically (PH3-14's
+  own "Known limitations" already states this for the Variational axis; the measure-aware
+  finding here is equally unexplained at the mechanism level) - a real, separate follow-up.
+- The new Kt-reporting fields (`stress_projection`/refinement/`domain_classification`) are
+  wired for the PLATE path only - Kirsch's own Kt reporting and the parametric path's `stress_
+  concentration` function report `None` for the 3 refinement fields (no `kt_convergence_check`
+  equivalent exists for either), consistent with every other Kirsch/parametric deferral in this
+  manifest.
+- `current_phase_3_evidence`'s 5 constants are a manually-maintained, dated snapshot, not
+  auto-derived from live benchmark runs - a future item could compute them from persisted
+  `AuthoritativeReport`s instead, but that would require running EVERY precondition's real
+  check on every CI pass, a much larger scope than this item's own "combine what's already
+  known" mandate.
+
 ### Reviewer verification
-NOT REVIEWED
+`cargo test -p pinn-core` 120/120. `cargo test --release -p pinn-solver --features
+ndarray-backend --lib verification_ladder::` 19/19 (up from 16), `--lib user_problem::` 58/58,
+`--lib parametric_problem::` 5/5 (1 ignored, unchanged), `--lib runner::` 21/21 passed, 21
+ignored (up from 20/0/20, +1 real regression-guard test - the measure-aware isolating test
+itself is `#[ignore]`d for the same real-training-run reason every comparable test in this file
+is). `cargo build -p app-egui` clean; real launch stayed alive 8s+ with an empty log.
 
 ## PH3-16 — Cross-configuration regression matrix
 

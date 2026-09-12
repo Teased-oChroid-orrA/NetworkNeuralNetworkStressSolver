@@ -1837,7 +1837,23 @@ pub fn stress_concentration_from_profile_generic(
         .map(|(p, _)| p.theta_deg)
         .unwrap_or(0.0);
     let kt = if nominal_stress.abs() > 1e-300 { reduced / nominal_stress.abs() } else { f64::NAN };
-    StressConcentration { nominal_stress, max_von_mises: reduced, max_theta_deg, kt }
+    StressConcentration {
+        nominal_stress, max_von_mises: reduced, max_theta_deg, kt,
+        stress_projection: match projection {
+            StressProjection::VonMises => "VonMises",
+            StressProjection::HoopStress => "HoopStress",
+        },
+        // Issue #62 PH3-15: this bare function never runs `kt_convergence_check` itself (it
+        // has no access to the model/geometry needed to re-probe at a different resolution/
+        // margin) - `None` here is a real "not computed by this call", not a claim of
+        // non-convergence. Real callers that DO have that context (`runner.rs`'s vis-cadence
+        // hole-analysis block) overwrite these 3 fields after calling this function - see that
+        // call site's own comment.
+        angular_refinement_relative_change: None,
+        radial_offset_refinement_relative_change: None,
+        refinement_converged: None,
+        domain_classification: "FiniteDomainReference",
+    }
 }
 
 /// Issue #61 EPIC P2-10's own "angular/radial convergence support" - runs the SAME Kt QoI

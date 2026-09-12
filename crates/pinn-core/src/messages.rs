@@ -399,6 +399,39 @@ pub struct StressConcentration {
     pub max_von_mises: f64,
     pub max_theta_deg: f64,
     pub kt: f64,
+    /// Issue #62 PH3-15 ("Kt SHALL report... stress projection") - which scalar field the Kt
+    /// reduction actually operated on (`pinn_solver::user_problem::StressProjection`'s own
+    /// variant name, e.g. `"VonMises"`) - every real call site in this codebase uses the
+    /// `VonMises`/`Max` default (`StressProjection::HoopStress`/`ReductionOp::Mean`/
+    /// `Percentile` exist as real, tested alternatives but nothing wires them into a live
+    /// training loop today), stated explicitly rather than left implicit.
+    pub stress_projection: &'static str,
+    /// Issue #62 PH3-15 ("Kt SHALL report... angular refinement") - relative change in Kt
+    /// between the reported angular resolution and 2x that resolution (same radial margin) -
+    /// `pinn_solver::user_problem::KtConvergenceReport::angular_relative_change` (P2-10,
+    /// already built and tested, only now wired into this live report). `None` where this
+    /// path doesn't run the convergence check (see `radial_offset_refinement_relative_change`'s
+    /// doc comment for which paths those are).
+    pub angular_refinement_relative_change: Option<f64>,
+    /// Issue #62 PH3-15 ("Kt SHALL report... radial offset refinement") - relative change in
+    /// Kt between the reported radial margin and 1.5x that margin (same angular resolution) -
+    /// `KtConvergenceReport::radial_relative_change`. `None` for the parametric path (no
+    /// derived-stress probe exists there to run this check against - a real, stated absence,
+    /// not a fabricated `0.0`).
+    pub radial_offset_refinement_relative_change: Option<f64>,
+    /// `true` iff BOTH refinement checks above are below the tolerance `kt_convergence_check`
+    /// was run with - `None` under the same "not computed for this path" condition as the two
+    /// fields above.
+    pub refinement_converged: Option<bool>,
+    /// Issue #62 PH3-15 ("Kt SHALL report... finite/infinite-domain reference classification")
+    /// - always `"FiniteDomainReference"` in this codebase: `nominal_stress` (the applied
+    /// far-field traction magnitude) is the standard Kt denominator for BOTH the classical
+    /// infinite-plate Kirsch solution and a finite rectangular plate, but this codebase's own
+    /// geometry (`UserGeometry`/`GeometryConfig`) is ALWAYS a finite rectangle - stated
+    /// explicitly so a reader never assumes an infinite-plate reference solution is being used
+    /// anywhere, which it structurally cannot be (no infinite-domain solver path exists in this
+    /// codebase at all).
+    pub domain_classification: &'static str,
 }
 
 /// One hole's full stress analysis, bundled for transport in a `TrainingUpdate` (Phase 16,

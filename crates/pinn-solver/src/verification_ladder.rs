@@ -313,6 +313,96 @@ pub fn assess_convergence(loss: &[f64], grad_norm: &[f64], bc_residual: &[f64]) 
     }
 }
 
+/// Issue #62 PH3-15: the hole/Kt activation gate - "the hole benchmark SHALL NOT be considered
+/// operational merely because Kt can be computed." Eligibility requires ALL FIVE of the plan's
+/// own named preconditions to hold; this function makes that combination a real, machine-
+/// checkable value instead of an implicit assumption. Every input is a plain `bool` the CALLER
+/// must supply from real, dated evidence (this function has no way to independently verify a
+/// claim) - see `crates::runner::tests::real_ph3_15_hole_activation_gate_reflects_the_actual_
+/// current_phase_3_evidence` for the one place this project's OWN real findings are plugged in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoleActivationGateResult {
+    pub eligible: bool,
+    pub no_hole_benchmark_passed: bool,
+    pub variational_path_passed: bool,
+    pub measure_aware_path_passed: bool,
+    pub authoritative_field_audit_passed: bool,
+    pub derivative_path_audit_passed: bool,
+}
+
+impl HoleActivationGateResult {
+    /// Names of every failed precondition, in the plan's own listed order - empty iff
+    /// `eligible`.
+    pub fn failed_conditions(&self) -> Vec<&'static str> {
+        let mut failed = Vec::new();
+        if !self.no_hole_benchmark_passed { failed.push("no_hole_benchmark"); }
+        if !self.variational_path_passed { failed.push("variational_path"); }
+        if !self.measure_aware_path_passed { failed.push("measure_aware_path"); }
+        if !self.authoritative_field_audit_passed { failed.push("authoritative_field_audit"); }
+        if !self.derivative_path_audit_passed { failed.push("derivative_path_audit"); }
+        failed
+    }
+}
+
+/// Combines the plan's own 5 named preconditions (issue #62 §19) into one eligibility verdict.
+/// `eligible` is `true` only when every single one holds - a pure AND, no partial credit, no
+/// threshold-tuning knob (that would be exactly the kind of "benchmark-specific hack" issue #62
+/// §3.1 forbids for a gate whose entire purpose is refusing to rubber-stamp readiness).
+pub fn evaluate_hole_activation_gate(
+    no_hole_benchmark_passed: bool,
+    variational_path_passed: bool,
+    measure_aware_path_passed: bool,
+    authoritative_field_audit_passed: bool,
+    derivative_path_audit_passed: bool,
+) -> HoleActivationGateResult {
+    HoleActivationGateResult {
+        eligible: no_hole_benchmark_passed && variational_path_passed && measure_aware_path_passed
+            && authoritative_field_audit_passed && derivative_path_audit_passed,
+        no_hole_benchmark_passed,
+        variational_path_passed,
+        measure_aware_path_passed,
+        authoritative_field_audit_passed,
+        derivative_path_audit_passed,
+    }
+}
+
+/// The current, dated, real Phase 3 evidence behind each of `evaluate_hole_activation_gate`'s 5
+/// inputs - a SINGLE source of truth shared by `runner::tests::real_ph3_15_hole_activation_
+/// gate_reflects_the_actual_current_phase_3_evidence` (which asserts against these) and
+/// `app-egui`'s own Hole Stress Analysis card (which reads these to render an honest "not yet
+/// operational" banner on any holed run) - see each constant's own doc comment for the exact
+/// manifest entry establishing it. Update these ONLY when a NEW, real, dated verification
+/// result changes one of them - never to "make the gate pass".
+pub mod current_phase_3_evidence {
+    /// PH3-09: `Debug_run/baseline_legacy_no_hole/` resumed to 2800 steps, `traction_rms_
+    /// over_ref` dropped under 1%, full P2-14 hard benchmark PASS.
+    pub const NO_HOLE_BENCHMARK_PASSED: bool = true;
+    /// PH3-14: a 16000-step run of the shipped `variational_no_hole_plate.toml` config
+    /// DIVERGES past step ~7000 (`sigma_xx_relative_error` reaching 539%), not merely under-
+    /// converges.
+    pub const VARIATIONAL_PATH_PASSED: bool = false;
+    /// PH3-15's own isolating test: measure-aware training under the SAME Hybrid formulation
+    /// PH3-09 proved converges still FAILS all 5 hard thresholds at the identical 2800-step
+    /// budget.
+    pub const MEASURE_AWARE_PATH_PASSED: bool = false;
+    /// PH3-07: `field_graph::consumer_field_report`, a real, tested registry cross-validated
+    /// against the Kt investigation's own written findings.
+    pub const AUTHORITATIVE_FIELD_AUDIT_PASSED: bool = true;
+    /// PH3-06: `differential_operator::ad_fd_strain_agreement`, real, live AD-vs-FD cross-
+    /// validation during actual training, agreement well within tolerance.
+    pub const DERIVATIVE_PATH_AUDIT_PASSED: bool = true;
+}
+
+/// Convenience wrapper: evaluates the gate against this project's own current, dated evidence
+/// (`current_phase_3_evidence`) rather than requiring every caller to spell out all 5 booleans.
+pub fn evaluate_hole_activation_gate_for_this_project() -> HoleActivationGateResult {
+    use current_phase_3_evidence::*;
+    evaluate_hole_activation_gate(
+        NO_HOLE_BENCHMARK_PASSED, VARIATIONAL_PATH_PASSED, MEASURE_AWARE_PATH_PASSED,
+        AUTHORITATIVE_FIELD_AUDIT_PASSED, DERIVATIVE_PATH_AUDIT_PASSED,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +561,28 @@ mod tests {
     fn assess_convergence_reports_the_true_min_sample_count_across_uneven_length_series() {
         let evidence = assess_convergence(&[1.0, 1.0, 1.0, 1.0, 1.0], &[1.0, 1.0, 1.0, 1.0], &[1.0, 1.0, 1.0]);
         assert_eq!(evidence.n_samples, 3);
+    }
+
+    #[test]
+    fn hole_activation_gate_is_eligible_only_when_all_five_conditions_hold() {
+        let g = evaluate_hole_activation_gate(true, true, true, true, true);
+        assert!(g.eligible);
+        assert!(g.failed_conditions().is_empty());
+    }
+
+    #[test]
+    fn hole_activation_gate_reports_every_failed_condition_by_name_not_just_the_first() {
+        let g = evaluate_hole_activation_gate(true, false, false, true, true);
+        assert!(!g.eligible);
+        assert_eq!(g.failed_conditions(), vec!["variational_path", "measure_aware_path"]);
+    }
+
+    #[test]
+    fn hole_activation_gate_is_not_eligible_when_only_one_condition_fails() {
+        // No partial credit - a single failed precondition still blocks eligibility entirely,
+        // per this function's own "pure AND, no threshold-tuning knob" doc comment.
+        let g = evaluate_hole_activation_gate(true, true, true, true, false);
+        assert!(!g.eligible);
+        assert_eq!(g.failed_conditions(), vec!["derivative_path_audit"]);
     }
 }
