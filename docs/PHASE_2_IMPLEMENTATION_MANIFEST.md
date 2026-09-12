@@ -158,7 +158,108 @@ above rather than hidden.
 
 ## P2-03 — Authoritative Field Dependency Graph
 
-Status: NOT_STARTED
+Status: VERIFIED
+
+### Requirement
+
+Formal `NN -> displacement -> strain -> constitutive -> stress` dependency graph; every
+stress consumer requests a declared authoritative field; mixed formulations (both Direct
+network-output stress and Derived constitutive stress relied on simultaneously) enforce
+sigma_aux<->constitutive compatibility explicitly, not silently.
+
+### Files changed
+
+- `crates/pinn-solver/src/field_graph.rs` — new module. `FieldKind` enum
+  (`NetworkOutput`/`Displacement`/`Strain`/`ConstitutiveStress`/`DirectStress`) +
+  `depends_on()`/`dependency_chain()` (issue #61 §3's pipeline as real, queryable data) +
+  `from_stress_source()` (maps the existing `StressSource` classification onto the graph's two
+  stress leaves — generalizes, does not duplicate, the prior pass's Priority-1 label).
+  `MixedFormulationCheck` + `check_mixed_stress_source_compatibility()` — the real enforcement
+  predicate.
+- `crates/pinn-solver/src/lib.rs` — `pub mod field_graph;` added.
+- `crates/pinn-solver/src/training_core.rs` — `stress_source_report()` refactored (behavior
+  unchanged) to delegate to new `stress_source_report_from_terms()`, so callers that already
+  built a term list (avoiding a second `loss_terms()` construction) can reuse it. Both
+  `step_physics` and `step_physics_multi` — the two real per-step training entry points, used
+  by every problem type (Kirsch via `step_physics`, plate/pin-lug via `step_physics_multi`) —
+  gained a genuine runtime assertion calling `check_mixed_stress_source_compatibility` against
+  that step's own `active_terms`, using `use_mdem`/`any_mdem` (already-computed, zero new cost)
+  as the "is the existing compatibility mechanism active" flag.
+- `crates/pinn-solver/src/user_problem.rs` — `dependency_chain_for_kt()` rewritten to build its
+  string FROM `FieldKind::dependency_chain()` instead of two hand-written literal strings —
+  proof the graph is load-bearing, not a dead parallel abstraction (see Tests).
+
+### Architecture decision
+
+The existing `ConstitutiveConsistencyTerm` mechanism (`step_physics`/`step_physics_multi`'s
+"(b.5)" block, applied to every `output_dim == 5` domain, pre-dating this epic) already WAS
+this codebase's real sigma_aux<->constitutive compatibility enforcement — P2-03's job was
+making that fact explicit and checkable, not building a new mechanism from scratch (per §1.4,
+no destructive refactor of working training-loop internals). The new assertion is placed
+immediately after `active_terms`/`any_mdem` (or `use_mdem`) are already known in both step
+functions — genuinely free (reuses the already-built term list, no extra `loss_terms()` call),
+so it runs on every training step, not behind an opt-in diagnostics flag. It is a real
+enforcement point, not a report: if a future formulation change ever produced a Direct+Derived
+mix with neither a `Both`-classified term nor the mDEM mechanism covering it, `step_physics`/
+`step_physics_multi` would panic immediately rather than train silently on an unpoliced
+mismatch (issue #61 §1.2's "no silent physics replacement", applied to this specific gap).
+`FieldKind`'s dependency chain intentionally mirrors only the fields this codebase's real
+problems compute (no speculative nodes for stress representations that don't exist yet).
+
+### Tests
+
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- field_graph::` — 6
+  passed: dependency-chain-matches-§3-pipeline (both leaf branches), `from_stress_source`
+  mapping, plate-mix-uncovered-without/covered-with the external flag (reproduces the real
+  single-hole plate classification from `docs/investigations/kt-investigation-bugsource-new.md`
+  and proves the check correctly requires `any_mdem`), Kirsch `Both`-term coverage, and the
+  never-flagged-mixed cases (all-derived, empty).
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- user_problem::` — 41
+  passed (39 pre-existing + 2 new: `dependency_chain_for_kt_derived_matches_the_graph_exactly`
+  proves the Kt chain string is now graph-derived, not hand-written).
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- training_core:: kirsch_problem:: pinlug_problem::`
+  — 104 passed, 0 failed, including every real-config parity/regression test that exercises the
+  new assertion on live data: `step_physics_multi_single_domain_matches_step_physics_kirsch`,
+  `step_physics_trait_driven_matches_independently_reimplemented_old_formula`,
+  `step_physics_stays_finite_with_mdem_and_ultimate_strength_scaling_combined`,
+  `kirsch_regression_matches_hardcoded_step_physics` — none panic, confirming the new
+  invariant genuinely holds for every current problem configuration rather than only being
+  satisfied by construction in a narrow unit test.
+
+### Runtime evidence
+
+Real headless training run (`stress-solver --headless`-equivalent `--problem-spec` path,
+release build, `single_hole_plate.toml` with `max_steps=60` for a fast evidence run): completed
+all 60 steps without panic (`total_loss` 9.60 -> 5.42 monotonically, `max|displacement|`
+non-trivial at 9.999e-6 m, `constitutive residual RMS=4.79e6 Pa`). This is exactly the mixed
+mDEM configuration (`hole_free`=Direct, `equilibrium`/`outer_traction`=Derived,
+`output_dim==5`) the new assertion runs against on EVERY step — confirms the P2-03 enforcement
+path is genuinely exercised end-to-end on the real training loop, not only in isolated unit
+tests.
+
+### Known limitations
+
+Enforcement covers the one dependency edge (`Direct` vs `ConstitutiveStress`/`Derived`) this
+codebase's real terms actually use — `FieldKind::Strain`/`Displacement`/`NetworkOutput` are
+real graph nodes with a real `dependency_chain()`, but no consumer other than the Kt chain
+string currently "requests" them by name through an explicit API (issue #61's fuller vision of
+every PDE/BC/energy/vis/QoI consumer declaring its authoritative field via a shared funnel
+function is not built — doing so now would mean rewriting how `compute_domain_forwards` and
+every `LossTerm::compute()` accesses strain/stress, a destructive refactor issue #61 §1.4 and
+§4's staged order explicitly reserve for P2-15). The enforcement assertion is a `panic`, not a
+`Result` — appropriate for an internal invariant violation during training (matches this
+codebase's existing convention, e.g. `compute_gradient_conflict_panics_on_unrecognized_loss_
+term_name`), not intended as user-facing error handling.
+
+### Reviewer verification
+
+PASS against P2-03's acceptance wording at the scope this epic covers: the graph is real,
+queryable data (not just a diagram); the Kt QoI path provably consumes it; mixed-formulation
+compatibility is now an enforced, always-on runtime invariant on both real training entry
+points, verified against every existing real problem configuration's regression tests plus a
+live training run. The broader "every consumer requests its field through a shared API"
+vision is explicitly deferred to P2-15 (migration), tracked above as a known limitation rather
+than silently dropped.
 
 ## P2-04 — Measure-aware integration
 

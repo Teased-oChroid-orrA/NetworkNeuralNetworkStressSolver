@@ -555,7 +555,18 @@ pub fn build_gradient_conflict_report(pairs: Vec<GradientConflictEntry>) -> Grad
 pub fn stress_source_report(
     problem: &dyn crate::problem::BoundaryValueProblem,
 ) -> Vec<(&'static str, crate::problem::StressSource)> {
-    problem.loss_terms().iter()
+    stress_source_report_from_terms(&problem.loss_terms())
+}
+
+/// Same shape/purpose as [`stress_source_report`], but takes an already-built term list
+/// instead of a `&dyn BoundaryValueProblem` — lets a caller that already built its own
+/// (possibly filtered, e.g. `step_physics_multi`'s `active_terms`) list reuse it instead of
+/// calling `problem.loss_terms()` a second time. `stress_source_report` itself is defined in
+/// terms of this function, not duplicated, so both stay in sync by construction.
+pub fn stress_source_report_from_terms(
+    terms: &[Box<dyn LossTerm>],
+) -> Vec<(&'static str, crate::problem::StressSource)> {
+    terms.iter()
         .filter_map(|term| term.stress_source().map(|source| (term.name(), source)))
         .collect()
 }
@@ -1075,6 +1086,23 @@ pub fn step_physics(
         .filter(|t| ctx.phase2_active || !t.phase2_only())
         .collect();
     let term_names: Vec<&'static str> = active_terms.iter().map(|t| t.name()).collect();
+
+    // Issue #61 P2-03: same real enforcement `step_physics_multi` applies — `use_mdem` is
+    // this function's own equivalent of that function's `any_mdem` (whether the ad-hoc
+    // constitutive-consistency mechanism below, gated on `use_mdem`, covers this step's
+    // Direct/Derived stress mix). See `field_graph::check_mixed_stress_source_compatibility`.
+    let mixed_check = crate::field_graph::check_mixed_stress_source_compatibility(
+        &stress_source_report_from_terms(&active_terms),
+        use_mdem,
+    );
+    assert!(
+        mixed_check.compatibility_enforced,
+        "P2-03 violation: active terms mix Direct stress ({:?}) and Derived/Both stress ({:?}) \
+         with no compatibility mechanism (`Both`-classified term or mDEM constitutive-\
+         consistency) covering the gap between them — see field_graph::check_mixed_stress_\
+         source_compatibility",
+        mixed_check.direct_terms, mixed_check.derived_or_both_terms,
+    );
 
     let saw_inputs: Vec<f32> = term_names.iter().map(|&n| term_scalar(n)).collect();
     let lams = saw.update(&saw_inputs);
@@ -1787,6 +1815,30 @@ pub fn step_physics_multi(
     if any_mdem {
         lam_by_name.insert("constitutive_consistency", effective_lam_const);
     }
+
+    // Issue #61 P2-03: real enforcement, not just a diagnostic. `active_terms` is already
+    // built above (zero extra `loss_terms()` cost) — `any_mdem` is exactly "did the
+    // constitutive-consistency mechanism run this step" (this function's own compatibility
+    // enforcement between the network's direct mDEM stress output and the constitutive-
+    // derived stress, see the "(b.5)" block above). If a future formulation/config change
+    // ever produces a `Direct`+`Derived`/`Both` mix among active terms with NO compatibility
+    // mechanism covering it (neither a `Both`-classified term nor `any_mdem`), that is exactly
+    // the "silent physics gap" issue #61 §1.2 forbids — fail loudly here rather than let it
+    // train silently on an unpoliced representation mismatch. See `field_graph`'s own test
+    // module for the two cases this reproduces (plate mDEM: covered only via `any_mdem`;
+    // Kirsch: covered via a `Both`-classified term with no external flag needed).
+    let mixed_check = crate::field_graph::check_mixed_stress_source_compatibility(
+        &stress_source_report_from_terms(&active_terms),
+        any_mdem,
+    );
+    assert!(
+        mixed_check.compatibility_enforced,
+        "P2-03 violation: active terms mix Direct stress ({:?}) and Derived/Both stress ({:?}) \
+         with no compatibility mechanism (`Both`-classified term or mDEM constitutive-\
+         consistency) covering the gap between them — see field_graph::check_mixed_stress_\
+         source_compatibility",
+        mixed_check.direct_terms, mixed_check.derived_or_both_terms,
+    );
 
     // Term-by-term diagnostics (Kt investigation - see `powershell_tool/CLAUDE.md`): raw
     // (unweighted) value per term, always cheap since `term_names`/`term_scalars` already

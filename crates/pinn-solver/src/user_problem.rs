@@ -1088,16 +1088,31 @@ pub const PROBE_HOLE_BOUNDARY_PROFILE_DERIVED_SOURCE: crate::problem::StressSour
 /// `derived` should be `true` when the profile came from [`probe_hole_boundary_profile_derived`]
 /// (the production Kt path, since bugSource-New #12), `false` for
 /// [`probe_hole_boundary_profile`] (the hole-BC-satisfaction-only variant).
+///
+/// Issue #61 P2-03: this string is now derived FROM [`crate::field_graph::FieldKind::
+/// dependency_chain`] rather than hand-written per-branch, so the field graph is provably
+/// load-bearing (not a dead parallel abstraction). The node labels are the graph's own
+/// (`"strain"` rather than the pre-P2-03 text's `"strain (FD stencil)"` — the backend detail
+/// belongs to `differential_operator::DerivativeBackend`, not this graph, per P2-02's
+/// separately-scoped abstraction), so the string content changed slightly; see the exact-match
+/// test [`dependency_chain_for_kt_derived_matches_the_graph_exactly`] for the new text.
 pub fn dependency_chain_for_kt(derived: bool) -> String {
     let source = if derived { PROBE_HOLE_BOUNDARY_PROFILE_DERIVED_SOURCE } else { PROBE_HOLE_BOUNDARY_PROFILE_SOURCE };
-    match source {
-        crate::problem::StressSource::Derived =>
-            "Kt -> von_mises -> derived sigma (energy::compute_stress) -> strain (FD stencil) -> displacement -> network".to_string(),
-        crate::problem::StressSource::Direct =>
-            "Kt -> von_mises -> direct sigma (network output cols 2..5) -> network".to_string(),
+    let sigma_label = match source {
+        crate::problem::StressSource::Derived => "derived sigma (energy::compute_stress)",
+        crate::problem::StressSource::Direct => "direct sigma (network output cols 2..5)",
         crate::problem::StressSource::Both =>
             unreachable!("a Kt profile probe reads exactly one representation, never both"),
-    }
+    };
+    let field = crate::field_graph::FieldKind::from_stress_source(source);
+    let mut chain: Vec<crate::field_graph::FieldKind> = field.dependency_chain();
+    chain.reverse();
+    let mut parts: Vec<String> = vec!["Kt".to_string(), "von_mises".to_string(), sigma_label.to_string()];
+    parts.extend(chain.into_iter().skip(1).map(|f| match f {
+        crate::field_graph::FieldKind::NetworkOutput => "network".to_string(),
+        other => other.label().to_string(),
+    }));
+    parts.join(" -> ")
 }
 
 /// Same sampling/forward-pass machinery as [`probe_hole_boundary_profile`], but reads
@@ -1741,6 +1756,21 @@ mod tests {
     fn dependency_chain_for_kt_reflects_which_probe_was_used() {
         assert!(dependency_chain_for_kt(true).contains("derived"));
         assert!(dependency_chain_for_kt(false).contains("direct"));
+    }
+
+    /// Issue #61 P2-03: proves `dependency_chain_for_kt` is genuinely built from
+    /// `field_graph::FieldKind::dependency_chain`, not a hardcoded string that merely happens
+    /// to contain "derived"/"direct" (the weaker assertion above).
+    #[test]
+    fn dependency_chain_for_kt_derived_matches_the_graph_exactly() {
+        assert_eq!(
+            dependency_chain_for_kt(true),
+            "Kt -> von_mises -> derived sigma (energy::compute_stress) -> strain -> displacement -> network",
+        );
+        assert_eq!(
+            dependency_chain_for_kt(false),
+            "Kt -> von_mises -> direct sigma (network output cols 2..5) -> network",
+        );
     }
 
     // ─── Phase 10 (Neural-Network-Wide Adaptive Collocation epic): hole-boundary profile ────
