@@ -16,6 +16,7 @@ pub mod headless;
 pub mod kirsch_problem;
 pub mod lr_schedule;
 pub mod manufactured;
+pub mod measure_integral;
 pub mod network;
 pub mod optim;
 pub mod parametric_problem;

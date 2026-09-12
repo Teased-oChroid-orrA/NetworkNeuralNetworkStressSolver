@@ -925,8 +925,9 @@ pub fn probe_energy_balance(
     let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / geometry.half_w) as f32, (y / geometry.half_h) as f32] };
 
     let interior = sampling.sample_interior(&placeholder, spec.training.n_interior);
-    let area = 4.0 * geometry.half_w * geometry.half_h
-        - geometry.holes.iter().map(|h| std::f64::consts::PI * h.radius * h.radius).sum::<f64>();
+    // Issue #61 P2-04: real geometric measure, via the shared abstraction (was inlined here).
+    let hole_radii: Vec<f64> = geometry.holes.iter().map(|h| h.radius).collect();
+    let area = crate::measure_integral::plate_domain_area(geometry.half_w, geometry.half_h, &hole_radii);
     let internal_energy = if interior.is_empty() {
         0.0
     } else {
@@ -941,9 +942,11 @@ pub fn probe_energy_balance(
         ], 1);
         let (exx, eyy, exy) = compute_strains::<BInner>(scaled, n_int, &fd);
         let energy_density = dem_energy_per_point::<BInner>(exx, eyy, exy, &spec.material);
-        let mean_density: f64 = energy_density.into_data().to_vec::<f32>().unwrap_or_default()
-            .iter().map(|&v| v as f64).sum::<f64>() / n_int as f64;
-        mean_density * area * geometry.thickness
+        let density_vals: Vec<f32> = energy_density.into_data().to_vec::<f32>().unwrap_or_default();
+        // Issue #61 P2-04: `Integral_Omega(f) ≈ |Omega|*mean(f)`, via the shared abstraction
+        // (byte-identical formula to this call site's pre-P2-04 inline `mean_density * area *
+        // thickness`, now a real, tested, reusable function - see `measure_integral`'s tests).
+        crate::measure_integral::domain_integral(area, geometry.thickness, &density_vals)
     };
 
     let bnd_pts_phys = sampling.sample_boundary(&placeholder, &spec.load, spec.training.n_boundary);
@@ -976,12 +979,15 @@ pub fn probe_energy_balance(
             .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
         let v_vals: Vec<f32> = scaled.slice([0..n_bnd, 1..2]).reshape([n_bnd])
             .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
-        let mut work = 0.0f64;
-        for i in 0..n_bnd {
-            let ds = if nx[i].abs() > 0.5 { ds_x_normal } else { ds_y_normal };
-            work += (tx_pred[i] as f64 * u_vals[i] as f64 + ty_pred[i] as f64 * v_vals[i] as f64) * ds * geometry.thickness;
-        }
-        0.5 * work
+        let traction_dot_u: Vec<f32> = (0..n_bnd)
+            .map(|i| tx_pred[i] * u_vals[i] + ty_pred[i] * v_vals[i])
+            .collect();
+        let ds_per_point: Vec<f64> = (0..n_bnd)
+            .map(|i| if nx[i].abs() > 0.5 { ds_x_normal } else { ds_y_normal })
+            .collect();
+        // Issue #61 P2-04: `∮ f ds ≈ Σ f_i * ds_i * thickness`, via the shared abstraction
+        // (byte-identical formula to this call site's pre-P2-04 inline accumulation loop).
+        0.5 * crate::measure_integral::boundary_integral(&traction_dot_u, &ds_per_point, geometry.thickness)
     };
 
     let denom = external_work.abs().max(1e-30);

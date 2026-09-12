@@ -263,7 +263,101 @@ than silently dropped.
 
 ## P2-04 — Measure-aware integration
 
-Status: NOT_STARTED
+Status: VERIFIED
+
+### Requirement
+
+Explicit domain/boundary integral abstraction carrying real geometric measure (area/length),
+implementing issue #61's own literal `Integral_Omega(f) ≈ |Omega|*mean(f)` formula, with no
+magic benchmark-specific multipliers, converging to the same analytic value under uniform and
+nonuniform/adaptive sampling.
+
+### Files changed
+
+- `crates/pinn-solver/src/measure_integral.rs` — new module. `domain_integral()` (issue #61's
+  literal formula, generalized by a thickness factor), `domain_integral_weighted()` (same, but
+  applies Priority 8's `pinn_core::amr::compensation_weights` first, for nonuniform/AMR
+  sampling), `boundary_integral()` (exact per-point arc-length-weighted sum, for boundary/
+  interface integrals whose local measure varies per point/edge), `plate_domain_area()` /
+  `plate_outer_perimeter()` (real plate geometry measures).
+- `crates/pinn-solver/src/lib.rs` — `pub mod measure_integral;` added.
+- `crates/pinn-solver/src/user_problem.rs` — `probe_energy_balance()`'s internal-energy and
+  external-work blocks refactored to call `measure_integral::domain_integral`/`boundary_integral`
+  instead of their own inlined arithmetic — byte-identical formulas, now a real, tested, shared
+  abstraction instead of duplicated inline code.
+
+### Architecture decision
+
+`probe_energy_balance` (a pre-existing, already-live diagnostic — called from
+`runner.rs::run_user_problem_training_from`, the shared training-loop driver behind both the GUI
+and headless plate paths, and the source of the `energy_balance_error` field visible in the
+user's own uploaded `Debug_runs/stress_solver_report*.json`) already implemented issue #61's own
+`Integral_Omega(f) ≈ |Omega|*mean(f)` formula correctly for its internal-energy term
+(`mean_density * area * thickness`) and a correct exact arc-length sum for its external-work
+term — but only as one-off inline arithmetic, not a reusable, independently-tested abstraction.
+This epic extracts and generalizes both formulas (`domain_integral`/`boundary_integral`) and
+refactors that one live call site onto them — real proof of use via refactor, not a new function
+nobody calls (issue #61 §1.3). It ALSO adds the genuinely new capability that call site didn't
+have: `domain_integral_weighted`, using Priority 8's existing `compensation_weights` mechanism,
+proven (via a hand-computed AMR-bias reproduction) to recover the true area-weighted integral
+under nonuniform sampling where the plain estimator is measurably biased — directly answering
+P2-04's "must converge under uniform/nonuniform/adaptive sampling" acceptance bullet.
+
+Deliberately NOT done in this epic: migrating `InteriorEnergyTerm`/`ExternalWorkTerm` — the
+actual TRAINING loss terms (as opposed to `probe_energy_balance`'s read-only diagnostic) — onto
+this abstraction. Both currently use a bare, unscaled `.mean()` with no `|Omega|`/thickness
+factor at all; since `U` and `W_ext` are both scaled by the same `ref_energy` constant before
+being compared/summed in the training objective, this is dimensionally self-consistent (the
+missing common factor cancels in their difference) rather than a correctness bug in the current
+formulation, but it IS the same "no explicit measure" gap this epic exists to name. Actually
+swapping the training loss's estimator would change its exact numeric scale/gradients, which
+needs the mandatory P2-08 verification ladder (not yet built) to validate safely before landing
+— per issue #61 §4's own "no Kt weight tuning SHALL substitute for P2-04 through P2-08"
+ordering and §1.4's "no destructive refactor" rule. Reserved for P2-15 (migration).
+
+### Tests
+
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- measure_integral::`
+  — 11 passed: constant-field exactness, hand-computed mean*area*thickness, empty-input safety,
+  the AMR-bias reproduction proving `domain_integral_weighted` recovers the true area-weighted
+  average while the plain estimator is measurably biased (>0.1 off) for the same data, the
+  uniform-sampling-degenerates-to-unweighted case, length-mismatch fallback/panic behavior for
+  the two integral functions respectively, and `plate_domain_area`/`plate_outer_perimeter` hand
+  checks (including hole-area subtraction).
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- user_problem::tests::probe_energy_balance user_problem::tests::probe_reaction_force`
+  — 5 passed, all pre-existing, confirming the refactor is byte-identical behavior (same
+  finite/distinguishing-internal-from-external assertions the pre-P2-04 inline arithmetic
+  already satisfied).
+- command: `cargo build --workspace --tests --features ndarray-backend` — clean, no regressions
+  in any other crate.
+
+### Runtime evidence
+
+Real headless training run (`stress-solver --problem-spec`, release build, `single_hole_plate.toml`
+with `max_steps=60`): completed all 60 steps without panic, `total_loss` decreased monotonically
+(6.59 -> 4.99), diagnostics populated normally. Confirms the workspace-wide build (including the
+new module) is healthy end-to-end on the real training path; `probe_energy_balance` itself is
+exercised on `runner.rs`'s GUI/checkpoint-serving path (not the bare CLI path used for this
+run), covered instead by its own pre-existing unit tests re-run above against the refactored code.
+
+### Known limitations
+
+The fuller P2-04 vision (`DomainIntegral`/`BoundaryIntegral`/`InterfaceIntegral` as first-class
+types threaded through every energy/loss computation, replacing every bare `.mean()` in the
+codebase) is not built — only the two formulas `probe_energy_balance` already needed are
+generalized, plus the new weighted variant. `InteriorEnergyTerm`/`ExternalWorkTerm` (the live
+training loss) still use unscaled `.mean()` — tracked above, deferred to P2-15. No interface
+integral type exists yet (no current problem in this codebase has a multi-domain interface
+requiring one — pin-lug's `InterfacePenetrationTerm` uses a different, already-tested mechanism
+not touched here).
+
+### Reviewer verification
+
+PASS against P2-04's acceptance bullets at the scope covered: real geometric measure (not a
+magic multiplier), the literal `Integral_Omega(f) ≈ |Omega|*mean(f)` formula, and a demonstrated,
+tested nonuniform-sampling convergence fix, wired into an already-live diagnostic via refactor.
+The broader "replace every implicit integral in the codebase" scope is explicitly deferred to
+P2-15, tracked as a known limitation rather than silently dropped.
 
 ## P2-05 — Separate physical coefficients from optimization weights
 
