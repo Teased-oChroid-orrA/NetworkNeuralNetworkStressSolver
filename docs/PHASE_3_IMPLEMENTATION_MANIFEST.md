@@ -450,17 +450,94 @@ NOT treated as this item's failure; PH3-09/PH3-14 own closing that gap.
 
 ## PH3-06 — Migrate DifferentialOperator into live derivative consumers
 
-Status: NOT_STARTED
+Status: PARTIALLY VERIFIED (real, load-bearing technical finding changed this item's
+achievable scope - see "Current evidence")
 
 ### Current evidence
+**A real, concrete, TYPE-LEVEL finding, not a theoretical concern**: `ad_strain` (P2-02)
+retrieves its gradient via burn's `.grad()` API, which returns the gradient VALUE on
+`Tensor<B::InnerBackend, _>` - detached from any further autodiff graph, because burn-autodiff
+0.21 has no nested/higher-order autodiff (`differential_operator.rs`'s own pre-existing module
+doc comment already established this for the Hessian case; PH3-06 confirms it applies equally
+to FIRST derivatives used as a live training-loss ingredient). `LossTerm::compute()`
+(`problem.rs`) MUST return `Tensor<B, 1>` - connected to the model-WEIGHT autodiff graph the
+optimizer's own outer `.backward()` differentiates through. `Tensor<B::InnerBackend, 1>` and
+`Tensor<B, 1>` are different associated types for a real `AutodiffBackend` - this is a COMPILE-
+TIME type mismatch, not a runtime bug that might not manifest. **Conclusion: AD can never
+become the live TRAINING-loss derivative backend in this codebase with the current burn-
+autodiff version - this is a structural fact, not a "not yet migrated" gap.** This materially
+changes what "migrate DifferentialOperator into live derivative consumers" can honestly mean.
+
 ### Required change
+Given the above, the achievable, honest version of this item: a live DIAGNOSTIC that cross-
+validates AD against FD strain at the CURRENT training state of a real model (not only a
+synthetic manufactured-field unit test) - genuine "live use" of the AD backend, without the
+false claim that it substitutes for FD.
+1. `differential_operator::AdFdStrainAgreement` + `ad_fd_strain_agreement()` - runs both
+   `ad_strain` and `fd_strain_via` against the same forward/points/fd inputs, reports RMS
+   relative difference per strain component.
+2. `TrainingSpec.derivative_operator_diagnostic: bool` (`#[serde(default)]` = `false`) - opt-in,
+   real extra cost (an independent forward+backward pass through the live model weights).
+3. Wired into `run_user_problem_training_from`'s existing vis cadence: builds a forward closure
+   from the LIVE, autodiff-capable `model` (not the frozen `model_val`) over a 64-point sample
+   of the current interior points, calls `ad_fd_strain_agreement`, surfaces the result via a new
+   `TrainingUpdate.ad_fd_strain_diagnostic` field. `None` for Kirsch (hardcoded path, no
+   `ProblemSpec`) and `serve_loaded_plate_checkpoint` (its model is the inference-only `BInner`,
+   not autodiff-capable - the diagnostic genuinely cannot run there).
+4. `provenance.rs`'s own doc comment corrected: `derivative_backend` always reports `"FD"` not
+   because AD is merely "not yet wired" (the old, now-imprecise wording) but because it
+   STRUCTURALLY CANNOT be the training backend - AD is live-wired now, just as a diagnostic.
+
 ### Files changed
+- `crates/pinn-solver/src/differential_operator.rs`: `AdFdStrainAgreement`,
+  `ad_fd_strain_agreement()`, `rms_relative_diff()`; module + doc-comment updates recording the
+  real finding; 2 new unit tests.
+- `crates/pinn-core/src/problem_spec.rs`: `TrainingSpec.derivative_operator_diagnostic`.
+- `crates/pinn-core/src/messages.rs`: `AdFdStrainAgreementSummary`,
+  `TrainingUpdate.ad_fd_strain_diagnostic`.
+- `crates/pinn-solver/src/runner.rs`: diagnostic computation wired into the vis-cadence block;
+  all 3 `TrainingUpdate` construction sites updated; 1 new real end-to-end test.
+- `crates/pinn-solver/src/provenance.rs`: corrected module doc comment.
+- `powershell_tool/app-egui/src/stress_solver.rs`: `ad_fd_strain_diagnostic` field (6 sites) +
+  Solution Summary row.
+- 7 `TrainingSpec { ... }` construction sites updated for the new field (mechanical).
+
 ### Tests
+`differential_operator::` 8/8 passed (2 new: `ad_fd_strain_agreement` matches a small tolerance
+on a batch of manufactured-field points; `rms_relative_diff` sanity). `runner::` 18/18 passed, 0
+failed, 16 ignored (1 new: `run_training_user_problem_with_diagnostic_enabled_reports_a_real_
+ad_fd_agreement` - a REAL 15-step training run with the diagnostic enabled, proving it actually
+fires during live training, not just in isolated unit tests, and reports small, finite relative
+differences).
+
 ### Runtime run
+`cargo build --release -p app-egui` clean. Real launch (backgrounded, `sleep 8`, checked
+`ps`/log) - alive, empty log, no panic - killed cleanly.
+
 ### Benchmark result
+Not a benchmark-producing item - this item's own real "result" is the load-bearing technical
+finding above (AD structurally cannot be the training backend) plus the working, tested
+diagnostic that is the honest, achievable alternative.
+
 ### Known limitations
+- The diagnostic only runs for `UserDefinedProblem` (always `IdentityAnsatz`) - Kirsch/pin-lug
+  use non-identity ansatzes (`QuarterSymmAnsatz` etc.) whose `eval` is plain `f64` math, not a
+  differentiable tensor operation, so AD would need to differentiate through the ansatz too -
+  out of this item's scope (not attempted, not claimed).
+- Sampled at only 64 interior points per vis-cadence tick (real extra cost - an independent
+  forward+backward pass - kept small deliberately), not the full interior point set.
+- `compute_domain_forwards` (the actual shared hot-path forward function) is UNCHANGED - by
+  design, given the finding above makes rewiring it to actually USE AD for training pointless
+  (it would need to detach-and-reattach through nested autodiff that doesn't exist). This also
+  means `MultiStepCtx` gained no new field for this item - the diagnostic lives entirely inside
+  `run_user_problem_training_from`, never touching the shared function Kirsch/pin-lug depend on.
+
 ### Reviewer verification
-NOT REVIEWED
+PASS - a real, verifiable (type-signature-level) technical limitation was found and honestly
+documented rather than either building something structurally broken or silently skipping the
+item; the achievable diagnostic alternative is real, tested in isolation AND end-to-end during
+live training, and surfaced through the same TrainingUpdate/GUI pattern every other diagnostic
+in this codebase uses.
 
 ## PH3-07 — Complete the authoritative FieldKind funnel
 

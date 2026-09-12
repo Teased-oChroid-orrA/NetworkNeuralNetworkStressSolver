@@ -132,6 +132,21 @@ pub struct NoHoleBenchmarkSummary {
     pub operational_status: &'static str,
 }
 
+/// Issue #62 PH3-06: transport-side mirror of `pinn_solver::differential_operator::
+/// AdFdStrainAgreement` - real, live AD-vs-FD strain agreement at the model's CURRENT training
+/// state (an actual currently-training model, not only a synthetic manufactured-field unit
+/// test). See that type's doc comment (and `differential_operator.rs`'s own module doc comment)
+/// for why this is a DIAGNOSTIC only, never a claim that AD replaces FD as the live
+/// training-loss backend - burn-autodiff 0.21 has no nested/higher-order autodiff, so an
+/// AD-retrieved gradient cannot stay connected to the model-weight autodiff graph a `LossTerm`
+/// needs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdFdStrainAgreementSummary {
+    pub eps_xx_rms_relative_diff: f64,
+    pub eps_yy_rms_relative_diff: f64,
+    pub eps_xy_rms_relative_diff: f64,
+}
+
 /// Stage I ("live network-evolution visualization", the user's own explicit follow-up ask) —
 /// a per-layer snapshot of `pinn_solver::network::ElasticityNet`'s weight tensors, read at the
 /// same vis cadence `VisFields` already uses (never inside the per-step hot loop — see
@@ -500,6 +515,13 @@ pub struct TrainingUpdate {
     /// own "no-hole gate" only has a defined reference solution for the no-hole case), NOT a
     /// placeholder for "not yet evaluated".
     pub no_hole_benchmark: Option<NoHoleBenchmarkSummary>,
+    /// Issue #62 PH3-06 - see `AdFdStrainAgreementSummary`'s doc comment. `Some` only when
+    /// `spec.training.derivative_operator_diagnostic` is enabled (opt-in, real extra cost - an
+    /// independent forward+backward pass through the live model weights) AND the domain's
+    /// ansatz is the identity (true for every `UserDefinedProblem` plate config; `None` for
+    /// Kirsch/pin-lug's non-identity ansatzes, where AD would also need to differentiate
+    /// through the ansatz's own `eval` function, which is not a tensor operation today).
+    pub ad_fd_strain_diagnostic: Option<AdFdStrainAgreementSummary>,
 }
 
 /// Pin-in-lug analogue of `TrainingUpdate` — one entry per domain's visualization fields,

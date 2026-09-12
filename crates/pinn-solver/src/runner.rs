@@ -638,6 +638,10 @@ pub fn run_training(
                 // `run_no_hole_benchmark` is `UserDefinedProblem`-specific (same "not
                 // applicable" reasoning as `stress_source_report` above).
                 no_hole_benchmark: None,
+                // Issue #62 PH3-06 - same "not applicable" reasoning as `no_hole_benchmark`
+                // above (Kirsch's own path never sets `spec.training.derivative_operator_
+                // diagnostic` - there is no such `spec` on this hardcoded path at all).
+                ad_fd_strain_diagnostic: None,
             };
             let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         }
@@ -1589,7 +1593,7 @@ fn run_user_problem_training_from(
         // expensive field probe still only runs on the original every-10th-step/last-step
         // cadence.
         let mut architecture_event = None;
-        let (vis, hole_analyses, bc_residual_rms, bc_residual_max, reaction_force, energy_balance, network_snapshot, no_hole_benchmark) = if send_vis {
+        let (vis, hole_analyses, bc_residual_rms, bc_residual_max, reaction_force, energy_balance, network_snapshot, no_hole_benchmark, ad_fd_strain_diagnostic) = if send_vis {
             let model_val: ElasticityNet<BInner> = model.valid();
             let vis = evaluate_user_vis_grid(
                 &model_val, &spec.geometry, [nx_vis, ny_vis], u_ref, spec.load.px,
@@ -1646,6 +1650,36 @@ fn run_user_problem_training_from(
             // `no_hole_benchmark_summary`'s own doc comment.
             let nhb = no_hole_benchmark_summary(&model_val, &spec, &device, &l0_result);
 
+            // Issue #62 PH3-06: opt-in live AD-vs-FD strain cross-validation - see
+            // `differential_operator::ad_fd_strain_agreement`'s own doc comment for why this is
+            // a DIAGNOSTIC only (real cost: an independent forward+backward pass through the
+            // LIVE, autodiff-capable `model` - not `model_val` - on a small sample of the
+            // current interior points, same vis cadence as every other opt-in probe here).
+            // `UserDefinedProblem`'s ansatz is always the identity (see `IdentityAnsatz`), so
+            // no ansatz-differentiability concern applies at this specific call site.
+            let ad_fd_diag = if spec.training.derivative_operator_diagnostic {
+                const SAMPLE: usize = 64;
+                let sample: Vec<[f32; 2]> = data.int_norm.iter().take(SAMPLE).copied().collect();
+                if sample.is_empty() {
+                    None
+                } else {
+                    let pts_t = norm_pts_to_tensor::<B>(&sample, &device);
+                    let n_fourier_diag = spec.geometry.n_fourier();
+                    let forward = |pts: burn::tensor::Tensor<B, 2>| -> burn::tensor::Tensor<B, 2> {
+                        let n = pts.dims()[0];
+                        crate::network::fwd::<B>(&model, pts, n_fourier_diag, &device).slice([0..n, 0..2]).mul_scalar(u_ref as f64)
+                    };
+                    let a = crate::differential_operator::ad_fd_strain_agreement::<B>(forward, &pts_t, &fd);
+                    Some(pinn_core::messages::AdFdStrainAgreementSummary {
+                        eps_xx_rms_relative_diff: a.eps_xx_rms_relative_diff,
+                        eps_yy_rms_relative_diff: a.eps_yy_rms_relative_diff,
+                        eps_xy_rms_relative_diff: a.eps_xy_rms_relative_diff,
+                    })
+                }
+            } else {
+                None
+            };
+
             // Smart adaptive architecture - only active when `spec.network.adaptive` (forces
             // `use_piratenet` in `net_cfg` above). Fed `bc_rms` as the training-progress
             // signal: the closest already-computed-at-this-cadence scalar to a PDE residual
@@ -1675,9 +1709,9 @@ fn run_user_problem_training_from(
                 }
             }
 
-            (Some(vis), hole_analyses, bc_rms, bc_max, Some(rf), Some(eb), Some(ns), nhb)
+            (Some(vis), hole_analyses, bc_rms, bc_max, Some(rf), Some(eb), Some(ns), nhb, ad_fd_diag)
         } else {
-            (None, Vec::new(), 0.0, 0.0, None, None, None, None)
+            (None, Vec::new(), 0.0, 0.0, None, None, None, None, None)
         };
 
         last_total_loss = out.total_scalar;
@@ -1777,6 +1811,7 @@ fn run_user_problem_training_from(
             formulation_kind_report,
             constraint_report,
             no_hole_benchmark,
+            ad_fd_strain_diagnostic,
         };
         let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         if auto_stopped {
@@ -1927,6 +1962,11 @@ pub fn serve_loaded_plate_checkpoint(
         formulation_kind_report,
         constraint_report,
         no_hole_benchmark: no_hole_benchmark_summary(&model, &spec, &device, &l0_result),
+        // Issue #62 PH3-06 - `model` here is `ElasticityNet<BInner>` (inference-only, per this
+        // function's own doc comment), not autodiff-capable - `ad_fd_strain_agreement` requires
+        // `B: AutodiffBackend`, so this diagnostic genuinely cannot run against a loaded/served
+        // checkpoint with no live training session.
+        ad_fd_strain_diagnostic: None,
     };
     let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
     let _ = tx.send(TrainingMsg::Done);
@@ -2293,7 +2333,7 @@ mod tests {
             material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
             load: LoadConfig::uniaxial_x(6.9e7),
             network: NetworkSpec { hidden_dim: 64, n_hidden: 3, ..Default::default() },
-            training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false },
+            training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false, derivative_operator_diagnostic: false },
             formulation: pinn_core::problem_spec::default_formulation(),
         }
     }
@@ -3350,9 +3390,44 @@ mod tests {
             material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
             load: LoadConfig::uniaxial_x(6.9e7),
             network: NetworkSpec { hidden_dim: 64, n_hidden: 3, ..Default::default() },
-            training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false },
+            training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false, derivative_operator_diagnostic: false },
             formulation: pinn_core::problem_spec::default_formulation(),
         }
+    }
+
+    /// Issue #62 PH3-06: real, live evidence that `ad_fd_strain_diagnostic` actually fires
+    /// during an actual training session (not just the isolated `differential_operator::` unit
+    /// tests against a synthetic manufactured field) - a short, fast run (past the first
+    /// vis-cadence tick at step 10, no need for real convergence).
+    #[test]
+    fn run_training_user_problem_with_diagnostic_enabled_reports_a_real_ad_fd_agreement() {
+        use pinn_core::problem_spec::FormulationSelection;
+        let mut spec = no_hole_plate_spec(15);
+        spec.training.derivative_operator_diagnostic = true;
+        spec.formulation = FormulationSelection::Variational; // cheap: only 2 base terms active
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, rx_ctrl));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut saw_diag: Option<pinn_core::messages::AdFdStrainAgreementSummary> = None;
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline && !saw_done {
+            match rx.try_recv() {
+                Ok(TrainingMsg::Update(u)) => { if let Some(d) = u.ad_fd_strain_diagnostic { saw_diag = Some(d); } }
+                Ok(TrainingMsg::Done) => saw_done = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+        drop(tx_ctrl);
+        let _ = handle.join();
+
+        let diag = saw_diag.expect("must have received at least one Some(ad_fd_strain_diagnostic) - the diagnostic was enabled and training ran past the first vis-cadence tick");
+        assert!(diag.eps_xx_rms_relative_diff.is_finite() && diag.eps_xx_rms_relative_diff < 0.1, "{diag:?}");
+        assert!(diag.eps_yy_rms_relative_diff.is_finite() && diag.eps_yy_rms_relative_diff < 0.1, "{diag:?}");
+        assert!(diag.eps_xy_rms_relative_diff.is_finite() && diag.eps_xy_rms_relative_diff < 0.1, "{diag:?}");
     }
 
     /// Issue #62 PH3-05: real, full-length (2000-step, matching PH3-01's own frozen legacy
@@ -3757,7 +3832,7 @@ mod tests {
                 adaptive: true, max_hidden_dim: Some(12), max_n_hidden: Some(4),
                 ..Default::default()
             },
-            training: TrainingSpec { max_steps, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false },
+            training: TrainingSpec { max_steps, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false, derivative_operator_diagnostic: false },
             formulation: pinn_core::problem_spec::default_formulation(),
         }
     }

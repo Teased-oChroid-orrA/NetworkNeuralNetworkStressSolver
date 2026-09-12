@@ -69,11 +69,23 @@ pub struct TrainingSpec {
     /// to `false`, never silently opting a pre-existing config into different training math.
     #[serde(default)]
     pub measure_aware_training: bool,
+    /// Issue #62 PH3-06: opt-in live AD-vs-FD strain cross-validation diagnostic
+    /// (`differential_operator::ad_fd_strain_agreement`) - real extra cost (an independent
+    /// forward+backward pass through the SAME model weights, on top of the normal training
+    /// step), never on by default. See that function's own doc comment for why this is a
+    /// DIAGNOSTIC only, never a live training-loss backend substitution (burn-autodiff 0.21 has
+    /// no nested/higher-order autodiff, so an AD-retrieved gradient is structurally incapable of
+    /// staying connected to the model-weight autodiff graph `LossTerm::compute()` needs).
+    #[serde(default)]
+    pub derivative_operator_diagnostic: bool,
 }
 
 impl Default for TrainingSpec {
     fn default() -> Self {
-        Self { max_steps: 2000, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false }
+        Self {
+            max_steps: 2000, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3,
+            measure_aware_training: false, derivative_operator_diagnostic: false,
+        }
     }
 }
 

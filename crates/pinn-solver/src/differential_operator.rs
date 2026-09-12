@@ -33,6 +33,26 @@
 //! is a genuine, cross-validated alternative a caller CAN route through today (proven via its
 //! own tests against the exact manufactured field `crate::manufactured` already established in
 //! a prior pass), not yet the path `compute_domain_forwards` itself calls.
+//!
+//! **Issue #62 PH3-06's own real, load-bearing finding: [`ad_strain`] can NEVER become the live
+//! TRAINING-loss derivative backend with this burn-autodiff version, for a concrete, verifiable
+//! (type-signature-level, not just theoretical) reason.** `ad_strain` computes its result via
+//! `pi.backward()` + `pts.grad(&grads)` - burn's gradient-RETRIEVAL API, which returns the
+//! gradient VALUE on `Tensor<B::InnerBackend, _>` (this module's own top comment already
+//! documents why: burn-autodiff 0.21 has no "double backward"/`create_graph` mechanism, so a
+//! retrieved gradient is necessarily detached from any further autodiff graph). `LossTerm::
+//! compute()` (`problem.rs`) MUST return `Tensor<B, 1>` - connected to the WEIGHT-autodiff graph
+//! `step_physics_multi`'s own outer `.backward()` differentiates through to update the model.
+//! `Tensor<B::InnerBackend, 1>` and `Tensor<B, 1>` are DIFFERENT ASSOCIATED TYPES for a real
+//! `AutodiffBackend` (`B::InnerBackend != B`) - passing one where the other is required is a
+//! compile error, not a subtle runtime bug. There is therefore no way to route `InteriorEnergy
+//! Term`/`ExternalWorkTerm`/`EquilibriumTerm`'s live strain computation through `ad_strain`
+//! without first solving nested autodiff itself (a burn-upstream limitation, not something this
+//! codebase can work around). [`ad_fd_strain_agreement`] is the honest, ACHIEVABLE version of
+//! "migrate DifferentialOperator into live consumers" this constraint still permits: a live
+//! DIAGNOSTIC cross-check of AD against FD at the model's CURRENT training state (not just a
+//! synthetic manufactured field), proving real live use of the AD backend without claiming it
+//! replaces FD as the optimization ingredient.
 
 use burn::tensor::{backend::AutodiffBackend, Tensor};
 
@@ -166,6 +186,52 @@ pub fn fd_strain_via<B: burn::tensor::backend::Backend>(
     compute_strains::<B>(out, n, fd)
 }
 
+/// Issue #62 PH3-06's own real, live-use result: how closely AD and FD agree on FIRST
+/// derivatives (strain) at a REAL model's CURRENT training state - see this module's own
+/// "PH3-06" doc comment section above for exactly why this is a DIAGNOSTIC cross-check, never a
+/// live training-loss ingredient.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdFdStrainAgreement {
+    pub eps_xx_rms_relative_diff: f64,
+    pub eps_yy_rms_relative_diff: f64,
+    pub eps_xy_rms_relative_diff: f64,
+}
+
+fn rms_relative_diff(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len().max(1) as f64;
+    let sq_diff: f64 = a.iter().zip(b).map(|(&x, &y)| ((x - y) as f64).powi(2)).sum();
+    let sq_b: f64 = b.iter().map(|&y| (y as f64).powi(2)).sum();
+    let rms_diff = (sq_diff / n).sqrt();
+    let rms_b = (sq_b / n).sqrt();
+    if rms_b > 1e-12 { rms_diff / rms_b } else { rms_diff }
+}
+
+/// Issue #62 PH3-06: runs BOTH [`ad_strain`] and [`fd_strain_via`] against the SAME `forward`/
+/// `pts_norm`/`fd` inputs and reports how closely they agree - the real, live-model-state
+/// counterpart of this module's own `ad_strain_matches_fd_strain_on_the_same_manufactured_
+/// field` unit test, callable against an ACTUAL currently-training model rather than only a
+/// synthetic manufactured field. `forward` MUST be built from an identity-ansatz domain's raw
+/// network output only (no Dirichlet-ansatz scaling baked in) - see this module's own doc
+/// comment on why AD cannot be used for a non-identity ansatz (Kirsch's `QuarterSymmAnsatz`)
+/// without also making `ansatz.eval` itself a differentiable tensor operation, which does not
+/// exist and is out of this item's scope.
+pub fn ad_fd_strain_agreement<B: AutodiffBackend>(
+    forward: impl Fn(Tensor<B, 2>) -> Tensor<B, 2>,
+    pts_norm: &Tensor<B, 2>,
+    fd: &FdConfig,
+) -> AdFdStrainAgreement {
+    let device = pts_norm.device();
+    let (ad_xx, ad_yy, ad_xy) = ad_strain::<B>(&forward, pts_norm, fd);
+    let (fd_xx, fd_yy, fd_xy) = fd_strain_via::<B>(&forward, pts_norm, fd, &device);
+    let v_inner = |t: Tensor<B::InnerBackend, 1>| -> Vec<f32> { t.into_data().to_vec::<f32>().unwrap() };
+    let v_outer = |t: Tensor<B, 1>| -> Vec<f32> { t.into_data().to_vec::<f32>().unwrap() };
+    AdFdStrainAgreement {
+        eps_xx_rms_relative_diff: rms_relative_diff(&v_inner(ad_xx), &v_outer(fd_xx)),
+        eps_yy_rms_relative_diff: rms_relative_diff(&v_inner(ad_yy), &v_outer(fd_yy)),
+        eps_xy_rms_relative_diff: rms_relative_diff(&v_inner(ad_xy), &v_outer(fd_xy)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +347,33 @@ mod tests {
         assert!((exx_ad_v - exx_fd_v).abs() / exx_fd_v.abs() < tol, "{exx_ad_v} vs {exx_fd_v}");
         assert!((eyy_ad_v - eyy_fd_v).abs() / eyy_fd_v.abs() < tol, "{eyy_ad_v} vs {eyy_fd_v}");
         assert!((exy_ad_v - exy_fd_v).abs() / exy_fd_v.abs() < tol, "{exy_ad_v} vs {exy_fd_v}");
+    }
+
+    // ─── Issue #62 PH3-06: live AD-vs-FD cross-validation diagnostic ───────────────────────
+
+    #[test]
+    fn ad_fd_strain_agreement_reports_a_small_relative_difference_on_a_smooth_manufactured_field() {
+        let device = Default::default();
+        let (a, b, c, d) = (5.0_f64, -3.0_f64, 2.0_f64, -1.5_f64);
+        let (half_w, half_h) = (0.1_f64, 0.1_f64);
+        let fd = FdConfig::new(1e-3, 2.0 * half_w, 2.0 * half_h);
+        // A batch of several points (not just one), matching how this would actually be called
+        // against a real interior collocation point set.
+        let pts_data: Vec<f32> = vec![
+            0.1, 0.2, 0.0,  -0.3, 0.4, 0.0,  0.5, -0.1, 0.0,  -0.2, -0.4, 0.0,
+        ];
+        let pts = Tensor::<TB, 2>::from_data(burn::tensor::TensorData::new(pts_data, vec![4, 3]), &device);
+        let forward = quadratic_field_forward::<TB>(a, b, c, d, half_w, half_h);
+        let agreement = ad_fd_strain_agreement::<TB>(forward, &pts, &fd);
+        let tol = 1e-3; // same real FD truncation/cancellation tolerance as the single-point test above
+        assert!(agreement.eps_xx_rms_relative_diff < tol, "{agreement:?}");
+        assert!(agreement.eps_yy_rms_relative_diff < tol, "{agreement:?}");
+        assert!(agreement.eps_xy_rms_relative_diff < tol, "{agreement:?}");
+    }
+
+    #[test]
+    fn rms_relative_diff_is_zero_for_identical_slices_and_positive_for_differing_ones() {
+        assert_eq!(rms_relative_diff(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]), 0.0);
+        assert!(rms_relative_diff(&[1.1, 2.0, 3.0], &[1.0, 2.0, 3.0]) > 0.0);
     }
 }

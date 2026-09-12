@@ -6,9 +6,19 @@
 //! `false` (confirmed by reading `network::ElasticityNetConfig::init` - it calls burn's
 //! `LinearConfig::init(device)` with no explicit seed anywhere in the call chain, so model
 //! weight initialization is genuinely NOT reproducible in this codebase today), and
-//! `derivative_backend` always reports `"FD"` (P2-02's `Ad`/`Analytic` backends exist and are
-//! tested, but are not yet wired into any live physics consumer - see that epic's own "Known
-//! limitations").
+//! `derivative_backend` always reports `"FD"` - and, per issue #62 PH3-06's own real finding,
+//! always WILL: FD is the only backend that can ever supply a live TRAINING-loss derivative in
+//! this codebase, a structural fact, not a temporary gap. `differential_operator::ad_strain`
+//! retrieves its gradient via burn's `.grad()` API, which returns a value on `B::InnerBackend` -
+//! detached from any autodiff graph, because burn-autodiff 0.21 has no nested/higher-order
+//! autodiff (`differential_operator.rs`'s own module doc comment has the full, verified
+//! derivation). A `LossTerm::compute()` result MUST stay on `Tensor<B, 1>` (connected to the
+//! model-WEIGHT autodiff graph the optimizer's own `.backward()` differentiates through), so
+//! `ad_strain`'s output can never be plugged in there - not "not yet", but "cannot be, given
+//! this dependency". AD IS live-wired now, as a DIAGNOSTIC only (`differential_operator::
+//! ad_fd_strain_agreement`, opt-in via `TrainingSpec.derivative_operator_diagnostic`, surfaced
+//! on `TrainingUpdate.ad_fd_strain_diagnostic`) - real, verified live use of the AD backend
+//! against a currently-training model, just never as the thing this field reports.
 
 use serde::{Deserialize, Serialize};
 
