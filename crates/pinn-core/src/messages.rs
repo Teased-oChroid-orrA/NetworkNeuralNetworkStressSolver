@@ -117,6 +117,19 @@ pub struct NoHoleBenchmarkSummary {
     /// type crosses the pinn-solver -> pinn-core transport boundary the same way every other
     /// `*Summary` type here does.
     pub failure_reasons: Vec<String>,
+    /// Issue #62 PH3-03: whether the MANDATORY L0 analytic sanity gate (`verification_ladder::
+    /// run_affine_amplitude_test`, P2-08) passed for this run's material/geometry/load - always
+    /// `true` in practice by the time a `TrainingUpdate` is ever sent, since a failing L0
+    /// panics training before it starts (see `verification_ladder::evaluate_no_hole_
+    /// operational_gate`'s doc comment). Carried here anyway so the persisted report is
+    /// self-contained proof L0 ran, not an assumed fact.
+    pub l0_passed: bool,
+    /// Issue #62 PH3-03: the combined L0+L4 machine-readable verdict - `"PASS"`/`"FAIL"` (never
+    /// this run's own `"INVALID"`/not-evaluated state, which the exporting caller reports
+    /// separately when this whole field is `None` - see `TrainingUpdate::no_hole_benchmark`'s
+    /// doc comment). Plain string, not `pinn_solver::verification_ladder::OperationalStatus`,
+    /// same "pinn-core never depends on pinn-solver" rule this whole struct already follows.
+    pub operational_status: &'static str,
 }
 
 /// Stage I ("live network-evolution visualization", the user's own explicit follow-up ask) —

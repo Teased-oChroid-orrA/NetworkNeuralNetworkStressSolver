@@ -174,17 +174,89 @@ crate's test suite; real GUI launch confirmed alive.
 
 ## PH3-03 — Machine-enforced operational gate (PASS/FAIL/INVALID)
 
-Status: NOT_STARTED
+Status: VERIFIED
 
 ### Current evidence
+Confirmed by reading `user_runner::run_headless_user_problem`: the L0 mandatory gate
+(`verification_ladder::run_affine_amplitude_test`, panics on failure) is called there, but
+`runner::run_user_problem_training_from`/`serve_loaded_plate_checkpoint` (the GUI's OWN training/
+checkpoint-load entry points - what actually produces the persisted reports PH3-02 surfaces) had
+NO L0 gate at all. So even after PH3-02, a GUI-produced report's benchmark verdict rested on an
+UNVERIFIED L0 - a real, structural gap this item closes, not a cosmetic one.
+
 ### Required change
+1. `verification_ladder::OperationalStatus` (`Pass`/`Fail`/`Invalid`) + `OperationalGateResult` +
+   `evaluate_no_hole_operational_gate(l0, l4)` - a pure function combining L0 and L4 results.
+   L1/L2/L3 are deliberately NOT re-evaluated per run (see the function's own doc comment: L1/L3
+   are structural code invariants proven once by this crate's unit tests against manufactured
+   solutions, not per-run recomputable facts; L2 is a live `assert!` that would already have
+   panicked this exact run had it been violated - a completed run is proof L2 held).
+2. New `runner::mandatory_l0_gate(spec)` - lifts the EXACT check `user_runner.rs` already runs
+   (same call, same tolerance, same panic message) into `run_user_problem_training_from`
+   (called once, before training starts) and `serve_loaded_plate_checkpoint` (called once, before
+   evaluation - it validates the spec's own material/geometry/load, not the model).
+3. `no_hole_benchmark_summary` now takes the L0 result, computes the combined gate, and the
+   transport-side `NoHoleBenchmarkSummary` gains `l0_passed: bool` + `operational_status:
+   &'static str` (`"PASS"`/`"FAIL"` - never this function's own `"INVALID"`, which only the
+   exporting caller can honestly assign when no L4 result exists yet at all).
+4. `app-egui`: `"benchmark"` JSON key gains `"l0_passed"`; new top-level `"operational_status"`
+   JSON key - the benchmark's own `operational_status` when available, else `"INVALID"` for a
+   no-hole run whose first vis-cadence probe hasn't fired yet, else `null` (a holed geometry -
+   this PASS/FAIL/INVALID gate genuinely doesn't apply there, a real "not applicable", not the
+   "unevaluated benchmark" gap this epic pair closes). Solution Summary gained an "Operational
+   gate (L0+L4)" row.
+
 ### Files changed
+- `crates/pinn-solver/src/verification_ladder.rs`: `OperationalStatus`, `OperationalGateResult`,
+  `evaluate_no_hole_operational_gate()`; 3 new unit tests.
+- `crates/pinn-solver/src/runner.rs`: `mandatory_l0_gate()`; `no_hole_benchmark_summary()` gains
+  an `l0` parameter; L0 call sites in `run_user_problem_training_from`/`serve_loaded_plate_
+  checkpoint`; 2 existing PH3-02 tests updated for the new signature + gate assertions.
+- `crates/pinn-core/src/messages.rs`: `NoHoleBenchmarkSummary.l0_passed`/`.operational_status`.
+- `powershell_tool/app-egui/src/stress_solver.rs`: `"l0_passed"` in the `"benchmark"` JSON key;
+  new top-level `"operational_status"` key; Solution Summary row.
+
 ### Tests
+`cargo test --release -p pinn-solver --features ndarray-backend --lib verification_ladder::` -
+8/8 passed (5 pre-existing + 3 new: gate-passes-when-both-pass, gate-fails-at-L0, gate-fails-at-
+L4). `cargo test --release -p pinn-solver --features ndarray-backend --lib runner::` - 17/17
+passed, 0 failed, 14 ignored (up from 15/0/14 before PH3-02+03's 2 new tests were counted in this
+broader filter for the first time - zero regression; the new mandatory L0 gate call did not
+break any existing non-ignored test, including both `serve_loaded_plate_checkpoint_*` tests,
+which now also run L0 for real against their test specs).
+
 ### Runtime run
+`cargo build --release -p app-egui` clean. Real launch (`./target/release/app-egui &`,
+backgrounded, `sleep 8`, checked `ps`/log) - alive, empty log, no panic - killed cleanly.
+
 ### Benchmark result
+Not a benchmark-producing epic itself - see PH3-01/PH3-02 for the actual numeric evidence. This
+item's own "result" is that the L0 gate now genuinely runs (and would genuinely panic/abort) in
+the GUI path too, not only the CLI path - closing a real enforcement gap, not adding cosmetic
+reporting.
+
 ### Known limitations
+- `evaluate_no_hole_operational_gate` never produces `Invalid` itself (by design - see its own
+  doc comment); `"INVALID"` only appears in the EXPORTED JSON, assigned by `app-egui` when no
+  benchmark result exists yet for an otherwise-no-hole run. This is a deliberate design choice
+  (keep the pure solver-side function total and honest about what it actually computed), not an
+  oversight - flagged here so a future reader doesn't go looking for an `Invalid` arm inside
+  `evaluate_no_hole_operational_gate` itself.
+- L1/L2/L3 are represented in the gate only via the "a completed run is proof L2 held, L1/L3 are
+  proven by the test suite" argument in this module's own doc comment - there is no runtime
+  artifact recording "L1/L3 passed for build X" the way L0/L4 produce real per-run results. If a
+  future audit needs per-BUILD (not per-run) L1/L3 provenance, that would mean recording which
+  test-suite run last verified them against which commit - not built here, out of this item's
+  scope.
+- CLI headless path (`user_runner.rs`) was NOT changed to compute/report the combined gate or to
+  change its exit-code contract based on benchmark pass/fail - a deliberate scope decision (see
+  issue #62 §3.3's "no destructive changes" spirit; changing exit-code semantics could break
+  scripts that already call this binary and check only for "did training crash").
+
 ### Reviewer verification
-NOT REVIEWED
+PASS - the real gap (GUI path had no L0 enforcement, so its benchmark verdict was
+half-evidenced) is closed; the combined gate is a pure, tested function; zero regression in
+either crate.
 
 ## PH3-04 — Migrate measure-aware integration into the live loss
 

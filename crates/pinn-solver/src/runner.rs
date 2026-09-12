@@ -1195,21 +1195,25 @@ pub fn run_training_user_problem_resume(
     run_user_problem_training_from(spec, model, device, steps_completed, tx, stop_rx);
 }
 
-/// Issue #62 PH3-02: runs the real P2-14 `run_no_hole_benchmark` against `model_val` and maps
-/// it to the transport-side `NoHoleBenchmarkSummary` (see that type's doc comment for the exact
-/// gap this closes - before this epic, `run_no_hole_benchmark` was only ever called from the
-/// CLI headless path and only ever printed, never persisted or shown in the GUI). `None` for a
-/// holed geometry - P2-14's no-hole reference solution genuinely does not apply there (see
+/// Issue #62 PH3-02/PH3-03: runs the real P2-14 `run_no_hole_benchmark` against `model_val`,
+/// combines it with `l0` (the mandatory L0 gate result computed once at this run's start - see
+/// `mandatory_l0_gate`) via `verification_ladder::evaluate_no_hole_operational_gate`, and maps
+/// both into the transport-side `NoHoleBenchmarkSummary` (see that type's doc comment for the
+/// exact gap this closes - before this epic, `run_no_hole_benchmark` was only ever called from
+/// the CLI headless path and only ever printed, never persisted or shown in the GUI). `None` for
+/// a holed geometry - P2-14's no-hole reference solution genuinely does not apply there (see
 /// `NoHoleBenchmarkSummary::no_hole_benchmark`'s own doc comment on `TrainingUpdate`).
 fn no_hole_benchmark_summary(
     model_val: &ElasticityNet<BInner>,
     spec: &ProblemSpec,
     device: &BDevice,
+    l0: &crate::verification_ladder::AffineAmplitudeResult,
 ) -> Option<pinn_core::messages::NoHoleBenchmarkSummary> {
     if !spec.geometry.holes.is_empty() {
         return None;
     }
     let r = crate::user_problem::run_no_hole_benchmark(model_val, spec, device);
+    let gate = crate::verification_ladder::evaluate_no_hole_operational_gate(l0, &r);
     Some(pinn_core::messages::NoHoleBenchmarkSummary {
         level: "L4",
         name: "no_hole",
@@ -1228,7 +1232,36 @@ fn no_hole_benchmark_summary(
             load_transfer_ratio_max: crate::user_problem::LOAD_TRANSFER_RATIO_MAX,
         },
         failure_reasons: r.failures.into_iter().map(str::to_string).collect(),
+        l0_passed: gate.l0_passed,
+        operational_status: match gate.status {
+            crate::verification_ladder::OperationalStatus::Pass => "PASS",
+            crate::verification_ladder::OperationalStatus::Fail => "FAIL",
+            crate::verification_ladder::OperationalStatus::Invalid => "INVALID",
+        },
     })
+}
+
+/// Issue #62 PH3-03: runs the MANDATORY L0 analytic-sanity gate (P2-08) for `spec`, panicking on
+/// failure - lifts the exact check `user_runner::run_headless_user_problem` already performs
+/// (same call, same tolerance/step count, same panic message) into the GUI-driving entry points
+/// (`run_user_problem_training_from`/`serve_loaded_plate_checkpoint`), which previously had NO
+/// L0 gate at all - a real gap: the CLI headless path enforced it, the GUI path (what actually
+/// produces the persisted reports PH3-02 now surfaces) did not.
+fn mandatory_l0_gate(spec: &ProblemSpec) -> crate::verification_ladder::AffineAmplitudeResult {
+    let result = crate::verification_ladder::run_affine_amplitude_test(
+        &spec.material, spec.load.px, spec.geometry.half_w, spec.geometry.half_h,
+        spec.geometry.thickness, 100, 1e-4,
+    );
+    if !result.passed {
+        panic!(
+            "P2-08 L0 gate FAILED: affine-amplitude test did not recover a_exact - \
+             a_recovered={:.6e} a_exact={:.6e} relative_error={:.3e} (tolerance 1e-4). \
+             Refusing to proceed to neural training on top of a functional that fails the \
+             most basic analytic sanity check.",
+            result.a_recovered, result.a_exact, result.relative_error,
+        );
+    }
+    result
 }
 
 /// Shared body for `run_training_user_problem`/`run_training_user_problem_resume` - identical
@@ -1256,6 +1289,11 @@ fn run_user_problem_training_from(
     /// Kirsch-specific curriculum) so refinement isn't driven by a freshly-initialized
     /// network's noisy residual signal.
     const AMR_WARMUP_STEPS: usize = 200;
+
+    // Issue #62 PH3-03: MANDATORY L0 gate, run before any neural optimization begins - see
+    // `mandatory_l0_gate`'s own doc comment for why this GUI-driving entry point previously had
+    // no such gate at all despite the CLI headless path already requiring it.
+    let l0_result = mandatory_l0_gate(&spec);
 
     let half_w = spec.geometry.half_w;
     let half_h = spec.geometry.half_h;
@@ -1591,7 +1629,7 @@ fn run_user_problem_training_from(
             // Issue #62 PH3-02 - same vis cadence as `rf`/`eb` above (a real forward pass +
             // boundary-residual probe, not free). `None` for a holed geometry - see
             // `no_hole_benchmark_summary`'s own doc comment.
-            let nhb = no_hole_benchmark_summary(&model_val, &spec, &device);
+            let nhb = no_hole_benchmark_summary(&model_val, &spec, &device, &l0_result);
 
             // Smart adaptive architecture - only active when `spec.network.adaptive` (forces
             // `use_piratenet` in `net_cfg` above). Fed `bc_rms` as the training-progress
@@ -1782,6 +1820,10 @@ pub fn serve_loaded_plate_checkpoint(
     stop_rx: Receiver<ControlMsg>,
 ) {
     let device = BDevice::default();
+    // Issue #62 PH3-03 - same MANDATORY L0 gate as `run_user_problem_training_from`, run even
+    // for a loaded (not freshly-trained) checkpoint: it validates the SPEC's own material/
+    // geometry/load, not the model, so it applies equally here.
+    let l0_result = mandatory_l0_gate(&spec);
     let half_w = spec.geometry.half_w;
     let half_h = spec.geometry.half_h;
     let u_ref = crate::training_core::compute_reference_scales_for_plate(&spec).u_ref;
@@ -1869,7 +1911,7 @@ pub fn serve_loaded_plate_checkpoint(
         derivative_order_report,
         formulation_kind_report,
         constraint_report,
-        no_hole_benchmark: no_hole_benchmark_summary(&model, &spec, &device),
+        no_hole_benchmark: no_hole_benchmark_summary(&model, &spec, &device, &l0_result),
     };
     let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
     let _ = tx.send(TrainingMsg::Done);
@@ -2241,7 +2283,7 @@ mod tests {
         }
     }
 
-    // ─── Issue #62 PH3-02 ────────────────────────────────────────────────────────────────────
+    // ─── Issue #62 PH3-02/PH3-03 ─────────────────────────────────────────────────────────────
 
     #[test]
     fn no_hole_benchmark_summary_returns_none_for_a_holed_geometry() {
@@ -2250,7 +2292,8 @@ mod tests {
             .with_input_dim(spec.geometry.net_input_dim()).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
         let device = BDevice::default();
         let model: ElasticityNet<BInner> = net_cfg.init(&device);
-        assert!(no_hole_benchmark_summary(&model, &spec, &device).is_none());
+        let l0 = mandatory_l0_gate(&spec);
+        assert!(no_hole_benchmark_summary(&model, &spec, &device, &l0).is_none());
     }
 
     #[test]
@@ -2271,7 +2314,9 @@ mod tests {
             .with_input_dim(spec.geometry.net_input_dim()).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
         let device = BDevice::default();
         let model: ElasticityNet<BInner> = net_cfg.init(&device);
-        let summary = no_hole_benchmark_summary(&model, &spec, &device)
+        let l0 = mandatory_l0_gate(&spec);
+        assert!(l0.passed, "this spec's material/geometry/load must pass L0: {l0:?}");
+        let summary = no_hole_benchmark_summary(&model, &spec, &device, &l0)
             .expect("a no-hole geometry must produce Some(NoHoleBenchmarkSummary)");
         assert_eq!(summary.level, "L4");
         assert_eq!(summary.name, "no_hole");
@@ -2283,6 +2328,10 @@ mod tests {
         assert!(!summary.failure_reasons.is_empty());
         assert_eq!(summary.thresholds.sigma_xx_relative_error_max, crate::user_problem::SIGMA_XX_RELATIVE_ERROR_MAX);
         assert_eq!(summary.thresholds.load_transfer_ratio_min, crate::user_problem::LOAD_TRANSFER_RATIO_MIN);
+        // Issue #62 PH3-03 - L0 passed (real, just computed above) but L4 failed (untrained
+        // model), so the combined operational verdict must fail at L4, not L0.
+        assert!(summary.l0_passed);
+        assert_eq!(summary.operational_status, "FAIL");
     }
 
     // ─── Stage H: model checkpoint save/load ────────────────────────────────────────────────

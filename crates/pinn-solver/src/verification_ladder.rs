@@ -170,6 +170,61 @@ pub fn no_hole_health_check(energy_balance: &pinn_core::messages::EnergyBalance,
     NoHoleHealthCheck { energy_balance_error, max_abs_displacement, passed: true, failure_reason: None }
 }
 
+/// Issue #62 PH3-03: the three states a production no-hole run's gate SHALL resolve to - never
+/// left as a `null`/`None`/"not evaluated" stand-in once L0 and L4 have actually run (issue #62
+/// §7's own literal wording). `Invalid` is for the caller to use when a run terminated before
+/// reaching the point where L4 could even be computed (e.g. a report exported before the first
+/// vis-cadence tick) - [`evaluate_no_hole_operational_gate`] itself is total given two REAL,
+/// already-executed results, and never returns `Invalid` on its own; that state exists for the
+/// caller to report honestly instead of calling this function with fabricated inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationalStatus {
+    Pass,
+    Fail,
+    Invalid,
+}
+
+/// See this module's own "PH3-03" doc comment above [`OperationalStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationalGateResult {
+    pub status: OperationalStatus,
+    /// Which rung failed, when `status == Fail` - `"L0"` or `"L4"`. `None` for `Pass` (and for
+    /// `Invalid`, which [`evaluate_no_hole_operational_gate`] itself never produces - see that
+    /// type's doc comment).
+    pub failed_rung: Option<&'static str>,
+    pub l0_passed: bool,
+    pub l4_passed: bool,
+}
+
+/// Combines the REAL, already-executed L0 ([`run_affine_amplitude_test`], P2-08 - mandatory,
+/// run before any neural optimization begins) and L4 (`user_problem::run_no_hole_benchmark`,
+/// P2-14 - the hard numeric-threshold no-hole gate) results into one machine-readable verdict.
+///
+/// L1 (differential-operator cross-validation)/L2 (mixed-stress-source enforcement)/L3
+/// (measure-aware integral correctness) are deliberately NOT re-evaluated here. L1/L3 are
+/// structural code invariants proven once, by this crate's own test suite
+/// (`differential_operator`'s/`measure_integral`'s own tests) against manufactured reference
+/// solutions - properties of the CODE, not of any one run's model/config, so there is nothing
+/// for a per-run gate to recompute (re-deriving them here would need a manufactured solution
+/// this run doesn't have, or would just re-invoke the same fixed unit tests a training run has
+/// no mechanism to call). L2 is a live `assert!` inside `step_physics`/`step_physics_multi`
+/// (`field_graph::check_mixed_stress_source_compatibility`) that would already have PANICKED
+/// this exact run had it been violated - a completed run is proof L2 held, by construction, not
+/// something to separately query after the fact.
+pub fn evaluate_no_hole_operational_gate(
+    l0: &AffineAmplitudeResult,
+    l4: &crate::user_problem::NoHoleBenchmarkResult,
+) -> OperationalGateResult {
+    let (status, failed_rung) = if !l0.passed {
+        (OperationalStatus::Fail, Some("L0"))
+    } else if !l4.passed {
+        (OperationalStatus::Fail, Some("L4"))
+    } else {
+        (OperationalStatus::Pass, None)
+    };
+    OperationalGateResult { status, failed_rung, l0_passed: l0.passed, l4_passed: l4.passed }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +273,55 @@ mod tests {
         let check = no_hole_health_check(&eb, 1e-5);
         assert!(!check.passed);
         assert_eq!(check.failure_reason, Some("energy_balance_error is not finite"));
+    }
+
+    // ─── Issue #62 PH3-03: machine-enforced operational gate ───────────────────────────────
+
+    fn passing_l0() -> AffineAmplitudeResult {
+        AffineAmplitudeResult { a_recovered: 1.0, a_exact: 1.0, relative_error: 0.0, steps_run: 100, passed: true }
+    }
+    fn failing_l0() -> AffineAmplitudeResult {
+        AffineAmplitudeResult { a_recovered: 0.5, a_exact: 1.0, relative_error: 0.5, steps_run: 100, passed: false }
+    }
+    fn passing_l4() -> crate::user_problem::NoHoleBenchmarkResult {
+        crate::user_problem::NoHoleBenchmarkResult {
+            sigma_xx_relative_error: 0.0, sigma_yy_over_ref: 0.0, sigma_xy_over_ref: 0.0,
+            traction_rms_over_ref: 0.0, load_transfer_ratio: 1.0, passed: true, failures: Vec::new(),
+        }
+    }
+    fn failing_l4() -> crate::user_problem::NoHoleBenchmarkResult {
+        crate::user_problem::NoHoleBenchmarkResult {
+            sigma_xx_relative_error: 0.5, sigma_yy_over_ref: 0.5, sigma_xy_over_ref: 0.5,
+            traction_rms_over_ref: 0.5, load_transfer_ratio: 0.1, passed: false,
+            failures: vec!["sigma_xx_relative_error"],
+        }
+    }
+
+    #[test]
+    fn operational_gate_passes_only_when_both_l0_and_l4_pass() {
+        let g = evaluate_no_hole_operational_gate(&passing_l0(), &passing_l4());
+        assert_eq!(g.status, OperationalStatus::Pass);
+        assert_eq!(g.failed_rung, None);
+        assert!(g.l0_passed && g.l4_passed);
+    }
+
+    #[test]
+    fn operational_gate_fails_at_l0_when_l0_fails_even_if_l4_would_pass() {
+        // L0 failing is a formulation-level defect - reported as the failed rung even though
+        // L4's own numbers (fabricated as "passing" here) look fine; in real operation L0
+        // failing panics training before L4 could ever be computed at all (see this module's
+        // own doc comment), but the pure function itself must still resolve this combination
+        // honestly if ever called with it directly.
+        let g = evaluate_no_hole_operational_gate(&failing_l0(), &passing_l4());
+        assert_eq!(g.status, OperationalStatus::Fail);
+        assert_eq!(g.failed_rung, Some("L0"));
+    }
+
+    #[test]
+    fn operational_gate_fails_at_l4_when_only_l4_fails() {
+        let g = evaluate_no_hole_operational_gate(&passing_l0(), &failing_l4());
+        assert_eq!(g.status, OperationalStatus::Fail);
+        assert_eq!(g.failed_rung, Some("L4"));
+        assert!(g.l0_passed && !g.l4_passed);
     }
 }
