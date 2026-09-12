@@ -1139,17 +1139,94 @@ app-egui` clean; real launch stayed alive 8s+ with an empty log.
 
 ## PH3-14 — Complete the variational acceptance test (NN bridge)
 
-Status: NOT_STARTED
+Status: VERIFIED (real, complete NEGATIVE finding - the bridge DIVERGES, not merely
+under-converges - see Benchmark result)
 
 ### Current evidence
+Plan text (§18, verbatim): prove the full pipeline "NN -> displacement -> strain ->
+constitutive stress -> measure-aware U-W -> optimized NN" recovers the analytical no-hole
+state - "the critical bridge between L0 analytic functional and full NN solver." PH3-05's own
+2000-step run of the shipped `variational_no_hole_plate.toml` FAILED every hard threshold by a
+wide margin and explicitly handed the real convergence/acceptance question to this item
+("do not optimize the present debug number... explicit hand-off to PH3-09/PH3-14").
+
 ### Required change
+A real, generous-budget run of the SAME shipped config to determine whether PH3-05's failure
+was under-convergence (fixable by more steps, PH3-09's own finding for a DIFFERENT/Hybrid
+baseline) or something structural.
+
 ### Files changed
+`crates/pinn-solver/src/runner.rs`:
+`ph3_14_variational_bridge_given_a_generous_step_budget_tests_whether_it_recovers_the_analytic_
+state` (`#[ignore]`d, real 16000-step run - 8x PH3-05's own budget).
+
 ### Tests
+The test itself IS the evidence for this item (an investigation, not a unit-test-style pass/
+fail gate) - real, run twice (see below), 0 code paths changed outside the test.
+
 ### Runtime run
+**First run** (auto_stop_on_plateau left at its default `true`): only reached step ~7900 of the
+requested 16000 (wall clock 1146.9s at this config's own ~0.146s/step) before the plateau
+tracker silently ended training early - while `sigma_xx_relative_error` was STILL improving on
+every logged 2000-step checkpoint (100%->63%->34%->24%). This is a real, separate finding in
+its own right (see Known limitations) - not itself PH3-14's answer, since the run never
+actually reached the requested budget.
+
+**Second run** (`spec.network.auto_stop_on_plateau = false`, a control-flow fix removing the
+premature early-stop, not a benchmark-specific hack): ran the FULL 16000 steps (`final
+step=15999`). The complete trajectory reveals the real story the first run's early truncation
+hid: `sigma_xx_relative_error` improves through step 6000 (24%) exactly as before, then
+REVERSES and diverges catastrophically - 55% (step 8000), 154% (10000), 261% (12000), 402%
+(14000), 539% (final, recomputed from the saved checkpoint). `total_loss` keeps decreasing
+(more negative) monotonically throughout (-13.6 -> -33.4 -> -83.9 -> -197.6) even as the
+physical solution diverges - `internal_energy` (248.2 J) vs `external_work` (130.2 J) at the
+end gives a 90.6% energy-balance error. Issue #62 PH3-10's own `convergence_evidence` mechanism
+correctly refused to certify this run: `grad_norm_trend: Worsening, bc_residual_trend:
+Worsening, plausibly_converged: false` - independent confirmation the divergence is real, not
+a benchmark-computation artifact.
+
 ### Benchmark result
+**FAILS, and does not converge given 8x the original budget - a genuine structural finding,
+not under-convergence.** The optimizer finds an ever-more-negative `total_loss` by exploiting
+some direction in the pure-Variational (U-W_ext) energy functional that does NOT correspond to
+the true elasticity solution - internal energy and external work both grow without the
+work-energy theorem holding between them. Per issue #62 §3.1 ("no benchmark-specific hacks to
+force a pass"), no attempt was made to add regularization, change the LR schedule, or
+otherwise alter the formulation to chase a passing number - the honest conclusion is reported
+instead. **Physical interpretation** (reasoned, not itself separately proven): pure Variational
+mode registers only `interior_energy`/`external_work`/`translation_gauge` (no `equilibrium`/
+`outer_traction` penalty - P2-01's own design, since a correctly-posed `W_ext` should encode
+the natural BC automatically) - `translation_gauge` suppresses pure rigid-body translation
+(P2-07) but nothing in this term set appears to bound the functional against OTHER non-physical
+deformation modes the network can discover once training runs long enough, letting `U - W_ext`
+be driven arbitrarily negative without corresponding to a valid displacement field.
+
 ### Known limitations
+- **A real, separate, useful finding surfaced investigating this**: `NetworkSpec::auto_stop_
+  on_plateau`'s default heuristic (tuned/validated against the Strong/Hybrid baseline's own
+  `bc_residual_rms` dynamics - see `powershell_tool/CLAUDE.md`) is NOT well-suited to the pure-
+  Variational formulation - it triggered a premature stop around step ~7900 while the tracked
+  metric still looked like it was improving. Left as a documented finding, not "fixed" for the
+  shipped default (`auto_stop_on_plateau` stays `true` - the Strong/Hybrid path this default
+  was validated against is unaffected, and disabling it globally would be a behavior change
+  well outside this item's own scope). A future item could make the plateau-detection window/
+  threshold formulation-aware.
+- The root cause of the divergence itself (which specific unconstrained mode the network is
+  exploiting) was NOT isolated - that would be a separate, real investigation (e.g. probing
+  which components of the learned displacement/stress field grow unboundedly), explicitly out
+  of scope for "does the bridge recover the analytic state" (it doesn't, at least not with this
+  exact term set/config) versus "why, mechanistically, does it fail" (a natural, stated
+  follow-up).
+- Per issue #62 §19's own explicit hole-eligibility rule ("eligible only after... variational
+  path = PASS"), this FAILING result means the hole/Kt path (PH3-15) cannot cite the
+  variational path as a satisfied precondition - PH3-15's own gate logic must account for this
+  honestly (documented there, not glossed over here).
+
 ### Reviewer verification
-NOT REVIEWED
+`cargo test --release -p pinn-solver --features ndarray-backend --lib runner::` 20/20 passed,
+20 ignored (up from 19/0/19 - +1 real investigation test), 0 regressions. Both real training
+runs (1146.9s and 2667.7s respectively) completed without panic/NaN - a real, clean negative
+result, not a crash.
 
 ## PH3-15 — Hole/Kt activation gate
 
