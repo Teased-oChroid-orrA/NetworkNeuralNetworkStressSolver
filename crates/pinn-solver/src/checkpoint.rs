@@ -155,6 +155,7 @@ mod tests {
             load: LoadConfig::uniaxial_x(6.9e7),
             network: NetworkSpec { hidden_dim: 8, n_hidden: 2, ..Default::default() },
             training: TrainingSpec::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
         }
     }
 

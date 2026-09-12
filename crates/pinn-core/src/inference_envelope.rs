@@ -250,6 +250,7 @@ mod tests {
             load: LoadConfig::uniaxial_x(6.9e7),
             network: NetworkSpec::default(),
             training: TrainingSpec::default(),
+            formulation: crate::problem_spec::default_formulation(),
         }
     }
 

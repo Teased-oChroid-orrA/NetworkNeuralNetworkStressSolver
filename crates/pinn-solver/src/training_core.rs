@@ -3476,6 +3476,7 @@ mod tests {
             load: LoadConfig::uniaxial_x(6.9e7),
             network: NetworkSpec::default(),
             training: TrainingSpec { max_steps: 1, n_interior: 1, n_boundary: 1, fd_h, lr: 1e-3 },
+            formulation: pinn_core::problem_spec::default_formulation(),
         }
     }
 

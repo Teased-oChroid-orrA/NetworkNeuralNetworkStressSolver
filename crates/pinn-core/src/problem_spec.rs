@@ -67,6 +67,62 @@ impl Default for TrainingSpec {
     }
 }
 
+/// Explicit formulation selection - Phase 2 remediation (issue #61, epic P2-01, "Explicit
+/// formulation model"). This is a REAL gate on which loss terms `UserDefinedProblem::
+/// loss_terms()` returns, not a classification label (see `pinn_solver::problem::
+/// LossTerm::formulation_kind()`, which only classifies terms that already exist in the
+/// returned list - this type controls what's IN that list in the first place).
+///
+/// Base terms are `interior_energy` (U), `equilibrium` (strong-form ∇·σ=0 residual),
+/// `outer_traction` (strong-form Neumann residual), `external_work` (W_ext, the DEM natural-BC
+/// counterpart to `outer_traction`). Every hole's essential (Dirichlet, `HoleBc::Fixed`)
+/// constraint is ALWAYS active regardless of formulation - an essential constraint is required
+/// in every formulation, not a formulation-specific choice (issue #61's own text lists
+/// "essential BC/gauge constraints separately declared" as a fixed member of the variational
+/// minimum, not an optional one). Each hole's NATURAL boundary (`HoleBc::Free`,
+/// traction-free) is where formulations genuinely differ - see each variant's own doc comment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum FormulationSelection {
+    /// `Pi = U - W_ext` ONLY (+ essential constraints). Natural boundaries (`outer_traction`'s
+    /// strong-form penalty, and each `HoleBc::Free` hole's traction-free penalty) are
+    /// EXCLUDED from the optimization objective by construction - satisfied automatically by
+    /// the variational principle itself (a correctly-posed `W_ext` already encodes the
+    /// natural BC; a separate penalty term would double-enforce it - issue #61 §1.2's
+    /// "duplicate natural Neumann enforcement" prohibition). `equilibrium`/`outer_traction`
+    /// remain available as post-hoc DIAGNOSTICS (`training_core::probe_interior_energy_
+    /// residuals`/`user_problem::probe_boundary_residuals` - neither depends on `loss_terms()`
+    /// at all), just not as optimization-objective terms.
+    Variational,
+    /// Only strong-form PDE/BC residuals (`equilibrium`, `outer_traction`, plus each hole's
+    /// `HoleBc::Free` traction-free penalty) - NO energy-functional terms (`interior_energy`,
+    /// `external_work` excluded).
+    Strong,
+    /// An explicit, named list of BASE terms (a subset of `interior_energy`/`equilibrium`/
+    /// `outer_traction`/`external_work`) - "Hybrid requires an explicit term list" (issue #61
+    /// P2-01 acceptance criterion): there is no implicit "everything" fallback, every entry
+    /// must be named. Every hole's terms (both essential `hole_fixed` and natural `hole_free`)
+    /// are always included for `Hybrid`, matching this codebase's own pre-remediation
+    /// behavior when reproduced via `default_formulation()`'s literal 4-name list below.
+    /// Unknown names panic at `loss_terms()` time (same "loud, not silent" failure mode
+    /// `base_weight`'s own `panic!("unknown loss term")` already established for this file).
+    Hybrid(Vec<String>),
+}
+
+/// The exact pre-remediation behavior (`UserDefinedProblem::loss_terms()` before issue #61):
+/// every base term active, unconditionally. Kept as the `#[serde(default)]` so every existing
+/// shipped/user TOML spec keeps parsing AND behaving identically (issue #61 §1.2/P2-15's
+/// "no silent formulation change" migration requirement) - formulation is now explicit
+/// (a real, named `Hybrid` selection), even though the DEFAULT explicit choice reproduces old
+/// behavior byte-for-byte.
+pub fn default_formulation() -> FormulationSelection {
+    FormulationSelection::Hybrid(vec![
+        "interior_energy".to_string(),
+        "equilibrium".to_string(),
+        "outer_traction".to_string(),
+        "external_work".to_string(),
+    ])
+}
+
 /// The complete user-defined problem: geometry (rectangular plate + N holes), material,
 /// far-field load, network size, and training schedule. See `examples/problems/` for a
 /// documented, ready-to-edit template.
@@ -79,6 +135,10 @@ pub struct ProblemSpec {
     pub network: NetworkSpec,
     #[serde(default)]
     pub training: TrainingSpec,
+    /// Issue #61 P2-01. Defaults to `default_formulation()` (the exact pre-remediation
+    /// behavior) so every existing spec file keeps parsing and training identically.
+    #[serde(default = "default_formulation")]
+    pub formulation: FormulationSelection,
 }
 
 #[cfg(test)]
@@ -101,6 +161,7 @@ mod tests {
             load: LoadConfig::uniaxial_x(6.9e7),
             network: NetworkSpec::default(),
             training: TrainingSpec::default(),
+            formulation: default_formulation(),
         }
     }
 
@@ -147,5 +208,41 @@ mod tests {
         let parsed: ProblemSpec = toml::from_str(toml_str).expect("deserialize");
         assert_eq!(parsed.network, NetworkSpec::default());
         assert_eq!(parsed.training, TrainingSpec::default());
+        assert_eq!(parsed.formulation, default_formulation(), "omitting [formulation] must reproduce pre-remediation behavior exactly");
+    }
+
+    #[test]
+    fn default_formulation_is_the_literal_pre_remediation_hybrid_list() {
+        assert_eq!(default_formulation(), FormulationSelection::Hybrid(vec![
+            "interior_energy".to_string(), "equilibrium".to_string(),
+            "outer_traction".to_string(), "external_work".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn formulation_variational_round_trips_through_toml() {
+        let mut spec = sample_spec();
+        spec.formulation = FormulationSelection::Variational;
+        let toml_str = toml::to_string(&spec).expect("serialize");
+        let parsed: ProblemSpec = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(parsed.formulation, FormulationSelection::Variational);
+    }
+
+    #[test]
+    fn formulation_strong_round_trips_through_toml() {
+        let mut spec = sample_spec();
+        spec.formulation = FormulationSelection::Strong;
+        let toml_str = toml::to_string(&spec).expect("serialize");
+        let parsed: ProblemSpec = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(parsed.formulation, FormulationSelection::Strong);
+    }
+
+    #[test]
+    fn formulation_hybrid_with_explicit_subset_round_trips_through_toml() {
+        let mut spec = sample_spec();
+        spec.formulation = FormulationSelection::Hybrid(vec!["interior_energy".to_string()]);
+        let toml_str = toml::to_string(&spec).expect("serialize");
+        let parsed: ProblemSpec = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(parsed.formulation, FormulationSelection::Hybrid(vec!["interior_energy".to_string()]));
     }
 }

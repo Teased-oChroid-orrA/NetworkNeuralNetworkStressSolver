@@ -2187,6 +2187,7 @@ mod tests {
             load: LoadConfig::uniaxial_x(6.9e7),
             network: NetworkSpec { hidden_dim: 64, n_hidden: 3, ..Default::default() },
             training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3 },
+            formulation: pinn_core::problem_spec::default_formulation(),
         }
     }
 
@@ -3180,6 +3181,7 @@ mod tests {
             load: LoadConfig::uniaxial_x(6.9e7),
             network: NetworkSpec { hidden_dim: 64, n_hidden: 3, ..Default::default() },
             training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3 },
+            formulation: pinn_core::problem_spec::default_formulation(),
         }
     }
 
@@ -3418,6 +3420,7 @@ mod tests {
                 ..Default::default()
             },
             training: TrainingSpec { max_steps, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3 },
+            formulation: pinn_core::problem_spec::default_formulation(),
         }
     }
 

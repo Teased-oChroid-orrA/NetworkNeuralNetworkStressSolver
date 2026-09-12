@@ -512,19 +512,58 @@ impl BoundaryValueProblem for UserDefinedProblem {
         let (ref_energy, ref_stress2) = (scales.ref_energy, scales.ref_stress2);
         let eq_ref_div2 = scales.stress_per_length2;
 
-        let mut terms: Vec<Box<dyn LossTerm>> = vec![
-            Box::new(InteriorEnergyTerm { material: self.spec.material.clone(), ref_energy }),
-            Box::new(EquilibriumTerm { point_set: "interior", material: self.spec.material.clone(), ref_div2: eq_ref_div2 }),
-            Box::new(OuterTractionTerm {
+        // Issue #61 P2-01 ("Explicit formulation model") - `self.spec.formulation` is a REAL
+        // gate on which base terms exist below, not a label applied after the fact. See
+        // `pinn_core::problem_spec::FormulationSelection`'s own doc comment for what each
+        // variant means. Essential (HoleBc::Fixed) constraints are always active in every
+        // formulation (an essential constraint is required regardless of formulation choice,
+        // per issue #61's own text) - only the natural (HoleBc::Free) treatment and which BASE
+        // terms are active differ.
+        use pinn_core::problem_spec::FormulationSelection;
+        let active_base: std::collections::HashSet<&'static str> = match &self.spec.formulation {
+            FormulationSelection::Variational => ["interior_energy", "external_work"].into_iter().collect(),
+            FormulationSelection::Strong => ["equilibrium", "outer_traction"].into_iter().collect(),
+            FormulationSelection::Hybrid(names) => names.iter().map(|s| match s.as_str() {
+                "interior_energy" => "interior_energy",
+                "equilibrium" => "equilibrium",
+                "outer_traction" => "outer_traction",
+                "external_work" => "external_work",
+                other => panic!(
+                    "UserDefinedProblem::loss_terms: unknown Hybrid formulation term '{other}' \
+                     - expected one of interior_energy/equilibrium/outer_traction/external_work"
+                ),
+            }).collect(),
+        };
+        // Natural (HoleBc::Free) hole boundaries are a strong-form penalty term - active for
+        // Strong and Hybrid (this codebase's own pre-remediation behavior always included it),
+        // OMITTED for Variational: a correctly-posed W_ext already encodes the traction-free
+        // natural boundary (its own contribution there is identically zero, since t̄=0), so a
+        // separate penalty would duplicate natural Neumann enforcement (issue #61 §1.2's
+        // explicit prohibition) rather than adding real constraint pressure.
+        let hole_free_active = !matches!(self.spec.formulation, FormulationSelection::Variational);
+
+        let mut terms: Vec<Box<dyn LossTerm>> = Vec::new();
+        if active_base.contains("interior_energy") {
+            terms.push(Box::new(InteriorEnergyTerm { material: self.spec.material.clone(), ref_energy }));
+        }
+        if active_base.contains("equilibrium") {
+            terms.push(Box::new(EquilibriumTerm { point_set: "interior", material: self.spec.material.clone(), ref_div2: eq_ref_div2 }));
+        }
+        if active_base.contains("outer_traction") {
+            terms.push(Box::new(OuterTractionTerm {
                 material: self.spec.material.clone(),
                 ref_stress2,
                 px: self.spec.load.px,
                 py: self.spec.load.py,
-            }),
-            Box::new(ExternalWorkTerm { px: self.spec.load.px, py: self.spec.load.py, ref_energy }),
-        ];
+            }));
+        }
+        if active_base.contains("external_work") {
+            terms.push(Box::new(ExternalWorkTerm { px: self.spec.load.px, py: self.spec.load.py, ref_energy }));
+        }
         for (hole, &name) in self.spec.geometry.holes.iter().zip(self.hole_names.iter()) {
-            terms.push(Box::new(HoleBcTerm { point_set: name, bc: hole.bc, ref_stress2 }));
+            if hole.bc == HoleBc::Fixed || hole_free_active {
+                terms.push(Box::new(HoleBcTerm { point_set: name, bc: hole.bc, ref_stress2 }));
+            }
         }
         terms
     }
@@ -1351,6 +1390,7 @@ mod tests {
             load: LoadConfig::uniaxial_x(1e7),
             network: Default::default(),
             training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
         };
         let problem = UserDefinedProblem::new(spec);
         let terms = problem.loss_terms();
@@ -1367,6 +1407,201 @@ mod tests {
         crate::problem::validate_loss_terms(&problem);
     }
 
+    /// Issue #61 P2-01 acceptance: "Variational activates only declared variational terms and
+    /// constraints." `interior_energy`/`external_work` (the U-W_ext pair) plus the essential
+    /// `hole_fixed` constraint are active; the natural `hole_free` boundary and both strong-form
+    /// residuals (`equilibrium`/`outer_traction`) are ABSENT entirely - not merely zero-weighted.
+    #[test]
+    fn variational_formulation_activates_only_u_minus_w_ext_and_essential_constraints() {
+        use pinn_core::problem_spec::FormulationSelection;
+        let mut spec = ProblemSpec {
+            geometry: two_hole_geometry(),
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        spec.formulation = FormulationSelection::Variational;
+        let problem = UserDefinedProblem::new(spec);
+        let names: Vec<&str> = problem.loss_terms().iter().map(|t| t.name()).collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names.contains(&"interior_energy"), "{names:?}");
+        assert!(names.contains(&"external_work"), "{names:?}");
+        assert!(names.contains(&"hole_fixed"), "{names:?} - essential constraint must stay active");
+        assert!(!names.contains(&"hole_free"), "{names:?} - natural boundary must be OMITTED under Variational");
+        assert!(!names.contains(&"equilibrium"), "{names:?} - strong-form residual must be OMITTED under Variational");
+        assert!(!names.contains(&"outer_traction"), "{names:?} - strong-form residual must be OMITTED under Variational");
+    }
+
+    /// Issue #61 P2-01 acceptance: "Strong activates declared PDE/BC residuals." No energy
+    /// functional terms (`interior_energy`/`external_work`) are present.
+    #[test]
+    fn strong_formulation_activates_only_pde_and_bc_residuals() {
+        use pinn_core::problem_spec::FormulationSelection;
+        let mut spec = ProblemSpec {
+            geometry: two_hole_geometry(),
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        spec.formulation = FormulationSelection::Strong;
+        let problem = UserDefinedProblem::new(spec);
+        let names: Vec<&str> = problem.loss_terms().iter().map(|t| t.name()).collect();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert!(names.contains(&"equilibrium"), "{names:?}");
+        assert!(names.contains(&"outer_traction"), "{names:?}");
+        assert!(names.contains(&"hole_free"), "{names:?}");
+        assert!(names.contains(&"hole_fixed"), "{names:?}");
+        assert!(!names.contains(&"interior_energy"), "{names:?} - energy functional must be OMITTED under Strong");
+        assert!(!names.contains(&"external_work"), "{names:?} - energy functional must be OMITTED under Strong");
+    }
+
+    /// Issue #61 P2-01 acceptance: "Hybrid requires an explicit term list" - an empty list
+    /// activates zero base terms (still real, not a fallback to "everything"); a named subset
+    /// activates exactly that subset; an unknown name panics rather than being silently
+    /// ignored.
+    #[test]
+    fn hybrid_formulation_activates_exactly_the_named_subset() {
+        use pinn_core::problem_spec::FormulationSelection;
+        let base_spec = ProblemSpec {
+            geometry: two_hole_geometry(),
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+
+        let mut only_energy = base_spec.clone();
+        only_energy.formulation = FormulationSelection::Hybrid(vec!["interior_energy".to_string()]);
+        let names: Vec<&str> = UserDefinedProblem::new(only_energy).loss_terms().iter().map(|t| t.name()).collect();
+        // Hole terms are always included for Hybrid (legacy behavior), regardless of the base list.
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names.contains(&"interior_energy"), "{names:?}");
+        assert!(names.contains(&"hole_free"), "{names:?}");
+        assert!(names.contains(&"hole_fixed"), "{names:?}");
+
+        let mut empty = base_spec.clone();
+        empty.formulation = FormulationSelection::Hybrid(vec![]);
+        let names: Vec<&str> = UserDefinedProblem::new(empty).loss_terms().iter().map(|t| t.name()).collect();
+        assert_eq!(names.len(), 2, "{names:?} - empty Hybrid list must activate zero base terms, not fall back to \"everything\"");
+        assert!(names.contains(&"hole_free") && names.contains(&"hole_fixed"), "{names:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown Hybrid formulation term 'bogus_term'")]
+    fn hybrid_formulation_panics_on_unknown_term_name() {
+        use pinn_core::problem_spec::FormulationSelection;
+        let spec = ProblemSpec {
+            geometry: two_hole_geometry(),
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: FormulationSelection::Hybrid(vec!["bogus_term".to_string()]),
+        };
+        UserDefinedProblem::new(spec).loss_terms();
+    }
+
+    /// Issue #61 P2-01 acceptance: "Tests prove inactive terms contribute no gradients." Rather
+    /// than asserting a zero gradient (which a term could satisfy by accident, e.g. at a
+    /// symmetric initial point), this proves the stronger claim: the excluded terms are not
+    /// even PART of the computation graph - `term_grad_norms` (built from `loss_terms()`
+    /// itself) has no entry for them at all under Variational, and gains real, nonzero entries
+    /// for them once switched to Hybrid-all on the identical model/step.
+    #[test]
+    fn variational_formulation_excluded_terms_have_no_gradient_norm_entry_at_all() {
+        use crate::problem::{DomainStepCtx, MultiStepCtx};
+        use crate::training_core::{step_physics_multi, sync_device, BDevice};
+        use crate::optim::{make_bias_optim, make_gate_optim, WeightOptim};
+        use crate::network::ElasticityNetConfig;
+        use crate::fd_stencil::FdConfig;
+        use crate::saw_brdr::SawBrdr;
+        use crate::lr_schedule::LrSchedule;
+        use pinn_core::problem_spec::FormulationSelection;
+
+        let device = BDevice::default();
+        let mut spec = ProblemSpec {
+            geometry: two_hole_geometry(),
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        spec.formulation = FormulationSelection::Variational;
+        let problem = UserDefinedProblem::new(spec.clone());
+
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(spec.geometry.net_input_dim())
+            .with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
+        let model = net_cfg.init(&device);
+        let mut optim = crate::problem::DomainOptim {
+            weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(),
+        };
+        let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+        let mut saw = SawBrdr::with_base(base_weights, 0.95);
+        let mut lr_sched = LrSchedule::new(1e-3, 100, 500);
+        let fd = FdConfig::new(1e-3, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+
+        let half_w = spec.geometry.half_w;
+        let half_h = spec.geometry.half_h;
+        let sampling = problem.sampling_strategy(0);
+        let placeholder_geom = pinn_core::geometry::GeometryConfig::kirsch_plate_inches();
+        let int_pts = sampling.sample_interior(&placeholder_geom, 64);
+        let int_norm: Vec<[f32; 2]> = int_pts.iter().map(|&[x, y]| [(x / half_w) as f32, (y / half_h) as f32]).collect();
+        let mut named = std::collections::HashMap::new();
+        for set in sampling.named_point_sets(&[]) {
+            let pts = &set.points;
+            named.insert(set.name, crate::problem::PointSetData {
+                norm: pts.iter().map(|p| [(p.x / half_w) as f32, (p.y / half_h) as f32]).collect(),
+                nx: pts.iter().map(|p| p.nx as f32).collect(),
+                ny: pts.iter().map(|p| p.ny as f32).collect(),
+                tx: pts.iter().map(|p| p.tx as f32).collect(),
+                ty: pts.iter().map(|p| p.ty as f32).collect(),
+            });
+        }
+        let bnd_pts = sampling.sample_boundary(&placeholder_geom, &spec.load, 32);
+        named.insert("outer_boundary", crate::problem::PointSetData {
+            norm: bnd_pts.iter().map(|p| [(p.x / half_w) as f32, (p.y / half_h) as f32]).collect(),
+            nx: bnd_pts.iter().map(|p| p.nx as f32).collect(),
+            ny: bnd_pts.iter().map(|p| p.ny as f32).collect(),
+            tx: bnd_pts.iter().map(|p| p.tx as f32).collect(),
+            ty: bnd_pts.iter().map(|p| p.ty as f32).collect(),
+        });
+        let data = crate::problem::DomainStepData { id: USER_DOMAIN, int_norm, extra_ring_norm: Vec::new(), named };
+        let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+        let ctx = MultiStepCtx {
+            config: &pinn_core::messages::SolverConfig::default_kirsch(),
+            problem: &problem,
+            fd: &fd,
+            k: 1.0,
+            domains: vec![DomainStepCtx { data: &data, u_ref: scales.u_ref, ref_energy: scales.ref_energy, ref_stress2: scales.ref_stress2 }],
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            dynamic_lam_penetration_cap: f64::MAX,
+            dynamic_lam_non_tension_cap: f64::MAX,
+            constitutive_consistency_weight: 50.0,
+            n_fourier: spec.geometry.n_fourier(),
+            probe_term_gradients: true,
+            phase2_active: true,
+            step: 0,
+        };
+        let (_new_model, out) = step_physics_multi(
+            vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+        sync_device(&device);
+        let norms = out.term_grad_norms.expect("probe_term_gradients=true must populate term_grad_norms");
+        assert!(norms.contains_key("interior_energy"), "{norms:?}");
+        assert!(norms.contains_key("external_work"), "{norms:?}");
+        assert!(!norms.contains_key("equilibrium"), "{norms:?} - excluded term must have NO gradient-norm entry, not just a zero one");
+        assert!(!norms.contains_key("outer_traction"), "{norms:?} - excluded term must have NO gradient-norm entry, not just a zero one");
+        assert!(!norms.contains_key("hole_free"), "{norms:?} - excluded natural boundary must have NO gradient-norm entry");
+    }
+
     /// `stress_source_report` on `UserDefinedProblem` matches `docs/investigations/
     /// kt-investigation-bugsource-new.md`'s own §2/§12 written conclusion exactly - the
     /// generalized, always-available answer to the question that document's own audit had to
@@ -1381,6 +1616,7 @@ mod tests {
             load: LoadConfig::uniaxial_x(1e7),
             network: Default::default(),
             training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
         };
         let problem = UserDefinedProblem::new(spec);
         let report = crate::training_core::stress_source_report(&problem);
@@ -1413,6 +1649,7 @@ mod tests {
             load: LoadConfig::uniaxial_x(1e7),
             network: Default::default(),
             training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
         };
         let problem = UserDefinedProblem::new(spec);
         let report = crate::training_core::boundary_operator_report(&problem);
@@ -1444,6 +1681,7 @@ mod tests {
             load: LoadConfig::uniaxial_x(1e7),
             network: Default::default(),
             training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
         };
         let problem = UserDefinedProblem::new(spec);
         let report = crate::training_core::derivative_order_report(&problem);
@@ -1474,6 +1712,7 @@ mod tests {
             load: LoadConfig::uniaxial_x(1e7),
             network: Default::default(),
             training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
         };
         let problem = UserDefinedProblem::new(spec);
         let terms = problem.loss_terms();
@@ -1659,6 +1898,7 @@ mod tests {
             load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
             network: Default::default(),
             training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
         };
         let (rms, max) = probe_boundary_residuals(&model, &spec, &device);
         assert!(rms.is_finite() && rms >= 0.0, "rms must be finite and non-negative, got {rms}");
@@ -1680,6 +1920,7 @@ mod tests {
             load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
             network: Default::default(),
             training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
         };
         let (rms, max) = probe_boundary_residuals(&model, &spec, &device);
         assert!(rms.is_finite() && rms >= 0.0);
@@ -1700,6 +1941,7 @@ mod tests {
             load: pinn_core::loading::LoadConfig::uniaxial_x(px),
             network: Default::default(),
             training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
         };
         let rf = probe_reaction_force(&model, &spec, &device);
         assert!(rf.net_fx.is_finite() && rf.net_fy.is_finite(), "net force must be finite, got fx={} fy={}", rf.net_fx, rf.net_fy);
@@ -1722,6 +1964,7 @@ mod tests {
             load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
             network: Default::default(),
             training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
         };
         let rf = probe_reaction_force(&model, &spec, &device);
         assert!(rf.net_fx.is_finite() && rf.net_fy.is_finite());
@@ -1740,6 +1983,7 @@ mod tests {
             load: pinn_core::loading::LoadConfig::uniaxial_x(0.0),
             network: Default::default(),
             training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
         };
         let rf = probe_reaction_force(&model, &spec, &device);
         assert!(rf.equilibrium_error.is_finite(), "equilibrium_error must stay finite at zero applied load, got {}", rf.equilibrium_error);
@@ -1757,6 +2001,7 @@ mod tests {
             load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
             network: Default::default(),
             training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
         };
         let eb = probe_energy_balance(&model, &spec, &device);
         assert!(eb.internal_energy.is_finite(), "internal_energy must be finite, got {}", eb.internal_energy);
@@ -1777,6 +2022,7 @@ mod tests {
             load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
             network: Default::default(),
             training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
         };
         let eb = probe_energy_balance(&model, &spec, &device);
         assert!(
