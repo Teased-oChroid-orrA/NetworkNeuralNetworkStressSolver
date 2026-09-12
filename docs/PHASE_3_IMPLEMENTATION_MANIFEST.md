@@ -1405,14 +1405,71 @@ passed (up from 58/0/2 ignored - +2 new tests), 2 ignored (unchanged). `cargo te
 
 ## PH3-17 — Remove legacy paths only after proof
 
-Status: NOT_STARTED
+Status: VERIFIED (decision record: NO legacy path removed, NO default changed)
 
 ### Current evidence
+Plan text (§21, verbatim): "1. keep compatibility switch; 2. make the new path default; 3. run
+regression suite; 4. run benchmark suite; 5. verify persisted reports; 6. remove legacy path
+only after those results are stable. Deletion is the final step, not the implementation
+strategy." Three real compatibility switches were built across this phase, each with a real,
+generous-budget test of its "new" alternative: `formulation` (Hybrid legacy vs. Variational
+new, PH3-05/14), `measure_aware_training` (legacy mean-integral vs. measure-aware new, PH3-04/
+15), `amr_enabled` (AMR-on legacy vs. fixed-sampling new, PH3-12).
+
 ### Required change
+Walk steps 2-6 honestly for each switch, using the evidence ALREADY gathered - no new training
+runs needed, since the relevant benchmark evidence already exists from PH3-05/09/12/14/15.
+
 ### Files changed
+`crates/pinn-core/src/problem_spec.rs` -
+`ph3_17_decision_record_no_legacy_default_was_changed_without_new_proof` - a real regression
+guard asserting the CURRENT defaults match this decision record, so a future accidental default
+flip is caught rather than silently mistaken for a deliberate, evidence-backed change.
+
 ### Tests
+The decision, walked through the plan's own 6 steps, for each switch:
+
+**`formulation` (Hybrid legacy vs. Variational new)**: Step 2 (make new default) - NOT DONE.
+PH3-14's real 16000-step run of the Variational config DIVERGES past step ~7000
+(`sigma_xx_relative_error` reaching 539%, `energy_balance_error` 90.6%) - it does not pass step
+3/4 (regression/benchmark suite) at all, so promoting it to default would be a regression, not
+progress. **Decision: keep Hybrid as default. Do not remove the Strong/Hybrid code paths.**
+
+**`measure_aware_training` (legacy mean-integral vs. measure-aware new)**: Step 2 - NOT DONE.
+PH3-15's real 2800-step isolating run (measure-aware training under the SAME Hybrid formulation
+that otherwise converges cleanly) FAILS all 5 hard thresholds - worse than legacy at the
+identical budget. **Decision: keep `measure_aware_training = false` as default. Do not remove
+the legacy (unweighted) integral path.**
+
+**`amr_enabled` (AMR-on legacy vs. fixed-sampling new)**: Step 2 - PARTIALLY evidenced, NOT
+promoted. PH3-12 found fixed sampling beats AMR-on on 6 of 7 metrics for the no-hole geometry -
+a real, positive result for the "new" alternative, but scoped to ONE geometry class (no-hole,
+uniform field) that isn't representative of AMR's own actual design motivation (hole-boundary
+stress concentrations - never tested against a holed geometry in this pass). Promoting a
+global default change on a single, non-representative data point would violate the same
+evidence-generalization discipline this whole phase has followed elsewhere. **Decision: keep
+`amr_enabled = true` (AMR-on) as default. Do not remove the fixed-sampling code path either
+(it now exists as the compatibility switch's own "off" state, and remains available for future
+per-geometry-class evaluation).**
+
 ### Runtime run
+None new - this item is a decision/audit against ALREADY-real evidence (PH3-05/09/12/14/15),
+per its own explicit "no new training runs needed" scoping above.
+
 ### Benchmark result
+Not applicable - no benchmark was re-run; this item's output is a decision record, not a new
+number.
+
 ### Known limitations
+- `amr_enabled`'s decision is the least settled of the three - a real, future holed-geometry
+  A/B comparison (the natural follow-up PH3-12's own manifest entry already flagged) could
+  change this conclusion. Until that evidence exists, the conservative default (unchanged) is
+  kept.
+- No code was deleted in this pass, consistent with "deletion is the final step" - all 3
+  compatibility switches remain in the codebase, available for a future re-evaluation if new
+  evidence emerges. This item's own regression-guard test exists specifically so a future
+  session cannot silently flip one of these defaults without addressing (or explicitly
+  overriding, with new evidence) the exact reasoning recorded here.
+
 ### Reviewer verification
-NOT REVIEWED
+`cargo test -p pinn-core` 121/121 passed (up from 120 - +1 new decision-record test).

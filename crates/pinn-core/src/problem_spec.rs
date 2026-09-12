@@ -242,6 +242,32 @@ mod tests {
         }
     }
 
+    /// Issue #62 PH3-17's own real decision record, enforced: after running every "new path"
+    /// this Phase 3 built a compatibility switch for through real, generous-budget evidence
+    /// (PH3-05/09/12/14/15), NONE of them qualified for promotion to default - `formulation`
+    /// defaults to Hybrid, not Variational (PH3-14: pure Variational DIVERGES past step ~7000);
+    /// `measure_aware_training` defaults to `false` (PH3-15: measure-aware training under the
+    /// SAME Hybrid formulation that otherwise converges still fails every hard threshold);
+    /// `amr_enabled` defaults to `true` (PH3-12: fixed sampling beat AMR on the no-hole
+    /// geometry, but that single-geometry result doesn't generalize to the holed geometries
+    /// AMR was actually designed for, so the legacy "AMR always on" default is kept). Per
+    /// issue #62 §21 ("deletion is the final step, not the implementation strategy"), the
+    /// correct, evidence-driven outcome of running that full process was "keep every legacy
+    /// default and remove nothing" - this test guards against an accidental future default
+    /// flip being mistaken for a deliberate, evidence-backed one. If a REAL new finding
+    /// justifies changing one of these defaults, update this test AND cite the manifest entry
+    /// that justifies it - never flip a default silently.
+    #[test]
+    fn ph3_17_decision_record_no_legacy_default_was_changed_without_new_proof() {
+        assert_eq!(default_formulation(), FormulationSelection::Hybrid(vec![
+            "interior_energy".to_string(), "equilibrium".to_string(),
+            "outer_traction".to_string(), "external_work".to_string(),
+        ]), "formulation must stay the legacy Hybrid baseline - PH3-14 found pure Variational diverges");
+        assert!(!TrainingSpec::default().measure_aware_training, "measure_aware_training must stay off by default - PH3-15 found it fails even under the converging Hybrid formulation");
+        assert!(TrainingSpec::default().amr_enabled, "amr_enabled must stay on by default - PH3-12's fixed-sampling result was no-hole-only, not shown to generalize to holed geometries");
+        assert!(NetworkSpec::default().auto_stop_on_plateau, "auto_stop_on_plateau must stay on by default - PH3-14's premature-stop finding was Variational-specific, not shown to be wrong for the default Hybrid path");
+    }
+
     /// Issue #62 PH3-05: the shipped pure-Variational + measure-aware production benchmark
     /// config must parse with EXACTLY the formulation/switch this epic's own manifest entry
     /// claims - a real regression guard, not just "the file exists".
