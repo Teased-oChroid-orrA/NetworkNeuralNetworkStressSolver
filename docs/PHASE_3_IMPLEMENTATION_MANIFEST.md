@@ -945,17 +945,90 @@ build -p app-egui` clean, real launch stayed alive 8s+ with an empty log.
 
 ## PH3-12 — Validate AMR as a convergence accelerator
 
-Status: NOT_STARTED
+Status: VERIFIED (real, honest NEGATIVE finding for this geometry - see Benchmark result)
 
 ### Current evidence
+Plan text (§16, verbatim): "The current AMR sweep reduced residual RMS only slightly. Add a
+controlled comparison: fixed sampling vs AMR, for the same training budget. Compare: stress
+error, traction error, energy balance, load transfer, displacement error, final objective. AMR
+is beneficial only if it improves a physically relevant metric, not merely its own refinement
+indicator." Before this item, the plate path's AMR sweep fired UNCONDITIONALLY (no config
+switch existed at all) - the mandated "fixed sampling" control arm was structurally
+unreachable.
+
 ### Required change
+A real on/off switch for the plate path's periodic AMR sweep, then a real, controlled A/B run
+at a fixed training budget comparing every metric the plan lists.
+
 ### Files changed
+- `crates/pinn-core/src/problem_spec.rs` - `TrainingSpec.amr_enabled: bool` (new,
+  `#[serde(default = "default_amr_enabled")]` = `true`, matching the exact pre-existing
+  unconditional behavior - every existing TOML spec keeps training exactly as before).
+- `crates/pinn-solver/src/runner.rs` - `run_user_problem_training_from`'s AMR sweep `if` gains
+  `spec.training.amr_enabled &&` (one-line gate, no other change to the sweep logic itself).
+  Kirsch's/pin-lug's own AMR paths are untouched (out of scope, no config surface exists there
+  to gate).
+- 6 mechanical `TrainingSpec {}` literal updates (`parametric_problem.rs`×2, `runner.rs`×3,
+  `training_core.rs`×1) - all set `amr_enabled: true`, byte-identical prior behavior.
+
 ### Tests
+`runner::tests::ph3_12_controlled_comparison_fixed_sampling_vs_amr_same_training_budget`
+(`#[ignore]`d, real ~2200-step training run, twice - both branches start from the IDENTICAL
+initial weights, same pattern PH3-04's own comparison test established). Computes a new
+`displacement_rms_relative_error` helper (RMS relative error against the exact no-hole solution
+over the whole vis grid) - the plan's own "displacement error" metric, not otherwise carried as
+a scalar anywhere in this codebase's diagnostics.
+
 ### Runtime run
+Real, 2200-step, no-hole plate config (`hidden_dim=64, n_hidden=3`), both branches sharing one
+initial model (`net_cfg.init` called once, cloned). Real numbers, `--release`:
+
+| Metric | Fixed sampling (AMR off) | AMR enabled | Better |
+|---|---|---|---|
+| sigma_xx_relative_error | 1.59% | 3.48% | fixed |
+| sigma_yy_over_reference | 1.79% | 1.75% | AMR (negligible) |
+| sigma_xy_over_reference | 0.26% | 0.71% | fixed |
+| traction_rms_over_reference | 1.70% | 2.75% | fixed |
+| load_transfer_ratio | 0.9988 | 1.0062 | fixed (closer to 1.0) |
+| displacement RMS relative error | 42.3% | 57.0% | fixed |
+| energy_balance_error | 0.051% | 0.198% | fixed |
+| total_loss (final objective) | -0.99630 | -1.00629 | AMR (marginal) |
+
 ### Benchmark result
+**A real, honest NEGATIVE finding for AMR at this geometry/step budget**: fixed (uniform)
+sampling beat AMR-enabled sampling on 6 of 7 physically relevant metrics, several by a wide
+margin (traction RMS ~1.6x worse under AMR, displacement error ~1.35x worse) - AMR only "won"
+on the raw optimizer loss (marginally) and one negligible stress component. Per the plan's own
+explicit rule ("AMR is beneficial only if it improves a physically relevant metric, not merely
+its own refinement indicator"), this run does NOT support AMR as a convergence accelerator for
+this configuration - no hack was applied to force a different outcome (issue #62 §3.1).
+**Physical interpretation** (a reasonable, evidence-consistent explanation, not itself proven
+by this one run): this is a NO-HOLE, uniform-field geometry with no localized feature for a
+residual-driven refinement indicator to usefully target - reallocating collocation points away
+from uniform coverage toward wherever the (here, essentially noise-driven) residual signal is
+locally highest plausibly degrades accuracy on an otherwise-uniform true solution, exactly the
+geometry class this codebase's own AMR design was never motivated by (it exists for hole-
+adjacent stress concentrations - see `powershell_tool/CLAUDE.md`'s own AMR-epic history). A
+holed-geometry comparison (where AMR has an actual feature to refine near) was NOT run this
+pass - a natural, stated follow-up, not silently assumed to reach the same conclusion.
+
 ### Known limitations
+- Only the no-hole geometry was tested. Given AMR's own design motivation (hole-boundary stress
+  concentration), a holed-geometry A/B comparison is the more representative test of AMR's
+  real value and was not run this pass (real wall-clock cost - this pass's own single no-hole
+  comparison already took ~13 minutes release-mode for 2 x 2200 steps).
+- Kirsch's/pin-lug's own AMR paths were not given an on/off switch (out of scope, same
+  deferral precedent as every other Kirsch/pin-lug feature gap in this manifest).
+- This finding does not itself justify removing/disabling AMR by default (`amr_enabled`
+  defaults to `true`, unchanged) - it is evidence for a FUTURE decision (e.g. gating AMR
+  activation on "does this geometry have a hole", matching AMR's own design intent), not an
+  action taken in this item.
+
 ### Reviewer verification
-NOT REVIEWED
+Targeted regression: `cargo test -p pinn-core` 120/120, `cargo test --release -p pinn-solver
+--features ndarray-backend --lib runner::` (19/19 passed, 19 ignored - up from 18 ignored,
++1 real controlled-comparison test), `--lib parametric_problem::` (5/5 passed, 1 ignored,
+unchanged). `cargo build -p app-egui` clean; real launch stayed alive 8s+ with an empty log.
 
 ## PH3-13 — Benchmark report becomes authoritative
 

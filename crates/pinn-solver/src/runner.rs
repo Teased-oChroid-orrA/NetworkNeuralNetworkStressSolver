@@ -1460,7 +1460,11 @@ fn run_user_problem_training_from(
         last_step = step;
 
         let mut amr_sweep_report = None;
-        if step >= AMR_WARMUP_STEPS && (step - AMR_WARMUP_STEPS) % amr_interval == 0 {
+        // Issue #62 PH3-12: real on/off switch - see `TrainingSpec::amr_enabled`'s own doc
+        // comment for why this exists (the plan's mandated "fixed sampling vs AMR" controlled
+        // comparison was previously impossible - AMR fired unconditionally with no fixed-
+        // sampling control arm reachable at all).
+        if spec.training.amr_enabled && step >= AMR_WARMUP_STEPS && (step - AMR_WARMUP_STEPS) % amr_interval == 0 {
             let probe_ctx = MultiStepCtx {
                 config: &config,
                 problem: &problem,
@@ -2411,7 +2415,7 @@ mod tests {
             material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
             load: LoadConfig::uniaxial_x(6.9e7),
             network: NetworkSpec { hidden_dim: 64, n_hidden: 3, ..Default::default() },
-            training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false, derivative_operator_diagnostic: false },
+            training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false, derivative_operator_diagnostic: false, amr_enabled: true },
             formulation: pinn_core::problem_spec::default_formulation(),
         }
     }
@@ -3468,7 +3472,7 @@ mod tests {
             material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
             load: LoadConfig::uniaxial_x(6.9e7),
             network: NetworkSpec { hidden_dim: 64, n_hidden: 3, ..Default::default() },
-            training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false, derivative_operator_diagnostic: false },
+            training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false, derivative_operator_diagnostic: false, amr_enabled: true },
             formulation: pinn_core::problem_spec::default_formulation(),
         }
     }
@@ -3893,6 +3897,100 @@ mod tests {
         assert!(measure_aware_final.total_loss.is_finite());
     }
 
+    /// Issue #62 PH3-12: real, controlled "fixed sampling vs AMR, same training budget"
+    /// comparison - the plan's own §16 mandate ("AMR is beneficial only if it improves a
+    /// physically relevant metric, not merely its own refinement indicator"). Both branches
+    /// start from the IDENTICAL initial weights (same shared `initial_model`, same pattern the
+    /// PH3-04 comparison test immediately above already established) and run for the SAME
+    /// 2200-step budget (`AMR_WARMUP_STEPS`=200 + 2 full `interval_steps`=1000 sweep
+    /// opportunities for the AMR-on branch). Deliberately does NOT assert AMR must win on any
+    /// metric - per issue #62 §3.1 ("no benchmark-specific hacks to force a pass"), this test
+    /// reports the real numbers honestly; the manifest entry records the actual comparison
+    /// result, whatever it turned out to be.
+    #[test]
+    #[ignore = "real ~2200-step training run, twice - see this test's own doc comment"]
+    fn ph3_12_controlled_comparison_fixed_sampling_vs_amr_same_training_budget() {
+        let device = crate::training_core::BDevice::default();
+        let steps = 2200;
+        let base_spec = no_hole_plate_spec(steps);
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(base_spec.geometry.net_input_dim())
+            .with_hidden_dim(base_spec.network.hidden_dim)
+            .with_n_hidden(base_spec.network.n_hidden)
+            .with_output_dim(5);
+        let initial_model = net_cfg.init(&device);
+
+        let run = |spec: ProblemSpec, model: ElasticityNet<B>| -> Box<TrainingUpdate> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+            let handle = std::thread::spawn(move || run_user_problem_training_from(spec, model, device, 0, tx, rx_ctrl));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            let mut last_update: Option<Box<TrainingUpdate>> = None;
+            let mut saw_done = false;
+            while std::time::Instant::now() < deadline && !saw_done {
+                match rx.try_recv() {
+                    Ok(TrainingMsg::Update(u)) => last_update = Some(u),
+                    Ok(TrainingMsg::Done) => saw_done = true,
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+            assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+            drop(tx_ctrl);
+            let _ = handle.join();
+            last_update.expect("must have received at least one Update")
+        };
+
+        // RMS relative displacement error against the exact no-hole solution
+        // (u=(px/E)x, v=-nu(px/E)y) over the whole vis grid - the plan's own "displacement
+        // error" metric, not otherwise carried as a scalar anywhere in this codebase's
+        // diagnostics.
+        fn displacement_rms_relative_error(vis: &pinn_core::messages::VisFields, half_w: f64, half_h: f64, e: f64, nu: f64, px: f64) -> f64 {
+            let (ny, nx) = vis.disp_u.dim();
+            let (mut num, mut den, mut n) = (0.0_f64, 0.0_f64, 0usize);
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    let (u, v) = (vis.disp_u[[iy, ix]] as f64, vis.disp_v[[iy, ix]] as f64);
+                    if !u.is_finite() || !v.is_finite() { continue; }
+                    let x_norm = -1.0 + 2.0 * ix as f64 / (nx.max(2) - 1) as f64;
+                    let y_norm = -1.0 + 2.0 * iy as f64 / (ny.max(2) - 1) as f64;
+                    let (x_phys, y_phys) = (x_norm * half_w, y_norm * half_h);
+                    let (u_a, v_a) = ((px / e) * x_phys, -nu * (px / e) * y_phys);
+                    num += (u - u_a).powi(2) + (v - v_a).powi(2);
+                    den += u_a.powi(2) + v_a.powi(2);
+                    n += 1;
+                }
+            }
+            assert!(n > 0, "no finite grid points found");
+            (num / den.max(1e-300)).sqrt()
+        }
+
+        let (half_w, half_h) = (base_spec.geometry.half_w, base_spec.geometry.half_h);
+        let (e, nu, px) = (base_spec.material.e, base_spec.material.nu, base_spec.load.px);
+
+        let mut fixed_spec = base_spec.clone();
+        fixed_spec.training.amr_enabled = false;
+        let fixed_final = run(fixed_spec, initial_model.clone());
+
+        let mut amr_spec = base_spec.clone();
+        amr_spec.training.amr_enabled = true;
+        let amr_final = run(amr_spec, initial_model);
+
+        let fixed_disp_err = fixed_final.vis.as_ref().map(|v| displacement_rms_relative_error(v, half_w, half_h, e, nu, px));
+        let amr_disp_err = amr_final.vis.as_ref().map(|v| displacement_rms_relative_error(v, half_w, half_h, e, nu, px));
+
+        println!("[PH3-12] fixed sampling: total_loss={:.6e} disp_rms_rel_err={:?} benchmark={:?} energy_balance={:?}",
+            fixed_final.total_loss, fixed_disp_err, fixed_final.no_hole_benchmark, fixed_final.energy_balance);
+        println!("[PH3-12] AMR enabled:    total_loss={:.6e} disp_rms_rel_err={:?} benchmark={:?} energy_balance={:?}",
+            amr_final.total_loss, amr_disp_err, amr_final.no_hole_benchmark, amr_final.energy_balance);
+
+        // Both must be numerically healthy - the switch (either direction) must not itself
+        // destabilize training. NOT asserting which one has the smaller error - see this
+        // test's own doc comment.
+        assert!(fixed_final.total_loss.is_finite());
+        assert!(amr_final.total_loss.is_finite());
+    }
+
     /// Real, `#[ignore]`d sanity test recommended by the Kt investigation
     /// (`powershell_tool/CLAUDE.md`): before trusting any hole-specific result, confirm the
     /// generic plate formulation (now including the new `EquilibriumTerm`) can recover the
@@ -4127,7 +4225,7 @@ mod tests {
                 adaptive: true, max_hidden_dim: Some(12), max_n_hidden: Some(4),
                 ..Default::default()
             },
-            training: TrainingSpec { max_steps, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false, derivative_operator_diagnostic: false },
+            training: TrainingSpec { max_steps, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false, derivative_operator_diagnostic: false, amr_enabled: true },
             formulation: pinn_core::problem_spec::default_formulation(),
         }
     }

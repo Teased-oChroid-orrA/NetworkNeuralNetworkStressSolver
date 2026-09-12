@@ -97,6 +97,20 @@ pub struct TrainingSpec {
     /// staying connected to the model-weight autodiff graph `LossTerm::compute()` needs).
     #[serde(default)]
     pub derivative_operator_diagnostic: bool,
+    /// Issue #62 PH3-12: real on/off switch for the periodic AMR sweep (`AdaptiveGrid::adapt`
+    /// + resample), so the plan's own mandated "fixed sampling vs AMR, same training budget"
+    /// controlled comparison is actually possible - before this field, AMR fired unconditionally
+    /// on the plate path with no way to run the "fixed sampling" control arm at all.
+    /// `#[serde(default = "default_amr_enabled")]` = `true`, matching the exact PRE-EXISTING
+    /// unconditional behavior (every existing TOML spec keeps training exactly as before -
+    /// per issue #62 §3.3, the new "fixed sampling" behavior is the one that must be explicitly
+    /// opted into, since AMR-on was already the shipped default, not the other way around).
+    #[serde(default = "default_amr_enabled")]
+    pub amr_enabled: bool,
+}
+
+fn default_amr_enabled() -> bool {
+    true
 }
 
 impl Default for TrainingSpec {
@@ -104,6 +118,7 @@ impl Default for TrainingSpec {
         Self {
             max_steps: 2000, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3,
             measure_aware_training: false, derivative_operator_diagnostic: false,
+            amr_enabled: true,
         }
     }
 }
