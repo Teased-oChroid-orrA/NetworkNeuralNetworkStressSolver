@@ -1,0 +1,73 @@
+{
+  "amr": {
+    "last_sweep": {
+      "points_after": 772,
+      "points_before": 484,
+      "residual_rms_after": 166409.26890144323,
+      "residual_rms_before": 167122.95745275173,
+      "step": 1200
+    },
+    "sweep_count": 2
+  },
+  "engineering_results": {
+    "avg_von_mises_pa": 69144056.0,
+    "max_displacement_m": 0.00012344583228696138,
+    "max_principal_stress_pa": 71807856.0,
+    "max_von_mises_pa": 71881632.0,
+    "min_displacement_m": 9.829205964706489e-7
+  },
+  "generated_at_unix": 1789211101,
+  "hole_analyses": [],
+  "model_validity": null,
+  "physics_validation": {
+    "bc_residual_max": 3062475.5,
+    "bc_residual_rms": 967708.5779856322,
+    "energy_balance": {
+      "energy_balance_error": 0.0008016607766235247,
+      "external_work_j": 6.6595807287711635,
+      "internal_energy_j": 6.664919453430177
+    },
+    "pde_residual_max": 1474785.25,
+    "pde_residual_p95": 318067.6875,
+    "pde_residual_rms": 182661.78125,
+    "reaction_force": {
+      "equilibrium_error": 0.0008531994831753295,
+      "net_fx_n": 57.16657247734142,
+      "net_fy_n": 14.062357023715917,
+      "reference_force_n": 69000.0
+    }
+  },
+  "problem": {
+    "geometry": {
+      "half_h_m": 0.1,
+      "half_w_m": 0.1,
+      "holes": [],
+      "thickness_m": 0.005
+    },
+    "kind": "Plate",
+    "load": {
+      "px_pa": 69000000.0,
+      "py_pa": 0.0
+    },
+    "material": {
+      "density_kg_m3": 2810.0,
+      "e_pa": 71700000000.0,
+      "nu": 0.33,
+      "ultimate_strength_pa": 503000000.0
+    },
+    "network": {
+      "hidden_dim": 64,
+      "n_hidden": 8
+    }
+  },
+  "spec_path": "/Users/nautilus/Claude/Projects/NeuralNetwork-Stress-Solver/examples/problems/no_hole_plate.toml",
+  "training": {
+    "elapsed_secs": 646.3173217773438,
+    "final_grad_norm": 0.4838598668575287,
+    "final_optimization_loss_energy_term": 0.9968821406364441,
+    "final_total_loss": -0.9749462604522705,
+    "max_steps": 2000,
+    "step": 1999
+  },
+  "unit_system": "USCS"
+}

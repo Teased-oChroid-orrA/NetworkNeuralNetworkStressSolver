@@ -31,10 +31,29 @@
         "n_boundary": 512,
         "fd_h": 0.001,
         "lr": 0.001
+      },
+      "formulation": {
+        "Hybrid": [
+          "interior_energy",
+          "equilibrium",
+          "outer_traction",
+          "external_work"
+        ]
       }
     }
   },
   "steps_completed": 2000,
-  "final_loss": -0.9641558,
-  "saved_at_unix": 1789153068
+  "final_loss": -0.97494626,
+  "saved_at_unix": 1789211087,
+  "provenance": {
+    "git_sha": "af92d02c908444415ecb514a8685b5e55ef68506",
+    "git_dirty": false,
+    "problem_hash": "04434347dde8bc97",
+    "interior_sampling_seed": 90210,
+    "model_init_seeded": false,
+    "backend": "NdArray",
+    "dtype": "f32",
+    "derivative_backend": "FD",
+    "formulation": "Hybrid([\"interior_energy\", \"equilibrium\", \"outer_traction\", \"external_work\"])"
+  }
 }
