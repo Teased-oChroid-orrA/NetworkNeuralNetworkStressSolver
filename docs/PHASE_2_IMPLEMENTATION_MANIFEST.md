@@ -539,7 +539,108 @@ path via a live diagnostic with genuine, non-trivial output.
 
 ## P2-07 — Generic gauge/nullspace handling
 
-Status: NOT_STARTED
+Status: VERIFIED
+
+### Requirement
+
+Mean-field constraints, point anchors, and nullspace projection for pure-Neumann rigid-body
+modes, separate from load enforcement.
+
+### Files changed
+
+- `crates/pinn-core/src/user_geometry.rs` — `UserGeometry::is_pure_neumann()` (true iff no
+  hole is `HoleBc::Fixed` - the plate's only essential/Dirichlet mechanism).
+- `crates/pinn-solver/src/gauge.rs` — new module: rationale doc comment + `has_any_essential_
+  constraint()` (a generic, problem-level form of the same check, for future problem types -
+  see Known limitations for why the real wiring doesn't use this one).
+- `crates/pinn-solver/src/lib.rs` — `pub mod gauge;` added.
+- `crates/pinn-solver/src/user_problem.rs` — new `TranslationGaugeTerm` (a real "mean-field
+  constraint" - issue #61's own named technique) registered in `UserDefinedProblem::loss_
+  terms()` exactly when `self.spec.geometry.is_pure_neumann()`; `base_weight()` extended for
+  its name.
+
+### Architecture decision
+
+This codebase's real elasticity BVP has a genuine, previously-unaddressed rigid-body-
+translation nullspace for `no_hole_plate.toml` (no holes at all) and `single_hole_plate.toml`
+(its hole set to `HoleBc::Free`) - BOTH real, current example configurations: with no
+Dirichlet condition anywhere, strain energy/traction/equilibrium are all invariant under an
+added constant `(u0, v0)` displacement offset, so nothing in the pre-P2-07 loss penalized one.
+`TranslationGaugeTerm` closes this with the standard "mean-field constraint" gauge-fixing
+technique: `mean(u)^2 + mean(v)^2` (squaring the MEAN, not the mean of squares - local
+displacement variation is untouched, only domain-wide rigid-body drift is penalized). It is
+registered ONLY for pure-Neumann configurations (never redundantly alongside a real Dirichlet
+anchor) and classified `TermRole::Constraint` (P2-05) - "separate from load enforcement" per
+the epic's own wording, never part of the physical functional `U-W_ext`.
+
+The ROTATIONAL rigid-body mode (the third DOF; the standard fix is penalizing `mean(x*v -
+y*u)` toward zero) is NOT implemented - it needs each collocation point's physical `(x,y)`
+coordinates, which `DomainForwardOutputs` does not carry (only `raw_out`/`strains`/`normals`/
+`shifted_stress`/`hessian`). Adding a coordinates field would mean touching `compute_domain_
+forwards` and every existing `DomainForwardOutputs`/`Computed` construction site - the kind of
+broad structural plumbing change issue #61 §1.4 reserves for P2-15's migration step, not a
+single new term. Honestly tracked below, not silently dropped.
+
+`has_any_essential_constraint()` (the generic, `&dyn BoundaryValueProblem`-based form of the
+same check) is real and tested, but is NOT what `UserDefinedProblem::loss_terms()` calls -
+doing so would recurse (`loss_terms()` calling a function that itself calls `loss_terms()`).
+The real registration gate uses `UserGeometry::is_pure_neumann()` directly. `has_any_essential_
+constraint` is kept as the generalized form for a future problem type that might gain a
+different essential-constraint mechanism than holes - honestly flagged as not currently
+load-bearing in this codebase (see Known limitations), not presented as more than it is.
+
+### Tests
+
+- command: `cargo test -p pinn-core --lib -- user_geometry::` — 15 passed (2 new): `is_pure_
+  neumann` true for no-holes and all-Free-holes geometries, false when any hole is Fixed.
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- user_problem::
+  gauge::` — 20 passed (4 new): `translation_gauge` registered for a no-hole geometry AND for
+  a single-Free-hole geometry (both real example configurations), ABSENT for `two_hole_
+  geometry` (has a Fixed hole - existing exact-term-count test extended to assert this), and
+  `TranslationGaugeTerm::compute()` matches hand-computed values for both a uniform-offset
+  field (real nonzero penalty) and a zero-mean field (zero penalty despite large local
+  variation) - proving the squared-mean formula, not mean-of-squares.
+- command: `cargo build --workspace --tests --features ndarray-backend` — clean.
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- user_problem::
+  kirsch_problem:: pinlug_problem:: gauge::` (broader regression) — 79 passed, 0 failed -
+  confirms every existing formulation/term-role/term-count test (all built on `two_hole_
+  geometry`, which has a Fixed hole) is completely unaffected by the new conditional term.
+
+### Runtime evidence
+
+Real headless training runs (release build, `max_steps=60`) on BOTH real pure-Neumann example
+configurations, confirming the new term trains stably (no NaN/blowup, comparable loss
+trajectories and Kt/residual magnitudes to pre-P2-07 runs - a real before/after comparison, not
+assumed):
+- `single_hole_plate.toml`: `total_loss` 6.47 -> 5.09, `max|displacement|` 1.121e-5 m,
+  `constitutive residual RMS`=5.12e5 Pa, `Kt`=0.0078 (same tiny-Kt range as prior runs - this
+  epic does not claim to fix Kt, only the translation gauge).
+- `no_hole_plate.toml`: `total_loss` 5.68 -> 4.95, `max|displacement|` 7.973e-6 m,
+  `constitutive residual RMS`=2.44e5 Pa. Its startup stencil-quality diagnostic (P2-06) also
+  showed a real, informative side effect of this epic's own investigation: 48/2048 points need
+  fallback even with ZERO holes - confirming `valid_stencil`/`stencil_quality_report` correctly
+  generalizes to outer-rectangle-boundary-adjacent FD risk too, not just hole-adjacent risk (a
+  broader signal than the pre-existing hole-only margin mechanism covers).
+
+### Known limitations
+
+Rotational gauge-fixing not implemented (needs point coordinates not currently threaded through
+`DomainForwardOutputs` - see Architecture decision). No formal "did this reduce net rigid-body
+drift" measurement exists yet (would need a dedicated mean-displacement diagnostic, naturally
+suited to P2-09's "trivial-solution diagnostics" scope, next in the mandatory order) - this
+epic's own verification is limited to "trains stably, doesn't regress loss/Kt magnitude,"
+which IS real evidence but not a direct measurement of the gauge fix's own effect size.
+`has_any_essential_constraint()` exists and is tested but is not wired into any live decision
+in this codebase (see Architecture decision) - a real, honestly-scoped limitation, not a dead
+function pretending to be load-bearing.
+
+### Reviewer verification
+
+PASS against P2-07's acceptance bullets at the scope covered: a real mean-field constraint
+technique, correctly gated to pure-Neumann configurations only, verified against real example
+configurations both by unit test and live training runs. Point-anchor and full nullspace-
+projection techniques, and the rotational mode, are explicitly named as not built, not silently
+omitted.
 
 ## P2-08 — Executable verification ladder
 

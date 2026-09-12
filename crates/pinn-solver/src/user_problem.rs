@@ -74,6 +74,9 @@ const LAM_EQUILIBRIUM_PLATE: f32 = 50.0;
 const LAM_EXTERNAL_WORK: f32 = 20.0;
 const LAM_HOLE_FREE: f32 = 100.0;
 const LAM_HOLE_FIXED: f32 = 50.0;
+/// Issue #61 P2-07: matches `LAM_HOLE_FIXED`/pin-lug's `LugShankAnchorTerm` (weight ~50) - the
+/// existing convention for a gauge/anchor term's weight in this codebase, not a new magnitude.
+const LAM_TRANSLATION_GAUGE: f32 = 50.0;
 
 /// Points sampled around each hole's circumference, per hole — a fixed, generous default;
 /// not user-configurable in v1 (see `ProblemSpec`'s scope note).
@@ -481,6 +484,34 @@ impl LossTerm for HoleBcTerm {
 // longer exists once `EquilibriumTerm` reads the displacement-Hessian-derived stress
 // everywhere instead of direct σ (see `EquilibriumTerm`'s own updated doc comment).
 
+/// Issue #61 EPIC P2-07: translational gauge-fixing (a "mean-field constraint", one of the
+/// three techniques the epic names) for pure-Neumann configurations - see `crate::gauge`'s
+/// module doc comment for the full rationale. Penalizes the mean interior displacement
+/// (`mean(u)^2 + mean(v)^2`, NOT `mean(u^2+v^2)` - squaring the mean, not the mean of squares,
+/// so LOCAL displacement variation is untouched and only the domain-wide rigid-body DRIFT is
+/// penalized) toward zero. Registered ONLY when `self.spec.geometry.is_pure_neumann()` (see
+/// `loss_terms()`) - never active for a problem that already has a real Dirichlet anchor.
+struct TranslationGaugeTerm;
+impl LossTerm for TranslationGaugeTerm {
+    fn name(&self) -> &'static str { "translation_gauge" }
+    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
+    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
+    // A gauge/admissibility fix, not part of the physical functional U-W_ext - "separate from
+    // load enforcement" per issue #61 P2-07's own acceptance wording.
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
+    // Displacement-only - no stress quantity involved.
+    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("translation_gauge: domain missing");
+        let n = d.raw_out.dims()[0];
+        let u = d.raw_out.clone().slice([0..n, 0..1]).reshape([n]);
+        let v = d.raw_out.clone().slice([0..n, 1..2]).reshape([n]);
+        let u_mean = u.mean();
+        let v_mean = v.mean();
+        u_mean.clone() * u_mean + v_mean.clone() * v_mean
+    }
+}
+
 pub struct UserDefinedProblem {
     spec: ProblemSpec,
     domains: Vec<DomainSpec>,
@@ -587,6 +618,13 @@ impl BoundaryValueProblem for UserDefinedProblem {
                 terms.push(Box::new(HoleBcTerm { point_set: name, bc: hole.bc, ref_stress2 }));
             }
         }
+        // Issue #61 P2-07: gauge-fix the rigid-body translation nullspace for pure-Neumann
+        // configurations (no hole is HoleBc::Fixed - `no_hole_plate.toml`/`single_hole_plate.
+        // toml` with its hole set to Free are both real, current examples of this). Never
+        // registered when a real Dirichlet anchor already exists (redundant there).
+        if self.spec.geometry.is_pure_neumann() {
+            terms.push(Box::new(TranslationGaugeTerm));
+        }
         terms
     }
 
@@ -598,6 +636,7 @@ impl BoundaryValueProblem for UserDefinedProblem {
             "external_work" => LAM_EXTERNAL_WORK,
             "hole_free" => LAM_HOLE_FREE,
             "hole_fixed" => LAM_HOLE_FIXED,
+            "translation_gauge" => LAM_TRANSLATION_GAUGE,
             other => panic!("UserDefinedProblem::base_weight: unknown loss term '{other}'"),
         }
     }
@@ -1486,6 +1525,87 @@ mod tests {
         assert_eq!(names.iter().filter(|&&n| n == "hole_free").count(), 1);
         assert_eq!(names.iter().filter(|&&n| n == "hole_fixed").count(), 1);
         crate::problem::validate_loss_terms(&problem);
+        // two_hole_geometry's 2nd hole is HoleBc::Fixed - a real Dirichlet anchor already
+        // exists, so the P2-07 gauge-fix must NOT be registered (would be redundant).
+        assert!(!names.contains(&"translation_gauge"));
+    }
+
+    /// Issue #61 P2-07: `translation_gauge` is registered exactly when the geometry is
+    /// pure-Neumann (no `HoleBc::Fixed` hole anywhere) - `no_hole_plate.toml`'s real
+    /// configuration (no holes at all).
+    #[test]
+    fn translation_gauge_term_is_registered_for_a_no_hole_pure_neumann_geometry() {
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        let problem = UserDefinedProblem::new(spec);
+        let names: Vec<&str> = problem.loss_terms().iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"translation_gauge"), "{names:?}");
+    }
+
+    /// Same as above, but for `single_hole_plate.toml`'s real configuration: one hole, set to
+    /// `HoleBc::Free` - still pure-Neumann (no Dirichlet condition anywhere).
+    #[test]
+    fn translation_gauge_term_is_registered_when_the_only_hole_is_free() {
+        let spec = ProblemSpec {
+            geometry: UserGeometry {
+                half_w: 0.1, half_h: 0.05, thickness: 0.005,
+                holes: vec![HoleSpec { center: [0.0, 0.0], radius: 0.01, bc: HoleBc::Free }],
+            },
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        let problem = UserDefinedProblem::new(spec);
+        let names: Vec<&str> = problem.loss_terms().iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"translation_gauge"), "{names:?}");
+    }
+
+    /// Issue #61 P2-07: `TranslationGaugeTerm::compute()` penalizes the SQUARED MEAN
+    /// displacement, not the mean of squares - a uniform rigid-body offset gets a real nonzero
+    /// penalty, while a field with zero mean (equal positive/negative displacement) gets zero
+    /// penalty regardless of how large the local variation is.
+    #[test]
+    fn translation_gauge_term_matches_hand_computed_value_for_a_uniform_offset_field() {
+        use burn::tensor::TensorData;
+        let device: crate::training_core::BDevice = Default::default();
+
+        // Uniform offset: u=0.002, v=-0.001 everywhere - expected = 0.002^2 + 0.001^2.
+        let n = 4;
+        let raw_out = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![0.002_f32, -0.001, 0.002, -0.001, 0.002, -0.001, 0.002, -0.001], vec![n, 2]),
+            &device,
+        );
+        let d = DomainForwardOutputs {
+            domain: USER_DOMAIN, raw_out: &raw_out,
+            strains: None, normals: None, shifted_stress: None, hessian: None,
+        };
+        let term = TranslationGaugeTerm;
+        let loss = term.compute(&[d]);
+        let loss_v = loss.into_data().to_vec::<f32>().unwrap()[0] as f64;
+        let expected = 0.002_f64 * 0.002 + 0.001 * 0.001;
+        assert!((loss_v - expected).abs() < 1e-12, "loss={loss_v} expected={expected}");
+
+        // Zero-mean field (equal positive/negative displacement) - expected = 0, regardless of
+        // local variation magnitude.
+        let raw_out_zero_mean = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![0.5_f32, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5], vec![n, 2]),
+            &device,
+        );
+        let d2 = DomainForwardOutputs {
+            domain: USER_DOMAIN, raw_out: &raw_out_zero_mean,
+            strains: None, normals: None, shifted_stress: None, hessian: None,
+        };
+        let loss2 = term.compute(&[d2]);
+        let loss2_v = loss2.into_data().to_vec::<f32>().unwrap()[0];
+        assert!(loss2_v.abs() < 1e-9, "zero-mean field must get zero penalty, got {loss2_v}");
     }
 
     /// Issue #61 P2-01 acceptance: "Variational activates only declared variational terms and

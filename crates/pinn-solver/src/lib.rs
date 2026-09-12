@@ -12,6 +12,7 @@ pub mod energy;
 pub mod execution;
 pub mod fd_stencil;
 pub mod field_graph;
+pub mod gauge;
 pub mod headless;
 pub mod kirsch_problem;
 pub mod lr_schedule;

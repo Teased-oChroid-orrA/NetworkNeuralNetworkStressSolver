@@ -158,6 +158,18 @@ impl UserGeometry {
         if nf > 0 { 4 * nf } else { 3 }
     }
 
+    /// Issue #61 EPIC P2-07: true iff NO hole is [`HoleBc::Fixed`] - the plate's only essential/
+    /// Dirichlet mechanism. Without ANY Dirichlet condition anywhere (this codebase's real
+    /// `no_hole_plate.toml`, and `single_hole_plate.toml` with its hole set to `HoleBc::Free`,
+    /// are BOTH this case), the elasticity BVP is only determined up to an additive rigid-body
+    /// motion - translation is a genuine mathematical nullspace: the network could add ANY
+    /// constant `(u0, v0)` offset to its output with zero effect on strain energy, traction
+    /// residuals, or equilibrium, since none of those quantities depend on absolute position.
+    /// See `pinn_solver::gauge`'s module doc comment for the gauge-fixing mechanism this drives.
+    pub fn is_pure_neumann(&self) -> bool {
+        !self.holes.iter().any(|h| h.bc == HoleBc::Fixed)
+    }
+
     /// Issue #61 EPIC P2-06: signed distance to the domain boundary (positive = inside the
     /// valid domain - inside the outer rectangle AND outside every hole; negative = outside).
     /// `min(rect_sdf, hole_sdfs...)` is an approximate (not exact) SDF for a rectangle-minus-
@@ -314,6 +326,23 @@ mod tests {
     fn contains_accepts_a_point_in_the_plate_between_holes() {
         let geom = two_hole_geometry();
         assert!(geom.contains(0.0, 0.0));
+    }
+
+    #[test]
+    fn is_pure_neumann_true_with_no_holes_or_all_free_holes() {
+        let no_holes = UserGeometry { half_w: 1.0, half_h: 1.0, thickness: 0.1, holes: vec![] };
+        assert!(no_holes.is_pure_neumann());
+
+        let mut all_free = two_hole_geometry();
+        all_free.holes[1].bc = HoleBc::Free; // two_hole_geometry's 2nd hole is Fixed by default
+        assert!(all_free.is_pure_neumann());
+    }
+
+    #[test]
+    fn is_pure_neumann_false_when_any_hole_is_fixed() {
+        // two_hole_geometry's 2nd hole is HoleBc::Fixed by construction.
+        let geom = two_hole_geometry();
+        assert!(!geom.is_pure_neumann());
     }
 
     #[test]
