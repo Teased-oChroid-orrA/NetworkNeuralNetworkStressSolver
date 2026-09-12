@@ -1,3 +1,4 @@
+pub mod amr_invariance;
 pub mod architecture_controller;
 pub mod augmented_lagrangian;
 pub mod bc;
