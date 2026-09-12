@@ -634,6 +634,10 @@ pub fn run_training(
                 derivative_order_report: Vec::new(),
                 formulation_kind_report: Vec::new(),
                 constraint_report: Vec::new(),
+                // Issue #62 PH3-02 - Kirsch has no `UserGeometry`/`ProblemSpec` and P2-14's
+                // `run_no_hole_benchmark` is `UserDefinedProblem`-specific (same "not
+                // applicable" reasoning as `stress_source_report` above).
+                no_hole_benchmark: None,
             };
             let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         }
@@ -1191,6 +1195,42 @@ pub fn run_training_user_problem_resume(
     run_user_problem_training_from(spec, model, device, steps_completed, tx, stop_rx);
 }
 
+/// Issue #62 PH3-02: runs the real P2-14 `run_no_hole_benchmark` against `model_val` and maps
+/// it to the transport-side `NoHoleBenchmarkSummary` (see that type's doc comment for the exact
+/// gap this closes - before this epic, `run_no_hole_benchmark` was only ever called from the
+/// CLI headless path and only ever printed, never persisted or shown in the GUI). `None` for a
+/// holed geometry - P2-14's no-hole reference solution genuinely does not apply there (see
+/// `NoHoleBenchmarkSummary::no_hole_benchmark`'s own doc comment on `TrainingUpdate`).
+fn no_hole_benchmark_summary(
+    model_val: &ElasticityNet<BInner>,
+    spec: &ProblemSpec,
+    device: &BDevice,
+) -> Option<pinn_core::messages::NoHoleBenchmarkSummary> {
+    if !spec.geometry.holes.is_empty() {
+        return None;
+    }
+    let r = crate::user_problem::run_no_hole_benchmark(model_val, spec, device);
+    Some(pinn_core::messages::NoHoleBenchmarkSummary {
+        level: "L4",
+        name: "no_hole",
+        passed: r.passed,
+        sigma_xx_relative_error: r.sigma_xx_relative_error,
+        sigma_yy_over_reference: r.sigma_yy_over_ref,
+        sigma_xy_over_reference: r.sigma_xy_over_ref,
+        traction_rms_over_reference: r.traction_rms_over_ref,
+        load_transfer_ratio: r.load_transfer_ratio,
+        thresholds: pinn_core::messages::NoHoleBenchmarkThresholds {
+            sigma_xx_relative_error_max: crate::user_problem::SIGMA_XX_RELATIVE_ERROR_MAX,
+            sigma_yy_over_reference_max: crate::user_problem::SIGMA_YY_OVER_REF_MAX,
+            sigma_xy_over_reference_max: crate::user_problem::SIGMA_XY_OVER_REF_MAX,
+            traction_rms_over_reference_max: crate::user_problem::TRACTION_RMS_OVER_REF_MAX,
+            load_transfer_ratio_min: crate::user_problem::LOAD_TRANSFER_RATIO_MIN,
+            load_transfer_ratio_max: crate::user_problem::LOAD_TRANSFER_RATIO_MAX,
+        },
+        failure_reasons: r.failures.into_iter().map(str::to_string).collect(),
+    })
+}
+
 /// Shared body for `run_training_user_problem`/`run_training_user_problem_resume` - identical
 /// either way except where `model`/`device` come from and where the step counter starts
 /// (`step_offset`: `0` for a fresh run, `steps_completed` for a resumed one - `spec.training.
@@ -1496,7 +1536,7 @@ fn run_user_problem_training_from(
         // expensive field probe still only runs on the original every-10th-step/last-step
         // cadence.
         let mut architecture_event = None;
-        let (vis, hole_analyses, bc_residual_rms, bc_residual_max, reaction_force, energy_balance, network_snapshot) = if send_vis {
+        let (vis, hole_analyses, bc_residual_rms, bc_residual_max, reaction_force, energy_balance, network_snapshot, no_hole_benchmark) = if send_vis {
             let model_val: ElasticityNet<BInner> = model.valid();
             let vis = evaluate_user_vis_grid(
                 &model_val, &spec.geometry, [nx_vis, ny_vis], u_ref, spec.load.px,
@@ -1548,6 +1588,10 @@ fn run_user_problem_training_from(
             // precedent as `reaction_force` above.
             let eb = crate::user_problem::probe_energy_balance(&model_val, &spec, &device);
             let ns = crate::network::network_snapshot(&model_val);
+            // Issue #62 PH3-02 - same vis cadence as `rf`/`eb` above (a real forward pass +
+            // boundary-residual probe, not free). `None` for a holed geometry - see
+            // `no_hole_benchmark_summary`'s own doc comment.
+            let nhb = no_hole_benchmark_summary(&model_val, &spec, &device);
 
             // Smart adaptive architecture - only active when `spec.network.adaptive` (forces
             // `use_piratenet` in `net_cfg` above). Fed `bc_rms` as the training-progress
@@ -1578,9 +1622,9 @@ fn run_user_problem_training_from(
                 }
             }
 
-            (Some(vis), hole_analyses, bc_rms, bc_max, Some(rf), Some(eb), Some(ns))
+            (Some(vis), hole_analyses, bc_rms, bc_max, Some(rf), Some(eb), Some(ns), nhb)
         } else {
-            (None, Vec::new(), 0.0, 0.0, None, None, None)
+            (None, Vec::new(), 0.0, 0.0, None, None, None, None)
         };
 
         last_total_loss = out.total_scalar;
@@ -1679,6 +1723,7 @@ fn run_user_problem_training_from(
             derivative_order_report,
             formulation_kind_report,
             constraint_report,
+            no_hole_benchmark,
         };
         let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
         if auto_stopped {
@@ -1824,6 +1869,7 @@ pub fn serve_loaded_plate_checkpoint(
         derivative_order_report,
         formulation_kind_report,
         constraint_report,
+        no_hole_benchmark: no_hole_benchmark_summary(&model, &spec, &device),
     };
     let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
     let _ = tx.send(TrainingMsg::Done);
@@ -2193,6 +2239,50 @@ mod tests {
             training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3 },
             formulation: pinn_core::problem_spec::default_formulation(),
         }
+    }
+
+    // ─── Issue #62 PH3-02 ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn no_hole_benchmark_summary_returns_none_for_a_holed_geometry() {
+        let spec = single_hole_like_spec(0);
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(spec.geometry.net_input_dim()).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
+        let device = BDevice::default();
+        let model: ElasticityNet<BInner> = net_cfg.init(&device);
+        assert!(no_hole_benchmark_summary(&model, &spec, &device).is_none());
+    }
+
+    #[test]
+    fn no_hole_benchmark_summary_maps_the_real_p2_14_result_for_an_untrained_no_hole_model() {
+        use pinn_core::loading::LoadConfig;
+        use pinn_core::material::MaterialProps;
+        use pinn_core::problem_spec::{NetworkSpec, TrainingSpec};
+        use pinn_core::user_geometry::UserGeometry;
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] },
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: NetworkSpec { hidden_dim: 8, n_hidden: 2, ..Default::default() },
+            training: TrainingSpec::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(spec.geometry.net_input_dim()).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
+        let device = BDevice::default();
+        let model: ElasticityNet<BInner> = net_cfg.init(&device);
+        let summary = no_hole_benchmark_summary(&model, &spec, &device)
+            .expect("a no-hole geometry must produce Some(NoHoleBenchmarkSummary)");
+        assert_eq!(summary.level, "L4");
+        assert_eq!(summary.name, "no_hole");
+        // An untrained model has no reason to already satisfy sigma_xx=px everywhere - real,
+        // honest "this correctly fails" check, same discipline as the P2-14 test this mirrors
+        // (`user_problem::tests::run_no_hole_benchmark_runs_end_to_end_and_correctly_fails_an_
+        // untrained_model`).
+        assert!(!summary.passed);
+        assert!(!summary.failure_reasons.is_empty());
+        assert_eq!(summary.thresholds.sigma_xx_relative_error_max, crate::user_problem::SIGMA_XX_RELATIVE_ERROR_MAX);
+        assert_eq!(summary.thresholds.load_transfer_ratio_min, crate::user_problem::LOAD_TRANSFER_RATIO_MIN);
     }
 
     // ─── Stage H: model checkpoint save/load ────────────────────────────────────────────────

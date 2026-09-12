@@ -79,6 +79,46 @@ pub struct EnergyBalance {
     pub energy_balance_error: f64,
 }
 
+/// Issue #62 PH3-02 ("persist the hard benchmark result"): transport-side mirror of
+/// `pinn_solver::user_problem::NoHoleBenchmarkResult` (issue #61 P2-14) — plain fields, not the
+/// solver's own type, same "pinn-core never depends on pinn-solver" rule `ReactionForce`/
+/// `EnergyBalance` already established. Exists because before this epic, the ONLY "is this run
+/// valid" signal reaching the GUI/persisted report was an unrelated parametric-surrogate query
+/// classification (`ValidityTier` in `app-egui`'s own code, keyed off `self.infer_result`) —
+/// the REAL hard P2-14 benchmark was computed only inside the CLI headless path
+/// (`user_runner::run_headless_user_problem`) and only ever printed to stdout, never
+/// persisted or shown in the GUI at all. `level`/`name` are fixed string tags (`"L4"`/
+/// `"no_hole"`) matching issue #62 §6's own JSON schema literally, not derived from anything -
+/// there is currently only one no-hole benchmark level, so no enum is warranted yet (PH3-15's
+/// hole/Kt gate may need `"L5"`/`"hole"` alongside this later).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoHoleBenchmarkThresholds {
+    pub sigma_xx_relative_error_max: f64,
+    pub sigma_yy_over_reference_max: f64,
+    pub sigma_xy_over_reference_max: f64,
+    pub traction_rms_over_reference_max: f64,
+    pub load_transfer_ratio_min: f64,
+    pub load_transfer_ratio_max: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoHoleBenchmarkSummary {
+    pub level: &'static str,
+    pub name: &'static str,
+    pub passed: bool,
+    pub sigma_xx_relative_error: f64,
+    pub sigma_yy_over_reference: f64,
+    pub sigma_xy_over_reference: f64,
+    pub traction_rms_over_reference: f64,
+    pub load_transfer_ratio: f64,
+    pub thresholds: NoHoleBenchmarkThresholds,
+    /// Which specific threshold(s) failed - empty iff `passed`. Owned `String`s (not
+    /// `&'static str`, unlike the solver-side `NoHoleBenchmarkResult::failures`) because this
+    /// type crosses the pinn-solver -> pinn-core transport boundary the same way every other
+    /// `*Summary` type here does.
+    pub failure_reasons: Vec<String>,
+}
+
 /// Stage I ("live network-evolution visualization", the user's own explicit follow-up ask) —
 /// a per-layer snapshot of `pinn_solver::network::ElasticityNet`'s weight tensors, read at the
 /// same vis cadence `VisFields` already uses (never inside the per-step hot loop — see
@@ -439,6 +479,14 @@ pub struct TrainingUpdate {
     /// established. Empty for Kirsch's own path and for any problem with no real constraint
     /// terms (the plate path currently has none) - a real absence, not a bug.
     pub constraint_report: Vec<(&'static str, &'static str)>,
+    /// Issue #62 PH3-02 - see `NoHoleBenchmarkSummary`'s doc comment for the gap this closes.
+    /// `Some` only for a no-hole geometry (`spec.geometry.holes.is_empty()`), on the same vis
+    /// cadence `energy_balance`/`reaction_force` already use (a real forward pass over 512+
+    /// interior points plus a boundary-residual probe - not free, never computed every step).
+    /// `None` for a holed geometry - honestly "not applicable to this run" (issue #61 P2-14's
+    /// own "no-hole gate" only has a defined reference solution for the no-hole case), NOT a
+    /// placeholder for "not yet evaluated".
+    pub no_hole_benchmark: Option<NoHoleBenchmarkSummary>,
 }
 
 /// Pin-in-lug analogue of `TrainingUpdate` — one entry per domain's visualization fields,

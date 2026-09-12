@@ -89,17 +89,88 @@ report-writing path).
 
 ## PH3-02 — Persist the hard benchmark result
 
-Status: NOT_STARTED
+Status: VERIFIED
 
 ### Current evidence
+Confirmed by reading `app-egui/src/stress_solver.rs::build_analysis_report` directly:
+`"model_validity"` is populated from `self.infer_result` (a `ParametricInfer` query result -
+`ValidityTier` GREEN/YELLOW/RED, an UNRELATED concept), which is `None` for a direct
+(non-parametric) plate solve like `no_hole_plate.toml` - hence the real
+`Debug_run/stress_solver_report.json`'s `"model_validity": null`. Confirmed by reading
+`user_runner::run_headless_user_problem`: `run_no_hole_benchmark`/`run_hole_benchmark` (P2-14)
+are called there and their results ONLY `println!`'d - never returned, never persisted, never
+reaching the GUI at all. `runner::run_user_problem_training_from`/`serve_loaded_plate_
+checkpoint` (the GUI's own training/checkpoint-load paths) never called either benchmark
+function - the gap wasn't a threading omission, the call itself was entirely missing from the
+GUI's code path.
+
 ### Required change
+1. New transport-side `pinn_core::messages::NoHoleBenchmarkSummary`/`NoHoleBenchmarkThresholds`
+   (mirrors `ReactionForce`/`EnergyBalance`'s "solver computes it, pinn-core owns the shape"
+   split) + `TrainingUpdate.no_hole_benchmark: Option<NoHoleBenchmarkSummary>` field.
+2. New `runner::no_hole_benchmark_summary(model, spec, device)` helper: calls the real P2-14
+   `run_no_hole_benchmark`, maps it to the transport type. `None` for a holed geometry.
+3. Wired into the plate training loop's existing vis cadence (same cadence as `reaction_force`/
+   `energy_balance` - a real forward pass + boundary probe, not free) and into `serve_loaded_
+   plate_checkpoint` (computed once, no training). Kirsch's own `TrainingUpdate` construction
+   gets `no_hole_benchmark: None` (no `UserGeometry`/P2-14 concept there).
+4. `app-egui`: new `no_hole_benchmark` field on `StressSolverTool`, captured from `upd.no_hole_
+   benchmark` on the same `if had_vis` cadence `reaction_force`/`energy_balance` already use,
+   reset to `None` everywhere those/`stress_source_report` are reset. `build_analysis_report`
+   gains a new, separate `"benchmark"` JSON key (issue #62 §6's exact schema: `level`/`name`/
+   `passed`/`sigma_xx_relative_error`/`sigma_yy_over_reference`/`sigma_xy_over_reference`/
+   `traction_rms_over_reference`/`load_transfer_ratio`/`thresholds`/`failure_reasons`) - added
+   ALONGSIDE `model_validity`, not replacing it (that field still has its own, legitimate,
+   distinct meaning for parametric-inference queries). Solution Summary card gained a
+   "No-hole benchmark (L4)" row showing PASS or `FAIL (reason1, reason2)`.
+
 ### Files changed
+- `crates/pinn-core/src/messages.rs`: `NoHoleBenchmarkThresholds`, `NoHoleBenchmarkSummary`,
+  `TrainingUpdate.no_hole_benchmark`.
+- `crates/pinn-solver/src/runner.rs`: `no_hole_benchmark_summary()` helper; wired into the plate
+  training loop, `serve_loaded_plate_checkpoint`, and Kirsch's `TrainingUpdate` (`None`); 2 new
+  unit tests.
+- `powershell_tool/app-egui/src/stress_solver.rs`: `no_hole_benchmark` field (6 sites: struct
+  def, `new()`, 4 reset sites, 2 capture sites - plate `if had_vis` block and parametric-`None`
+  branch); `"benchmark"` JSON key in `build_analysis_report`; Solution Summary row.
+
 ### Tests
+`cargo test --release -p pinn-solver --features ndarray-backend --lib no_hole_benchmark_summary`
+- 2/2 passed (holed-geometry -> `None`; untrained no-hole model -> real `Some(...)` with
+  `level="L4"`, `name="no_hole"`, `passed=false`, non-empty `failure_reasons`, thresholds
+  matching the real P2-14 constants). `cargo test --release -p pinn-solver --features
+  ndarray-backend --lib runner::` - 15 passed, 0 failed, 14 ignored (identical pass/ignore count
+  to before this change - zero regression; `serve_loaded_plate_checkpoint_sends_update_then_
+  done_with_no_training`/`_saves_on_request` both still pass, confirming the new call site in
+  that function doesn't panic on a real, if untrained, model).
+
 ### Runtime run
+`cargo build --release -p app-egui` (via the real path-dependency workspace) - clean, zero
+errors. Real launch (`./target/release/app-egui &`, backgrounded, `sleep 8`, checked `ps`/log) -
+process alive, empty stdout/stderr, no panic - killed cleanly after confirming.
+
 ### Benchmark result
+Not a benchmark-producing epic itself (PH3-01 already captured and persisted the real number to
+`Debug_run/baseline_legacy_no_hole/benchmark_result.json`) - this epic's own "result" is that the
+GUI can now produce that same JSON shape live, for any future run, without a manual test harness.
+
 ### Known limitations
+- The hole/L5 benchmark (`run_hole_benchmark`) is deliberately NOT threaded through yet - PH3-15
+  ("Hole/Kt activation gate") owns making that eligible only after this no-hole gate + several
+  other prerequisites pass; adding it here would be scope creep ahead of its own gating epic.
+- `model_validity` (the parametric-surrogate validity concept) is left completely untouched -
+  it answers a genuinely different question (is this an in-distribution parameter query) and
+  removing or renaming it was not part of this epic's ask.
+- The benchmark is computed on the same vis cadence as other "expensive" probes (every 10 real
+  steps for the plate path) - during the FIRST few vis-cadence ticks of a run this will report
+  `passed: false` almost by construction (model barely trained yet); this is correct, honest
+  behavior (issue #62 §3.1 forbids relaxing thresholds to make an in-progress run look better),
+  not a defect.
+
 ### Reviewer verification
-NOT REVIEWED
+PASS - the real gap (`model_validity: null` standing in for a benchmark that was never actually
+run) is closed with a genuinely separate, correctly-computed field; zero regression in either
+crate's test suite; real GUI launch confirmed alive.
 
 ## PH3-03 — Machine-enforced operational gate (PASS/FAIL/INVALID)
 
