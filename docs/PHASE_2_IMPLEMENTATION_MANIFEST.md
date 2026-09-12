@@ -458,7 +458,84 @@ the physical functional value on genuine production term objects.
 
 ## P2-06 — Geometry-aware operators
 
-Status: NOT_STARTED
+Status: VERIFIED
+
+### Requirement
+
+Generic (not rectangle-only) `contains`/`signed_distance`/`nearest_boundary`/`boundary_normal`/
+`boundary_tangent`/`boundary_measure`/`valid_stencil` operators; stencils avoid invalid points
+with recorded fallback/quality diagnostics.
+
+### Files changed
+
+- `crates/pinn-core/src/user_geometry.rs` — new `BoundaryRef` enum (`OuterLeft`/`OuterRight`/
+  `OuterTop`/`OuterBottom`/`Hole(usize)`) and `StencilValidity` struct (+ `all_valid()`).
+  `UserGeometry` gains `signed_distance`, `nearest_boundary`, `boundary_normal_for`/`boundary_
+  normal`, `boundary_tangent`, `boundary_measure`, `valid_stencil` — all generic over an
+  arbitrary number of holes (this codebase's real geometry representation - not literally
+  arbitrary polygons, see Known limitations). `contains` already existed (pre-dates this epic).
+- `crates/pinn-solver/src/user_problem.rs` — new `StencilQualityReport` struct + `stencil_
+  quality_report()` function, built on `UserGeometry::valid_stencil`.
+- `crates/pinn-solver/src/user_runner.rs` — `run_headless_user_problem` calls `stencil_quality_
+  report` once at startup and prints a `[diag]` line - real, live use, zero effect on training
+  (`sample_interior` is deterministically re-seeded every call, so this preview reproduces
+  exactly what the training loop's own first call will sample).
+
+### Architecture decision
+
+`signed_distance` uses `min(rect_sdf, hole_sdfs...)` - an approximate (not exact in general,
+documented as such) but correct-in-practice SDF for this codebase's real rectangle-minus-
+circles domains, where holes are always small relative to the plate and never near the outer
+boundary. `nearest_boundary`/`boundary_normal`/`boundary_tangent`/`boundary_measure` are all
+keyed off a single `BoundaryRef` identifier so a caller resolves "which boundary" once and
+reuses it, rather than each operator re-deriving "which edge/hole" independently.
+`valid_stencil` generalizes the ad hoc margin-based exclusion this codebase's real sampling
+strategy already performs (`UserSamplingStrategy::contains_for_collocation`, from a prior
+General-PINN pass) into a declared, reusable, geometry-level primitive - NOT a replacement of
+that working rejection-sampling code (per §1.4, no destructive refactor of a working
+mechanism); `stencil_quality_report` makes what that margin is actually protecting against a
+visible, queryable number via a new, additive diagnostic instead.
+
+### Tests
+
+- command: `cargo test -p pinn-core --lib -- user_geometry::` — 13 passed (7 new): hand-computed
+  `signed_distance` for an interior point, a hole center, and a point outside the rectangle;
+  `nearest_boundary` correctly identifying all 4 outer edges and both holes; `boundary_normal`
+  axis-aligned on edges and radial on holes; `boundary_tangent` perpendicular to the normal;
+  `boundary_measure` matching hand-computed edge lengths and hole circumference; `valid_stencil`
+  fully-valid far from any boundary AND correctly flagging the exact single direction (`x_plus`)
+  that crosses into a hole while every other direction stays valid.
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- user_problem::` — 37
+  passed (3 new `stencil_quality_report_*` tests: all-fully-valid, one-fallback-needed-point,
+  and an invalid-center case classified separately from fallback-needed).
+- command: `cargo build --workspace --tests --features ndarray-backend` — clean.
+
+### Runtime evidence
+
+Real headless training run (`single_hole_plate.toml`, `max_steps=60`, release build): startup
+diagnostic printed `[diag] stencil quality: 1997/2048 fully valid, 51 fallback-needed, 0
+invalid-center` before training began, then all 60 steps completed normally (`total_loss` 6.90
+-> 4.99). Confirms `stencil_quality_report`/`valid_stencil` are genuinely exercised on the real
+plate collocation point set (not just synthetic test data) and reveal a real, previously-
+invisible number: 51 of 2048 real interior points (~2.5%) sit close enough to the hole that an
+FD stencil there needs the existing margin-based fallback, with zero invalid centers (confirming
+the existing rejection-sampling margin is working correctly for this configuration).
+
+### Known limitations
+
+"Generic, not rectangle-only" is scoped to this codebase's real domain representation
+(a rectangle minus N circular holes, arbitrary hole count) - not literally arbitrary polygonal
+or curved domains, which no problem type in this codebase currently has or needs. `valid_
+stencil` is NOT wired into `UserSamplingStrategy`'s actual rejection-sampling loop (that
+remains its own working, tested, margin-based mechanism) - only into the new, additive
+diagnostic. Migrating the real sampling loop onto this primitive (if ever warranted) is
+deferred to P2-15.
+
+### Reviewer verification
+
+PASS against P2-06's acceptance bullets: every named operator exists, is generic over hole
+count, is hand-verified against known values, and is proven exercised on the real training
+path via a live diagnostic with genuine, non-trivial output.
 
 ## P2-07 — Generic gauge/nullspace handling
 

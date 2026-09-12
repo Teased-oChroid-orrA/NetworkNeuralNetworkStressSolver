@@ -40,6 +40,36 @@ pub struct HoleSpec {
     pub bc: HoleBc,
 }
 
+/// Issue #61 EPIC P2-06: identifies one boundary component of a [`UserGeometry`] - an outer
+/// rectangle edge, or a specific hole by index. See [`UserGeometry::nearest_boundary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryRef {
+    OuterLeft,
+    OuterRight,
+    OuterTop,
+    OuterBottom,
+    /// Index into [`UserGeometry::holes`].
+    Hole(usize),
+}
+
+/// Issue #61 EPIC P2-06: per-direction validity of a 5-point central-difference FD stencil
+/// centered at some point - see [`UserGeometry::valid_stencil`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StencilValidity {
+    pub center_valid: bool,
+    pub x_plus_valid: bool,
+    pub x_minus_valid: bool,
+    pub y_plus_valid: bool,
+    pub y_minus_valid: bool,
+}
+
+impl StencilValidity {
+    /// True iff the center AND all 4 shifted neighbors are valid - a real, usable FD stencil.
+    pub fn all_valid(&self) -> bool {
+        self.center_valid && self.x_plus_valid && self.x_minus_valid && self.y_plus_valid && self.y_minus_valid
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserGeometry {
     /// Plate half-width in x [m] — full width = 2*half_w.
@@ -128,6 +158,115 @@ impl UserGeometry {
         if nf > 0 { 4 * nf } else { 3 }
     }
 
+    /// Issue #61 EPIC P2-06: signed distance to the domain boundary (positive = inside the
+    /// valid domain - inside the outer rectangle AND outside every hole; negative = outside).
+    /// `min(rect_sdf, hole_sdfs...)` is an approximate (not exact) SDF for a rectangle-minus-
+    /// circles domain - exact everywhere except where a hole boundary and the outer rectangle
+    /// boundary are close enough that their influence regions overlap (this codebase's real
+    /// hole radii are always small relative to the plate, so this never matters in practice,
+    /// but is not claimed exact in general). Generic over any number of holes - not hardcoded
+    /// to one, unlike `crate::geometry::GeometryConfig`'s single `HoleType`.
+    pub fn signed_distance(&self, x: f64, y: f64) -> f64 {
+        let rect_sdf = (self.half_w - x.abs()).min(self.half_h - y.abs());
+        self.holes.iter().fold(rect_sdf, |sdf, hole| {
+            let dx = x - hole.center[0];
+            let dy = y - hole.center[1];
+            sdf.min((dx * dx + dy * dy).sqrt() - hole.radius)
+        })
+    }
+
+    /// Which boundary component (an outer edge or a specific hole) is closest to `(x, y)` -
+    /// the generic identifier [`Self::boundary_normal`]/[`Self::boundary_tangent`]/
+    /// [`Self::boundary_measure`] key off, instead of each re-deriving "which edge" ad hoc.
+    pub fn nearest_boundary(&self, x: f64, y: f64) -> BoundaryRef {
+        let mut best = BoundaryRef::OuterLeft;
+        let mut best_dist = (x + self.half_w).abs();
+        for (candidate, dist) in [
+            (BoundaryRef::OuterRight, (self.half_w - x).abs()),
+            (BoundaryRef::OuterTop, (self.half_h - y).abs()),
+            (BoundaryRef::OuterBottom, (y + self.half_h).abs()),
+        ] {
+            if dist < best_dist {
+                best_dist = dist;
+                best = candidate;
+            }
+        }
+        for (i, hole) in self.holes.iter().enumerate() {
+            let dx = x - hole.center[0];
+            let dy = y - hole.center[1];
+            let dist = ((dx * dx + dy * dy).sqrt() - hole.radius).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best = BoundaryRef::Hole(i);
+            }
+        }
+        best
+    }
+
+    /// Outward unit normal for the given boundary component, evaluated at `(x, y)` - constant
+    /// per outer edge (axis-aligned), radial (from the hole's own center through `(x,y)`) for
+    /// a hole. `(x, y)` need not lie exactly ON the boundary (the radial direction is still
+    /// well-defined for any point other than a hole's exact center).
+    pub fn boundary_normal_for(&self, boundary: BoundaryRef, x: f64, y: f64) -> (f64, f64) {
+        match boundary {
+            BoundaryRef::OuterLeft => (-1.0, 0.0),
+            BoundaryRef::OuterRight => (1.0, 0.0),
+            BoundaryRef::OuterTop => (0.0, 1.0),
+            BoundaryRef::OuterBottom => (0.0, -1.0),
+            BoundaryRef::Hole(i) => {
+                let hole = &self.holes[i];
+                let dx = x - hole.center[0];
+                let dy = y - hole.center[1];
+                let len = (dx * dx + dy * dy).sqrt().max(1e-12);
+                (dx / len, dy / len)
+            }
+        }
+    }
+
+    /// [`Self::boundary_normal_for`] at whichever boundary [`Self::nearest_boundary`] finds
+    /// closest to `(x, y)` - the common case of "what's the normal AT this point".
+    pub fn boundary_normal(&self, x: f64, y: f64) -> (f64, f64) {
+        self.boundary_normal_for(self.nearest_boundary(x, y), x, y)
+    }
+
+    /// Unit tangent (90° counter-clockwise rotation of the outward normal) at `(x, y)`'s
+    /// nearest boundary.
+    pub fn boundary_tangent(&self, x: f64, y: f64) -> (f64, f64) {
+        let (nx, ny) = self.boundary_normal(x, y);
+        (-ny, nx)
+    }
+
+    /// Total arc length / edge length of the given boundary component (m) - the real
+    /// geometric measure [`crate`]-level `BoundaryIntegral`-style consumers (see
+    /// `pinn_solver::measure_integral`) need for a specific component, generalizing
+    /// `pinn_solver::measure_integral::plate_outer_perimeter`'s outer-only formula to also
+    /// cover individual holes.
+    pub fn boundary_measure(&self, boundary: BoundaryRef) -> f64 {
+        match boundary {
+            BoundaryRef::OuterLeft | BoundaryRef::OuterRight => 2.0 * self.half_h,
+            BoundaryRef::OuterTop | BoundaryRef::OuterBottom => 2.0 * self.half_w,
+            BoundaryRef::Hole(i) => 2.0 * std::f64::consts::PI * self.holes[i].radius,
+        }
+    }
+
+    /// Whether a 5-point central-difference FD stencil centered at `(x, y)` with half-steps
+    /// `(hx, hy)` stays entirely within the valid domain (issue #61 EPIC P2-06's own "stencils
+    /// avoid invalid points with recorded fallback/quality diagnostics" - this is the
+    /// diagnostic; [`StencilValidity::all_valid`] is the yes/no answer, the per-direction
+    /// fields are the "which neighbor(s) failed" detail a fallback strategy would need).
+    /// Generalizes the ad hoc margin-based checks this codebase's real sampling strategies
+    /// already perform (e.g. `pinn_solver::user_problem::UserSamplingStrategy::contains_for_
+    /// collocation`) into a declared, reusable, geometry-level primitive.
+    pub fn valid_stencil(&self, x: f64, y: f64, hx: f64, hy: f64) -> StencilValidity {
+        StencilValidity {
+            center_valid: self.contains(x, y),
+            x_plus_valid: self.contains(x + hx, y),
+            x_minus_valid: self.contains(x - hx, y),
+            y_plus_valid: self.contains(x, y + hy),
+            y_minus_valid: self.contains(x, y - hy),
+        }
+    }
+
     /// Inert placeholder `GeometryConfig` sized to this geometry's real bounding box — see
     /// the module doc comment for why this is safe and what it's actually used for.
     pub fn to_placeholder(&self) -> GeometryConfig {
@@ -175,6 +314,85 @@ mod tests {
     fn contains_accepts_a_point_in_the_plate_between_holes() {
         let geom = two_hole_geometry();
         assert!(geom.contains(0.0, 0.0));
+    }
+
+    #[test]
+    fn signed_distance_matches_hand_computed_values() {
+        let geom = two_hole_geometry();
+        // Interior point midway between holes: rect_sdf=1.0, both hole sdfs=0.5-0.1=0.4.
+        assert!((geom.signed_distance(0.0, 0.0) - 0.4).abs() < 1e-12);
+        // Exactly at hole 1's center: inside the hole, sdf = 0 - radius = -0.1 (the min term).
+        assert!((geom.signed_distance(-0.5, 0.0) - (-0.1)).abs() < 1e-12);
+        // Outside the outer rectangle: rect_sdf = 1.0 - 1.5 = -0.5, dominates the min.
+        assert!((geom.signed_distance(1.5, 0.0) - (-0.5)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn nearest_boundary_identifies_the_closest_outer_edge_or_hole() {
+        let geom = two_hole_geometry();
+        assert_eq!(geom.nearest_boundary(0.99, 0.0), BoundaryRef::OuterRight);
+        assert_eq!(geom.nearest_boundary(-0.99, 0.0), BoundaryRef::OuterLeft);
+        assert_eq!(geom.nearest_boundary(0.0, 0.99), BoundaryRef::OuterTop);
+        assert_eq!(geom.nearest_boundary(0.0, -0.99), BoundaryRef::OuterBottom);
+        // Just outside hole 1's boundary (radius 0.1, center -0.5) - much closer to that hole
+        // than to any outer edge.
+        assert_eq!(geom.nearest_boundary(-0.39, 0.0), BoundaryRef::Hole(0));
+        assert_eq!(geom.nearest_boundary(0.39, 0.0), BoundaryRef::Hole(1));
+    }
+
+    #[test]
+    fn boundary_normal_is_axis_aligned_on_outer_edges_and_radial_on_holes() {
+        let geom = two_hole_geometry();
+        assert_eq!(geom.boundary_normal(0.99, 0.0), (1.0, 0.0));
+        assert_eq!(geom.boundary_normal(-0.99, 0.0), (-1.0, 0.0));
+        assert_eq!(geom.boundary_normal(0.0, 0.99), (0.0, 1.0));
+        assert_eq!(geom.boundary_normal(0.0, -0.99), (0.0, -1.0));
+        // Point just outside hole 1, to its right - radial direction points away from the
+        // hole's center, i.e. in +x.
+        let (nx, ny) = geom.boundary_normal(-0.39, 0.0);
+        assert!((nx - 1.0).abs() < 1e-9, "{nx}");
+        assert!(ny.abs() < 1e-9, "{ny}");
+    }
+
+    #[test]
+    fn boundary_tangent_is_perpendicular_to_the_normal() {
+        let geom = two_hole_geometry();
+        assert_eq!(geom.boundary_tangent(0.99, 0.0), (0.0, 1.0));
+        let (nx, ny) = geom.boundary_normal(0.99, 0.0);
+        let (tx, ty) = geom.boundary_tangent(0.99, 0.0);
+        assert!((nx * tx + ny * ty).abs() < 1e-12, "normal and tangent must be perpendicular");
+    }
+
+    #[test]
+    fn boundary_measure_matches_hand_computed_lengths() {
+        let geom = two_hole_geometry();
+        assert!((geom.boundary_measure(BoundaryRef::OuterLeft) - 2.0).abs() < 1e-12);
+        assert!((geom.boundary_measure(BoundaryRef::OuterTop) - 2.0).abs() < 1e-12);
+        let expected_circumference = 2.0 * std::f64::consts::PI * 0.1;
+        assert!((geom.boundary_measure(BoundaryRef::Hole(0)) - expected_circumference).abs() < 1e-12);
+    }
+
+    #[test]
+    fn valid_stencil_is_fully_valid_far_from_any_boundary() {
+        let geom = two_hole_geometry();
+        let v = geom.valid_stencil(0.0, 0.0, 0.05, 0.05);
+        assert!(v.all_valid());
+    }
+
+    #[test]
+    fn valid_stencil_flags_exactly_the_direction_that_crosses_into_a_hole() {
+        let geom = two_hole_geometry();
+        // (-0.65, 0) is outside hole 1 (dist to center 0.15 > radius 0.1) - a valid center.
+        // Shifting +hx=0.1 lands at (-0.55, 0): dist to hole 1 center = 0.05 < radius 0.1 -
+        // INSIDE the hole. Shifting -hx lands at (-0.75, 0): still well outside. y-shifts stay
+        // at x=-0.65, also well outside either hole.
+        let v = geom.valid_stencil(-0.65, 0.0, 0.1, 0.1);
+        assert!(v.center_valid);
+        assert!(!v.x_plus_valid, "x+ neighbor crosses into hole 1, must be flagged invalid");
+        assert!(v.x_minus_valid);
+        assert!(v.y_plus_valid);
+        assert!(v.y_minus_valid);
+        assert!(!v.all_valid());
     }
 
     #[test]

@@ -87,6 +87,23 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
     let sampling = problem.sampling_strategy(0);
     let placeholder_geom = pinn_core::geometry::GeometryConfig::kirsch_plate_inches(); // ignored by UserSamplingStrategy
 
+    // Issue #61 P2-06: one-time startup diagnostic (no effect on training - `sample_interior`
+    // is deterministic, re-seeded identically every call, so this just previews the same
+    // point set the training loop's own first-step call will reproduce). Reports how many of
+    // this run's real interior collocation points have a fully valid 5-point FD stencil vs.
+    // need `UserSamplingStrategy`'s own margin-based fallback - makes that margin's real,
+    // per-run effect a visible number instead of an invisible property of the sampling
+    // process. See `stencil_quality_report`'s own doc comment.
+    {
+        let preview_pts = sampling.sample_interior(&placeholder_geom, spec.training.n_interior);
+        let fd_h = spec.training.fd_h as f64;
+        let report = crate::user_problem::stencil_quality_report(&spec.geometry, &preview_pts, fd_h, fd_h);
+        println!(
+            "  [diag] stencil quality: {}/{} fully valid, {} fallback-needed, {} invalid-center",
+            report.fully_valid, report.total, report.fallback_needed, report.invalid_center,
+        );
+    }
+
     let mut last_total = f32::NAN;
     for step in 0..spec.training.max_steps {
         let int_pts = sampling.sample_interior(&placeholder_geom, spec.training.n_interior);

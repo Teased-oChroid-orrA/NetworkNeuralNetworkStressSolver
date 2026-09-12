@@ -835,6 +835,44 @@ pub fn probe_boundary_residuals(
     crate::training_core::residual_stats(&residuals)
 }
 
+/// Issue #61 EPIC P2-06's own "stencils avoid invalid points with recorded fallback/quality
+/// diagnostics" - a real report over an arbitrary point set, built on
+/// [`pinn_core::user_geometry::UserGeometry::valid_stencil`]. `fully_valid` are stencils safe
+/// to use as-is; `fallback_needed` have a valid center but at least one invalid shifted
+/// neighbor (this codebase's real FD paths already avoid these via margin-based rejection
+/// sampling - `UserSamplingStrategy::contains_for_collocation` - this report makes how many
+/// points that margin is actually protecting against a visible, queryable number instead of an
+/// invisible property of the sampling process); `invalid_center` should never be nonzero for
+/// points that already passed `contains()`-based sampling - a nonzero count here would flag a
+/// genuine wiring bug (a point admitted despite being outside the domain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StencilQualityReport {
+    pub total: usize,
+    pub fully_valid: usize,
+    pub fallback_needed: usize,
+    pub invalid_center: usize,
+}
+
+pub fn stencil_quality_report(
+    geometry: &pinn_core::user_geometry::UserGeometry,
+    points: &[[f64; 2]],
+    hx: f64,
+    hy: f64,
+) -> StencilQualityReport {
+    let mut report = StencilQualityReport { total: points.len(), fully_valid: 0, fallback_needed: 0, invalid_center: 0 };
+    for &[x, y] in points {
+        let v = geometry.valid_stencil(x, y, hx, hy);
+        if !v.center_valid {
+            report.invalid_center += 1;
+        } else if v.all_valid() {
+            report.fully_valid += 1;
+        } else {
+            report.fallback_needed += 1;
+        }
+    }
+    report
+}
+
 /// `enhancement.md` Phase 9 ("Force Equilibrium Validation") - a real reaction-force check,
 /// distinct from `probe_boundary_residuals`'s pointwise mean residual: integrates the
 /// PREDICTED traction over the outer boundary's real point set (arc-length-weighted,
@@ -2045,6 +2083,45 @@ mod tests {
             "reference_force must equal the analytically nominal one-edge load |px * 2*half_h * thickness|: got {} expected {expected_reference}",
             rf.reference_force
         );
+    }
+
+    #[test]
+    fn stencil_quality_report_counts_fully_valid_points_far_from_any_boundary() {
+        let geom = two_hole_geometry();
+        // Interior points midway between the two holes, well clear of both holes and the
+        // outer rectangle at the given fd_h.
+        let points = vec![[0.0, 0.0], [0.005, 0.01], [-0.005, -0.01]];
+        let report = stencil_quality_report(&geom, &points, 1e-3, 1e-3);
+        assert_eq!(report.total, 3);
+        assert_eq!(report.fully_valid, 3);
+        assert_eq!(report.fallback_needed, 0);
+        assert_eq!(report.invalid_center, 0);
+    }
+
+    #[test]
+    fn stencil_quality_report_flags_points_whose_stencil_crosses_into_a_hole() {
+        let geom = two_hole_geometry();
+        // Hole 1: center [-0.03, 0.0], radius 0.01. Point at [-0.042, 0.0] is dist=0.012 from
+        // the center - outside the hole (valid), but a +0.005 step in x lands at [-0.037, 0.0]
+        // (dist=0.007) - inside the hole. The -x/+-y shifts all stay outside.
+        let points = vec![[-0.042, 0.0]];
+        let report = stencil_quality_report(&geom, &points, 0.005, 0.005);
+        assert_eq!(report.total, 1);
+        assert_eq!(report.fully_valid, 0);
+        assert_eq!(report.fallback_needed, 1, "center is valid but the +x neighbor crosses into the hole");
+        assert_eq!(report.invalid_center, 0);
+    }
+
+    #[test]
+    fn stencil_quality_report_flags_an_invalid_center_separately_from_fallback_needed() {
+        let geom = two_hole_geometry();
+        // Dead center of hole 1 - not a real collocation point (would never pass `contains()`-
+        // based sampling), but the report must still classify it correctly, not silently.
+        let points = vec![[-0.03, 0.0]];
+        let report = stencil_quality_report(&geom, &points, 1e-3, 1e-3);
+        assert_eq!(report.invalid_center, 1);
+        assert_eq!(report.fully_valid, 0);
+        assert_eq!(report.fallback_needed, 0);
     }
 
     #[test]
