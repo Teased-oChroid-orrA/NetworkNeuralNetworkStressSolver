@@ -6,6 +6,7 @@ pub mod contact_export;
 pub mod controllers; // ConvergenceTracker is `pub` (see controllers.rs) for cross-crate curriculum reuse
 pub mod decision_maker;
 pub mod diagnostics;
+pub mod differential_operator;
 pub mod engine;
 pub mod energy;
 pub mod execution;

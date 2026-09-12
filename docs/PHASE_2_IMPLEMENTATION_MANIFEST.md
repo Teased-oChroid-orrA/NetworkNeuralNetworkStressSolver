@@ -87,7 +87,74 @@ bullets satisfied by the test list above).
 
 ## P2-02 — DifferentialOperator abstraction
 
-Status: NOT_STARTED
+Status: VERIFIED
+
+### Requirement
+
+Explicit `DifferentialOperator` abstraction with named backends (AD/FD/Analytic), no silent
+backend switching, cross-validated against a manufactured field's exact derivatives.
+
+### Files changed
+
+- `crates/pinn-solver/src/differential_operator.rs` — new module. `DerivativeBackend` enum
+  (`Fd`/`Ad`/`Analytic`), `DerivativeBackendPolicy` struct (`primary`/`verification`/`fallback`
+  fields, explicit routing record — no field silently swaps backend) + `FD_ONLY` const,
+  `ScalarDerivatives` struct + `fd_scalar_derivatives()`, `ad_strain<B: AutodiffBackend>()` (real
+  AD strain via sum-trick over network input coords), `fd_strain_via<B: Backend>()` (adapter over
+  existing `fd_stencil` functions, same interface shape as `ad_strain` for direct comparison).
+- `crates/pinn-solver/src/lib.rs` — `pub mod differential_operator;` added.
+
+### Architecture decision
+
+Scope held to scalar/strain-level operators only (gradient/strain), not the full
+gradient/divergence/laplacian/hessian/directional_derivative trait surface issue #61 describes,
+per §1.4 (no destructive refactor) and §4's staged order — `compute_domain_forwards` and its
+existing FD/Hessian call sites are NOT touched in this epic; P2-15 (migration) is where existing
+paths get adapted onto this abstraction, not P2-02 itself. `ad_strain` differentiates network
+INPUT coordinates via burn autodiff's sum-trick (`d(sum(u))/d(pts)` recovers per-row `du_i/dx_i`
+in one `.backward()`, exploiting the batched pointwise-no-cross-row-coupling structure) rather
+than N independent passes or full Jacobian materialization. Hessian-via-AD is a documented
+NON-GOAL, not a gap: grepped `burn-autodiff` 0.21 source for
+`second.order|higher.order|create_graph|grad_grad|double.backward` — zero matches, confirming
+this backend has no nested/higher-order autodiff support. A fake zero-returning `ad_hessian` was
+drafted, recognized mid-write as exactly the "dead abstraction" pattern issue #61 §1.3/§6
+forbids, and deleted; the module doc comment states the limitation honestly instead. Existing FD
+9-point Hessian stencil (`fd_stencil.rs`, from the prior General-PINN pass) remains the only
+Hessian backend and is unaffected.
+
+### Tests
+
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- differential_operator::`
+  — 4 passed:
+  - `fd_scalar_derivatives_matches_analytic_values_for_the_acceptance_polynomial` — issue #61's
+    own literal example polynomial f(x,y)=x²+3xy+2y², FD vs hand-derived analytic first/second
+    derivatives.
+  - `fd_scalar_derivatives_matches_manufactured_field_exact_strain_formula` — cross-check against
+    `manufactured::ManufacturedField::quadratic` (Priority 7 module, reused not duplicated).
+  - `ad_strain_matches_exact_manufactured_strain` — AD backend vs hand-derived exact formula.
+  - `ad_strain_matches_fd_strain_on_the_same_manufactured_field` — AD vs FD, same field, same
+    point, backend cross-check.
+
+### Runtime evidence
+
+Unit-tested only (pure-function operators, no training-loop integration in this epic per the
+staged-migration decision above — nothing in the live training path calls this module yet, so
+there is no live-run evidence to report and none is claimed).
+
+### Known limitations
+
+Hessian-via-AD not implemented (confirmed backend limitation, not an oversight — see Architecture
+decision). Not yet wired into any live physics consumer (`compute_domain_forwards`,
+`EquilibriumTerm`, etc.) — that migration is explicitly P2-15's job, done only after P2-03..P2-14
+land, per issue #61 §4's mandatory order. Directional-derivative and divergence operators not
+implemented (not needed by any current consumer; would be speculative scaffolding today).
+
+### Reviewer verification
+
+PASS against P2-02's acceptance bullets that apply at this stage (named backends, explicit
+routing record, cross-validated against manufactured/analytic ground truth, no silent switching).
+Hessian trait surface and live-path wiring deliberately deferred, tracked as known limitations
+above rather than hidden.
 
 ## P2-03 — Authoritative Field Dependency Graph
 
