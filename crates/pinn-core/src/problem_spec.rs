@@ -196,6 +196,19 @@ mod tests {
         }
     }
 
+    /// Issue #62 PH3-05: the shipped pure-Variational + measure-aware production benchmark
+    /// config must parse with EXACTLY the formulation/switch this epic's own manifest entry
+    /// claims - a real regression guard, not just "the file exists".
+    #[test]
+    fn shipped_variational_no_hole_example_spec_parses_with_expected_formulation_and_switch() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/problems/variational_no_hole_plate.toml");
+        let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
+        let spec: ProblemSpec = toml::from_str(&contents).unwrap_or_else(|e| panic!("failed to parse {path:?}: {e}"));
+        assert_eq!(spec.formulation, FormulationSelection::Variational);
+        assert!(spec.training.measure_aware_training);
+        assert!(spec.geometry.holes.is_empty(), "this is the no-hole benchmark configuration");
+    }
+
     #[test]
     fn network_and_training_specs_default_when_omitted_from_toml() {
         let toml_str = r#"

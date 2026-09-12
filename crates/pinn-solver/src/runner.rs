@@ -3355,6 +3355,92 @@ mod tests {
         }
     }
 
+    /// Issue #62 PH3-05: real, full-length (2000-step, matching PH3-01's own frozen legacy
+    /// baseline's step count for a comparable run) training evidence for the shipped `examples/
+    /// problems/variational_no_hole_plate.toml` production configuration (pure `Variational`
+    /// formulation + `measure_aware_training=true`, PH3-04's real switch). Loads the ACTUAL
+    /// shipped TOML file (not a hand-built literal) - this is also, structurally, "did the
+    /// shipped file train correctly", not just "does this TOML parse". `#[ignore]`d - run
+    /// explicitly with `cargo test --release -p pinn-solver --features ndarray-backend
+    /// variational_no_hole_plate_trains -- --ignored --nocapture` (real ~10+ minute wall clock,
+    /// matching PH3-01's own recorded `elapsed_secs: 646.3` for the same network/step size).
+    #[test]
+    #[ignore = "real, full-length (2000-step) production training run - see this test's own doc comment"]
+    fn variational_no_hole_plate_trains_and_produces_real_benchmark_evidence() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/problems/variational_no_hole_plate.toml");
+        let contents = std::fs::read_to_string(&path).expect("read variational_no_hole_plate.toml");
+        let spec: ProblemSpec = toml::from_str(&contents).expect("parse variational_no_hole_plate.toml");
+        assert_eq!(spec.formulation, pinn_core::problem_spec::FormulationSelection::Variational);
+        assert!(spec.training.measure_aware_training);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, rx_ctrl));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
+        let mut saw_done = false;
+        let mut last_logged_step = usize::MAX;
+        let mut last_update: Option<Box<TrainingUpdate>> = None;
+        while std::time::Instant::now() < deadline && !saw_done {
+            match rx.try_recv() {
+                Ok(TrainingMsg::Update(u)) => {
+                    if u.step % 500 == 0 && u.step != last_logged_step {
+                        last_logged_step = u.step;
+                        println!("  [variational-no-hole] step={} total_loss={:.4e} energy_loss={:.4e}", u.step, u.total_loss, u.energy_loss);
+                    }
+                    last_update = Some(u);
+                }
+                Ok(TrainingMsg::Done) => saw_done = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+        let final_update = last_update.expect("must have received at least one Update");
+
+        let path_ck = std::env::temp_dir().join(format!("pinn_solver_variational_no_hole_{}", std::process::id()));
+        tx_ctrl.send(ControlMsg::SaveCheckpoint { path: path_ck.clone(), saved_at_unix: 0 }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut saved: Option<Result<String, String>> = None;
+        while std::time::Instant::now() < deadline && saved.is_none() {
+            if let Ok(TrainingMsg::CheckpointSaved(r)) = rx.try_recv() { saved = Some(r); }
+            else { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        }
+        let written = saved.expect("must receive a CheckpointSaved response").expect("save must succeed");
+        tx_ctrl.send(ControlMsg::Stop).unwrap();
+        handle.join().unwrap();
+
+        println!("[PH3-05] final total_loss={:.6e} energy_loss={:.6e}", final_update.total_loss, final_update.energy_loss);
+        if let Some(b) = &final_update.no_hole_benchmark {
+            println!("[PH3-05] no_hole_benchmark: {b:?}");
+        } else {
+            println!("[PH3-05] no_hole_benchmark: None (last update wasn't on the vis cadence - real evidence is in the saved checkpoint's own recomputation below)");
+        }
+
+        // Recompute the REAL hard benchmark directly against the saved checkpoint (same
+        // technique PH3-01's baseline used) - authoritative evidence independent of whichever
+        // vis-cadence tick happened to be the last `Update` received.
+        let device = crate::training_core::BDevice::default();
+        let (model, meta) = crate::checkpoint::load_checkpoint(&path_ck, &device).expect("load just-saved checkpoint");
+        let loaded_spec = match &meta.spec {
+            crate::checkpoint::CheckpointSpec::Plate(s) => s.clone(),
+            crate::checkpoint::CheckpointSpec::Parametric(_) => panic!("expected a Plate checkpoint"),
+        };
+        let benchmark = crate::user_problem::run_no_hole_benchmark(&model, &loaded_spec, &device);
+        let energy_balance = crate::user_problem::probe_energy_balance(&model, &loaded_spec, &device);
+        println!("[PH3-05] recomputed benchmark from saved checkpoint: {benchmark:?}");
+        println!("[PH3-05] recomputed energy balance: {energy_balance:?}");
+
+        assert!(final_update.total_loss.is_finite());
+        assert!(benchmark.sigma_xx_relative_error.is_finite());
+        assert!(energy_balance.energy_balance_error.is_finite());
+
+        let _ = std::fs::remove_file(&written);
+        let mut meta_path = path_ck.clone();
+        meta_path.set_file_name(format!("{}.meta.json", path_ck.file_stem().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_file(meta_path);
+    }
+
     /// Issue #62 PH3-04: real, controlled A/B evidence that `measure_aware_training` actually
     /// changes live training behavior once AMR makes sampling nonuniform (per this crate's own
     /// `derive_amr_config`, `interval_steps` is always 1000 and `AMR_WARMUP_STEPS` is 200, so a

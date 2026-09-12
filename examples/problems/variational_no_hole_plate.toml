@@ -1,0 +1,42 @@
+# Issue #62 PH3-05: production benchmark configuration for the PURE Variational (Deep Energy
+# Method) formulation, with measure-aware training enabled (PH3-04). Identical material/load/
+# geometry/network/training parameters to `no_hole_plate.toml` (the legacy Hybrid baseline
+# frozen for PH3-01 at `Debug_run/baseline_legacy_no_hole/`) - this file differs ONLY in
+# `formulation = "Variational"` (issue #61 P2-01's own gate: activates ONLY `interior_energy`/
+# `external_work` + essential constraints - NO `equilibrium`/`outer_traction` penalty, since a
+# correctly-posed W_ext already encodes the natural traction-free boundary automatically) and
+# `training.measure_aware_training = true` (PH3-04's real, tested measure-aware integral path).
+#
+# Run with: cargo run -p pinn-app --release -- --headless --problem-spec examples/problems/variational_no_hole_plate.toml
+#
+# All lengths in meters [m], all stresses/moduli in pascals [Pa].
+
+formulation = "Variational"
+
+[geometry]
+half_w = 0.10
+half_h = 0.10
+thickness = 0.005
+holes = []
+
+[material]
+e = 71.7e9               # Al 7075-T6
+nu = 0.33
+density = 2810.0
+ultimate_strength_pa = 503e6
+
+[load]
+px = 6.9e7
+py = 0.0
+
+[network]
+hidden_dim = 64
+n_hidden = 8
+
+[training]
+max_steps = 2000
+n_interior = 2048
+n_boundary = 512
+fd_h = 1e-3
+lr = 1e-3
+measure_aware_training = true

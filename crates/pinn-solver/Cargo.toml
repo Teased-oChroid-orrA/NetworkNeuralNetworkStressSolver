@@ -35,6 +35,9 @@ burn-ndarray      = { version = "0.21", optional = true, default-features = fals
 
 [dev-dependencies]
 criterion = "0.5"
+# Issue #62 PH3-05: test-only, to load the real shipped `examples/problems/*.toml` files
+# directly (proving the shipped file itself trains correctly, not a hand-copied literal).
+toml = { workspace = true }
 
 [features]
 ndarray-backend = ["burn/ndarray", "dep:burn-ndarray"]

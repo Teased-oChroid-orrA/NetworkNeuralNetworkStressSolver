@@ -2329,6 +2329,35 @@ mod tests {
         assert!(!names.contains(&"outer_traction"), "{names:?} - strong-form residual must be OMITTED under Variational");
     }
 
+    /// Issue #62 PH3-05's own real production configuration (`examples/problems/variational_
+    /// no_hole_plate.toml`): a NO-HOLE, pure-Neumann geometry under `Variational` must activate
+    /// EXACTLY `interior_energy`/`external_work` plus the `TranslationGaugeTerm` (issue #61
+    /// P2-07 - a no-hole plate has no `HoleBc::Fixed` essential constraint at all, so the
+    /// rigid-body translation nullspace needs gauge-fixing instead) - no `hole_fixed`/
+    /// `hole_free` (there are no holes), no `equilibrium`/`outer_traction` (Strong-form,
+    /// omitted under Variational).
+    #[test]
+    fn variational_formulation_on_a_no_hole_geometry_activates_u_minus_w_ext_and_translation_gauge() {
+        use pinn_core::problem_spec::FormulationSelection;
+        let mut spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        spec.formulation = FormulationSelection::Variational;
+        let problem = UserDefinedProblem::new(spec);
+        let names: Vec<&str> = problem.loss_terms().iter().map(|t| t.name()).collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names.contains(&"interior_energy"), "{names:?}");
+        assert!(names.contains(&"external_work"), "{names:?}");
+        assert!(names.contains(&"translation_gauge"), "{names:?} - no essential constraint exists on a no-hole geometry, so the rigid-body nullspace must be gauge-fixed instead");
+        assert!(!names.contains(&"equilibrium"), "{names:?}");
+        assert!(!names.contains(&"outer_traction"), "{names:?}");
+    }
+
     /// Issue #61 P2-01 acceptance: "Strong activates declared PDE/BC residuals." No energy
     /// functional terms (`interior_energy`/`external_work`) are present.
     #[test]
