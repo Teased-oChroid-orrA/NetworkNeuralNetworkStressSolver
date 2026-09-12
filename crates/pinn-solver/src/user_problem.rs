@@ -82,7 +82,10 @@ const LAM_TRANSLATION_GAUGE: f32 = 50.0;
 /// not user-configurable in v1 (see `ProblemSpec`'s scope note).
 const HOLE_RING_POINTS: usize = 64;
 const REJECTION_SAMPLE_ATTEMPTS_FACTOR: usize = 20;
-const SEED_INTERIOR: u64 = 90_210;
+/// Issue #61 EPIC P2-13: made `pub` (was private) so `crate::provenance` can record this
+/// codebase's real, fixed interior-collocation seed as genuine reproducibility metadata,
+/// instead of guessing or omitting it.
+pub const SEED_INTERIOR: u64 = 90_210;
 
 /// Safety multiple applied to the FD stencil's physical reach when computing the near-hole
 /// collocation-exclusion margin (see [`UserSamplingStrategy::new`]'s margin computation) —

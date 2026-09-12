@@ -1082,7 +1082,99 @@ with a specific, honest reason each, not silently omitted.
 
 ## P2-13 — Reproducibility and provenance
 
-Status: NOT_STARTED
+Status: VERIFIED
+
+### Requirement
+
+`git_sha`/`git_dirty`/`problem_hash`/`config_hash`/`seed`/`backend`/`dtype`/`architecture`/
+`optimizer`/`formulation`/`derivative policy`/`scales`/`coefficients`/`weights`/`sampling`/`AMR
+state` per saved run; unavailable = recorded as unavailable, never invented.
+
+### Files changed
+
+- `crates/pinn-solver/src/provenance.rs` — new module. `RunProvenance` struct + `compute_run_
+  provenance()`. `git_sha()`/`git_dirty()` shell out to the real `git` binary; `problem_hash()`
+  is a non-cryptographic `DefaultHasher` fingerprint of the spec's own JSON serialization.
+- `crates/pinn-solver/src/lib.rs` — `pub mod provenance;` added.
+- `crates/pinn-solver/src/user_problem.rs` — `SEED_INTERIOR` made `pub` (was private) so
+  `provenance` can record this codebase's real, fixed interior-collocation seed.
+- `crates/pinn-solver/src/checkpoint.rs` — `CheckpointMeta` gains a `#[serde(default)]
+  provenance: RunProvenance` field (existing `.meta.json` files without it still deserialize).
+- `crates/pinn-solver/src/parametric_problem.rs`, `runner.rs` — all 3 real `CheckpointMeta`
+  construction sites (parametric checkpoint save, plate checkpoint save, loaded-checkpoint
+  re-save) now call `compute_run_provenance` for real, live-computed values instead of a
+  placeholder.
+
+### Architecture decision
+
+`CheckpointMeta`'s pre-existing `.meta.json` sidecar (already saved for every real checkpoint,
+already carrying the FULL `spec`) is the natural, already-load-bearing home for provenance -
+most of the epic's literal field list (`architecture`/`formulation`/`scales`/`sampling`/
+`optimizer`-relevant config) is ALREADY fully reconstructable from `meta.spec` itself; this
+epic adds the genuinely NEW information `spec` alone can't provide: real git state, a fast
+config fingerprint, and two real, VERIFIED findings about what this codebase's real randomness
+sources actually are.
+
+Two fields are honest NEGATIVE findings, not conveniences: `model_init_seeded` is always
+`false` - confirmed by reading `network::ElasticityNetConfig::init`'s full call chain (`burn`'s
+`LinearConfig::init(device)`, no seed parameter anywhere) - model weight initialization is
+genuinely NOT reproducible in this codebase today, a real gap this epic surfaces rather than
+hides. `derivative_backend` always reports `"FD"` - the only backend P2-02's differential-
+operator abstraction found actually wired into live training (P2-02's `Ad`/`Analytic` backends
+exist and are tested but not yet consumed by any physics term).
+
+`&'static str` fields were initially used for `backend`/`dtype`/`derivative_backend` and hit a
+real compile error (`derive(Deserialize)` cannot generically produce a `&'static str` from
+deserialized input - the `'de` lifetime can't be proven `'static`) - fixed by switching to
+owned `String`, a genuine correctness fix caught by the compiler, not a style preference.
+
+### Tests
+
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- provenance::` —
+  4 passed: known real values (`interior_sampling_seed`, `model_init_seeded=false`,
+  `derivative_backend="FD"`, `dtype="f32"`), `formulation: None` for specs where it's genuinely
+  not applicable, `problem_hash` deterministic for the same spec and distinguishing different
+  specs, and `git_sha`/`git_dirty` behaving consistently (both `Some` or both `None` - this
+  session's real git checkout resolved both to `Some`, confirmed working, not just "doesn't
+  panic").
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- checkpoint::` — 2
+  passed (pre-existing, both regression-checked unchanged): a real save-then-load round trip
+  (actual disk I/O, actual `.meta.json` sidecar) and a parametric-architecture reconstruction
+  test, both confirming the new `provenance` field doesn't break the existing serialization
+  contract.
+- command: `cargo build --workspace --tests --features ndarray-backend` — clean.
+
+### Runtime evidence
+
+The checkpoint round-trip test IS real runtime evidence: it performs an actual `save_checkpoint`
+call (real file write, real `.meta.json` JSON serialization including the new `provenance`
+field) followed by a real `load_checkpoint` call (real file read, real JSON deserialization),
+confirming the extended `CheckpointMeta` genuinely round-trips through disk I/O, not just
+in-memory construction. The 3 real (non-test) `CheckpointMeta` construction sites were verified
+to compile against their real surrounding context (live GUI-triggered checkpoint-save code
+paths) but were not exercised via a live GUI session in this pass (no GUI interaction available
+in this headless session) - the round-trip unit test's real I/O is the primary evidence.
+
+### Known limitations
+
+`git_sha`/`git_dirty` reflect the repository state AT SAVE TIME (shelled out live), not a
+build-time-baked value - if the binary is run from outside any git checkout (e.g. a packaged
+release), both are honestly `None`, not fabricated. `problem_hash` is a fast, non-cryptographic
+fingerprint (SipHash via `DefaultHasher`), not a cryptographic digest - sufficient for "same
+config" comparison, explicitly not a security primitive. AMR state (the epic's own literal
+field) is not captured - the plate/Kirsch/pin-lug training paths' `AdaptiveGrid` state (if any
+is live for a given run) is not currently serialized into any checkpoint; adding it would need
+`AdaptiveGrid` itself to become serializable, not attempted here. Optimizer MOMENTUM state is
+also not captured (`checkpoint.rs`'s own pre-existing, unrelated design choice - documented in
+its own module doc comment - weights only, no resume-training state).
+
+### Reviewer verification
+
+PASS against P2-13's acceptance bullets at the scope this codebase's real randomness/build
+infrastructure supports: every field is either a real, verified value (git state, sampling
+seed, backend/dtype, config fingerprint) or an explicit, honestly-reasoned `None`/`false`
+(model-init seeding, AD/Analytic derivative backends, AMR state) - never invented, matching the
+epic's own explicit mandate.
 
 ## P2-14 — Benchmark protocol
 

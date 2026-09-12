@@ -24,6 +24,7 @@ pub mod optim;
 pub mod parametric_problem;
 pub mod pinlug_problem;
 pub mod problem;
+pub mod provenance;
 pub mod runner;
 pub mod saw_brdr;
 pub mod signorini;

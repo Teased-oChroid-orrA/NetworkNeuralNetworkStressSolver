@@ -44,6 +44,13 @@ pub struct CheckpointMeta {
     /// its own (kept a pure function of its arguments, same as every other solver-side probe
     /// in this codebase).
     pub saved_at_unix: u64,
+    /// Issue #61 EPIC P2-13: reproducibility/provenance metadata - `#[serde(default)]` so
+    /// existing `.meta.json` files saved before this field existed still deserialize (with
+    /// `RunProvenance::default()`, whose `Option` fields are `None` and whose non-`Option`
+    /// fields are their type's zero value - an honest "this old checkpoint predates provenance
+    /// tracking", not a fabricated value).
+    #[serde(default)]
+    pub provenance: crate::provenance::RunProvenance,
 }
 
 fn recorder() -> NamedMpkGzFileRecorder<HalfPrecisionSettings> {
@@ -178,7 +185,7 @@ mod tests {
         let probe_tensor = crate::fd_stencil::norm_pts_to_tensor::<BInner>(&probe_pts, &device);
         let before = crate::network::fwd::<BInner>(&model, probe_tensor.clone(), n_fourier, &device)
             .into_data().to_vec::<f32>().unwrap();
-        let meta = CheckpointMeta { spec: CheckpointSpec::Plate(spec), steps_completed: 42, final_loss: 0.0123, saved_at_unix: 1_700_000_000 };
+        let meta = CheckpointMeta { spec: CheckpointSpec::Plate(spec), steps_completed: 42, final_loss: 0.0123, saved_at_unix: 1_700_000_000, provenance: Default::default() };
         let weights_path = tmp_path("roundtrip");
         let written = save_checkpoint(model, &meta, &weights_path).expect("save must succeed");
         assert!(written.exists(), "the weights file reported as written must actually exist on disk: {written:?}");
@@ -223,7 +230,7 @@ mod tests {
             network: NetworkSpec { hidden_dim: 8, n_hidden: 2, ..Default::default() },
             training: TrainingSpec::default(),
         };
-        let meta = CheckpointMeta { spec: CheckpointSpec::Parametric(spec), steps_completed: 6, final_loss: 1.0, saved_at_unix: 0 };
+        let meta = CheckpointMeta { spec: CheckpointSpec::Parametric(spec), steps_completed: 6, final_loss: 1.0, saved_at_unix: 0, provenance: Default::default() };
         let weights_path = tmp_path("parametric");
         let written = save_checkpoint(model, &meta, &weights_path).expect("save must succeed");
 

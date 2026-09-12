@@ -912,11 +912,13 @@ fn serve_parametric_inference(
                 let mut live_spec = spec.clone();
                 live_spec.network.hidden_dim = current_hidden_dim;
                 live_spec.network.n_hidden = current_n_hidden;
+                let provenance = crate::provenance::compute_run_provenance(&live_spec, None);
                 let meta = crate::checkpoint::CheckpointMeta {
                     spec: crate::checkpoint::CheckpointSpec::Parametric(live_spec),
                     steps_completed: last_step + 1,
                     final_loss: last_total_loss,
                     saved_at_unix,
+                    provenance,
                 };
                 let result = crate::checkpoint::save_checkpoint(model.clone(), &meta, &path)
                     .map(|p| p.display().to_string());

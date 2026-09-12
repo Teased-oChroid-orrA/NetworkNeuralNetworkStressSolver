@@ -1704,11 +1704,13 @@ fn run_user_problem_training_from(
                 let mut live_spec = spec.clone();
                 live_spec.network.hidden_dim = current_hidden_dim;
                 live_spec.network.n_hidden = current_n_hidden;
+                let provenance = crate::provenance::compute_run_provenance(&live_spec, Some(format!("{:?}", live_spec.formulation)));
                 let meta = crate::checkpoint::CheckpointMeta {
                     spec: crate::checkpoint::CheckpointSpec::Plate(live_spec),
                     steps_completed: last_step + 1,
                     final_loss: last_total_loss,
                     saved_at_unix,
+                    provenance,
                 };
                 let model_val: ElasticityNet<BInner> = model.valid();
                 let result = crate::checkpoint::save_checkpoint(model_val, &meta, &path)
@@ -1830,6 +1832,7 @@ pub fn serve_loaded_plate_checkpoint(
         match stop_rx.recv() {
             Ok(ControlMsg::Stop) | Err(_) => return,
             Ok(ControlMsg::SaveCheckpoint { path, saved_at_unix }) => {
+                let provenance = crate::provenance::compute_run_provenance(&spec, Some(format!("{:?}", spec.formulation)));
                 let meta = crate::checkpoint::CheckpointMeta {
                     spec: crate::checkpoint::CheckpointSpec::Plate(spec.clone()),
                     // Loaded, not (re)trained this session - honestly 0, not fabricated from
@@ -1837,6 +1840,7 @@ pub fn serve_loaded_plate_checkpoint(
                     steps_completed: 0,
                     final_loss: 0.0,
                     saved_at_unix,
+                    provenance,
                 };
                 let result = crate::checkpoint::save_checkpoint(model.clone(), &meta, &path)
                     .map(|p| p.display().to_string());
