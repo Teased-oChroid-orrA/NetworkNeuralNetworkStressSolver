@@ -1,4 +1,5 @@
 use ndarray::Array2;
+use serde::{Deserialize, Serialize};
 use crate::geometry::GeometryConfig;
 use crate::loading::LoadConfig;
 use crate::material::MaterialProps;
@@ -51,7 +52,7 @@ pub struct AmrSweepReport {
 /// nonzero "applied resultant" to compare against; a nonzero PREDICTED net force is itself the
 /// meaningful inconsistency. `reference_force` [N] is the nominal one-edge load magnitude used
 /// to normalize `equilibrium_error` into a scale-free ratio.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ReactionForce {
     pub net_fx: f64,
     pub net_fy: f64,
@@ -72,7 +73,7 @@ pub struct ReactionForce {
 /// loaded boundary. For a converged linear-elastic solution under pure traction loading (no
 /// body force), the work-energy theorem requires these to be equal — `energy_balance_error`
 /// is how far apart they are, normalized by `external_work`'s own magnitude.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EnergyBalance {
     pub internal_energy: f64,
     pub external_work: f64,

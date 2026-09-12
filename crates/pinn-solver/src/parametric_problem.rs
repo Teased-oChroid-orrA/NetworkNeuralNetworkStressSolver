@@ -915,13 +915,21 @@ fn serve_parametric_inference(
                 let mut live_spec = spec.clone();
                 live_spec.network.hidden_dim = current_hidden_dim;
                 live_spec.network.n_hidden = current_n_hidden;
-                let provenance = crate::provenance::compute_run_provenance(&live_spec, None, Some(live_spec.network.model_init_seed));
+                let provenance = crate::provenance::compute_run_provenance(&live_spec, None, Some(live_spec.network.model_init_seed), &live_spec.network, &live_spec.training);
                 let meta = crate::checkpoint::CheckpointMeta {
                     spec: crate::checkpoint::CheckpointSpec::Parametric(live_spec),
                     steps_completed: last_step + 1,
                     final_loss: last_total_loss,
                     saved_at_unix,
                     provenance,
+                    // Issue #62 PH3-13: the full authoritative report is scoped to the plate
+                    // path this pass (see `run_user_problem_training_from`'s own SaveCheckpoint
+                    // handler) - the parametric path has no AMR mechanism and no measure-aware
+                    // integration upgrade (see this module's own doc comment: it reuses
+                    // `energy.rs` functions directly, never `step_physics_multi`/`measure_
+                    // integral`), so claiming an `integration_mode`/`sampling_mode` for it here
+                    // would misrepresent behavior this path doesn't actually have.
+                    report: None,
                 };
                 let result = crate::checkpoint::save_checkpoint(model.clone(), &meta, &path)
                     .map(|p| p.display().to_string());

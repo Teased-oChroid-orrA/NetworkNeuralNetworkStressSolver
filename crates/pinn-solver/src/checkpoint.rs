@@ -51,6 +51,16 @@ pub struct CheckpointMeta {
     /// tracking", not a fabricated value).
     #[serde(default)]
     pub provenance: crate::provenance::RunProvenance,
+    /// Issue #62 PH3-13: the full authoritative report (`RunProvenance` plus L0-L5 verdicts,
+    /// integration/sampling mode, AMR state, energy balance, reaction force, convergence
+    /// evidence) - `#[serde(default)]`, `None` for a checkpoint saved before this field
+    /// existed (an honest "predates the authoritative report", not a fabricated value, same
+    /// treatment as `provenance` above before it). `provenance` above is kept, not removed
+    /// (this field's own `AuthoritativeReport.provenance` is a real duplicate of it) - avoids
+    /// an actually-breaking schema change for the one field every existing `.meta.json` file
+    /// already has.
+    #[serde(default)]
+    pub report: Option<crate::provenance::AuthoritativeReport>,
 }
 
 fn recorder() -> NamedMpkGzFileRecorder<HalfPrecisionSettings> {
@@ -185,7 +195,7 @@ mod tests {
         let probe_tensor = crate::fd_stencil::norm_pts_to_tensor::<BInner>(&probe_pts, &device);
         let before = crate::network::fwd::<BInner>(&model, probe_tensor.clone(), n_fourier, &device)
             .into_data().to_vec::<f32>().unwrap();
-        let meta = CheckpointMeta { spec: CheckpointSpec::Plate(spec), steps_completed: 42, final_loss: 0.0123, saved_at_unix: 1_700_000_000, provenance: Default::default() };
+        let meta = CheckpointMeta { spec: CheckpointSpec::Plate(spec), steps_completed: 42, final_loss: 0.0123, saved_at_unix: 1_700_000_000, provenance: Default::default(), report: None };
         let weights_path = tmp_path("roundtrip");
         let written = save_checkpoint(model, &meta, &weights_path).expect("save must succeed");
         assert!(written.exists(), "the weights file reported as written must actually exist on disk: {written:?}");
@@ -230,7 +240,7 @@ mod tests {
             network: NetworkSpec { hidden_dim: 8, n_hidden: 2, ..Default::default() },
             training: TrainingSpec::default(),
         };
-        let meta = CheckpointMeta { spec: CheckpointSpec::Parametric(spec), steps_completed: 6, final_loss: 1.0, saved_at_unix: 0, provenance: Default::default() };
+        let meta = CheckpointMeta { spec: CheckpointSpec::Parametric(spec), steps_completed: 6, final_loss: 1.0, saved_at_unix: 0, provenance: Default::default(), report: None };
         let weights_path = tmp_path("parametric");
         let written = save_checkpoint(model, &meta, &weights_path).expect("save must succeed");
 

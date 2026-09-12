@@ -1032,17 +1032,110 @@ unchanged). `cargo build -p app-egui` clean; real launch stayed alive 8s+ with a
 
 ## PH3-13 — Benchmark report becomes authoritative
 
-Status: NOT_STARTED
+Status: VERIFIED (scoped to the plate path)
 
 ### Current evidence
+Plan text (§17, verbatim): the final report SHALL contain run identity/git SHA/dirty/problem
+hash/config hash/seeds/formulation/derivative backend/integration mode/sampling mode/AMR state,
+L0-L5 results, field/traction accuracy/load transfer/energy consistency/displacement accuracy/
+stress consistency - and "the GUI/headless runner, persisted JSON, and checkpoint metadata
+SHALL agree. No duplicate reporting logic may produce contradictory statuses." Before this
+item: `RunProvenance` (P2-13) had most of "run identity" but no `config_hash`; nothing
+combined L0-L5 + integration/sampling/AMR state + energy/reaction/convergence into one
+structure; `app-egui`'s `build_analysis_report()` hand-built its own separate ad hoc JSON tree
+for the benchmark/operational-status fields, structurally unable to agree-by-construction with
+`CheckpointMeta`'s own (much thinner) persisted data.
+
 ### Required change
+One real, shared `AuthoritativeReport` type + `build_authoritative_report()` function, called
+identically by both the checkpoint-save path and the GUI export path.
+
 ### Files changed
+- `crates/pinn-core/src/messages.rs` - `ReactionForce`/`EnergyBalance` gained `PartialEq,
+  Serialize, Deserialize` (both are plain `f64`-only `Copy` structs - safe, no lifetime issues).
+- `crates/pinn-solver/src/provenance.rs` - `RunProvenance.config_hash: String` (new, hashes
+  `NetworkSpec`+`TrainingSpec` only, distinct axis from the existing whole-spec `problem_hash`
+  - see that field's own doc comment for the honest caveat that `problem_hash` is NOT
+  independent of solver config today, since it hashes the whole spec). `L1_STATUS`/`L2_STATUS`/
+  `L3_STATUS` (real textual status for the 3 rungs with no per-run number - see `verification_
+  ladder`'s own doc comment for why). `PersistedNoHoleBenchmark`/`PersistedConvergenceEvidence`
+  (owned-`String` mirrors of `NoHoleBenchmarkResult`/`NoHoleBenchmarkSummary` and
+  `ConvergenceEvidenceSummary` - needed because `&'static str` fields can't `Deserialize` from
+  an arbitrary JSON buffer; each has `From` impls from BOTH the solver-side and transport-side
+  source types, converging on one shape). `AmrStateSummary`, `AuthoritativeReport`,
+  `build_authoritative_report()`.
+- `crates/pinn-solver/src/checkpoint.rs` - `CheckpointMeta.report: Option<AuthoritativeReport>`
+  (new, `#[serde(default)]`; `provenance` field kept, not removed - avoids an actually-breaking
+  schema change for the one field every existing `.meta.json` already has).
+- `crates/pinn-solver/src/runner.rs` - `run_user_problem_training_from`'s `SaveCheckpoint`
+  handler now builds a full report (real `no_hole_benchmark`/`energy_balance`/`reaction_force`
+  recomputed fresh from `model_val` at save time, `convergence_evidence` reusing the SAME
+  accumulated `loss_hist`/`grad_norm_hist`/`bc_residual_hist` issue #62 PH3-10 already
+  maintains - training has finished by the time this serving loop runs, so the history is
+  complete). `serve_loaded_plate_checkpoint`'s own `SaveCheckpoint` handler builds a report too
+  (honestly `None` for `last_amr_sweep_step`/`convergence_evidence` - no training ran this
+  session). New `last_amr_sweep_step` hoisted variable (mirrors `last_step`/`last_total_loss`'s
+  own hoisting pattern) tracking the real last sweep across the whole run.
+- `crates/pinn-solver/src/parametric_problem.rs` - `compute_run_provenance` call site updated
+  (new `network`/`training` params); `CheckpointMeta.report: None` for parametric checkpoints -
+  explicit scope decision (the parametric path has no AMR mechanism and no measure-aware
+  integration, so an `integration_mode`/`sampling_mode` claim for it would misrepresent
+  behavior it doesn't have).
+- `powershell_tool/app-egui/src/stress_solver.rs` - `build_analysis_report()`'s ad hoc
+  `"benchmark"`/`"convergence_evidence"` JSON keys replaced with one `"authoritative_report"`
+  key built via the SAME `pinn_solver::provenance::build_authoritative_report` function the
+  checkpoint-save path calls - the plan's own "no duplicate reporting logic" rule enforced by
+  construction, not convention. `"operational_status"` kept as a convenience top-level
+  duplicate for callers that only want that one verdict (still SOURCED from the same
+  `no_hole_benchmark`/L0 data the report itself uses, not a second independent computation).
+
 ### Tests
+9 new/updated unit tests in `provenance::tests` (config_hash determinism/distinguishing-power
+and its honest overlap with `problem_hash`, `AuthoritativeReport`'s integration/sampling-mode
+derivation, the two `PersistedNoHoleBenchmark` conversions agreeing with each other, a full
+JSON round-trip). 1 new real integration test in `runner::tests`
+(`serve_loaded_plate_checkpoint_saves_a_full_authoritative_report_for_a_no_hole_geometry`) -
+saves a real checkpoint, reloads it straight off DISK (not the in-memory struct), and asserts
+the full report round-tripped with real L0-L4 content. A real, caught-before-landing bug in
+this test itself: `load_checkpoint` takes the EXTENSIONLESS base path `save_checkpoint` was
+given, not the `.mpk.gz`-suffixed path `save_checkpoint` returns - and the model's own
+`hidden_dim`/`n_hidden` must match the saved spec's own network dims, not an arbitrarily chosen
+small test size (a real shape-mismatch panic caught this the first time).
+
 ### Runtime run
+Real (via the new integration test): a no-hole plate checkpoint's `.meta.json`, reloaded from
+disk, carries `l0_passed=true`, real L1/L2/L3 status text, a real L4 `NoHoleBenchmarkResult`,
+real `energy_balance`/`reaction_force`, and `sampling_mode` matching the spec's own
+`amr_enabled` default.
+
 ### Benchmark result
+Not applicable - this item is a reporting/consolidation mechanism, not a physics change.
+
 ### Known limitations
+- Scoped to the plate path. Kirsch's `runner::run_training`/pin-lug's `run_training_pinlug`
+  and the parametric path (`run_training_parametric`) do NOT get a full `AuthoritativeReport` -
+  same deferral precedent as every other Kirsch/pin-lug/parametric gap in this manifest (no
+  AMR/measure-aware-integration concept exists for Kirsch/pin-lug's frozen paths or the
+  parametric path, so claiming those fields for them would misrepresent behavior they don't
+  have).
+- The headless CLI path (`user_runner::run_headless_user_problem`) does not persist ANY report
+  today (it only prints to stdout) - building a new persisted-JSON output for it was judged out
+  of scope for this pass (a real, separate feature, not a consistency fix to something that
+  already exists there).
+- L5 (hole benchmark) is honestly `"not yet implemented - see issue #62 PH3-15"` in every
+  report - stated explicitly, not silently omitted.
+- `problem_hash` and `config_hash` are NOT fully independent axes today (`problem_hash` hashes
+  the whole spec, config included) - a real, stated limitation of extending the existing P2-13
+  `problem_hash` concept rather than restructuring it, which would have been a larger, riskier
+  change than this item's own scope justified.
+
 ### Reviewer verification
-NOT REVIEWED
+`cargo build -p pinn-core -p pinn-solver --features ndarray-backend` clean. `cargo test -p
+pinn-core` 120/120. `cargo test --release -p pinn-solver --features ndarray-backend --lib
+provenance::` 9/9, `--lib checkpoint::` 2/2, `--lib parametric_problem::` 5/5 (1 ignored,
+unchanged), `--lib runner::` 20/20 passed (19 ignored - up from 19/0/19, +1 new real test, 0
+regressions). `cargo build -p pinn-app --features ndarray-backend` clean. `cargo build -p
+app-egui` clean; real launch stayed alive 8s+ with an empty log.
 
 ## PH3-14 — Complete the variational acceptance test (NN bridge)
 

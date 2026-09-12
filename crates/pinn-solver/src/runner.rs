@@ -1379,6 +1379,12 @@ fn run_user_problem_training_from(
     let mut grad_norm_hist: Vec<f64> = Vec::new();
     let mut bc_residual_hist: Vec<f64> = Vec::new();
 
+    // Issue #62 PH3-13: the last real AMR sweep step this run experienced - `amr_sweep_report`
+    // (below) is `Some` only on the exact step a sweep fires, so this must be tracked across
+    // the whole run (same "amr_sweep is Some only on the firing tick" gotcha PH3-04's own
+    // comparison test already had to work around).
+    let mut last_amr_sweep_step: Option<usize> = None;
+
     let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
     let mut saw = SawBrdr::with_base(base_weights, 0.95);
     let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
@@ -1535,6 +1541,7 @@ fn run_user_problem_training_from(
                         .remove(&USER_DOMAIN).unwrap_or_default();
                     let (rms_after, max_after) = residual_stats(&after_residuals);
 
+                    last_amr_sweep_step = Some(step);
                     amr_sweep_report = Some(pinn_core::messages::AmrSweepReport {
                         domain_label: "interior",
                         step,
@@ -1911,15 +1918,50 @@ fn run_user_problem_training_from(
                 let mut live_spec = spec.clone();
                 live_spec.network.hidden_dim = current_hidden_dim;
                 live_spec.network.n_hidden = current_n_hidden;
-                let provenance = crate::provenance::compute_run_provenance(&live_spec, Some(format!("{:?}", live_spec.formulation)), Some(live_spec.network.model_init_seed));
+                let provenance = crate::provenance::compute_run_provenance(&live_spec, Some(format!("{:?}", live_spec.formulation)), Some(live_spec.network.model_init_seed), &live_spec.network, &live_spec.training);
+                // Issue #62 PH3-13: the full authoritative report - real values recomputed
+                // fresh from `model_val` at save time (same standalone-probe pattern
+                // `serve_loaded_plate_checkpoint` already uses), not stale values from
+                // whichever step last happened to be a vis-cadence tick.
+                let model_val: ElasticityNet<BInner> = model.valid();
+                let no_hole_benchmark = if live_spec.geometry.holes.is_empty() {
+                    Some(crate::provenance::PersistedNoHoleBenchmark::from(
+                        &crate::user_problem::run_no_hole_benchmark(&model_val, &live_spec, &device),
+                    ))
+                } else {
+                    None
+                };
+                let energy_balance = crate::user_problem::probe_energy_balance(&model_val, &live_spec, &device);
+                let reaction_force = crate::user_problem::probe_reaction_force(&model_val, &live_spec, &device);
+                // Reuses the SAME accumulated history `convergence_evidence` is built from on
+                // the final training-loop update (issue #62 PH3-10) - training has already
+                // finished by the time this serving loop runs, so this history is complete.
+                let convergence_evidence = crate::verification_ladder::assess_convergence(&loss_hist, &grad_norm_hist, &bc_residual_hist);
+                let convergence_evidence = crate::provenance::PersistedConvergenceEvidence {
+                    n_samples: convergence_evidence.n_samples,
+                    loss_trend: format!("{:?}", convergence_evidence.loss_trend),
+                    grad_norm_trend: format!("{:?}", convergence_evidence.grad_norm_trend),
+                    bc_residual_trend: format!("{:?}", convergence_evidence.bc_residual_trend),
+                    plausibly_converged: convergence_evidence.plausibly_converged,
+                };
+                let report = crate::provenance::build_authoritative_report(
+                    provenance.clone(),
+                    live_spec.training.measure_aware_training,
+                    live_spec.training.amr_enabled,
+                    last_amr_sweep_step,
+                    no_hole_benchmark,
+                    Some(energy_balance),
+                    Some(reaction_force),
+                    Some(convergence_evidence),
+                );
                 let meta = crate::checkpoint::CheckpointMeta {
                     spec: crate::checkpoint::CheckpointSpec::Plate(live_spec),
                     steps_completed: last_step + 1,
                     final_loss: last_total_loss,
                     saved_at_unix,
                     provenance,
+                    report: Some(report),
                 };
-                let model_val: ElasticityNet<BInner> = model.valid();
                 let result = crate::checkpoint::save_checkpoint(model_val, &meta, &path)
                     .map(|p| p.display().to_string());
                 let _ = tx.try_send(TrainingMsg::CheckpointSaved(result));
@@ -2020,6 +2062,11 @@ pub fn serve_loaded_plate_checkpoint(
             }))
             .collect();
 
+    // Hoisted so both the one-shot `TrainingUpdate` below AND the `SaveCheckpoint` handler's
+    // own authoritative report (issue #62 PH3-13) can reuse the SAME computed value instead of
+    // calling this real forward-pass probe twice.
+    let no_hole_benchmark = no_hole_benchmark_summary(&model, &spec, &device, &l0_result);
+
     let update = TrainingUpdate {
         step: 0, total_loss: 0.0, energy_loss: 0.0, neumann_loss: 0.0, lr: 0.0,
         lam_energy: 0.0, lam_neumann: 0.0, n_colloc: 0, kt_estimate: None,
@@ -2035,7 +2082,7 @@ pub fn serve_loaded_plate_checkpoint(
         derivative_order_report,
         formulation_kind_report,
         constraint_report,
-        no_hole_benchmark: no_hole_benchmark_summary(&model, &spec, &device, &l0_result),
+        no_hole_benchmark: no_hole_benchmark.clone(),
         // Issue #62 PH3-06 - `model` here is `ElasticityNet<BInner>` (inference-only, per this
         // function's own doc comment), not autodiff-capable - `ad_fd_strain_agreement` requires
         // `B: AutodiffBackend`, so this diagnostic genuinely cannot run against a loaded/served
@@ -2057,7 +2104,23 @@ pub fn serve_loaded_plate_checkpoint(
                 // this function's own doc comment), so nothing here actually called
                 // `Backend::seed` - honestly distinct from the checkpoint's OWN historical seed
                 // (still recoverable from `CheckpointMeta.spec.network.model_init_seed`).
-                let provenance = crate::provenance::compute_run_provenance(&spec, Some(format!("{:?}", spec.formulation)), None);
+                let provenance = crate::provenance::compute_run_provenance(&spec, Some(format!("{:?}", spec.formulation)), None, &spec.network, &spec.training);
+                // Issue #62 PH3-13: real values, reusing the SAME probes already run once
+                // above (this function's own single evaluation of the loaded model) - no
+                // second forward pass. `last_amr_sweep_step`/`convergence_evidence` are both
+                // honestly `None` - no training ran this session, so neither has anything to
+                // report (same "real absence" treatment as `TrainingUpdate.convergence_
+                // evidence` above).
+                let report = crate::provenance::build_authoritative_report(
+                    provenance.clone(),
+                    spec.training.measure_aware_training,
+                    spec.training.amr_enabled,
+                    None,
+                    no_hole_benchmark.as_ref().map(crate::provenance::PersistedNoHoleBenchmark::from),
+                    Some(energy_balance),
+                    Some(reaction_force),
+                    None,
+                );
                 let meta = crate::checkpoint::CheckpointMeta {
                     spec: crate::checkpoint::CheckpointSpec::Plate(spec.clone()),
                     // Loaded, not (re)trained this session - honestly 0, not fabricated from
@@ -2066,6 +2129,7 @@ pub fn serve_loaded_plate_checkpoint(
                     final_loss: 0.0,
                     saved_at_unix,
                     provenance,
+                    report: Some(report),
                 };
                 let result = crate::checkpoint::save_checkpoint(model.clone(), &meta, &path)
                     .map(|p| p.display().to_string());
@@ -2558,6 +2622,86 @@ mod tests {
         let mut meta = path.clone();
         meta.set_file_name(format!("{}.meta.json", path.file_stem().unwrap().to_string_lossy()));
         let _ = std::fs::remove_file(meta);
+    }
+
+    /// Issue #62 PH3-13: real, end-to-end evidence that a saved checkpoint's `.meta.json`
+    /// actually carries the full authoritative report (not just the bare `provenance` field
+    /// PH3-13 built on top of) - round-tripped through DISK, not just in-memory, since that's
+    /// the one place `checkpoint::CheckpointMeta`, the GUI, and any future headless report
+    /// consumer all actually have to agree.
+    #[test]
+    fn serve_loaded_plate_checkpoint_saves_a_full_authoritative_report_for_a_no_hole_geometry() {
+        let spec = no_hole_plate_spec(0);
+        let device = BDevice::default();
+        // Must match `spec.network`'s own dims - `load_checkpoint` reconstructs the network
+        // from `meta.spec` (the saved `no_hole_plate_spec`, hidden_dim=64/n_hidden=3), so a
+        // differently-shaped model here would fail to load back with a real shape-mismatch
+        // panic (caught the hard way: the first version of this test hardcoded 8/2 like the
+        // `single_hole_like_spec`-based test above it, which happens to match THAT helper's
+        // own spec but not this one's).
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(spec.geometry.net_input_dim())
+            .with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden)
+            .with_output_dim(5);
+        let model: ElasticityNet<BInner> = net_cfg.init(&device);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || serve_loaded_plate_checkpoint(spec, model, tx, rx_ctrl));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline && !saw_done {
+            match rx.try_recv() {
+                Ok(TrainingMsg::Done) => saw_done = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(saw_done);
+
+        let path = std::env::temp_dir().join(format!("pinn_solver_authoritative_report_test_{}", std::process::id()));
+        tx_ctrl.send(ControlMsg::SaveCheckpoint { path: path.clone(), saved_at_unix: 789 }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut saved: Option<Result<String, String>> = None;
+        while std::time::Instant::now() < deadline && saved.is_none() {
+            if let Ok(TrainingMsg::CheckpointSaved(r)) = rx.try_recv() { saved = Some(r); }
+            else { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        }
+        let written = saved.expect("must receive a CheckpointSaved response").expect("save must succeed");
+        tx_ctrl.send(ControlMsg::Stop).unwrap();
+        handle.join().unwrap();
+
+        // Load straight back off DISK (not the in-memory `meta` this thread built) - proves
+        // the report actually round-trips through the real `.meta.json` file, not just through
+        // an in-process struct.
+        // `load_checkpoint` expects the same EXTENSIONLESS base path `save_checkpoint` was
+        // originally given (`path`, not the `.mpk.gz`-suffixed `written` this call returned) -
+        // it derives both the weights file and the `.meta.json` sidecar path from it itself.
+        let (_, meta) = crate::checkpoint::load_checkpoint(&path, &device)
+            .expect("must reload the checkpoint just saved");
+        let report = meta.report.expect("a checkpoint saved by this pass must carry a full AuthoritativeReport");
+        assert!(report.l0_passed);
+        assert!(!report.l1_status.is_empty());
+        assert!(!report.l2_status.is_empty());
+        assert!(!report.l3_status.is_empty());
+        assert!(report.l4_no_hole_benchmark.is_some(), "no-hole geometry must produce a real L4 result");
+        assert!(!report.l5_hole_benchmark_note.is_empty());
+        assert!(report.energy_balance.is_some());
+        assert!(report.reaction_force.is_some());
+        assert_eq!(report.sampling_mode, if spec_default_amr_enabled() { "AMR" } else { "FixedUniform" });
+        assert!(!report.provenance.config_hash.is_empty());
+
+        let _ = std::fs::remove_file(&written);
+        let mut meta_path = path.clone();
+        meta_path.set_file_name(format!("{}.meta.json", path.file_stem().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_file(meta_path);
+    }
+
+    /// Small helper so the test above doesn't hardcode `true` and silently go stale if
+    /// `TrainingSpec`'s own `amr_enabled` default ever changes.
+    fn spec_default_amr_enabled() -> bool {
+        pinn_core::problem_spec::TrainingSpec::default().amr_enabled
     }
 
     // ─── Phase 19 (Neural-Network-Wide Adaptive Collocation epic): generalization validation ──
