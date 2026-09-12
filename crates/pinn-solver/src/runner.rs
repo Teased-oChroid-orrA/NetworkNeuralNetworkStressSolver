@@ -3516,6 +3516,103 @@ mod tests {
         let _ = std::fs::remove_file(meta_path);
     }
 
+    /// Issue #62 PH3-09: tests the "optimizer convergence issue" candidate cause directly - the
+    /// only one of the plan's own named candidates (model approximation/FD stencil/boundary
+    /// sampling/measure-integration/formulation/optimizer-convergence) that's both (a)
+    /// consistent with PH3-08's own real finding (an incompletely-suppressed translation mode,
+    /// itself a convergence-budget symptom) and (b) directly testable with EXISTING machinery
+    /// (`run_training_user_problem_resume`) rather than new architecture. RESUMES the real
+    /// PH3-01 baseline checkpoint (never mutates it - `Debug_run/baseline_legacy_no_hole/` is
+    /// only ever LOADED from, and a resume writes nowhere unless a `SaveCheckpoint` request is
+    /// sent, which this test never sends) for real additional training, then recomputes the
+    /// hard benchmark to see whether `traction_rms_over_ref` (PH3-01's own recorded 1.404%,
+    /// `> 1%` threshold) has genuinely moved. `#[ignore]`d - real ~800-step additional training,
+    /// run explicitly with `cargo test --release -p pinn-solver --features ndarray-backend
+    /// ph3_09_resuming -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "real ~800-step additional training run, resumed from the PH3-01 baseline checkpoint"]
+    fn ph3_09_resuming_the_baseline_checkpoint_tests_whether_more_training_closes_the_traction_gap() {
+        let weights_path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../Debug_run/baseline_legacy_no_hole/model"
+        ));
+        let device = crate::training_core::BDevice::default();
+
+        // Baseline (BEFORE additional training) - recomputed fresh from the checkpoint, not
+        // trusted from the PH3-01 manifest entry's own recorded numbers, so this comparison is
+        // self-contained.
+        let (model_before, meta_before) = crate::checkpoint::load_checkpoint(&weights_path, &device)
+            .expect("PH3-01 baseline checkpoint must load");
+        let spec_before = match &meta_before.spec {
+            crate::checkpoint::CheckpointSpec::Plate(s) => s.clone(),
+            crate::checkpoint::CheckpointSpec::Parametric(_) => panic!("expected a Plate checkpoint"),
+        };
+        let benchmark_before = crate::user_problem::run_no_hole_benchmark(&model_before, &spec_before, &device);
+        println!("[PH3-09] BEFORE additional training: {benchmark_before:?}");
+
+        const ADDITIONAL_STEPS: usize = 800;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn({
+            let weights_path = weights_path.clone();
+            move || run_training_user_problem_resume(weights_path, ADDITIONAL_STEPS, tx, rx_ctrl)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        let mut saw_done = false;
+        let mut last_logged = usize::MAX;
+        while std::time::Instant::now() < deadline && !saw_done {
+            match rx.try_recv() {
+                Ok(TrainingMsg::Update(u)) => {
+                    if u.step % 200 == 0 && u.step != last_logged {
+                        last_logged = u.step;
+                        println!("  [PH3-09] resumed step={} total_loss={:.4e}", u.step, u.total_loss);
+                    }
+                }
+                Ok(TrainingMsg::Done) => saw_done = true,
+                Ok(TrainingMsg::Error(e)) => panic!("resume training reported an error: {e}"),
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+
+        let path_ck = std::env::temp_dir().join(format!("pinn_solver_ph3_09_resumed_{}", std::process::id()));
+        tx_ctrl.send(ControlMsg::SaveCheckpoint { path: path_ck.clone(), saved_at_unix: 0 }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut saved: Option<Result<String, String>> = None;
+        while std::time::Instant::now() < deadline && saved.is_none() {
+            if let Ok(TrainingMsg::CheckpointSaved(r)) = rx.try_recv() { saved = Some(r); }
+            else { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        }
+        let written = saved.expect("must receive a CheckpointSaved response").expect("save must succeed");
+        drop(tx_ctrl);
+        let _ = handle.join();
+
+        let (model_after, meta_after) = crate::checkpoint::load_checkpoint(&path_ck, &device).expect("load resumed checkpoint");
+        let spec_after = match &meta_after.spec {
+            crate::checkpoint::CheckpointSpec::Plate(s) => s.clone(),
+            crate::checkpoint::CheckpointSpec::Parametric(_) => panic!("expected a Plate checkpoint"),
+        };
+        let benchmark_after = crate::user_problem::run_no_hole_benchmark(&model_after, &spec_after, &device);
+        println!("[PH3-09] AFTER {ADDITIONAL_STEPS} additional steps: {benchmark_after:?}");
+        println!(
+            "[PH3-09] traction_rms_over_ref: {:.4}% -> {:.4}% (target <1%)",
+            benchmark_before.traction_rms_over_ref * 100.0, benchmark_after.traction_rms_over_ref * 100.0,
+        );
+
+        let _ = std::fs::remove_file(&written);
+        let mut meta_path = path_ck.clone();
+        meta_path.set_file_name(format!("{}.meta.json", path_ck.file_stem().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_file(meta_path);
+
+        assert!(benchmark_after.traction_rms_over_ref.is_finite());
+        // The immutable baseline itself must be untouched by this test - a real safety check,
+        // not just a comment.
+        let (_, meta_still_baseline) = crate::checkpoint::load_checkpoint(&weights_path, &device)
+            .expect("PH3-01 baseline checkpoint must still load after this test");
+        assert_eq!(meta_still_baseline.steps_completed, meta_before.steps_completed, "the immutable PH3-01 baseline checkpoint must not have been overwritten by this test's resume-and-save");
+    }
+
     /// Issue #62 PH3-04: real, controlled A/B evidence that `measure_aware_training` actually
     /// changes live training behavior once AMR makes sampling nonuniform (per this crate's own
     /// `derive_amr_config`, `interval_steps` is always 1000 and `AMR_WARMUP_STEPS` is 200, so a
