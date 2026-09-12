@@ -5,6 +5,62 @@ issue's own §7/§8: `IMPLEMENTED` means code exists; `VERIFIED` requires tests 
 evidence; only `VERIFIED` counts toward completion. Updated after each epic, not batched at
 the end.
 
+## Final reviewer summary (issue #61 §8)
+
+**14 of 15 epics VERIFIED** (P2-01 through P2-14). **P2-15 PARTIALLY VERIFIED**: its own
+mandatory implementation order was followed strictly (P2-01 -> P2-14 in the exact sequence
+issue #61 §4 requires), and its "add abstractions" stage is fully complete - the remaining
+"migrate live loss formula" / "remove legacy" stages are correctly left unexecuted because the
+epic's own text makes them conditional on human approval a fully autonomous session cannot
+itself grant (see P2-15's own entry below for the concrete plan).
+
+Checklist, self-reviewed against issue #61's own stated rules:
+
+- [x] §1.1 No benchmark-specific patches - every fix targets the general architecture (formulation
+      gating, field graph, measure-aware integration, gauge-fixing, verification ladder, QoI
+      pipeline, provenance, benchmark thresholds), never a plate-specific numeric hack.
+- [x] §1.2 No silent physics replacement - `FormulationSelection` gates real term activation (not
+      a label); P2-03's mixed-source check is a real, always-on runtime assertion; `Translation
+      GaugeTerm` is a real, new, honestly-classified `TermRole::Constraint` term, not a disguised
+      physical-functional change.
+- [x] §1.3 No "implemented" claims without tests+integration+proof-of-live-use - every epic's own
+      manifest entry lists real test commands AND runtime evidence (a live headless training run,
+      or - where a live consumer genuinely doesn't apply, e.g. P2-11's AMR invariance checker -
+      an explicit, honest note explaining why its own test suite against real production types is
+      the load-bearing proof instead).
+- [x] §1.4 No destructive refactors - every change is additive (new modules/functions/fields) or a
+      thin default-preserving wrapper (`stress_concentration_from_profile`, `stress_source_
+      report`) proven byte-identical via regression tests; P2-15's higher-risk migrations are
+      explicitly NOT attempted for exactly this reason.
+- [x] §1.5 Continuous validation after each slice - every epic ran its own targeted tests plus a
+      `cargo build --workspace --tests` check before commit; P2-01/P2-03/P2-05/P2-07's changes to
+      shared code (`ProblemSpec`, `LossTerm`, `CheckpointMeta`) were each followed by a broader
+      regression sweep of the affected modules (documented per-epic).
+- [x] §2 Source-of-truth hierarchy respected - math correctness checked first (hand-derived
+      formulas in tests: hoop stress, affine amplitude, quadratic AMR integral, load-transfer
+      ratio cases) before matching issue text, before this Phase 2 plan, before the problem
+      definition.
+- [x] §3 Target architecture pipeline - explicitly implemented in named stages: `FormulationKind`
+      gate, `DifferentialOperator` (FD/AD, cross-validated), `FieldKind` graph, measure-aware
+      integrals, `TermRole`, geometry-aware operators, gauge-fixing, verification ladder,
+      `StressProjection`/`ReductionOp` QoI pipeline, AMR invariance, complete ledger, provenance,
+      benchmark protocol.
+- [x] §4 Mandatory strict order P2-01 -> P2-15 - followed exactly, epic by epic, in this session.
+- [x] §7 Manifest maintained per-epic, not batched - this file was updated and committed
+      immediately after each epic, per the user's own mid-session instruction.
+- [x] Real, evidence-based negative findings recorded, not hidden: burn-autodiff 0.21 has no
+      higher-order autodiff (P2-02); model weight initialization is not seeded/reproducible
+      (P2-13); a `step_physics_multi` clone-based reproducibility test surfaced unexplained
+      nondeterminism, flagged for a future P2-13-adjacent investigation rather than chased
+      mid-epic (P2-05).
+- [ ] P2-15's "migrate current plate problem" / "remove legacy" stages - NOT executed, by design
+      (see P2-15's own manifest entry for the full plan and rationale).
+
+CI: not manually triggered during this pass (per the user's own instruction); pushing to `main`
+auto-triggers it as an unavoidable side effect of `git push`, and it was allowed to run
+naturally throughout. A final CI run is initiated at the end of this pass, per the user's own
+instruction ("it will be run at the end after completion").
+
 ## P2-01 — Explicit formulation model
 
 Status: VERIFIED
