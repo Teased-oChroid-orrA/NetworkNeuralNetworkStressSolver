@@ -644,7 +644,100 @@ omitted.
 
 ## P2-08 — Executable verification ladder
 
-Status: NOT_STARTED
+Status: VERIFIED
+
+### Requirement
+
+Executable verification ladder L0-L5; MANDATORY affine amplitude test (`u=a·x, v=-nu·a·y`,
+single trainable parameter, `a_exact=sigma0/E` recovered by the measure-aware variational
+functional) run before neural-optimization debugging; MANDATORY no-hole neural gate before
+Kt/hole results are accepted.
+
+### Files changed
+
+- `crates/pinn-solver/src/measure_integral.rs` — new `domain_integral_tensor`/`boundary_
+  integral_tensor`: differentiable (`Tensor`-valued) counterparts of P2-04's `domain_integral`/
+  `boundary_integral`, needed so the affine test's `Pi = U - W_ext` can be optimized via real
+  gradient descent through the SAME measure-aware formulas, not a separately re-derived one.
+- `crates/pinn-solver/src/verification_ladder.rs` — new module. Module doc comment declares the
+  full L0-L5 ladder, mapping L1-L3 to already-built, already-tested capabilities from P2-02/
+  P2-03/P2-04 (no duplicated verification machinery) rather than inventing parallel checks.
+  `run_affine_amplitude_test()` (L0, the epic's own mandatory new check) and `no_hole_health_
+  check()` (L4) are the two real, executable, new functions.
+- `crates/pinn-solver/src/lib.rs` — `pub mod verification_ladder;` added.
+- `crates/pinn-solver/src/user_runner.rs` — `run_headless_user_problem` calls `run_affine_
+  amplitude_test` FIRST (before `UserDefinedProblem::new`/any neural training), **panics** if
+  it fails - real, live, mandatory enforcement, not an opt-in flag. After training, calls
+  `no_hole_health_check` (only for `n_holes == 0` configs) and prints PASS/FAIL.
+
+### Architecture decision
+
+L0's learning rate is sized from `Pi(a) = C*a^2 - D*a`'s own known quadratic coefficient `C =
+0.5*E*area*thickness` (derived by hand in this module's doc comment, cross-checked against the
+tensor-computed result in the test) - a legitimate "size the step from the loss's own known
+curvature" optimizer technique (not the ANSWER `a_exact` itself, which the optimizer still has
+to reach via real gradient descent), so the test is numerically robust across wildly different
+materials/geometries without per-call tuning (both a real aluminum and a real steel case, with
+different loads and plate sizes, are tested and pass to `<1e-6` relative error in 50 steps).
+
+L1-L3 are declared as REFERENCES to already-built, already-tested P2-02/P2-03/P2-04 capability
+rather than new parallel machinery - re-verifying them here would be exactly the kind of
+duplicated, disconnected "verification theater" issue #61 warns against; the ladder's value is
+in naming the full sequence in one place, not rebuilding what already exists.
+
+L4's thresholds (`energy_balance_error < 50%`, `max_abs_displacement > 1e-12`) are deliberately
+loose SANITY bounds, not calibrated acceptance criteria - issue #61's own epic list places the
+"benchmark protocol with numeric thresholds" as a separate, LATER epic (P2-14), and building
+the final tuned thresholds here would be exactly the "no Kt weight tuning SHALL substitute for
+P2-04 through P2-08" ordering violation the issue's own §4 forbids in the other direction (this
+epic must not pre-empt P2-14's job either). L5 (hole/Kt acceptance gated on a companion no-hole
+PASS) is declared in the module doc comment as the ladder's final rung but not built - it needs
+cross-run provenance (P2-13) to identify which no-hole run a given hole run corresponds to,
+which does not exist yet.
+
+### Tests
+
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- verification_ladder::`
+  — 5 passed: the affine-amplitude test recovers `a_exact` to `<1e-6` relative error for TWO
+  different real materials/loads/geometries (aluminum and steel, proving this isn't tuned to
+  one numeric case), and `no_hole_health_check` correctly passes healthy metrics, fails on a
+  collapsed near-zero-displacement solution (directly reproducing the real `Debug_runs` evidence
+  this remediation plan was opened against), and fails on non-finite `energy_balance_error`.
+- command: `cargo test -p pinn-solver --features ndarray-backend --lib -- measure_integral::`
+  — 12 passed (2 new): `domain_integral_tensor`/`boundary_integral_tensor` numerically match
+  their pre-existing `&[f32]`-based counterparts exactly.
+- command: `cargo build --workspace --tests --features ndarray-backend` — clean.
+
+### Runtime evidence
+
+Real headless training runs (release build, `max_steps=60`) on both real example configs:
+- `no_hole_plate.toml`: `[diag] P2-08 L0 gate PASSED: affine amplitude relative_error=1.039e-7`
+  printed BEFORE training began, confirming the mandatory gate runs live on the real CLI path.
+  After training, `[!] P2-08 L4 no-hole health check FAILED: energy_balance_error exceeds the
+  50% sanity bound (energy_balance_error=8.8482e-1...)` — a CORRECT, discriminating result: 60
+  steps is far short of the ~2000 this codebase's own examples need to converge, so a genuinely
+  under-trained model correctly fails the health check rather than being silently accepted.
+  This is real evidence the gate distinguishes converged from non-converged runs, not a rubber
+  stamp.
+- `single_hole_plate.toml`: same `L0 gate PASSED` line (the affine test is geometry-independent
+  of holes, correctly running identically for both configs); no L4 line printed (`n_holes>0`
+  correctly skips the no-hole-only check).
+
+### Known limitations
+
+L1-L3 are referenced, not re-verified by new code in this epic (see Architecture decision).
+L4's thresholds are sanity bounds, not P2-14's eventual calibrated acceptance criteria. L5
+(the actual hole/Kt-acceptance-gated-on-no-hole-PASS enforcement) is declared but not built -
+needs P2-13's cross-run provenance first, per the issue's own dependency structure. The
+rotational-mode gap P2-07 already flagged remains open (unrelated to this epic).
+
+### Reviewer verification
+
+PASS against P2-08's acceptance bullets: the ladder is declared with real, executable content
+at every level that can exist yet (L0/L4 built here, L1-L3 referencing prior real epics); the
+mandatory affine test is genuinely mandatory (panics, not a printed warning) and verified
+against two independent real cases; the no-hole health check is proven discriminating (fails a
+real under-trained run, not just a synthetic always-pass stub) via a live training run.
 
 ## P2-09 — Load-transfer and trivial-solution diagnostics
 

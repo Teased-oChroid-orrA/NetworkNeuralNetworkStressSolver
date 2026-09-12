@@ -31,6 +31,7 @@ pub mod toy_beam;
 pub mod training_core;
 pub mod user_problem;
 pub mod user_runner;
+pub mod verification_ladder;
 
 pub use runner::{run_training, run_training_pinlug};
 pub use headless::{run_headless, run_headless_pinlug};

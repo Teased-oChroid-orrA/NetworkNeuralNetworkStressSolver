@@ -56,6 +56,27 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         spec.training.max_steps, spec.training.n_interior, spec.training.n_boundary
     );
 
+    // Issue #61 EPIC P2-08: MANDATORY L0 affine-amplitude gate, run BEFORE any neural
+    // optimization begins - the issue's own wording. Cheap (a single scalar parameter, 100
+    // gradient-descent steps through the measure-aware variational functional) - aborts
+    // loudly rather than proceeding to train a network on top of a functional that can't even
+    // recover the textbook exact solution for the simplest possible case.
+    {
+        let result = crate::verification_ladder::run_affine_amplitude_test(
+            &spec.material, spec.load.px, half_w, half_h, spec.geometry.thickness, 100, 1e-4,
+        );
+        if !result.passed {
+            panic!(
+                "P2-08 L0 gate FAILED: affine-amplitude test did not recover a_exact - \
+                 a_recovered={:.6e} a_exact={:.6e} relative_error={:.3e} (tolerance 1e-4). \
+                 Refusing to proceed to neural training on top of a functional that fails the \
+                 most basic analytic sanity check.",
+                result.a_recovered, result.a_exact, result.relative_error,
+            );
+        }
+        println!("  [diag] P2-08 L0 gate PASSED: affine amplitude relative_error={:.3e}", result.relative_error);
+    }
+
     let problem = UserDefinedProblem::new(spec.clone());
     crate::problem::validate_loss_terms(&problem);
 
@@ -216,6 +237,24 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
             );
             let sc = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
             println!("  [diag] hole {i}: max_von_mises={:.4e} Pa  nominal={:.4e} Pa  Kt={:.4}", sc.max_von_mises, sc.nominal_stress, sc.kt);
+        }
+
+        // Issue #61 EPIC P2-08: L4 no-hole neural training health gate. Only meaningful for a
+        // no-hole geometry itself (the "companion no-hole run" a hole run would need per the
+        // epic's own "MANDATORY no-hole gate before Kt/hole results accepted" - the actual
+        // cross-run enforcement tying a hole run's Kt acceptance to a verified no-hole PASS is
+        // P2-14's job, which owns the full benchmark protocol + P2-13's provenance).
+        if n_holes == 0 {
+            let energy_balance = crate::user_problem::probe_energy_balance(&model_val, &spec, &device);
+            let check = crate::verification_ladder::no_hole_health_check(&energy_balance, max_abs_disp as f64);
+            if check.passed {
+                println!("  [diag] P2-08 L4 no-hole health check PASSED (energy_balance_error={:.4e})", check.energy_balance_error);
+            } else {
+                println!(
+                    "  [!] P2-08 L4 no-hole health check FAILED: {} (energy_balance_error={:.4e}, max_abs_displacement={:.4e})",
+                    check.failure_reason.unwrap_or("unknown"), check.energy_balance_error, check.max_abs_displacement,
+                );
+            }
         }
     }
 

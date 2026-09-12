@@ -82,6 +82,43 @@ pub fn boundary_integral(samples: &[f32], ds_per_point: &[f64], thickness: f64) 
     samples.iter().zip(ds_per_point.iter()).map(|(&v, &ds)| v as f64 * ds * thickness).sum()
 }
 
+/// Differentiable (tensor-valued) counterpart of [`domain_integral`] — same formula
+/// (`mean(f) * measure * thickness`), but operating on a live `Tensor` instead of a realized
+/// `&[f32]` slice, so gradients flow through it. Issue #61 EPIC P2-08's mandatory affine
+/// amplitude test is this function's first real consumer (see `verification_ladder.rs`) —
+/// without this, [`domain_integral`]/[`boundary_integral`] (P2-04) could only ever be used as
+/// post-hoc reporting on already-computed forward-pass outputs, never as part of a live,
+/// differentiable training objective, which is exactly what "recovered by the measure-aware
+/// variational functional" (issue #61's own wording for that test) requires.
+pub fn domain_integral_tensor<B: burn::tensor::backend::Backend>(
+    measure: f64,
+    thickness: f64,
+    values: burn::tensor::Tensor<B, 1>,
+) -> burn::tensor::Tensor<B, 1> {
+    values.mean().mul_scalar(measure * thickness)
+}
+
+/// Differentiable counterpart of [`boundary_integral`] — `Σ f_i * ds_i * thickness`, computed
+/// via elementwise multiply + sum so gradients flow through `values`. `ds_per_point` is a
+/// plain `&[f64]` (the geometric measure itself is never a network output, so it never needs
+/// to carry a gradient).
+pub fn boundary_integral_tensor<B: burn::tensor::backend::Backend>(
+    values: burn::tensor::Tensor<B, 1>,
+    ds_per_point: &[f64],
+    thickness: f64,
+) -> burn::tensor::Tensor<B, 1> {
+    let device = values.device();
+    let n = ds_per_point.len();
+    assert_eq!(
+        values.dims()[0], n,
+        "boundary_integral_tensor: values ({}) and ds_per_point ({n}) must be the same length",
+        values.dims()[0],
+    );
+    let ds_scaled: Vec<f32> = ds_per_point.iter().map(|&ds| (ds * thickness) as f32).collect();
+    let ds_t = burn::tensor::Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(ds_scaled, vec![n]), &device);
+    (values * ds_t).sum()
+}
+
 /// Real plate domain area (m²): outer rectangle minus every hole's circular area. Matches
 /// `probe_energy_balance`'s pre-existing inline formula exactly (that call site is refactored
 /// to call this function instead of repeating the arithmetic — see this module's own tests).
@@ -218,6 +255,34 @@ mod tests {
         let with_hole = plate_domain_area(half_w, half_h, &[radius]);
         let expected = 4.0 * half_w * half_h - std::f64::consts::PI * radius * radius;
         assert!((with_hole - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn domain_integral_tensor_matches_the_f32_slice_version() {
+        use burn::tensor::{Tensor, TensorData};
+        type TB = crate::training_core::BInner;
+        let device = crate::training_core::BDevice::default();
+        let samples = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let expected = domain_integral(10.0, 0.5, &samples);
+        let values = Tensor::<TB, 1>::from_data(TensorData::new(samples, vec![4]), &device);
+        let result = domain_integral_tensor::<TB>(10.0, 0.5, values);
+        let result_v = result.into_data().to_vec::<f32>().unwrap()[0] as f64;
+        assert!((result_v - expected).abs() < 1e-6, "result={result_v} expected={expected}");
+    }
+
+    #[test]
+    fn boundary_integral_tensor_matches_the_f32_slice_version() {
+        use burn::tensor::{Tensor, TensorData};
+        type TB = crate::training_core::BInner;
+        let device = crate::training_core::BDevice::default();
+        let samples = vec![2.0_f32, 4.0, 6.0];
+        let ds = vec![0.1, 0.2, 0.3];
+        let thickness = 0.5;
+        let expected = boundary_integral(&samples, &ds, thickness);
+        let values = Tensor::<TB, 1>::from_data(TensorData::new(samples, vec![3]), &device);
+        let result = boundary_integral_tensor::<TB>(values, &ds, thickness);
+        let result_v = result.into_data().to_vec::<f32>().unwrap()[0] as f64;
+        assert!((result_v - expected).abs() < 1e-6, "result={result_v} expected={expected}");
     }
 
     #[test]
