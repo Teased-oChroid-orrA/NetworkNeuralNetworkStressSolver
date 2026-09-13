@@ -22,14 +22,14 @@
 //! separately (e.g. with `AdamW`). Panics if `step` is called with `D != 2`, mirroring
 //! burn's own native `Muon` optimizer.
 
-use burn::{
-    config::Config,
-    optim::{SimpleOptimizer, adaptor::OptimizerAdaptor},
-    record::Record,
-    tensor::{Tensor, TensorData, backend::Backend, backend::AutodiffBackend, ops::Device},
-};
 use burn::module::AutodiffModule;
 use burn::optim::LearningRate;
+use burn::{
+    config::Config,
+    optim::{adaptor::OptimizerAdaptor, SimpleOptimizer},
+    record::Record,
+    tensor::{backend::AutodiffBackend, backend::Backend, ops::Device, Tensor, TensorData},
+};
 
 /// Configuration for the [`SoapMuon`] hybrid optimizer.
 #[derive(Config, Debug)]
@@ -188,22 +188,38 @@ pub fn migrate_soap_muon_state_for_growth<B: Backend>(
         None => old.gg1.clone(),
     };
 
-    let d0_new = grow_dim0.map(|(_, n)| n).unwrap_or_else(|| old.q0.dims()[0]);
-    let d1_new = grow_dim1.map(|(_, n)| n).unwrap_or_else(|| old.q1.dims()[0]);
+    let d0_new = grow_dim0
+        .map(|(_, n)| n)
+        .unwrap_or_else(|| old.q0.dims()[0]);
+    let d1_new = grow_dim1
+        .map(|(_, n)| n)
+        .unwrap_or_else(|| old.q1.dims()[0]);
     let q0 = Tensor::eye(d0_new, device);
     let q1 = Tensor::eye(d1_new, device);
 
     let exp_avg = migrate_moment::<B>(&old.exp_avg, grow_dim0, grow_dim1, device);
     let exp_avg_sq = migrate_moment::<B>(&old.exp_avg_sq, grow_dim0, grow_dim1, device);
 
-    SoapMuonState { gg0, gg1, q0, q1, exp_avg, exp_avg_sq, step: old.step }
+    SoapMuonState {
+        gg0,
+        gg1,
+        q0,
+        q1,
+        exp_avg,
+        exp_avg_sq,
+        step: old.step,
+    }
 }
 
 /// Builds the `[d_old, d_new]` duplication/pullback matrix `P` used by [`migrate_gg`]:
 /// `P[s,s]=1` for `s<d_old` (identity on the preserved block), `P[g(j), d_old+j]=1` for each
 /// new unit `j` (routes a new unit's pullback contribution to its twin's row/column). All other
 /// entries are 0.
-fn build_duplication_matrix<B: Backend>(d_old: usize, d_new: usize, device: &Device<B>) -> Tensor<B, 2> {
+fn build_duplication_matrix<B: Backend>(
+    d_old: usize,
+    d_new: usize,
+    device: &Device<B>,
+) -> Tensor<B, 2> {
     let k = d_new - d_old;
     let (g, _m) = crate::network::duplication_map(d_old, k);
 
@@ -222,7 +238,12 @@ fn build_duplication_matrix<B: Backend>(d_old: usize, d_new: usize, device: &Dev
 /// the old block and correctly seeds new rows/columns from their twin's history. Built as a
 /// real matmul against a real duplication-matrix tensor (not a hand-derived closed-form
 /// shortcut) so correctness is easy to verify by inspection.
-fn migrate_gg<B: Backend>(gg_old: &Tensor<B, 2>, d_old: usize, d_new: usize, device: &Device<B>) -> Tensor<B, 2> {
+fn migrate_gg<B: Backend>(
+    gg_old: &Tensor<B, 2>,
+    d_old: usize,
+    d_new: usize,
+    device: &Device<B>,
+) -> Tensor<B, 2> {
     let p = build_duplication_matrix::<B>(d_old, d_new, device);
     p.clone().transpose().matmul(gg_old.clone()).matmul(p)
 }
@@ -241,11 +262,17 @@ fn migrate_moment<B: Backend>(
     let data = old.clone().into_data().to_vec::<f32>().unwrap();
 
     let (d0_new, g0) = match grow_dim0 {
-        Some((d_old, d_new)) => (d_new, Some(crate::network::duplication_map(d_old, d_new - d_old).0)),
+        Some((d_old, d_new)) => (
+            d_new,
+            Some(crate::network::duplication_map(d_old, d_new - d_old).0),
+        ),
         None => (d0_old, None),
     };
     let (d1_new, g1) = match grow_dim1 {
-        Some((d_old, d_new)) => (d_new, Some(crate::network::duplication_map(d_old, d_new - d_old).0)),
+        Some((d_old, d_new)) => (
+            d_new,
+            Some(crate::network::duplication_map(d_old, d_new - d_old).0),
+        ),
         None => (d1_old, None),
     };
 
@@ -291,20 +318,36 @@ pub fn migrate_soap_muon_state_for_shrink<B: Backend>(
         Some(keep) => select_symmetric::<B>(&old.gg1, keep, device),
         None => old.gg1.clone(),
     };
-    let d0_new = keep_dim0.map(|k| k.len()).unwrap_or_else(|| old.q0.dims()[0]);
-    let d1_new = keep_dim1.map(|k| k.len()).unwrap_or_else(|| old.q1.dims()[0]);
+    let d0_new = keep_dim0
+        .map(|k| k.len())
+        .unwrap_or_else(|| old.q0.dims()[0]);
+    let d1_new = keep_dim1
+        .map(|k| k.len())
+        .unwrap_or_else(|| old.q1.dims()[0]);
     let q0 = Tensor::eye(d0_new, device);
     let q1 = Tensor::eye(d1_new, device);
 
     let exp_avg = select_moment::<B>(&old.exp_avg, keep_dim0, keep_dim1, device);
     let exp_avg_sq = select_moment::<B>(&old.exp_avg_sq, keep_dim0, keep_dim1, device);
 
-    SoapMuonState { gg0, gg1, q0, q1, exp_avg, exp_avg_sq, step: old.step }
+    SoapMuonState {
+        gg0,
+        gg1,
+        q0,
+        q1,
+        exp_avg,
+        exp_avg_sq,
+        step: old.step,
+    }
 }
 
 /// Projects a symmetric `[d_old, d_old]` matrix onto the `keep.len()` kept rows/columns (the
 /// same indices on both axes, since `gg0`/`gg1` are Gram matrices over a single dimension).
-fn select_symmetric<B: Backend>(m: &Tensor<B, 2>, keep: &[usize], device: &Device<B>) -> Tensor<B, 2> {
+fn select_symmetric<B: Backend>(
+    m: &Tensor<B, 2>,
+    keep: &[usize],
+    device: &Device<B>,
+) -> Tensor<B, 2> {
     let [d_old, _] = m.dims();
     let data = m.clone().into_data().to_vec::<f32>().unwrap();
     let d_new = keep.len();
@@ -328,8 +371,12 @@ fn select_moment<B: Backend>(
     let [d0_old, d1_old] = old.dims();
     let data = old.clone().into_data().to_vec::<f32>().unwrap();
 
-    let rows: Vec<usize> = keep_dim0.map(|k| k.to_vec()).unwrap_or_else(|| (0..d0_old).collect());
-    let cols: Vec<usize> = keep_dim1.map(|k| k.to_vec()).unwrap_or_else(|| (0..d1_old).collect());
+    let rows: Vec<usize> = keep_dim0
+        .map(|k| k.to_vec())
+        .unwrap_or_else(|| (0..d0_old).collect());
+    let cols: Vec<usize> = keep_dim1
+        .map(|k| k.to_vec())
+        .unwrap_or_else(|| (0..d1_old).collect());
     let (d0_new, d1_new) = (rows.len(), cols.len());
 
     let mut out = vec![0f32; d0_new * d1_new];
@@ -426,7 +473,8 @@ fn eigh_eigenvectors_batched<B: Backend>(
     let mut combined_out = Vec::with_capacity(sz0 + sz1);
     combined_out.extend_from_slice(&out0);
     combined_out.extend_from_slice(&out1);
-    let combined_t = Tensor::<B, 1>::from_data(TensorData::new(combined_out, vec![sz0 + sz1]), device);
+    let combined_t =
+        Tensor::<B, 1>::from_data(TensorData::new(combined_out, vec![sz0 + sz1]), device);
     let q0 = combined_t.clone().narrow(0, 0, sz0).reshape([n0, n0]);
     let q1 = combined_t.narrow(0, sz0, sz1).reshape([n1, n1]);
     (q0, q1)
@@ -466,7 +514,11 @@ fn newton_schulz<B: Backend>(
         x = x.clone().mul_scalar(a).add(b_matrix.matmul(x.clone()));
     }
 
-    if needs_transpose { x.transpose() } else { x }
+    if needs_transpose {
+        x.transpose()
+    } else {
+        x
+    }
 }
 
 impl<B: Backend> SimpleOptimizer<B> for SoapMuon<B> {
@@ -498,10 +550,15 @@ impl<B: Backend> SimpleOptimizer<B> for SoapMuon<B> {
         // 1. EMA-update the Shampoo-style preconditioner accumulators.
         let gb = self.shampoo_beta;
         st.gg0 = st.gg0.mul_scalar(gb).add(
-            g2.clone().matmul(g2.clone().transpose()).mul_scalar(1.0 - gb),
+            g2.clone()
+                .matmul(g2.clone().transpose())
+                .mul_scalar(1.0 - gb),
         );
         st.gg1 = st.gg1.mul_scalar(gb).add(
-            g2.clone().transpose().matmul(g2.clone()).mul_scalar(1.0 - gb),
+            g2.clone()
+                .transpose()
+                .matmul(g2.clone())
+                .mul_scalar(1.0 - gb),
         );
         st.step += 1;
 
@@ -516,12 +573,21 @@ impl<B: Backend> SimpleOptimizer<B> for SoapMuon<B> {
         }
 
         // 3. Project gradient into the eigenbasis: q0^T @ grad @ q1
-        let grad_proj = st.q0.clone().transpose().matmul(g2.clone()).matmul(st.q1.clone());
+        let grad_proj = st
+            .q0
+            .clone()
+            .transpose()
+            .matmul(g2.clone())
+            .matmul(st.q1.clone());
 
         // 4. Adam moment update in the rotated space (bias-corrected, as in burn's Adam).
         let b1 = self.beta1;
         let b2 = self.beta2;
-        st.exp_avg = st.exp_avg.clone().mul_scalar(b1).add(grad_proj.clone().mul_scalar(1.0 - b1));
+        st.exp_avg = st
+            .exp_avg
+            .clone()
+            .mul_scalar(b1)
+            .add(grad_proj.clone().mul_scalar(1.0 - b1));
         st.exp_avg_sq = st
             .exp_avg_sq
             .clone()
@@ -531,14 +597,19 @@ impl<B: Backend> SimpleOptimizer<B> for SoapMuon<B> {
         let t = st.step as i32;
         let bias_correction2_sqrt = (1.0 - b2.powi(t)).sqrt();
         let combined_factor = bias_correction2_sqrt / (1.0 - b1.powi(t));
-        let update_rotated = st
-            .exp_avg
-            .clone()
-            .mul_scalar(combined_factor)
-            .div(st.exp_avg_sq.clone().sqrt().add_scalar(self.eps * bias_correction2_sqrt));
+        let update_rotated = st.exp_avg.clone().mul_scalar(combined_factor).div(
+            st.exp_avg_sq
+                .clone()
+                .sqrt()
+                .add_scalar(self.eps * bias_correction2_sqrt),
+        );
 
         // 5. Project back: q0 @ update_rotated @ q1^T
-        let update = st.q0.clone().matmul(update_rotated).matmul(st.q1.clone().transpose());
+        let update = st
+            .q0
+            .clone()
+            .matmul(update_rotated)
+            .matmul(st.q1.clone().transpose());
 
         // 6. Newton-Schulz refinement pass (the paper's "iterative whitening" contribution).
         let update = newton_schulz(update, self.ns_coefficients, self.ns_steps, self.ns_eps);
@@ -586,8 +657,16 @@ mod tests {
         let product = ortho.clone().matmul(ortho.transpose());
         let data = product.into_data();
         let values = data.as_slice::<f32>().unwrap();
-        assert!((values[0] - 1.0).abs() < 0.1, "expected ~1.0, got {}", values[0]);
-        assert!((values[3] - 1.0).abs() < 0.1, "expected ~1.0, got {}", values[3]);
+        assert!(
+            (values[0] - 1.0).abs() < 0.1,
+            "expected ~1.0, got {}",
+            values[0]
+        );
+        assert!(
+            (values[3] - 1.0).abs() < 0.1,
+            "expected ~1.0, got {}",
+            values[3]
+        );
     }
 
     #[test]
@@ -598,9 +677,21 @@ mod tests {
         let product = q.clone().matmul(q.transpose());
         let data = product.into_data();
         let values = data.as_slice::<f32>().unwrap();
-        assert!((values[0] - 1.0).abs() < 1e-4, "Q^T Q [0,0] should be ~1.0, got {}", values[0]);
-        assert!((values[3] - 1.0).abs() < 1e-4, "Q^T Q [1,1] should be ~1.0, got {}", values[3]);
-        assert!(values[1].abs() < 1e-4, "Q^T Q off-diagonal should be ~0, got {}", values[1]);
+        assert!(
+            (values[0] - 1.0).abs() < 1e-4,
+            "Q^T Q [0,0] should be ~1.0, got {}",
+            values[0]
+        );
+        assert!(
+            (values[3] - 1.0).abs() < 1e-4,
+            "Q^T Q [1,1] should be ~1.0, got {}",
+            values[3]
+        );
+        assert!(
+            values[1].abs() < 1e-4,
+            "Q^T Q off-diagonal should be ~0, got {}",
+            values[1]
+        );
     }
 
     #[test]
@@ -616,12 +707,14 @@ mod tests {
     #[test]
     fn multi_step_changes_weights_without_nan() {
         let device = Default::default();
-        let optim: SoapMuon<Wgpu> = SoapMuonConfig::new()
-            .with_precondition_frequency(2)
-            .build();
+        let optim: SoapMuon<Wgpu> = SoapMuonConfig::new().with_precondition_frequency(2).build();
 
         let mut tensor = Tensor::<Wgpu, 2>::from_floats(
-            [[1.0, 0.5, -0.3, 0.2], [0.5, 1.0, 0.1, -0.4], [0.2, 0.1, 1.0, 0.3]],
+            [
+                [1.0, 0.5, -0.3, 0.2],
+                [0.5, 1.0, 0.1, -0.4],
+                [0.2, 0.1, 1.0, 0.3],
+            ],
             &device,
         );
         let initial = tensor.clone().into_data();
@@ -629,7 +722,11 @@ mod tests {
 
         for i in 0..8 {
             let grad = Tensor::<Wgpu, 2>::from_floats(
-                [[0.1, -0.2, 0.05, 0.3], [0.2, 0.1, -0.1, 0.05], [-0.05, 0.15, 0.2, -0.1]],
+                [
+                    [0.1, -0.2, 0.05, 0.3],
+                    [0.2, 0.1, -0.1, 0.05],
+                    [-0.05, 0.15, 0.2, -0.1],
+                ],
                 &device,
             )
             .mul_scalar(1.0 + i as f32 * 0.1);
@@ -658,13 +755,21 @@ mod tests {
     fn build_real_state(device: &Device<Wgpu>) -> SoapMuonState<Wgpu> {
         let optim: SoapMuon<Wgpu> = SoapMuonConfig::new().with_precondition_frequency(2).build();
         let mut tensor = Tensor::<Wgpu, 2>::from_floats(
-            [[1.0, 0.5, -0.3, 0.2], [0.5, 1.0, 0.1, -0.4], [0.2, 0.1, 1.0, 0.3]],
+            [
+                [1.0, 0.5, -0.3, 0.2],
+                [0.5, 1.0, 0.1, -0.4],
+                [0.2, 0.1, 1.0, 0.3],
+            ],
             device,
         );
         let mut state = None;
         for i in 0..5 {
             let grad = Tensor::<Wgpu, 2>::from_floats(
-                [[0.1, -0.2, 0.05, 0.3], [0.2, 0.1, -0.1, 0.05], [-0.05, 0.15, 0.2, -0.1]],
+                [
+                    [0.1, -0.2, 0.05, 0.3],
+                    [0.2, 0.1, -0.1, 0.05],
+                    [-0.05, 0.15, 0.2, -0.1],
+                ],
                 device,
             )
             .mul_scalar(1.0 + i as f32 * 0.1);
@@ -741,7 +846,8 @@ mod tests {
                 let expected = if r == c { 1.0 } else { 0.0 };
                 assert!(
                     (values[r * 7 + c] - expected).abs() < 1e-4,
-                    "q1 @ q1^T should be the identity at [{r},{c}], got {}", values[r * 7 + c]
+                    "q1 @ q1^T should be the identity at [{r},{c}], got {}",
+                    values[r * 7 + c]
                 );
             }
         }
@@ -774,7 +880,10 @@ mod tests {
         for row in 0..d0 {
             let twin = new_vals[row * 5 + 4];
             let src = old_vals[row * 4]; // g(0) = 0
-            assert_eq!(twin, src, "migrated.exp_avg[{row},4] should exactly copy exp_avg[{row},g(0)], no division");
+            assert_eq!(
+                twin, src,
+                "migrated.exp_avg[{row},4] should exactly copy exp_avg[{row},g(0)], no division"
+            );
         }
     }
 
@@ -794,8 +903,16 @@ mod tests {
         let new_data = migrated.exp_avg.into_data();
         let new_vals = new_data.as_slice::<f32>().unwrap();
         for row in 0..3 {
-            assert_eq!(new_vals[row * 2], old_vals[row * 4 + 1], "row {row} col 0 must be the OLD column 1");
-            assert_eq!(new_vals[row * 2 + 1], old_vals[row * 4 + 3], "row {row} col 1 must be the OLD column 3");
+            assert_eq!(
+                new_vals[row * 2],
+                old_vals[row * 4 + 1],
+                "row {row} col 0 must be the OLD column 1"
+            );
+            assert_eq!(
+                new_vals[row * 2 + 1],
+                old_vals[row * 4 + 3],
+                "row {row} col 1 must be the OLD column 3"
+            );
         }
     }
 
@@ -812,10 +929,26 @@ mod tests {
 
         let new_data = migrated.gg1.into_data();
         let new_vals = new_data.as_slice::<f32>().unwrap();
-        assert_eq!(new_vals[0], old_vals[1 * 4 + 1], "[0,0] must be old gg1[1,1]");
-        assert_eq!(new_vals[1], old_vals[1 * 4 + 3], "[0,1] must be old gg1[1,3]");
-        assert_eq!(new_vals[2], old_vals[3 * 4 + 1], "[1,0] must be old gg1[3,1]");
-        assert_eq!(new_vals[3], old_vals[3 * 4 + 3], "[1,1] must be old gg1[3,3]");
+        assert_eq!(
+            new_vals[0],
+            old_vals[1 * 4 + 1],
+            "[0,0] must be old gg1[1,1]"
+        );
+        assert_eq!(
+            new_vals[1],
+            old_vals[1 * 4 + 3],
+            "[0,1] must be old gg1[1,3]"
+        );
+        assert_eq!(
+            new_vals[2],
+            old_vals[3 * 4 + 1],
+            "[1,0] must be old gg1[3,1]"
+        );
+        assert_eq!(
+            new_vals[3],
+            old_vals[3 * 4 + 3],
+            "[1,1] must be old gg1[3,3]"
+        );
     }
 
     #[test]
@@ -831,7 +964,10 @@ mod tests {
         for r in 0..2 {
             for c in 0..2 {
                 let expected = if r == c { 1.0 } else { 0.0 };
-                assert!((values[r * 2 + c] - expected).abs() < 1e-4, "q1 @ q1^T should be identity at [{r},{c}]");
+                assert!(
+                    (values[r * 2 + c] - expected).abs() < 1e-4,
+                    "q1 @ q1^T should be identity at [{r},{c}]"
+                );
             }
         }
     }
@@ -866,15 +1002,20 @@ mod tests {
         let migrated = migrate_soap_muon_state_for_shrink(&state, None, Some(&keep), &device);
 
         let tensor = Tensor::<Wgpu, 2>::from_floats(
-            [[0.5, -0.3, 0.2], [1.0, 0.1, -0.4], [0.1, 1.0, 0.3]], &device,
+            [[0.5, -0.3, 0.2], [1.0, 0.1, -0.4], [0.1, 1.0, 0.3]],
+            &device,
         );
         let grad = Tensor::<Wgpu, 2>::from_floats(
-            [[-0.2, 0.05, 0.3], [0.1, -0.1, 0.05], [0.15, 0.2, -0.1]], &device,
+            [[-0.2, 0.05, 0.3], [0.1, -0.1, 0.05], [0.15, 0.2, -0.1]],
+            &device,
         );
         let (new_tensor, _) = optim.step(0.01, tensor, grad, Some(migrated));
         let data = new_tensor.into_data();
         let vals = data.as_slice::<f32>().unwrap();
-        assert!(vals.iter().all(|v| v.is_finite()), "a step immediately after shrink migration must not produce NaN/Inf");
+        assert!(
+            vals.iter().all(|v| v.is_finite()),
+            "a step immediately after shrink migration must not produce NaN/Inf"
+        );
     }
 
     #[test]
@@ -883,7 +1024,11 @@ mod tests {
         let optim: SoapMuon<Wgpu> = SoapMuonConfig::new().with_precondition_frequency(2).build();
 
         let mut tensor = Tensor::<Wgpu, 2>::from_floats(
-            [[1.0, 0.5, -0.3, 0.2], [0.5, 1.0, 0.1, -0.4], [0.2, 0.1, 1.0, 0.3]],
+            [
+                [1.0, 0.5, -0.3, 0.2],
+                [0.5, 1.0, 0.1, -0.4],
+                [0.2, 0.1, 1.0, 0.3],
+            ],
             &device,
         );
         let mut state = None;
@@ -891,23 +1036,35 @@ mod tests {
 
         for i in 0..5 {
             let grad = Tensor::<Wgpu, 2>::from_floats(
-                [[0.1, -0.2, 0.05, 0.3], [0.2, 0.1, -0.1, 0.05], [-0.05, 0.15, 0.2, -0.1]],
+                [
+                    [0.1, -0.2, 0.05, 0.3],
+                    [0.2, 0.1, -0.1, 0.05],
+                    [-0.05, 0.15, 0.2, -0.1],
+                ],
                 &device,
             )
             .mul_scalar(1.0 + i as f32 * 0.1);
             let prev = tensor.clone();
             let (new_tensor, new_state) = optim.step(0.01, tensor, grad, state);
-            let delta: f32 = (new_tensor.clone() - prev).powf_scalar(2.0).sum().sqrt().into_scalar();
+            let delta: f32 = (new_tensor.clone() - prev)
+                .powf_scalar(2.0)
+                .sum()
+                .sqrt()
+                .into_scalar();
             pre_migration_update_norms.push(delta);
             tensor = new_tensor;
             state = new_state;
         }
 
-        let max_prior_norm = pre_migration_update_norms.iter().cloned().fold(0.0_f32, f32::max);
+        let max_prior_norm = pre_migration_update_norms
+            .iter()
+            .cloned()
+            .fold(0.0_f32, f32::max);
 
         // Migrate [3,4] -> [3,7] (grow_dim1 only — d0=3 rows never grow for this parameter).
         let old_state = state.expect("state should exist after 5 steps");
-        let migrated_state = migrate_soap_muon_state_for_growth(&old_state, None, Some((4, 7)), &device);
+        let migrated_state =
+            migrate_soap_muon_state_for_growth(&old_state, None, Some((4, 7)), &device);
 
         let old_data = tensor.into_data();
         let old_vals = old_data.as_slice::<f32>().unwrap().to_vec();
@@ -921,24 +1078,28 @@ mod tests {
                 grown_tensor_data[row * 7 + 4 + j] = old_vals[row * 4 + gj];
             }
         }
-        let mut tensor = Tensor::<Wgpu, 2>::from_data(
-            TensorData::new(grown_tensor_data, vec![3, 7]),
-            &device,
-        );
+        let mut tensor =
+            Tensor::<Wgpu, 2>::from_data(TensorData::new(grown_tensor_data, vec![3, 7]), &device);
         let mut state = Some(migrated_state);
 
         for i in 0..5 {
-            let base = [[0.1, -0.2, 0.05, 0.3, 0.1, -0.2, 0.05],
-                        [0.2, 0.1, -0.1, 0.05, 0.2, 0.1, -0.1],
-                        [-0.05, 0.15, 0.2, -0.1, -0.05, 0.15, 0.2]];
-            let grad = Tensor::<Wgpu, 2>::from_floats(base, &device).mul_scalar(1.0 + i as f32 * 0.1);
+            let base = [
+                [0.1, -0.2, 0.05, 0.3, 0.1, -0.2, 0.05],
+                [0.2, 0.1, -0.1, 0.05, 0.2, 0.1, -0.1],
+                [-0.05, 0.15, 0.2, -0.1, -0.05, 0.15, 0.2],
+            ];
+            let grad =
+                Tensor::<Wgpu, 2>::from_floats(base, &device).mul_scalar(1.0 + i as f32 * 0.1);
             let prev = tensor.clone();
             let (new_tensor, new_state) = optim.step(0.01, tensor, grad, state);
 
             let data = new_tensor.clone().into_data();
             let vals = data.as_slice::<f32>().unwrap();
             for v in vals {
-                assert!(!v.is_nan() && !v.is_infinite(), "weight became NaN/Inf after post-migration step {i}");
+                assert!(
+                    !v.is_nan() && !v.is_infinite(),
+                    "weight became NaN/Inf after post-migration step {i}"
+                );
             }
 
             if i == 0 {

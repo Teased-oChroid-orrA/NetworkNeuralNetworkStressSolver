@@ -22,6 +22,7 @@
 //! against a currently-training model, just never as the thing this field reports.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// See this module's own doc comment.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -283,6 +284,125 @@ pub struct AuthoritativeReport {
     pub energy_balance: Option<pinn_core::messages::EnergyBalance>,
     pub reaction_force: Option<pinn_core::messages::ReactionForce>,
     pub convergence_evidence: Option<PersistedConvergenceEvidence>,
+    /// Phase 4: enough information to reconstruct the physical objective separately from
+    /// the optimizer's term weights. `None` only for reports created by non-plate callers or
+    /// older serialized checkpoints (`#[serde(default)]` preserves their readability).
+    #[serde(default)]
+    pub objective_snapshot: Option<MathematicalObjectiveSnapshot>,
+}
+
+/// Persisted physical-versus-optimization ledger for one plate run.  `physical_w_ext` is the
+/// full prescribed-traction work in `Pi = U - W_ext`; it deliberately differs from the
+/// half-work value in `EnergyBalance`, which is retained for the linear energy-balance check
+/// `U = W_ext / 2`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct MathematicalObjectiveSnapshot {
+    pub formulation: String,
+    pub physical_functional: String,
+    pub physical_u: Option<f64>,
+    pub physical_w_ext: Option<f64>,
+    pub physical_pi: Option<f64>,
+    pub normalized_u: Option<f64>,
+    pub normalized_w_ext: Option<f64>,
+    pub normalized_pi: Option<f64>,
+    pub physical_block_optimizer_scale: Option<f64>,
+    pub active_terms: Vec<String>,
+    pub base_weights: BTreeMap<String, f64>,
+    /// Last live SAW/BRDR effective weights, if this session trained.  A loaded checkpoint
+    /// has no honest current adaptive state and records `None`, rather than inventing one.
+    pub adaptive_weights: Option<BTreeMap<String, f64>>,
+    pub adaptive_weight_policy: String,
+    pub constraint_names: Vec<String>,
+    pub constraint_base_weights: BTreeMap<String, f64>,
+    pub normalization: String,
+    pub reference_energy_j: f64,
+    pub domain_area_m2: f64,
+    pub outer_boundary_length_m: f64,
+    pub thickness_m: f64,
+    pub sampling_estimator: String,
+    pub optimizer: String,
+}
+
+/// Builds the Phase 4 objective ledger from the same `ProblemSpec` and physical diagnostic
+/// used by checkpoint/report production. No optimizer scalar can alter `physical_*`: those
+/// values are reconstructed before term weighting.
+pub fn mathematical_objective_snapshot(
+    spec: &pinn_core::problem_spec::ProblemSpec,
+    energy_balance: Option<&pinn_core::messages::EnergyBalance>,
+    adaptive_weights: Option<BTreeMap<String, f64>>,
+) -> MathematicalObjectiveSnapshot {
+    use crate::problem::{BoundaryValueProblem, TermRole};
+
+    let problem = crate::user_problem::UserDefinedProblem::new(spec.clone());
+    let terms = problem.loss_terms();
+    let mut active_terms = Vec::with_capacity(terms.len());
+    let mut base_weights = BTreeMap::new();
+    let mut constraint_names = Vec::new();
+    let mut constraint_base_weights = BTreeMap::new();
+    for term in terms {
+        let name = term.name().to_string();
+        let weight = problem.base_weight(term.name()) as f64;
+        if term.term_role() == TermRole::Constraint {
+            constraint_names.push(name.clone());
+            constraint_base_weights.insert(name.clone(), weight);
+        }
+        base_weights.insert(name.clone(), weight);
+        active_terms.push(name);
+    }
+    active_terms.sort();
+    constraint_names.sort();
+
+    let hole_radii: Vec<f64> = spec.geometry.holes.iter().map(|h| h.radius).collect();
+    let domain_area_m2 = crate::measure_integral::plate_domain_area(
+        spec.geometry.half_w, spec.geometry.half_h, &hole_radii,
+    );
+    let thickness_m = spec.geometry.thickness;
+    let reference_energy_j = crate::training_core::compute_reference_scales_for_plate(spec)
+        .ref_energy as f64 * domain_area_m2 * thickness_m;
+    let (physical_u, physical_w_ext) = energy_balance.map(|balance| {
+        // EnergyBalance intentionally stores half external work for its linear work-energy
+        // equality diagnostic. The variational functional uses full prescribed work.
+        (balance.internal_energy, 2.0 * balance.external_work)
+    }).unzip();
+    let physical_pi = physical_u.zip(physical_w_ext).map(|(u, w)| u - w);
+    let normalize = |v: Option<f64>| v.map(|x| x / reference_energy_j.max(1e-30));
+    let formulation = format!("{:?}", spec.formulation);
+    let physical_block_optimizer_scale = adaptive_weights.as_ref()
+        .and_then(|m| m.get("physical_potential").copied())
+        .or_else(|| base_weights.get("physical_potential").copied());
+
+    MathematicalObjectiveSnapshot {
+        formulation,
+        physical_functional: if matches!(spec.formulation, pinn_core::problem_spec::FormulationSelection::Variational) {
+            "Pi = U - W_ext (atomic prescribed-traction potential)".to_string()
+        } else {
+            "No single variational physical functional selected".to_string()
+        },
+        physical_u,
+        physical_w_ext,
+        physical_pi,
+        normalized_u: normalize(physical_u),
+        normalized_w_ext: normalize(physical_w_ext),
+        normalized_pi: normalize(physical_pi),
+        physical_block_optimizer_scale,
+        active_terms,
+        base_weights,
+        adaptive_weights,
+        adaptive_weight_policy: "SAW-BRDR effective lambda is applied after each LossTerm computes its raw value; corrected Variational has one atomic physical_potential term.".to_string(),
+        constraint_names,
+        constraint_base_weights,
+        normalization: "physical values divided by ref_energy * domain_area * thickness; ref_energy = sigma_ref^2 / E".to_string(),
+        reference_energy_j,
+        domain_area_m2,
+        outer_boundary_length_m: 4.0 * (spec.geometry.half_w + spec.geometry.half_h),
+        thickness_m,
+        sampling_estimator: if spec.training.measure_aware_training {
+            "domain: density-compensated area integral; boundary: prescribed traction integral with per-point ds".to_string()
+        } else {
+            "legacy mean estimator (not valid for Variational)".to_string()
+        },
+        optimizer: format!("AdamW, lr={}; optional controller/L-BFGS tier transitions are runtime-dependent", spec.training.lr),
+    }
 }
 
 /// Assembles an [`AuthoritativeReport`] from already-computed pieces - pure data assembly, no
@@ -313,8 +433,38 @@ pub fn build_authoritative_report(
         energy_balance,
         reaction_force,
         convergence_evidence,
+        objective_snapshot: None,
         provenance,
     }
+}
+
+/// Plate-specific authoritative report. Keep the older generic builder for non-plate callers;
+/// all plate checkpoint and GUI paths use this function so serialized reports receive the
+/// Phase 4 mathematical-objective snapshot.
+#[allow(clippy::too_many_arguments)]
+pub fn build_plate_authoritative_report(
+    spec: &pinn_core::problem_spec::ProblemSpec,
+    provenance: RunProvenance,
+    last_amr_sweep_step: Option<usize>,
+    no_hole_benchmark: Option<PersistedNoHoleBenchmark>,
+    energy_balance: Option<pinn_core::messages::EnergyBalance>,
+    reaction_force: Option<pinn_core::messages::ReactionForce>,
+    convergence_evidence: Option<PersistedConvergenceEvidence>,
+    adaptive_weights: Option<BTreeMap<String, f64>>,
+) -> AuthoritativeReport {
+    let snapshot = mathematical_objective_snapshot(spec, energy_balance.as_ref(), adaptive_weights);
+    let mut report = build_authoritative_report(
+        provenance,
+        spec.training.measure_aware_training,
+        spec.training.amr_enabled,
+        last_amr_sweep_step,
+        no_hole_benchmark,
+        energy_balance,
+        reaction_force,
+        convergence_evidence,
+    );
+    report.objective_snapshot = Some(snapshot);
+    report
 }
 
 #[cfg(test)]
@@ -407,6 +557,36 @@ mod tests {
         assert_eq!(report.amr_state, AmrStateSummary { enabled: false, last_sweep_step: Some(1200) });
         assert!(report.l0_passed);
         assert_eq!(report.l4_no_hole_benchmark, None);
+    }
+
+    #[test]
+    fn objective_snapshot_keeps_full_variational_work_separate_from_half_work_balance() {
+        let mut spec = sample_spec();
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        let snapshot = mathematical_objective_snapshot(
+            &spec,
+            Some(&pinn_core::messages::EnergyBalance {
+                internal_energy: 3.0,
+                // EnergyBalance is deliberately half prescribed work for U=W/2 validation.
+                external_work: 2.0,
+                energy_balance_error: 0.5,
+            }),
+            Some(BTreeMap::from([("physical_potential".to_string(), 1.25)])),
+        );
+        assert_eq!(snapshot.physical_u, Some(3.0));
+        assert_eq!(snapshot.physical_w_ext, Some(4.0));
+        assert_eq!(snapshot.physical_pi, Some(-1.0));
+        assert_eq!(snapshot.physical_block_optimizer_scale, Some(1.25));
+        assert_eq!(snapshot.active_terms, vec![
+            "physical_potential".to_string(),
+            "rotation_gauge".to_string(),
+            "translation_gauge".to_string(),
+        ]);
+        assert_eq!(snapshot.constraint_names, vec![
+            "rotation_gauge".to_string(),
+            "translation_gauge".to_string(),
+        ]);
     }
 
     #[test]

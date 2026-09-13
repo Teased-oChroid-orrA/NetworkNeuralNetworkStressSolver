@@ -36,7 +36,8 @@ use crate::{
     // `old_hardcoded_step_physics` regression oracle (tests module) imports the raw formulas
     // itself, separately, since it deliberately does NOT go through the trait.
     energy::compute_stress,
-    fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig},
+    differential_operator::production_strain as compute_strains,
+    fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig},
     kirsch_problem::KIRSCH_DOMAIN,
     lr_schedule::LrSchedule,
     network::{fwd, fwd_masked, ElasticityNet},
@@ -1792,6 +1793,11 @@ pub fn step_physics_multi(
     let mut lam_by_name: HashMap<&'static str, f64> = HashMap::new();
     for (name, &raw_lam) in term_names.iter().zip(lams.iter()) {
         let lam = match *name {
+            // Variational Pi is one physical functional. A changing SAW multiplier changes
+            // optimizer dynamics despite preserving the continuum stationary point only in the
+            // constant-weight limit. Keep its live coefficient fixed at the canonical unit
+            // scale; constraints remain independently adaptive.
+            "physical_potential" => 1.0,
             // "hole_free" is `UserDefinedProblem`'s own name for exactly the same traction-
             // free hole condition "hole_traction"/"lug_free_edge_traction" already cap here -
             // a real, previously-missed gap (confirmed via direct code read, not assumed):
@@ -1848,6 +1854,16 @@ pub fn step_physics_multi(
     // `powershell_tool/CLAUDE.md`'s Stress Solver section for the investigation that found it
     // (a Von Mises field with no real concentration at a hole, smooth everywhere else).
     //
+    // This is required only when an active term actually consumes direct auxiliary stress.
+    // A pure Variational `physical_potential` uses displacement-derived strain exclusively;
+    // injecting a direct-stress consistency loss into it would add an undeclared, weight-50
+    // constraint and violate its atomic-Pi contract. The direct-stress output channels may
+    // exist in the network without becoming physics until a declared consumer uses them.
+    let needs_constitutive_consistency = active_terms.iter().any(|term| matches!(
+        term.stress_source(),
+        Some(crate::problem::StressSource::Direct | crate::problem::StressSource::Both),
+    ));
+
     // The weight is `ctx.constitutive_consistency_weight` — a plain, static, caller-supplied
     // value (NOT adaptive/per-step) that defaults to `LAM_CONSTITUTIVE_CONSISTENCY` (5.0,
     // matching `step_physics`'s own hardcoded value in `engine.rs`) at every call site except
@@ -1881,6 +1897,9 @@ pub fn step_physics_multi(
     let mut const_scalar_sum = 0.0_f32;
     let mut any_mdem = false;
     for (i, domain) in ctx.problem.domains().iter().enumerate() {
+        if !needs_constitutive_consistency {
+            break;
+        }
         if domain.output_dim != 5 {
             continue;
         }
@@ -7716,4 +7735,3 @@ mod tests {
         assert!(!model_is_finite(&model));
     }
 }
-

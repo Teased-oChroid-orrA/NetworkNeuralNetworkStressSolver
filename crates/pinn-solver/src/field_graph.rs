@@ -29,6 +29,8 @@
 //!    comment for why this is a real enforcement point, not a diagnostic-only report.
 
 use crate::problem::StressSource;
+use burn::tensor::{backend::Backend, Tensor};
+use pinn_core::material::MaterialProps;
 
 /// A node in the authoritative field dependency graph (issue #61 §3's pipeline diagram,
 /// narrowed to the fields this codebase's plate/Kirsch/pin-lug problems actually compute).
@@ -55,6 +57,55 @@ pub enum FieldKind {
     /// Stress read directly from the network's own mDEM output columns, with no constitutive
     /// derivation involved. Only meaningful for `output_dim == 5` domains.
     DirectStress,
+}
+
+/// A field value resolved through [`FieldKind`].  Keeping the variants typed prevents a
+/// consumer from silently treating a direct auxiliary stress channel as constitutive stress.
+pub enum ResolvedField<B: Backend> {
+    NetworkOutput(Tensor<B, 2>),
+    Displacement(Tensor<B, 2>),
+    Strain((Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>)),
+    ConstitutiveStress((Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>)),
+    DirectStress((Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>)),
+}
+
+/// Explicit failure instead of an ad-hoc direct/derived fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldResolutionError {
+    MissingStrain,
+    MissingMaterial,
+    MissingDirectStressChannels,
+}
+
+/// Resolves a requested field from one production forward result.  Callers must name the
+/// requested field; this is intentionally not a "best available stress" helper.
+pub fn resolve_field<B: Backend>(
+    kind: FieldKind,
+    raw_output: &Tensor<B, 2>,
+    strains: Option<(Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>)>,
+    material: Option<&MaterialProps>,
+) -> Result<ResolvedField<B>, FieldResolutionError> {
+    let n = raw_output.dims()[0];
+    match kind {
+        FieldKind::NetworkOutput => Ok(ResolvedField::NetworkOutput(raw_output.clone())),
+        FieldKind::Displacement => Ok(ResolvedField::Displacement(raw_output.clone().slice([0..n, 0..2]))),
+        FieldKind::Strain => strains.map(ResolvedField::Strain).ok_or(FieldResolutionError::MissingStrain),
+        FieldKind::ConstitutiveStress => {
+            let material = material.ok_or(FieldResolutionError::MissingMaterial)?;
+            let (exx, eyy, exy) = strains.ok_or(FieldResolutionError::MissingStrain)?;
+            Ok(ResolvedField::ConstitutiveStress(crate::energy::compute_stress(exx, eyy, exy, material)))
+        }
+        FieldKind::DirectStress => {
+            if raw_output.dims()[1] < 5 {
+                return Err(FieldResolutionError::MissingDirectStressChannels);
+            }
+            Ok(ResolvedField::DirectStress((
+                raw_output.clone().slice([0..n, 2..3]).reshape([n]),
+                raw_output.clone().slice([0..n, 3..4]).reshape([n]),
+                raw_output.clone().slice([0..n, 4..5]).reshape([n]),
+            )))
+        }
+    }
 }
 
 impl FieldKind {
@@ -327,5 +378,46 @@ mod tests {
             assert_eq!(chain.first(), Some(&FieldKind::NetworkOutput), "{name}'s chain must root at NetworkOutput");
             assert_eq!(chain.last(), Some(&kind), "{name}'s chain must end at its own resolved field");
         }
+    }
+
+    #[test]
+    fn resolver_rejects_direct_stress_when_network_has_only_displacements() {
+        use burn::tensor::{Tensor, TensorData};
+        let device = crate::training_core::BDevice::default();
+        let raw = Tensor::<crate::training_core::BInner, 2>::from_data(
+            TensorData::new(vec![1.0f32, -2.0], vec![1, 2]), &device,
+        );
+        let result = resolve_field(
+            FieldKind::DirectStress, &raw, None, None,
+        );
+        assert_eq!(result.err(), Some(FieldResolutionError::MissingDirectStressChannels));
+    }
+
+    #[test]
+    fn resolver_keeps_direct_and_constitutive_stress_distinct() {
+        use burn::tensor::{Tensor, TensorData};
+        let device = crate::training_core::BDevice::default();
+        let raw = Tensor::<crate::training_core::BInner, 2>::from_data(
+            TensorData::new(vec![0.0f32, 0.0, 99.0, 88.0, 77.0], vec![1, 5]), &device,
+        );
+        let strain = || (
+            Tensor::<crate::training_core::BInner, 1>::from_data(TensorData::new(vec![1.0e-3], vec![1]), &device),
+            Tensor::<crate::training_core::BInner, 1>::zeros([1], &device),
+            Tensor::<crate::training_core::BInner, 1>::zeros([1], &device),
+        );
+        let direct = match resolve_field(FieldKind::DirectStress, &raw, None, None).unwrap() {
+            ResolvedField::DirectStress(value) => value,
+            _ => unreachable!(),
+        };
+        let constitutive = match resolve_field(
+            FieldKind::ConstitutiveStress, &raw, Some(strain()), Some(&MaterialProps::al7075_t6()),
+        ).unwrap() {
+            ResolvedField::ConstitutiveStress(value) => value,
+            _ => unreachable!(),
+        };
+        let direct_xx = direct.0.into_scalar();
+        let constitutive_xx = constitutive.0.into_scalar();
+        assert_eq!(direct_xx, 99.0);
+        assert!((constitutive_xx - 99.0).abs() > 1.0, "resolver must not silently use direct stress for a constitutive request");
     }
 }

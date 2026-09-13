@@ -2,8 +2,8 @@
 # Method) formulation, with measure-aware training enabled (PH3-04). Identical material/load/
 # geometry/network/training parameters to `no_hole_plate.toml` (the legacy Hybrid baseline
 # frozen for PH3-01 at `Debug_run/baseline_legacy_no_hole/`) - this file differs ONLY in
-# `formulation = "Variational"` (issue #61 P2-01's own gate: activates ONLY `interior_energy`/
-# `external_work` + essential constraints - NO `equilibrium`/`outer_traction` penalty, since a
+# `formulation = "Variational"` activates atomic `physical_potential = U-W_ext` plus essential
+# constraints - NO `equilibrium`/`outer_traction` penalty, since a
 # correctly-posed W_ext already encodes the natural traction-free boundary automatically) and
 # `training.measure_aware_training = true` (PH3-04's real, tested measure-aware integral path).
 #

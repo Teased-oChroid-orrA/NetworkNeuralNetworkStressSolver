@@ -224,9 +224,11 @@ pub fn representation_consistency_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::{Autodiff, Wgpu};
+    use burn::backend::Autodiff;
 
-    type TB = Autodiff<Wgpu>;
+    // Test the backend selected for this build. Hard-coding Wgpu made otherwise CPU/ndarray
+    // verification fail before any solver math ran on machines without a Metal adapter.
+    type TB = Autodiff<crate::training_core::BInner>;
 
     fn material(e: f64, nu: f64) -> MaterialProps {
         MaterialProps { e, nu, density: 0.0, ultimate_strength_pa: 1.0 }

@@ -66,7 +66,8 @@ use pinn_core::{
 use crate::{
     architecture_controller::{ArchitectureConfig, ArchitectureController},
     energy::{compute_stress, constitutive_consistency_loss, dem_energy_loss, dem_energy_per_point, hole_traction_loss_direct, neumann_loss},
-    fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig},
+    differential_operator::production_strain as compute_strains,
+    fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig},
     lr_schedule::LrSchedule,
     network::{fwd, ElasticityNet, ElasticityNetConfig},
     optim::{apply_arch_action, make_bias_optim, make_gate_optim, BiasOptim, GateOptim, WeightOptim},

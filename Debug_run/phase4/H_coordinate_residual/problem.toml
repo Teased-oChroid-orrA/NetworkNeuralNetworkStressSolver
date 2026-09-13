@@ -1,0 +1,35 @@
+# Issue #64 controlled coordinate-residual run. Matches completed F 1,000-step control;
+# only model implementation differs: ElasticityNet now learns raw-coordinate u/v residual.
+formulation = "Variational"
+
+[geometry]
+half_w = 0.10
+half_h = 0.10
+thickness = 0.005
+holes = []
+
+[material]
+e = 7.17e10
+nu = 0.33
+density = 2810.0
+ultimate_strength_pa = 503e6
+
+[load]
+px = 6.9e7
+py = 0.0
+
+[network]
+hidden_dim = 16
+n_hidden = 2
+adaptive = false
+auto_stop_on_plateau = false
+model_init_seed = 90211
+
+[training]
+max_steps = 1000
+n_interior = 512
+n_boundary = 256
+fd_h = 1e-2
+lr = 3e-3
+measure_aware_training = true
+amr_enabled = false

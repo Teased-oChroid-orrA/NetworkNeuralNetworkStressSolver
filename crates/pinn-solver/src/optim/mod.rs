@@ -1,18 +1,18 @@
 pub mod soap_muon;
 
 pub use soap_muon::{
-    SoapMuon, SoapMuonConfig, SoapMuonState, migrate_soap_muon_state_for_growth,
-    migrate_soap_muon_state_for_shrink,
+    migrate_soap_muon_state_for_growth, migrate_soap_muon_state_for_shrink, SoapMuon,
+    SoapMuonConfig, SoapMuonState,
 };
 
 use burn::module::ParamId;
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor};
+use burn::optim::{adaptor::OptimizerAdaptor, AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::ops::Device;
 
 use crate::architecture_controller::ArchAction;
 use crate::decision_maker::OptimizerTier;
 use crate::network::ElasticityNet;
-use crate::training_core::{B, BInner};
+use crate::training_core::{BInner, B};
 
 /// Optimizer for 2D weight-matrix parameters: either the SOAP-Muon hybrid, or — as an
 /// explicit fallback, per [`pinn_core::messages::SolverConfig::use_soap_muon`] — plain
@@ -94,7 +94,8 @@ impl WeightOptim {
             let mut records = o.to_record();
             if let Some(record) = records.remove(&weight_id) {
                 let state: SoapMuonState<BInner> = record.into_state::<2>();
-                let migrated = migrate_soap_muon_state_for_growth(&state, grow_dim0, grow_dim1, device);
+                let migrated =
+                    migrate_soap_muon_state_for_growth(&state, grow_dim0, grow_dim1, device);
                 records.insert(
                     weight_id,
                     burn::optim::record::AdaptorRecord::from_state::<2>(migrated),
@@ -125,7 +126,8 @@ impl WeightOptim {
             let mut records = o.to_record();
             if let Some(record) = records.remove(&weight_id) {
                 let state: SoapMuonState<BInner> = record.into_state::<2>();
-                let migrated = migrate_soap_muon_state_for_shrink(&state, shrink_dim0, shrink_dim1, device);
+                let migrated =
+                    migrate_soap_muon_state_for_shrink(&state, shrink_dim0, shrink_dim1, device);
                 records.insert(
                     weight_id,
                     burn::optim::record::AdaptorRecord::from_state::<2>(migrated),
@@ -189,25 +191,43 @@ pub fn apply_arch_action(
     match action {
         ArchAction::GrowWidth(new_hidden_dim) => {
             *snapshot = Some((model.clone(), hidden_dim, n_hidden));
-            let (weight_ids, _) = model.param_ids();
+            let weight_ids = model.mlp_weight_ids();
             let grown = model.grow_width(*new_hidden_dim, device);
             if use_soap_muon {
                 let n_layers = weight_ids.len() - 1; // last id is `out`
                 for (i, &id) in weight_ids.iter().enumerate() {
                     if i == n_layers {
-                        optim_w.migrate_for_growth(id, Some((hidden_dim, *new_hidden_dim)), None, device);
+                        optim_w.migrate_for_growth(
+                            id,
+                            Some((hidden_dim, *new_hidden_dim)),
+                            None,
+                            device,
+                        );
                     } else if i == 0 {
-                        optim_w.migrate_for_growth(id, None, Some((hidden_dim, *new_hidden_dim)), device);
+                        optim_w.migrate_for_growth(
+                            id,
+                            None,
+                            Some((hidden_dim, *new_hidden_dim)),
+                            device,
+                        );
                     } else {
                         optim_w.migrate_for_growth(
-                            id, Some((hidden_dim, *new_hidden_dim)), Some((hidden_dim, *new_hidden_dim)), device,
+                            id,
+                            Some((hidden_dim, *new_hidden_dim)),
+                            Some((hidden_dim, *new_hidden_dim)),
+                            device,
                         );
                     }
                 }
             } else {
                 *optim_w = WeightOptim::new(false);
             }
-            (grown, format!("Grew width {hidden_dim} -> {new_hidden_dim}"), *new_hidden_dim, n_hidden)
+            (
+                grown,
+                format!("Grew width {hidden_dim} -> {new_hidden_dim}"),
+                *new_hidden_dim,
+                n_hidden,
+            )
         }
         ArchAction::GrowDepth => {
             *snapshot = Some((model.clone(), hidden_dim, n_hidden));
@@ -215,19 +235,34 @@ pub fn apply_arch_action(
             // doc comment) - naturally absent from the optimizer's record map, so no migration
             // call is needed; every EXISTING layer's shape/`ParamId` is untouched.
             let grown = model.append_dormant_layer(1.6666666666666667, device);
-            (grown, format!("Grew depth {n_hidden} -> {}", n_hidden + 1), hidden_dim, n_hidden + 1)
+            (
+                grown,
+                format!("Grew depth {n_hidden} -> {}", n_hidden + 1),
+                hidden_dim,
+                n_hidden + 1,
+            )
         }
         ArchAction::ShrinkDepth(idx) => {
             // Never watched/reverted (provably zero-effect) - no snapshot taken. The removed
             // layer's whole `ParamId` disappears with it; its now-orphaned optimizer record is
             // simply never looked up again - no migration call needed either.
             let shrunk = model.remove_layer(*idx, gate_epsilon);
-            (shrunk, format!("Removed dormant layer {idx} ({n_hidden} -> {})", n_hidden - 1), hidden_dim, n_hidden - 1)
+            (
+                shrunk,
+                format!(
+                    "Removed dormant layer {idx} ({n_hidden} -> {})",
+                    n_hidden - 1
+                ),
+                hidden_dim,
+                n_hidden - 1,
+            )
         }
         ArchAction::PruneWidth { drop_indices } => {
             *snapshot = Some((model.clone(), hidden_dim, n_hidden));
-            let (weight_ids, _) = model.param_ids();
-            let keep: Vec<usize> = (0..hidden_dim).filter(|i| !drop_indices.contains(i)).collect();
+            let weight_ids = model.mlp_weight_ids();
+            let keep: Vec<usize> = (0..hidden_dim)
+                .filter(|i| !drop_indices.contains(i))
+                .collect();
             let new_hidden_dim = keep.len();
             let pruned = model.prune_width(drop_indices, device);
             if use_soap_muon {
@@ -244,7 +279,15 @@ pub fn apply_arch_action(
             } else {
                 *optim_w = WeightOptim::new(false);
             }
-            (pruned, format!("Pruned {} neurons ({hidden_dim} -> {new_hidden_dim})", drop_indices.len()), new_hidden_dim, n_hidden)
+            (
+                pruned,
+                format!(
+                    "Pruned {} neurons ({hidden_dim} -> {new_hidden_dim})",
+                    drop_indices.len()
+                ),
+                new_hidden_dim,
+                n_hidden,
+            )
         }
         ArchAction::RevertLastChange => match snapshot.take() {
             Some((restored, h, n)) => {
@@ -252,12 +295,22 @@ pub fn apply_arch_action(
                 // but the actual trained WEIGHTS are fully restored from the snapshot - that's
                 // what "not throwing away trained progress" means here.
                 *optim_w = WeightOptim::new(use_soap_muon);
-                (restored, "Reverted last architecture change (no improvement)".to_string(), h, n)
+                (
+                    restored,
+                    "Reverted last architecture change (no improvement)".to_string(),
+                    h,
+                    n,
+                )
             }
             // Should not happen in practice (the controller only emits `RevertLastChange`
             // after a watched action, which always sets `snapshot`) - defensive no-op instead
             // of a panic if it ever does.
-            None => (model, "Revert requested but no change was pending (no-op)".to_string(), hidden_dim, n_hidden),
+            None => (
+                model,
+                "Revert requested but no change was pending (no-op)".to_string(),
+                hidden_dim,
+                n_hidden,
+            ),
         },
     }
 }

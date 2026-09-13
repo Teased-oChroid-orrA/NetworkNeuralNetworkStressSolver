@@ -46,6 +46,12 @@ use crate::{
 pub const USER_DOMAIN: DomainId = DomainId(0);
 
 const LAM_INTERIOR_ENERGY: f32 = 1.0;
+/// One optimization scale for the complete physical potential `Π = U - W_ext`.
+///
+/// This is deliberately a single term weight.  In particular, SAW-BRDR must never see `U`
+/// and `-W_ext` as independently adaptable terms: doing so changes the Euler equation and the
+/// physical affine minimizer.  Constraints retain their own weights below.
+const LAM_PHYSICAL_POTENTIAL: f32 = 1.0;
 const LAM_OUTER_TRACTION: f32 = 10.0;
 /// Plate-specific base weight for `equilibrium` - deliberately NOT `kirsch_problem::LAM_EQ`
 /// (5.0) anymore. That value was calibrated for Kirsch's direct-σ-based `EquilibriumRingTerm`;
@@ -61,8 +67,10 @@ const LAM_OUTER_TRACTION: f32 = 10.0;
 /// (~10x, matching the observed gap; also `constitutive_consistency`'s existing fixed weight,
 /// not a new magnitude in this codebase) is the first thing to test, not a final tuned value.
 const LAM_EQUILIBRIUM_PLATE: f32 = 50.0;
-/// Base weight for `ExternalWorkTerm` - deliberately NOT tied to `LAM_INTERIOR_ENERGY` (the
-/// TRUE `Π=U-W_ext` 1:1 ratio `ExternalWorkTerm` was originally given). bugSource-New #8's
+/// Legacy-Hybrid-only base weight for `ExternalWorkTerm`. It is deliberately NOT a physical
+/// coefficient: Phase 4 found that independently weighting U and W changes the variational
+/// stationary point. Corrected `FormulationSelection::Variational` never registers this term;
+/// it uses `PhysicalPotentialEnergyTerm` instead. bugSource-New #8's historical
 /// displacement-slope diagnostic on the trained no-hole model found `du_norm/dx_norm=0.816`
 /// (target 1.0) and `dv_norm/dy_norm=-0.246` (target -0.33) - the network is systematically
 /// under-stretching, i.e. `interior_energy` (U, preferring less strain) is still winning
@@ -77,6 +85,7 @@ const LAM_HOLE_FIXED: f32 = 50.0;
 /// Issue #61 P2-07: matches `LAM_HOLE_FIXED`/pin-lug's `LugShankAnchorTerm` (weight ~50) - the
 /// existing convention for a gauge/anchor term's weight in this codebase, not a new magnitude.
 const LAM_TRANSLATION_GAUGE: f32 = 50.0;
+const LAM_ROTATION_GAUGE: f32 = 50.0;
 
 /// Points sampled around each hole's circumference, per hole — a fixed, generous default;
 /// not user-configurable in v1 (see `ProblemSpec`'s scope note).
@@ -180,6 +189,24 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
     fn sample_interior(&self, _geom: &GeometryConfig, n: usize) -> Vec<[f64; 2]> {
         use pinn_core::LcgRng;
         let mut pts = Vec::with_capacity(n);
+        // A plain pseudorandom batch lets a flexible displacement field lower the sampled
+        // energy below the continuum affine minimum between sparse clusters. Start with one
+        // point per deterministic stratum instead: this remains geometry-generic, preserves
+        // rejection around arbitrary holes, and gives the variational functional domain-wide
+        // coverage before the existing rejection fallback fills excluded strata.
+        let nx = (n as f64).sqrt().ceil() as usize;
+        let ny = n.div_ceil(nx);
+        let cells = nx * ny;
+        for i in 0..n {
+            let cell = i * cells / n;
+            let ix = cell % nx;
+            let iy = cell / nx;
+            let x = -self.geometry.half_w + (ix as f64 + 0.5) * 2.0 * self.geometry.half_w / nx as f64;
+            let y = -self.geometry.half_h + (iy as f64 + 0.5) * 2.0 * self.geometry.half_h / ny as f64;
+            if self.contains_for_collocation(x, y) {
+                pts.push([x, y]);
+            }
+        }
         let mut attempts = 0usize;
         let max_attempts = n * REJECTION_SAMPLE_ATTEMPTS_FACTOR;
         let mut rng = LcgRng::new(SEED_INTERIOR);
@@ -442,6 +469,79 @@ struct ExternalWorkTerm {
     /// top, bottom, repeated `per_edge` times) - only read when `measure_aware`.
     ds_per_point: Vec<f64>,
 }
+
+/// Atomic linear-elastic potential energy, `Π = U - W_ext`.
+///
+/// `LossTerm` normally maps one domain to one point set.  This term deliberately repeats the
+/// same domain id for the interior and outer-boundary point sets, so the generic live driver
+/// builds both required forwards and gives this one term both halves of the physical
+/// functional.  That keeps its physical 1:-1 coefficient ratio inside the tensor graph before
+/// any optimizer/adaptive weighting is applied.
+struct PhysicalPotentialEnergyTerm {
+    material: MaterialProps,
+    px: f64,
+    py: f64,
+    measure_aware: bool,
+    domain_area: f64,
+    thickness: f64,
+    ref_energy: f32,
+    ref_energy_absolute: f64,
+    interior_weights: Option<Vec<f64>>,
+    ds_per_point: Vec<f64>,
+}
+
+impl LossTerm for PhysicalPotentialEnergyTerm {
+    fn name(&self) -> &'static str { "physical_potential" }
+    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN, USER_DOMAIN] }
+    fn point_sets(&self) -> Vec<&'static str> { vec!["interior", "outer_boundary"] }
+    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Weak }
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
+
+    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        assert_eq!(inputs.len(), 2, "physical_potential requires interior and outer-boundary forwards");
+        let interior = &inputs[0];
+        let boundary = &inputs[1];
+        let (exx, eyy, exy) = interior.strains.clone()
+            .expect("physical_potential: interior strains must be Some");
+        let u = if self.measure_aware {
+            let density = crate::energy::dem_energy_per_point(exx, eyy, exy, &self.material);
+            match &self.interior_weights {
+                Some(weights) => crate::measure_integral::domain_integral_weighted_tensor::<B>(
+                    self.domain_area, self.thickness, density, weights,
+                ),
+                None => crate::measure_integral::domain_integral_tensor::<B>(
+                    self.domain_area, self.thickness, density,
+                ),
+            }.mul_scalar(1.0 / self.ref_energy_absolute)
+        } else {
+            dem_energy_loss(exx, eyy, exy, &self.material)
+                .mul_scalar(1.0 / self.ref_energy as f64)
+        };
+
+        let (nx, ny) = boundary.normals.clone()
+            .expect("physical_potential: boundary normals must be Some");
+        let n = boundary.raw_out.dims()[0];
+        let displacement = match crate::field_graph::resolve_field(
+            crate::field_graph::FieldKind::Displacement, boundary.raw_out, None, None,
+        ).expect("physical_potential requires displacement") {
+            crate::field_graph::ResolvedField::Displacement(value) => value,
+            _ => unreachable!("displacement resolver returned wrong field kind"),
+        };
+        let ux = displacement.clone().slice([0..n, 0..1]).reshape([n]);
+        let uy = displacement.slice([0..n, 1..2]).reshape([n]);
+        let work_density = nx.mul_scalar(self.px) * ux + ny.mul_scalar(self.py) * uy;
+        let w_ext = if self.measure_aware {
+            crate::measure_integral::boundary_integral_tensor::<B>(
+                work_density, &self.ds_per_point, self.thickness,
+            ).mul_scalar(1.0 / self.ref_energy_absolute)
+        } else {
+            work_density.mean().mul_scalar(1.0 / self.ref_energy as f64)
+        };
+        u - w_ext
+    }
+}
 impl LossTerm for ExternalWorkTerm {
     fn name(&self) -> &'static str { "external_work" }
     fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
@@ -521,9 +621,12 @@ impl LossTerm for HoleBcTerm {
         match self.bc {
             HoleBc::Free => {
                 let (nx, ny) = d.normals.clone().expect("hole_bc(free): normals must be Some");
-                let sxx = d.raw_out.clone().slice([0..n, 2..3]).reshape([n]);
-                let syy = d.raw_out.clone().slice([0..n, 3..4]).reshape([n]);
-                let sxy = d.raw_out.clone().slice([0..n, 4..5]).reshape([n]);
+                let (sxx, syy, sxy) = match crate::field_graph::resolve_field(
+                    crate::field_graph::FieldKind::DirectStress, d.raw_out, None, None,
+                ).expect("hole_free requires direct mDEM stress") {
+                    crate::field_graph::ResolvedField::DirectStress(value) => value,
+                    _ => unreachable!("direct-stress resolver returned wrong field kind"),
+                };
                 hole_traction_loss_direct(sxx, syy, sxy, nx, ny).mul_scalar(1.0 / self.ref_stress2 as f64)
             }
             HoleBc::Fixed => {
@@ -548,7 +651,14 @@ impl LossTerm for HoleBcTerm {
 /// so LOCAL displacement variation is untouched and only the domain-wide rigid-body DRIFT is
 /// penalized) toward zero. Registered ONLY when `self.spec.geometry.is_pure_neumann()` (see
 /// `loss_terms()`) - never active for a problem that already has a real Dirichlet anchor.
-struct TranslationGaugeTerm;
+///
+/// The raw displacement means are in metres while physical Pi is dimensionless after reference
+/// energy normalization. `inv_u_ref_sq` makes this a dimensionless admissibility constraint;
+/// without it a micrometre-scale rigid translation contributes ~1e-12 and is inert regardless
+/// of its nominal base weight.
+struct TranslationGaugeTerm {
+    inv_u_ref_sq: f64,
+}
 impl LossTerm for TranslationGaugeTerm {
     fn name(&self) -> &'static str { "translation_gauge" }
     fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
@@ -565,7 +675,50 @@ impl LossTerm for TranslationGaugeTerm {
         let v = d.raw_out.clone().slice([0..n, 1..2]).reshape([n]);
         let u_mean = u.mean();
         let v_mean = v.mean();
-        u_mean.clone() * u_mean + v_mean.clone() * v_mean
+        (u_mean.clone() * u_mean + v_mean.clone() * v_mean).mul_scalar(self.inv_u_ref_sq)
+    }
+}
+
+/// Removes the remaining rigid-body rotation in a pure-Neumann plate without constraining
+/// symmetric strain.  `UserSamplingStrategy::sample_boundary` orders each repeated edge group
+/// as right, left, top, bottom.  The edge-mean finite differences below estimate the domain
+/// average infinitesimal rotation `1/2 (dv/dx - du/dy)`: it is nonzero for a rigid rotation,
+/// exactly zero for every affine symmetric strain (extension or shear), and shifts by exactly
+/// the added rigid rotation.  This selects a displacement representative only; stress and
+/// strain are unchanged.
+struct RotationGaugeTerm {
+    half_w: f64,
+    half_h: f64,
+}
+
+impl LossTerm for RotationGaugeTerm {
+    fn name(&self) -> &'static str { "rotation_gauge" }
+    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
+    fn point_sets(&self) -> Vec<&'static str> { vec!["outer_boundary"] }
+    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
+
+    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        let d = inputs.iter().find(|i| i.domain == USER_DOMAIN)
+            .expect("rotation_gauge: domain missing");
+        let n = d.raw_out.dims()[0];
+        assert!(n >= 4 && n % 4 == 0,
+            "rotation_gauge requires four equally sampled outer edges, got {n} points");
+        let per_edge = n / 4;
+        let u = d.raw_out.clone().slice([0..n, 0..1]).reshape([n]);
+        let v = d.raw_out.clone().slice([0..n, 1..2]).reshape([n]);
+        let mean = |values: Tensor<B, 1>, start: usize| {
+            values.slice([start..start + per_edge]).mean()
+        };
+        let u_top = mean(u.clone(), 2 * per_edge);
+        let u_bottom = mean(u, 3 * per_edge);
+        let v_right = mean(v.clone(), 0);
+        let v_left = mean(v.clone(), per_edge);
+        let dv_dx = (v_right - v_left).mul_scalar(1.0 / (2.0 * self.half_w));
+        let du_dy = (u_top - u_bottom).mul_scalar(1.0 / (2.0 * self.half_h));
+        let omega = (dv_dx - du_dy).mul_scalar(0.5);
+        omega.clone() * omega
     }
 }
 
@@ -645,6 +798,11 @@ impl BoundaryValueProblem for UserDefinedProblem {
     }
 
     fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
+        assert!(
+            !matches!(self.spec.formulation, pinn_core::problem_spec::FormulationSelection::Variational)
+                || self.spec.training.measure_aware_training,
+            "Variational formulation requires training.measure_aware_training=true: legacy mean U and boundary-mean W_ext do not share physical measures"
+        );
         // Centralized (General-PINN architecture recommendations §35-37, Priority 2,
         // "dimensionless normalization") - see `training_core::PlateReferenceScales`'s doc
         // comment for why this replaced ~15 independently hand-written formula copies, and
@@ -693,7 +851,7 @@ impl BoundaryValueProblem for UserDefinedProblem {
         // terms are active differ.
         use pinn_core::problem_spec::FormulationSelection;
         let active_base: std::collections::HashSet<&'static str> = match &self.spec.formulation {
-            FormulationSelection::Variational => ["interior_energy", "external_work"].into_iter().collect(),
+            FormulationSelection::Variational => ["physical_potential"].into_iter().collect(),
             FormulationSelection::Strong => ["equilibrium", "outer_traction"].into_iter().collect(),
             FormulationSelection::Hybrid(names) => names.iter().map(|s| match s.as_str() {
                 "interior_energy" => "interior_energy",
@@ -715,6 +873,13 @@ impl BoundaryValueProblem for UserDefinedProblem {
         let hole_free_active = !matches!(self.spec.formulation, FormulationSelection::Variational);
 
         let mut terms: Vec<Box<dyn LossTerm>> = Vec::new();
+        if active_base.contains("physical_potential") {
+            terms.push(Box::new(PhysicalPotentialEnergyTerm {
+                material: self.spec.material.clone(), px: self.spec.load.px, py: self.spec.load.py,
+                measure_aware, domain_area, thickness, ref_energy, ref_energy_absolute,
+                interior_weights: interior_weights.clone(), ds_per_point: ds_per_point.clone(),
+            }));
+        }
         if active_base.contains("interior_energy") {
             terms.push(Box::new(InteriorEnergyTerm {
                 material: self.spec.material.clone(), ref_energy,
@@ -749,7 +914,19 @@ impl BoundaryValueProblem for UserDefinedProblem {
         // toml` with its hole set to Free are both real, current examples of this). Never
         // registered when a real Dirichlet anchor already exists (redundant there).
         if self.spec.geometry.is_pure_neumann() {
-            terms.push(Box::new(TranslationGaugeTerm));
+            terms.push(Box::new(TranslationGaugeTerm {
+                inv_u_ref_sq: 1.0 / (scales.u_ref as f64).powi(2).max(1e-30),
+            }));
+        }
+        // PH4 preserves frozen legacy Hybrid/Strong trajectories. Corrected Variational is a
+        // new formulation contract and additionally removes its rotational nullspace.
+        if self.spec.geometry.is_pure_neumann()
+            && matches!(self.spec.formulation, FormulationSelection::Variational)
+        {
+            terms.push(Box::new(RotationGaugeTerm {
+                half_w: self.spec.geometry.half_w,
+                half_h: self.spec.geometry.half_h,
+            }));
         }
         terms
     }
@@ -757,12 +934,14 @@ impl BoundaryValueProblem for UserDefinedProblem {
     fn base_weight(&self, term_name: &str) -> f32 {
         match term_name {
             "interior_energy" => LAM_INTERIOR_ENERGY,
+            "physical_potential" => LAM_PHYSICAL_POTENTIAL,
             "equilibrium" => LAM_EQUILIBRIUM_PLATE,
             "outer_traction" => LAM_OUTER_TRACTION,
             "external_work" => LAM_EXTERNAL_WORK,
             "hole_free" => LAM_HOLE_FREE,
             "hole_fixed" => LAM_HOLE_FIXED,
             "translation_gauge" => LAM_TRANSLATION_GAUGE,
+            "rotation_gauge" => LAM_ROTATION_GAUGE,
             other => panic!("UserDefinedProblem::base_weight: unknown loss term '{other}'"),
         }
     }
@@ -778,16 +957,15 @@ impl BoundaryValueProblem for UserDefinedProblem {
 
 /// Builds a `VisFields` for GUI display by evaluating `model` once over a
 /// `[nx,ny]`-shaped normalized grid masked by `geometry.contains` — mirrors `runner.rs`'s
-/// private `evaluate_vis_grid_mdem` (same mDEM direct-column read, same von Mises formula,
+/// private `evaluate_vis_grid_mdem` (same mDEM forward convention, same von Mises formula,
 /// same Phase 14 strain/residual/AMR-score/density extension), adapted for `UserGeometry`'s
 /// N-hole containment check instead of `GeometryConfig`'s single-hole one.
 ///
 /// Phase 14 extension reuses the exact FD-stencil + physical-scale-before-derivative
 /// convention `probe_hole_boundary_profile` already established for this same ansatz (see
-/// that function's doc comment): `sigma_xx/yy/xy` are direct network outputs here, so an
-/// independent FD-derived strain estimate is a genuine second measurement, and comparing it
-/// against the direct stress via the material's constitutive law is exactly the
-/// `constitutive_consistency` training term's per-point residual, now surfaced for display.
+/// that function's doc comment): displayed `sigma_xx/yy/xy` are constitutive stress from
+/// FD-derived strain. Direct mDEM stress is auxiliary; direct-minus-constitutive is the
+/// explicit consistency residual surfaced for display.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_user_vis_grid(
     model: &crate::network::ElasticityNet<crate::training_core::BInner>,
@@ -801,7 +979,8 @@ pub fn evaluate_user_vis_grid(
     device: &crate::training_core::BDevice,
 ) -> pinn_core::messages::VisFields {
     use crate::network::fwd;
-    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor};
+    use crate::differential_operator::production_strain as compute_strains;
+    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor};
     use crate::energy::dem_energy_per_point;
     use crate::training_core::BInner;
     use ndarray::Array2;
@@ -885,13 +1064,18 @@ pub fn evaluate_user_vis_grid(
     for (i_act, &i_full) in active.iter().enumerate() {
         let u = center_vals[i_act * 5];
         let v = center_vals[i_act * 5 + 1];
-        let sxx = center_vals[i_act * 5 + 2] as f64;
-        let syy = center_vals[i_act * 5 + 3] as f64;
-        let sxy = center_vals[i_act * 5 + 4] as f64;
+        let direct_sxx = center_vals[i_act * 5 + 2] as f64;
+        let direct_syy = center_vals[i_act * 5 + 3] as f64;
+        let direct_sxy = center_vals[i_act * 5 + 4] as f64;
+        // Engineering/visualization stress is constitutive stress.  Direct mDEM stress is
+        // auxiliary and remains visible only through its explicit consistency residual.
+        let sxx = sxx_fd_v[i_act] as f64;
+        let syy = syy_fd_v[i_act] as f64;
+        let sxy = sxy_fd_v[i_act] as f64;
         let vm = (sxx * sxx - sxx * syy + syy * syy + 3.0 * sxy * sxy).sqrt();
-        let dex = sxx - sxx_fd_v[i_act] as f64;
-        let dey = syy - syy_fd_v[i_act] as f64;
-        let dexy = sxy - sxy_fd_v[i_act] as f64;
+        let dex = direct_sxx - sxx;
+        let dey = direct_syy - syy;
+        let dexy = direct_sxy - sxy;
         s_xx[i_full] = sxx as f32;
         s_yy[i_full] = syy as f32;
         s_xy[i_full] = sxy as f32;
@@ -918,7 +1102,8 @@ pub fn probe_boundary_residuals(
     device: &crate::training_core::BDevice,
 ) -> (f64, f64) {
     use crate::energy::compute_stress;
-    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig};
+    use crate::differential_operator::production_strain as compute_strains;
+    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
     use crate::network::fwd;
     use crate::training_core::BInner;
     use burn::tensor::TensorData;
@@ -1059,7 +1244,8 @@ pub fn probe_reaction_force(
     device: &crate::training_core::BDevice,
 ) -> pinn_core::messages::ReactionForce {
     use crate::energy::compute_stress;
-    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig};
+    use crate::differential_operator::production_strain as compute_strains;
+    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
     use crate::network::fwd;
     use crate::training_core::BInner;
     use burn::tensor::TensorData;
@@ -1157,7 +1343,8 @@ pub fn probe_load_transfer(
     device: &crate::training_core::BDevice,
 ) -> LoadTransferReport {
     use crate::energy::compute_stress;
-    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig};
+    use crate::differential_operator::production_strain as compute_strains;
+    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
     use crate::network::fwd;
     use crate::training_core::BInner;
     use burn::tensor::TensorData;
@@ -1288,7 +1475,8 @@ pub fn run_no_hole_benchmark(
          for a holed geometry",
     );
     use crate::energy::compute_stress;
-    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig};
+    use crate::differential_operator::production_strain as compute_strains;
+    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
     use crate::network::fwd;
     use crate::training_core::{residual_stats, BInner};
 
@@ -1345,6 +1533,82 @@ pub fn run_no_hole_benchmark(
         sigma_xx_relative_error, sigma_yy_over_ref, sigma_xy_over_ref,
         traction_rms_over_ref, load_transfer_ratio: load_transfer.load_transfer_ratio,
         passed: failures.is_empty(), failures,
+    }
+}
+
+/// Independent no-hole displacement/strain validation against the exact affine field. This
+/// consumes published visualization fields, not the training loss or direct mDEM stress.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NoHoleFieldValidation {
+    pub u_l2: f64,
+    pub u_linf: f64,
+    pub v_l2: f64,
+    pub v_linf: f64,
+    pub strain_l2: f64,
+    pub strain_linf: f64,
+    pub sigma_xx_relative_error: f64,
+    pub sigma_yy_over_ref: f64,
+    pub sigma_xy_over_ref: f64,
+    pub rigid_translation_residual: f64,
+    pub rigid_rotation_residual: f64,
+}
+
+/// Validate constitutive/displayed fields on a regular no-hole grid. NaN-masked points are
+/// excluded. Rotation uses the antisymmetric displacement gradient, so symmetric strain alone
+/// cannot hide a rigid-body mode.
+pub fn validate_no_hole_fields(
+    fields: &pinn_core::messages::VisFields,
+    spec: &ProblemSpec,
+) -> NoHoleFieldValidation {
+    assert!(spec.geometry.holes.is_empty(), "field validation requires no-hole geometry");
+    let (ny, nx) = fields.disp_u.dim();
+    let a = spec.load.px / spec.material.e;
+    let stress_ref = spec.load.px.abs().max(1e-30);
+    let mut u_sq: f64 = 0.0; let mut u_max: f64 = 0.0;
+    let mut v_sq: f64 = 0.0; let mut v_max: f64 = 0.0;
+    let mut strain_sq: f64 = 0.0; let mut strain_max: f64 = 0.0;
+    let mut sxx_sq: f64 = 0.0; let mut syy_sq: f64 = 0.0; let mut sxy_sq: f64 = 0.0;
+    let mut count: f64 = 0.0; let mut mean_du: f64 = 0.0; let mut mean_dv: f64 = 0.0;
+    for iy in 0..ny { for ix in 0..nx {
+        let x = -spec.geometry.half_w + 2.0 * spec.geometry.half_w * ix as f64 / (nx.max(2)-1) as f64;
+        let y = -spec.geometry.half_h + 2.0 * spec.geometry.half_h * iy as f64 / (ny.max(2)-1) as f64;
+        let u = fields.disp_u[(iy, ix)] as f64; let v = fields.disp_v[(iy, ix)] as f64;
+        if !(u.is_finite() && v.is_finite()) { continue; }
+        let du = u - a*x; let dv = v + spec.material.nu*a*y;
+        u_sq += du*du; v_sq += dv*dv; u_max = u_max.max(du.abs()); v_max = v_max.max(dv.abs());
+        mean_du += du; mean_dv += dv; count += 1.0;
+        let ex = fields.eps_xx[(iy, ix)] as f64 - a;
+        let ey = fields.eps_yy[(iy, ix)] as f64 + spec.material.nu*a;
+        let es = fields.eps_xy[(iy, ix)] as f64;
+        if ex.is_finite() && ey.is_finite() && es.is_finite() {
+            let e2 = ex*ex + ey*ey + es*es; strain_sq += e2; strain_max = strain_max.max(e2.sqrt());
+        }
+        let sx = fields.sigma_xx[(iy, ix)] as f64 - spec.load.px;
+        let sy = fields.sigma_yy[(iy, ix)] as f64;
+        let ss = fields.sigma_xy[(iy, ix)] as f64;
+        if sx.is_finite() { sxx_sq += sx*sx; } if sy.is_finite() { syy_sq += sy*sy; } if ss.is_finite() { sxy_sq += ss*ss; }
+    }}
+    let denom = count.max(1.0);
+    let mut rotation_sq = 0.0; let mut rotation_count = 0.0;
+    if nx > 2 && ny > 2 {
+        let dx = 2.0 * spec.geometry.half_w / (nx - 1) as f64;
+        let dy = 2.0 * spec.geometry.half_h / (ny - 1) as f64;
+        for iy in 1..ny-1 { for ix in 1..nx-1 {
+            let vals = [fields.disp_v[(iy, ix+1)], fields.disp_v[(iy, ix-1)], fields.disp_u[(iy+1, ix)], fields.disp_u[(iy-1, ix)]];
+            if vals.iter().all(|v| v.is_finite()) {
+                let omega = 0.5 * (((vals[0]-vals[1]) as f64 / (2.0*dx)) - ((vals[2]-vals[3]) as f64 / (2.0*dy)));
+                rotation_sq += omega*omega; rotation_count += 1.0;
+            }
+        }}
+    }
+    NoHoleFieldValidation {
+        u_l2: (u_sq/denom).sqrt(), u_linf: u_max, v_l2: (v_sq/denom).sqrt(), v_linf: v_max,
+        strain_l2: (strain_sq/denom).sqrt(), strain_linf: strain_max,
+        sigma_xx_relative_error: (sxx_sq/denom).sqrt()/stress_ref,
+        sigma_yy_over_ref: (syy_sq/denom).sqrt()/stress_ref,
+        sigma_xy_over_ref: (sxy_sq/denom).sqrt()/stress_ref,
+        rigid_translation_residual: ((mean_du/denom).powi(2)+(mean_dv/denom).powi(2)).sqrt(),
+        rigid_rotation_residual: if rotation_count > 0.0 { (rotation_sq/rotation_count).sqrt() } else { f64::NAN },
     }
 }
 
@@ -1449,16 +1713,31 @@ pub fn run_hole_benchmark(
 /// uses, halved for the same quasi-static-linear-loading `1/2` factor `energy::
 /// dem_energy_per_point`'s own `1/2 * sigma:epsilon` formula carries (so both sides are on a
 /// consistent basis).
+fn prescribed_traction_dot_displacement(
+    load: &LoadConfig,
+    nx: &[f32],
+    ny: &[f32],
+    u: &[f32],
+    v: &[f32],
+) -> Vec<f32> {
+    assert_eq!(nx.len(), ny.len());
+    assert_eq!(nx.len(), u.len());
+    assert_eq!(nx.len(), v.len());
+    (0..nx.len()).map(|i| {
+        (load.px as f32 * nx[i]) * u[i] + (load.py as f32 * ny[i]) * v[i]
+    }).collect()
+}
+
 pub fn probe_energy_balance(
     model: &crate::network::ElasticityNet<crate::training_core::BInner>,
     spec: &ProblemSpec,
     device: &crate::training_core::BDevice,
 ) -> pinn_core::messages::EnergyBalance {
-    use crate::energy::{compute_stress, dem_energy_per_point};
-    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig};
+    use crate::energy::dem_energy_per_point;
+    use crate::differential_operator::production_strain as compute_strains;
+    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
     use crate::network::fwd;
     use crate::training_core::BInner;
-    use burn::tensor::TensorData;
 
     let geometry = &spec.geometry;
     let sampling = UserSamplingStrategy::new(geometry.clone(), spec.training.fd_h);
@@ -1510,23 +1789,18 @@ pub fn probe_energy_balance(
             raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
             raw.slice([0..m, 2..5]).mul_scalar(px_pa),
         ], 1);
-        let (exx, eyy, exy) = compute_strains::<BInner>(scaled.clone(), n_bnd, &fd);
-        let (sxx, syy, sxy) = compute_stress::<BInner>(exx, eyy, exy, &spec.material);
         let nx: Vec<f32> = bnd_pts_phys.iter().map(|p| p.nx as f32).collect();
         let ny: Vec<f32> = bnd_pts_phys.iter().map(|p| p.ny as f32).collect();
-        let nx_t = Tensor::<BInner, 1>::from_data(TensorData::new(nx.clone(), vec![n_bnd]), device);
-        let ny_t = Tensor::<BInner, 1>::from_data(TensorData::new(ny.clone(), vec![n_bnd]), device);
-        let tx_pred = (sxx.clone() * nx_t.clone() + sxy.clone() * ny_t.clone())
-            .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
-        let ty_pred = (sxy * nx_t + syy * ny_t)
-            .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
         let u_vals: Vec<f32> = scaled.clone().slice([0..n_bnd, 0..1]).reshape([n_bnd])
             .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
         let v_vals: Vec<f32> = scaled.slice([0..n_bnd, 1..2]).reshape([n_bnd])
             .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
-        let traction_dot_u: Vec<f32> = (0..n_bnd)
-            .map(|i| tx_pred[i] * u_vals[i] + ty_pred[i] * v_vals[i])
-            .collect();
+        // Physical external work is the prescribed traction `tbar` dotted with the trial
+        // displacement.  Using model-derived traction here would diagnose a different,
+        // non-variational quantity and make `U-W_ext` unreconstructable from persisted data.
+        let traction_dot_u = prescribed_traction_dot_displacement(
+            &spec.load, &nx, &ny, &u_vals, &v_vals,
+        );
         let ds_per_point: Vec<f64> = (0..n_bnd)
             .map(|i| if nx[i].abs() > 0.5 { ds_x_normal } else { ds_y_normal })
             .collect();
@@ -1568,7 +1842,8 @@ pub fn probe_hole_boundary_profile(
     px_pa: f64,
     device: &crate::training_core::BDevice,
 ) -> Vec<HoleBoundaryPoint> {
-    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor};
+    use crate::differential_operator::production_strain as compute_strains;
+    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor};
     use crate::network::fwd;
     use crate::training_core::BInner;
 
@@ -1693,7 +1968,8 @@ pub fn probe_hole_boundary_profile_derived(
     device: &crate::training_core::BDevice,
 ) -> Vec<HoleBoundaryPoint> {
     use crate::energy::compute_stress;
-    use crate::fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor};
+    use crate::differential_operator::production_strain as compute_strains;
+    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor};
     use crate::network::fwd;
     use crate::training_core::BInner;
 
@@ -2107,6 +2383,149 @@ mod tests {
         assert!((loss_v - expected).abs() / expected.abs() < 1e-3, "loss={loss_v} expected={expected}");
     }
 
+    /// PH4-03: exercise the exact two-point-set shape used by `step_physics_multi`, not a
+    /// helper-only reconstruction.  One returned tensor contains both U and W; a caller can
+    /// therefore only scale their already-combined physical ratio uniformly.
+    #[test]
+    fn physical_potential_is_one_live_atomic_u_minus_w_term() {
+        use burn::tensor::TensorData;
+
+        let device: crate::training_core::BDevice = Default::default();
+        let material = MaterialProps::al7075_t6();
+        let n_interior = 2;
+        let exx = Tensor::<B, 1>::from_data(TensorData::new(vec![0.001_f32, 0.0015], vec![n_interior]), &device);
+        let eyy = Tensor::<B, 1>::from_data(TensorData::new(vec![-0.00033_f32, -0.0005], vec![n_interior]), &device);
+        let exy = Tensor::<B, 1>::zeros([n_interior], &device);
+        let interior_out = Tensor::<B, 2>::zeros([n_interior, 5], &device);
+
+        let n_boundary = 2;
+        let boundary_out = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![2e-5_f32, 0.0, -2e-5, 0.0], vec![n_boundary, 2]), &device,
+        );
+        let nx = Tensor::<B, 1>::from_data(TensorData::new(vec![1.0_f32, -1.0], vec![n_boundary]), &device);
+        let ny = Tensor::<B, 1>::zeros([n_boundary], &device);
+        let domain_area = 2.0;
+        let thickness = 0.5;
+        let ref_energy_absolute = 7.0;
+        let px = 6.9e7;
+        let term = PhysicalPotentialEnergyTerm {
+            material: material.clone(), px, py: 0.0, measure_aware: true, domain_area,
+            thickness, ref_energy: 1.0, ref_energy_absolute, interior_weights: None,
+            ds_per_point: vec![1.0, 1.0],
+        };
+        assert_eq!(term.domains(), vec![USER_DOMAIN, USER_DOMAIN]);
+        assert_eq!(term.point_sets(), vec!["interior", "outer_boundary"]);
+        let actual = term.compute(&[
+            DomainForwardOutputs {
+                domain: USER_DOMAIN, raw_out: &interior_out,
+                strains: Some((exx.clone(), eyy.clone(), exy.clone())), normals: None,
+                shifted_stress: None, hessian: None,
+            },
+            DomainForwardOutputs {
+                domain: USER_DOMAIN, raw_out: &boundary_out, strains: None,
+                normals: Some((nx, ny)), shifted_stress: None, hessian: None,
+            },
+        ]).into_data().to_vec::<f32>().unwrap()[0] as f64;
+
+        let u = crate::measure_integral::domain_integral_tensor::<B>(
+            domain_area, thickness,
+            crate::energy::dem_energy_per_point::<B>(exx, eyy, exy, &material),
+        ).into_data().to_vec::<f32>().unwrap()[0] as f64;
+        let w = 2.0 * px * 2e-5 * thickness;
+        let expected = (u - w) / ref_energy_absolute;
+        assert!((actual - expected).abs() / expected.abs().max(1e-12) < 1e-5,
+            "atomic Pi={actual}, expected (U-W)/reference={expected}");
+    }
+
+    /// PH4-03 acceptance at the exact production-term layer: use the prescribed affine
+    /// displacement/strain field and prove this term's stationary point is `sigma0 / E`.
+    /// This catches a sign, measure, or independently-scaled U/W regression that a helper-only
+    /// affine calculation would miss.
+    #[test]
+    fn physical_potential_live_term_has_the_correct_affine_minimizer() {
+        use burn::tensor::TensorData;
+
+        let device: crate::training_core::BDevice = Default::default();
+        let material = MaterialProps::al7075_t6();
+        let (half_w, half_h, thickness) = (0.13_f64, 0.07_f64, 0.004_f64);
+        let area = 4.0 * half_w * half_h;
+        let sigma0 = 4.2e7_f64;
+        let exact = sigma0 / material.e;
+        let evaluate = |a: f64| -> f64 {
+            let interior_out = Tensor::<B, 2>::zeros([1, 5], &device);
+            let exx = Tensor::<B, 1>::from_data(TensorData::new(vec![a as f32], vec![1]), &device);
+            let eyy = Tensor::<B, 1>::from_data(TensorData::new(vec![(-material.nu * a) as f32], vec![1]), &device);
+            let exy = Tensor::<B, 1>::zeros([1], &device);
+            // Boundary order is right, left, top, bottom. Only right/left do prescribed work.
+            let boundary_out = Tensor::<B, 2>::from_data(TensorData::new(vec![
+                (a * half_w) as f32, 0.0, (-a * half_w) as f32, 0.0,
+                0.0, (-material.nu * a * half_h) as f32,
+                0.0, (material.nu * a * half_h) as f32,
+            ], vec![4, 2]), &device);
+            let nx = Tensor::<B, 1>::from_data(TensorData::new(vec![1.0_f32, -1.0, 0.0, 0.0], vec![4]), &device);
+            let ny = Tensor::<B, 1>::from_data(TensorData::new(vec![0.0_f32, 0.0, 1.0, -1.0], vec![4]), &device);
+            PhysicalPotentialEnergyTerm {
+                material: material.clone(), px: sigma0, py: 0.0, measure_aware: true,
+                domain_area: area, thickness, ref_energy: 1.0, ref_energy_absolute: 1.0,
+                interior_weights: None,
+                ds_per_point: vec![2.0 * half_h, 2.0 * half_h, 2.0 * half_w, 2.0 * half_w],
+            }.compute(&[
+                DomainForwardOutputs { domain: USER_DOMAIN, raw_out: &interior_out,
+                    strains: Some((exx, eyy, exy)), normals: None, shifted_stress: None, hessian: None },
+                DomainForwardOutputs { domain: USER_DOMAIN, raw_out: &boundary_out,
+                    strains: None, normals: Some((nx, ny)), shifted_stress: None, hessian: None },
+            ]).into_data().to_vec::<f32>().unwrap()[0] as f64
+        };
+        let pi_exact = evaluate(exact);
+        let pi_low = evaluate(0.75 * exact);
+        let pi_high = evaluate(1.25 * exact);
+        assert!(pi_exact < pi_low && pi_exact < pi_high,
+            "atomic live Pi must minimize at sigma0/E: exact={pi_exact}, low={pi_low}, high={pi_high}");
+        let h = exact * 1e-3;
+        let derivative = (evaluate(exact + h) - evaluate(exact - h)) / (2.0 * h);
+        let scale = (sigma0 * area * thickness).abs();
+        assert!(derivative.abs() / scale < 2e-3,
+            "dPi/da at sigma0/E must vanish, got {derivative}");
+    }
+
+    #[test]
+    fn physical_potential_live_measure_aware_weights_remove_nonuniform_interior_bias() {
+        use burn::tensor::TensorData;
+        let device: crate::training_core::BDevice = Default::default();
+        let material = MaterialProps::al7075_t6();
+        let exx = Tensor::<B, 1>::from_data(TensorData::new(vec![0.0005_f32, 0.004], vec![2]), &device);
+        let eyy = Tensor::<B, 1>::from_data(TensorData::new(vec![-0.000165_f32, -0.00132], vec![2]), &device);
+        let exy = Tensor::<B, 1>::zeros([2], &device);
+        let interior_out = Tensor::<B, 2>::zeros([2, 5], &device);
+        let boundary_out = Tensor::<B, 2>::zeros([4, 2], &device);
+        let nx = Tensor::<B, 1>::zeros([4], &device);
+        let ny = Tensor::<B, 1>::zeros([4], &device);
+        let weights = vec![1.8, 0.2]; // mean one; an AMR-density compensation shape.
+        let make_term = |weights: Option<Vec<f64>>| PhysicalPotentialEnergyTerm {
+            material: material.clone(), px: 0.0, py: 0.0, measure_aware: true,
+            domain_area: 1.0, thickness: 1.0, ref_energy: 1.0, ref_energy_absolute: 1.0,
+            interior_weights: weights, ds_per_point: vec![0.25; 4],
+        };
+        let weighted = make_term(Some(weights.clone())).compute(&[
+            DomainForwardOutputs { domain: USER_DOMAIN, raw_out: &interior_out,
+                strains: Some((exx.clone(), eyy.clone(), exy.clone())), normals: None, shifted_stress: None, hessian: None },
+            DomainForwardOutputs { domain: USER_DOMAIN, raw_out: &boundary_out,
+                strains: None, normals: Some((nx.clone(), ny.clone())), shifted_stress: None, hessian: None },
+        ]).into_data().to_vec::<f32>().unwrap()[0] as f64;
+        let unweighted = make_term(None).compute(&[
+            DomainForwardOutputs { domain: USER_DOMAIN, raw_out: &interior_out,
+                strains: Some((exx.clone(), eyy.clone(), exy.clone())), normals: None, shifted_stress: None, hessian: None },
+            DomainForwardOutputs { domain: USER_DOMAIN, raw_out: &boundary_out,
+                strains: None, normals: Some((nx, ny)), shifted_stress: None, hessian: None },
+        ]).into_data().to_vec::<f32>().unwrap()[0] as f64;
+        let expected = crate::measure_integral::domain_integral_weighted_tensor::<B>(
+            1.0, 1.0, crate::energy::dem_energy_per_point::<B>(exx, eyy, exy, &material), &weights,
+        ).into_data().to_vec::<f32>().unwrap()[0] as f64;
+        assert!((weighted - expected).abs() / expected.abs() < 1e-6, "{weighted} vs {expected}");
+        assert!((weighted - unweighted).abs() / unweighted.abs() > 0.1,
+            "compensation must materially change this deliberately biased sample");
+    }
+
     fn two_hole_geometry() -> UserGeometry {
         UserGeometry {
             half_w: 0.1,
@@ -2297,7 +2716,7 @@ mod tests {
             domain: USER_DOMAIN, raw_out: &raw_out,
             strains: None, normals: None, shifted_stress: None, hessian: None,
         };
-        let term = TranslationGaugeTerm;
+        let term = TranslationGaugeTerm { inv_u_ref_sq: 1.0 };
         let loss = term.compute(&[d]);
         let loss_v = loss.into_data().to_vec::<f32>().unwrap()[0] as f64;
         let expected = 0.002_f64 * 0.002 + 0.001 * 0.001;
@@ -2318,12 +2737,58 @@ mod tests {
         assert!(loss2_v.abs() < 1e-9, "zero-mean field must get zero penalty, got {loss2_v}");
     }
 
+    #[test]
+    fn translation_gauge_is_dimensionless_at_the_reference_displacement() {
+        use burn::tensor::TensorData;
+        let device: crate::training_core::BDevice = Default::default();
+        let u_ref = 2.0e-5_f64;
+        let raw_out = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![u_ref as f32, 0.0, u_ref as f32, 0.0], vec![2, 2]), &device,
+        );
+        let d = DomainForwardOutputs {
+            domain: USER_DOMAIN, raw_out: &raw_out,
+            strains: None, normals: None, shifted_stress: None, hessian: None,
+        };
+        let loss = TranslationGaugeTerm { inv_u_ref_sq: 1.0 / u_ref.powi(2) }
+            .compute(&[d]).into_data().to_vec::<f32>().unwrap()[0] as f64;
+        assert!((loss - 1.0).abs() < 1e-5, "reference rigid translation must be O(1), got {loss}");
+    }
+
+    #[test]
+    fn rotation_gauge_removes_only_rigid_rotation_not_affine_symmetric_strain() {
+        use burn::tensor::TensorData;
+        let device: crate::training_core::BDevice = Default::default();
+        let term = RotationGaugeTerm { half_w: 2.0, half_h: 1.0 };
+        // One point per edge in UserSamplingStrategy's right, left, top, bottom order.
+        // Rigid rotation u=-omega*y, v=omega*x has omega=0.03 exactly.
+        let rotation = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![0.0_f32, 0.06, 0.0, -0.06, -0.03, 0.0, 0.03, 0.0], vec![4, 2]),
+            &device,
+        );
+        let rigid_loss = term.compute(&[DomainForwardOutputs {
+            domain: USER_DOMAIN, raw_out: &rotation, strains: None, normals: None,
+            shifted_stress: None, hessian: None,
+        }]).into_data().to_vec::<f32>().unwrap()[0] as f64;
+        assert!((rigid_loss - 0.03_f64.powi(2)).abs() < 1e-9, "{rigid_loss}");
+
+        // Symmetric affine extension u=a*x, v=-nu*a*y has zero rotation.
+        let extension = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![0.04_f32, 0.0, -0.04, 0.0, 0.0, -0.01, 0.0, 0.01], vec![4, 2]),
+            &device,
+        );
+        let extension_loss = term.compute(&[DomainForwardOutputs {
+            domain: USER_DOMAIN, raw_out: &extension, strains: None, normals: None,
+            shifted_stress: None, hessian: None,
+        }]).into_data().to_vec::<f32>().unwrap()[0];
+        assert!(extension_loss.abs() < 1e-12, "{extension_loss}");
+    }
+
     /// Issue #61 P2-01 acceptance: "Variational activates only declared variational terms and
-    /// constraints." `interior_energy`/`external_work` (the U-W_ext pair) plus the essential
+    /// constraints." Atomic `physical_potential` (`U-W_ext`) plus the essential
     /// `hole_fixed` constraint are active; the natural `hole_free` boundary and both strong-form
     /// residuals (`equilibrium`/`outer_traction`) are ABSENT entirely - not merely zero-weighted.
     #[test]
-    fn variational_formulation_activates_only_u_minus_w_ext_and_essential_constraints() {
+    fn variational_formulation_activates_only_atomic_pi_and_essential_constraints() {
         use pinn_core::problem_spec::FormulationSelection;
         let mut spec = ProblemSpec {
             geometry: two_hole_geometry(),
@@ -2334,11 +2799,11 @@ mod tests {
             formulation: pinn_core::problem_spec::default_formulation(),
         };
         spec.formulation = FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
         let problem = UserDefinedProblem::new(spec);
         let names: Vec<&str> = problem.loss_terms().iter().map(|t| t.name()).collect();
-        assert_eq!(names.len(), 3, "{names:?}");
-        assert!(names.contains(&"interior_energy"), "{names:?}");
-        assert!(names.contains(&"external_work"), "{names:?}");
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.contains(&"physical_potential"), "{names:?}");
         assert!(names.contains(&"hole_fixed"), "{names:?} - essential constraint must stay active");
         assert!(!names.contains(&"hole_free"), "{names:?} - natural boundary must be OMITTED under Variational");
         assert!(!names.contains(&"equilibrium"), "{names:?} - strong-form residual must be OMITTED under Variational");
@@ -2347,13 +2812,13 @@ mod tests {
 
     /// Issue #62 PH3-05's own real production configuration (`examples/problems/variational_
     /// no_hole_plate.toml`): a NO-HOLE, pure-Neumann geometry under `Variational` must activate
-    /// EXACTLY `interior_energy`/`external_work` plus the `TranslationGaugeTerm` (issue #61
+    /// EXACTLY atomic `physical_potential` plus the `TranslationGaugeTerm` (issue #61
     /// P2-07 - a no-hole plate has no `HoleBc::Fixed` essential constraint at all, so the
     /// rigid-body translation nullspace needs gauge-fixing instead) - no `hole_fixed`/
     /// `hole_free` (there are no holes), no `equilibrium`/`outer_traction` (Strong-form,
     /// omitted under Variational).
     #[test]
-    fn variational_formulation_on_a_no_hole_geometry_activates_u_minus_w_ext_and_translation_gauge() {
+    fn variational_formulation_on_a_no_hole_geometry_activates_atomic_pi_and_translation_gauge() {
         use pinn_core::problem_spec::FormulationSelection;
         let mut spec = ProblemSpec {
             geometry: UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] },
@@ -2364,14 +2829,29 @@ mod tests {
             formulation: pinn_core::problem_spec::default_formulation(),
         };
         spec.formulation = FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
         let problem = UserDefinedProblem::new(spec);
         let names: Vec<&str> = problem.loss_terms().iter().map(|t| t.name()).collect();
         assert_eq!(names.len(), 3, "{names:?}");
-        assert!(names.contains(&"interior_energy"), "{names:?}");
-        assert!(names.contains(&"external_work"), "{names:?}");
+        assert!(names.contains(&"physical_potential"), "{names:?}");
         assert!(names.contains(&"translation_gauge"), "{names:?} - no essential constraint exists on a no-hole geometry, so the rigid-body nullspace must be gauge-fixed instead");
+        assert!(names.contains(&"rotation_gauge"), "{names:?} - rigid rotation is also a pure-Neumann nullspace mode");
         assert!(!names.contains(&"equilibrium"), "{names:?}");
         assert!(!names.contains(&"outer_traction"), "{names:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "Variational formulation requires training.measure_aware_training=true")]
+    fn variational_legacy_mean_is_explicitly_unsupported() {
+        use pinn_core::problem_spec::FormulationSelection;
+        let mut spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(), load: LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(), training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        spec.formulation = FormulationSelection::Variational;
+        let _ = UserDefinedProblem::new(spec).loss_terms();
     }
 
     /// Issue #61 P2-01 acceptance: "Strong activates declared PDE/BC residuals." No energy
@@ -2534,6 +3014,7 @@ mod tests {
             formulation: pinn_core::problem_spec::default_formulation(),
         };
         spec.formulation = FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
         let problem = UserDefinedProblem::new(spec.clone());
 
         let net_cfg = ElasticityNetConfig::new()
@@ -2565,7 +3046,11 @@ mod tests {
                 ty: pts.iter().map(|p| p.ty as f32).collect(),
             });
         }
-        let bnd_pts = sampling.sample_boundary(&placeholder_geom, &spec.load, 32);
+        let bnd_pts = sampling.sample_boundary(
+            &placeholder_geom,
+            &spec.load,
+            spec.training.n_boundary,
+        );
         named.insert("outer_boundary", crate::problem::PointSetData {
             norm: bnd_pts.iter().map(|p| [(p.x / half_w) as f32, (p.y / half_h) as f32]).collect(),
             nx: bnd_pts.iter().map(|p| p.nx as f32).collect(),
@@ -2596,11 +3081,12 @@ mod tests {
         );
         sync_device(&device);
         let norms = out.term_grad_norms.expect("probe_term_gradients=true must populate term_grad_norms");
-        assert!(norms.contains_key("interior_energy"), "{norms:?}");
-        assert!(norms.contains_key("external_work"), "{norms:?}");
+        assert!(norms.contains_key("physical_potential"), "{norms:?}");
         assert!(!norms.contains_key("equilibrium"), "{norms:?} - excluded term must have NO gradient-norm entry, not just a zero one");
         assert!(!norms.contains_key("outer_traction"), "{norms:?} - excluded term must have NO gradient-norm entry, not just a zero one");
         assert!(!norms.contains_key("hole_free"), "{norms:?} - excluded natural boundary must have NO gradient-norm entry");
+        assert!(!norms.contains_key("constitutive_consistency"),
+            "{norms:?} - pure Variational has no direct-stress consumer, so auxiliary stress consistency must not become a hidden constraint");
     }
 
     /// `stress_source_report` on `UserDefinedProblem` matches `docs/investigations/
@@ -2723,6 +3209,7 @@ mod tests {
         // kirsch_problem.rs/pinlug_problem.rs's own formulation_kind classification tests.
         let expected: &[(&str, Fk)] = &[
             ("interior_energy", Fk::Weak),
+            ("physical_potential", Fk::Weak),
             ("equilibrium", Fk::Strong),
             ("outer_traction", Fk::Strong),
             ("external_work", Fk::Weak),
@@ -3555,6 +4042,19 @@ mod tests {
     // ─── enhancement.md Phase 10: energy balance ────────────────────────────────────────────
 
     #[test]
+    fn physical_work_probe_uses_prescribed_not_model_traction() {
+        let load = LoadConfig { px: 10.0, py: -4.0 };
+        let values = prescribed_traction_dot_displacement(
+            &load,
+            &[1.0, -1.0, 0.0, 0.0],
+            &[0.0, 0.0, 1.0, -1.0],
+            &[2.0, -2.0, 99.0, 99.0],
+            &[99.0, 99.0, 3.0, -3.0],
+        );
+        assert_eq!(values, vec![20.0, 20.0, -12.0, -12.0]);
+    }
+
+    #[test]
     fn probe_energy_balance_is_finite_for_a_fresh_model() {
         let model = tiny_model(two_hole_geometry().n_fourier());
         let device = crate::training_core::BDevice::default();
@@ -3593,5 +4093,20 @@ mod tests {
             "internal_energy and external_work were suspiciously identical - suspect a copy-paste bug comparing a value against itself: {} vs {}",
             eb.internal_energy, eb.external_work
         );
+    }
+
+    #[test]
+    fn no_hole_field_validation_accepts_affine_and_detects_translation() {
+        use ndarray::Array2;
+        let spec = ProblemSpec { geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] }, material: MaterialProps::al7075_t6(), load: LoadConfig::uniaxial_x(1e7), network: Default::default(), training: Default::default(), formulation: pinn_core::problem_spec::default_formulation() };
+        let (ny, nx) = (5, 5); let a = spec.load.px / spec.material.e;
+        let mut u = Array2::zeros((ny, nx)); let mut v = Array2::zeros((ny, nx));
+        for iy in 0..ny { for ix in 0..nx { let x = -0.1 + 0.2 * ix as f64 / 4.0; let y = -0.1 + 0.2 * iy as f64 / 4.0; u[(iy,ix)] = (a*x) as f32; v[(iy,ix)] = (-spec.material.nu*a*y) as f32; }}
+        let z = || Array2::zeros((ny,nx));
+        let fields = pinn_core::messages::VisFields { von_mises:z(), sigma_xx:Array2::from_elem((ny,nx), spec.load.px as f32), sigma_yy:z(), sigma_xy:z(), disp_u:u, disp_v:v, eps_xx:Array2::from_elem((ny,nx),a as f32), eps_yy:Array2::from_elem((ny,nx),(-spec.material.nu*a) as f32), eps_xy:z(), pde_residual:z(), amr_score:z(), collocation_density:z() };
+        let ok = validate_no_hole_fields(&fields, &spec);
+        assert!(ok.u_linf < 1e-12 && ok.v_linf < 1e-12 && ok.strain_linf < 1e-7 && ok.rigid_translation_residual < 1e-12 && ok.rigid_rotation_residual < 1e-12);
+        let mut translated = fields.clone(); translated.disp_u += 1.0;
+        assert!(validate_no_hole_fields(&translated, &spec).rigid_translation_residual > 0.1);
     }
 }

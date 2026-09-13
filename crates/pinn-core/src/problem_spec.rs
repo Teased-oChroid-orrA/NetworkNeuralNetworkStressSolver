@@ -129,9 +129,9 @@ impl Default for TrainingSpec {
 /// LossTerm::formulation_kind()`, which only classifies terms that already exist in the
 /// returned list - this type controls what's IN that list in the first place).
 ///
-/// Base terms are `interior_energy` (U), `equilibrium` (strong-form ∇·σ=0 residual),
-/// `outer_traction` (strong-form Neumann residual), `external_work` (W_ext, the DEM natural-BC
-/// counterpart to `outer_traction`). Every hole's essential (Dirichlet, `HoleBc::Fixed`)
+/// Base terms are `physical_potential` (atomic `U-W_ext`), `interior_energy` (legacy hybrid
+/// U), `equilibrium` (strong-form ∇·σ=0 residual), `outer_traction` (strong-form Neumann
+/// residual), and `external_work` (legacy hybrid W_ext). Every hole's essential (Dirichlet, `HoleBc::Fixed`)
 /// constraint is ALWAYS active regardless of formulation - an essential constraint is required
 /// in every formulation, not a formulation-specific choice (issue #61's own text lists
 /// "essential BC/gauge constraints separately declared" as a fixed member of the variational
@@ -139,7 +139,7 @@ impl Default for TrainingSpec {
 /// traction-free) is where formulations genuinely differ - see each variant's own doc comment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FormulationSelection {
-    /// `Pi = U - W_ext` ONLY (+ essential constraints). Natural boundaries (`outer_traction`'s
+    /// Atomic `Pi = U - W_ext` ONLY (+ essential constraints). Natural boundaries (`outer_traction`'s
     /// strong-form penalty, and each `HoleBc::Free` hole's traction-free penalty) are
     /// EXCLUDED from the optimization objective by construction - satisfied automatically by
     /// the variational principle itself (a correctly-posed `W_ext` already encodes the

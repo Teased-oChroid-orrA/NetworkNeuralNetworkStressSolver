@@ -54,7 +54,7 @@
 //! synthetic manufactured field), proving real live use of the AD backend without claiming it
 //! replaces FD as the optimization ingredient.
 
-use burn::tensor::{backend::AutodiffBackend, Tensor};
+use burn::tensor::{backend::{AutodiffBackend, Backend}, Tensor};
 
 use crate::fd_stencil::{compute_strains, FdConfig};
 
@@ -93,6 +93,24 @@ impl DerivativeBackendPolicy {
     /// This codebase's own pre-remediation behavior everywhere: FD only, no cross-check, no
     /// fallback (there was only ever one backend before this epic existed).
     pub const FD_ONLY: Self = Self { primary: DerivativeBackend::Fd, verification: None, fallback: None };
+}
+
+/// Declared derivative contract for every production loss graph.  First-order AD remains a
+/// detached diagnostic under Burn 0.21, while second derivatives are FD-only; therefore FD is
+/// the only policy that can preserve the outer weight-autodiff graph today.
+pub const PRODUCTION_POLICY: DerivativeBackendPolicy = DerivativeBackendPolicy::FD_ONLY;
+
+/// Production first-derivative resolver.  Keep this narrow wrapper as the one approved entry
+/// point from a live tensor loss graph into the derivative backend.  It deliberately does not
+/// offer a fake AD branch: `ad_strain` returns detached inner-backend tensors and cannot be
+/// differentiated again with respect to model weights.
+pub fn production_strain<B: Backend>(
+    stencil_output: Tensor<B, 2>,
+    n: usize,
+    fd: &FdConfig,
+) -> (Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) {
+    debug_assert!(matches!(PRODUCTION_POLICY.primary, DerivativeBackend::Fd));
+    compute_strains(stencil_output, n, fd)
 }
 
 // ─── Scalar-field derivatives (issue #61's own literal acceptance-test shape) ────────────────

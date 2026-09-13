@@ -7,14 +7,13 @@
 ///     Full n_interior batch. lam_h capped at 50 so kirsch gradient dominates h gradient.
 ///     K_t is REPORTED from probe_kt_shared() as a verification metric — not used as a loss.
 /// - No hardcoded constants — everything flows from SolverConfig via EngineParams.
-
 use std::collections::HashMap;
 
 use burn::module::AutodiffModule;
 use pinn_core::{
     amr::AdaptiveGrid,
     messages::{DecisionMakerConfig, SolverConfig, StiffnessConfig},
-    sampling::{sample_boundary, sample_interior, sample_eq_ring},
+    sampling::{sample_boundary, sample_eq_ring, sample_interior},
     units::{IN_TO_M, KSI_TO_PA, MSI_TO_PA},
 };
 
@@ -22,9 +21,10 @@ use crate::{
     bc::apply_dirichlet_ansatz,
     controllers::{ConvergenceTracker, STUCK_NONE_THRESHOLD},
     decision_maker::{OptimizerTier, PinnDecisionMaker},
-    engine::EngineParams,
+    differential_operator::production_strain as compute_strains,
     energy::dem_energy_per_point,
-    fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig},
+    engine::EngineParams,
+    fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig},
     kirsch_problem::KirschProblem,
     lr_schedule::LrSchedule,
     network::{fwd, ElasticityNet, ElasticityNetConfig},
@@ -35,7 +35,7 @@ use crate::{
     training_core::{
         build_gathered_boundary_tensors, compute_gradient_conflict, compute_reference_scales,
         extract_boundary_indices, make_lbfgs, model_is_finite, normalize_point, probe_kt_shared,
-        step_lbfgs, step_physics, BInner, LbfgsCtxScalars, StepCtx, StepOutput, B, BDevice,
+        step_lbfgs, step_physics, BDevice, BInner, LbfgsCtxScalars, StepCtx, StepOutput, B,
     },
 };
 
@@ -133,7 +133,10 @@ pub fn run_headless(config: SolverConfig) -> bool {
 /// `initial_model`: test-only hook (always `None` from the public `run_headless`), mirroring
 /// `run_headless_pinlug_inner`'s `initial_models` parameter — lets tests inject a pre-built
 /// (e.g. deliberately corrupted) model instead of relying on process RNG determinism.
-pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<ElasticityNet<B>>) -> KirschHeadlessResult {
+pub(crate) fn run_headless_inner(
+    config: SolverConfig,
+    initial_model: Option<ElasticityNet<B>>,
+) -> KirschHeadlessResult {
     let mut config = config;
     let engine = EngineParams::analyze(&config);
     engine.apply_to(&mut config);
@@ -147,25 +150,64 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║       PINN Structural Stress Solver  —  Headless Mode   ║");
     println!("╚══════════════════════════════════════════════════════════╝");
-    println!("  Material : E={:.2} Msi  ν={:.3}", config.material.e / MSI_TO_PA, config.material.nu);
-    println!("  Geometry : {:.3}×{:.3} in  ({:?})",
-        config.geometry.half_w / IN_TO_M, config.geometry.half_h / IN_TO_M, engine.symmetry);
-    println!("  Load     : Px={:.2} ksi  Py={:.2} ksi",
-        config.load.px / KSI_TO_PA, config.load.py / KSI_TO_PA);
-    println!("  Steps    : {}   Interior: {}  Boundary: {}",
-        config.max_steps, config.n_interior, config.n_boundary);
-    println!("  Engine   : k={:.1}  fd_h={:.2e}  net={}×{}  eq_ring={}",
-        k, config.fd_h, engine.hidden_dim, engine.n_hidden, engine.n_eq_ring);
-    println!("  Optimizer: {} (weights)  +  AdamW (biases)",
-        if config.use_soap_muon { "SOAP-Muon" } else { "AdamW" });
-    println!("  Expected K_t at probe (r={:.2}·r_hole): {:.4}",
-        engine.probe_r_factor, engine.expected_kt);
-    println!("  Curriculum: Phase 1 (BC, {} pts) 0..{}  →  Phase 2 (+kirsch_stress, {} pts) {}..{}",
-        engine.phase1_n_interior, engine.phase1_steps,
-        config.n_interior, engine.phase1_steps, config.max_steps);
+    println!(
+        "  Material : E={:.2} Msi  ν={:.3}",
+        config.material.e / MSI_TO_PA,
+        config.material.nu
+    );
+    println!(
+        "  Geometry : {:.3}×{:.3} in  ({:?})",
+        config.geometry.half_w / IN_TO_M,
+        config.geometry.half_h / IN_TO_M,
+        engine.symmetry
+    );
+    println!(
+        "  Load     : Px={:.2} ksi  Py={:.2} ksi",
+        config.load.px / KSI_TO_PA,
+        config.load.py / KSI_TO_PA
+    );
+    println!(
+        "  Steps    : {}   Interior: {}  Boundary: {}",
+        config.max_steps, config.n_interior, config.n_boundary
+    );
+    println!(
+        "  Engine   : k={:.1}  fd_h={:.2e}  net={}×{}  eq_ring={}",
+        k, config.fd_h, engine.hidden_dim, engine.n_hidden, engine.n_eq_ring
+    );
+    println!(
+        "  Optimizer: {} (weights)  +  AdamW (biases)",
+        if config.use_soap_muon {
+            "SOAP-Muon"
+        } else {
+            "AdamW"
+        }
+    );
+    println!(
+        "  Expected K_t at probe (r={:.2}·r_hole): {:.4}",
+        engine.probe_r_factor, engine.expected_kt
+    );
+    println!(
+        "  Curriculum: Phase 1 (BC, {} pts) 0..{}  →  Phase 2 (+kirsch_stress, {} pts) {}..{}",
+        engine.phase1_n_interior,
+        engine.phase1_steps,
+        config.n_interior,
+        engine.phase1_steps,
+        config.max_steps
+    );
     println!("──────────────────────────────────────────────────────────────────────────────────────────────");
-    println!("{:>6}  {:>10}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>8}  {:>7}",
-        "step", "total", "energy", "neumann", "h_loss", "d_loss", "eq_loss", "k_stress", "lr", "K_t");
+    println!(
+        "{:>6}  {:>10}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>8}  {:>7}",
+        "step",
+        "total",
+        "energy",
+        "neumann",
+        "h_loss",
+        "d_loss",
+        "eq_loss",
+        "k_stress",
+        "lr",
+        "K_t"
+    );
     println!("────────────────────────────────────────────────────────────────────────────────────────────────────────");
 
     let device = BDevice::default();
@@ -205,7 +247,10 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
     let (u_ref, ref_energy, ref_stress2) = compute_reference_scales(&config);
 
     let problem = KirschProblem::new(
-        config.material.clone(), engine.output_dim(), engine.phase1_steps, engine.expected_kt,
+        config.material.clone(),
+        engine.output_dim(),
+        engine.phase1_steps,
+        engine.expected_kt,
     );
     validate_loss_terms(&problem);
 
@@ -218,8 +263,10 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
     let mut amr: Option<AdaptiveGrid> = None;
 
     let bnd_pts = sample_boundary(&config.geometry, &config.load, config.n_boundary);
-    let bnd_norm: Vec<[f32; 2]> = bnd_pts.iter()
-        .map(|b| normalize_point(b.x, b.y, &config)).collect();
+    let bnd_norm: Vec<[f32; 2]> = bnd_pts
+        .iter()
+        .map(|b| normalize_point(b.x, b.y, &config))
+        .collect();
     let bnd_nx: Vec<f32> = bnd_pts.iter().map(|b| b.nx as f32).collect();
     let bnd_ny: Vec<f32> = bnd_pts.iter().map(|b| b.ny as f32).collect();
     let bnd_tx: Vec<f32> = bnd_pts.iter().map(|b| b.tx as f32).collect();
@@ -238,7 +285,9 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
 
     // Equilibrium ring points: precomputed outside loop (fixed seed 42424242, fixed geometry).
     let eq_ring_norm: Vec<[f32; 2]> = sample_eq_ring(&config.geometry, engine.n_eq_ring)
-        .iter().map(|&[x, y]| normalize_point(x, y, &config)).collect();
+        .iter()
+        .map(|&[x, y]| normalize_point(x, y, &config))
+        .collect();
 
     let mut tracker = ConvergenceTracker::new();
 
@@ -252,8 +301,10 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
 
     // Cache normalized interior points — recomputed only when int_pts_phys changes (Phase 2 start
     // and each AMR event every 1000 steps), not every step. Avoids ~14 000 Vec allocations per run.
-    let mut int_norm: Vec<[f32; 2]> = int_pts_phys.iter()
-        .map(|&[x, y]| normalize_point(x, y, &config)).collect();
+    let mut int_norm: Vec<[f32; 2]> = int_pts_phys
+        .iter()
+        .map(|&[x, y]| normalize_point(x, y, &config))
+        .collect();
     let mut int_pts_dirty = false;
 
     // Tracks the model's actual current `hidden_dim` — only ever changes once, at the single
@@ -271,7 +322,7 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
         if config.width_growth.enabled && step == config.width_growth.trigger_step {
             let h_old = current_hidden_dim;
             let h_new = config.width_growth.target_hidden_dim;
-            let (weight_ids, _bias_ids) = model.param_ids();
+            let weight_ids = model.mlp_weight_ids();
             let grown = model.grow_width(h_new, &device);
 
             if use_soap_muon {
@@ -293,7 +344,10 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                     } else {
                         // `layers[1..].weight`: grows both dims.
                         optim_w.migrate_for_growth(
-                            id, Some((h_old, h_new)), Some((h_old, h_new)), &device,
+                            id,
+                            Some((h_old, h_new)),
+                            Some((h_old, h_new)),
+                            &device,
                         );
                     }
                 }
@@ -327,7 +381,9 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
             optim_b = make_bias_optim();
             optim_gate = make_gate_optim();
             stiffness_controller = StiffnessController::new(stiff_config.clone());
-            lbfgs_opt = None; frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None;
+            lbfgs_opt = None;
+            frozen_lbfgs_ctx = None;
+            frozen_lbfgs_lams = None;
         }
 
         // === AMR sweep ===
@@ -344,45 +400,59 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                     let out = apply_dirichlet_ansatz::<BInner>(
                         fwd::<BInner>(&model_val, stencil.clone(), engine.n_fourier, &device),
                         &stencil,
-                        config.geometry.symmetry, k,
-                    ).mul_scalar(u_ref as f64);
+                        config.geometry.symmetry,
+                        k,
+                    )
+                    .mul_scalar(u_ref as f64);
                     let (exx, eyy, exy) = compute_strains::<BInner>(out, n_amr, &fd);
                     dem_energy_per_point::<BInner>(exx, eyy, exy, &config.material)
-                        .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_amr])
-                        .into_iter().map(|e| e.abs()).collect()
+                        .into_data()
+                        .to_vec::<f32>()
+                        .unwrap_or_else(|_| vec![0.0; n_amr])
+                        .into_iter()
+                        .map(|e| e.abs())
+                        .collect()
                 };
                 grid.update_residuals(&amr_residuals);
                 grid.adapt();
                 let amr_stats = grid.stats();
                 int_pts_phys = grid.sample_points();
                 int_pts_dirty = true;
-                println!("  [AMR@{step}] cells={} depth={} mean_res={:.3e} pts={}",
-                    amr_stats.active_count, amr_stats.max_depth,
-                    amr_stats.mean_residual, int_pts_phys.len());
+                println!(
+                    "  [AMR@{step}] cells={} depth={} mean_res={:.3e} pts={}",
+                    amr_stats.active_count,
+                    amr_stats.max_depth,
+                    amr_stats.mean_residual,
+                    int_pts_phys.len()
+                );
                 // AMR invalidates L-BFGS curvature history (new quadrature points).
                 if decision_maker.current_tier == OptimizerTier::Converge {
                     println!("  [DM@{step}] AMR → demote Converge→Align");
                     decision_maker = PinnDecisionMaker::new(dm_config.clone(), true, false);
                     optim_w = WeightOptim::from_tier(use_soap_muon, &decision_maker.current_tier);
-                    lbfgs_opt = None; frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None;
+                    lbfgs_opt = None;
+                    frozen_lbfgs_ctx = None;
+                    frozen_lbfgs_lams = None;
                 }
             }
         }
 
         // Recompute cached int_norm only when int_pts_phys changed (Phase 2 start or AMR).
         if int_pts_dirty {
-            int_norm = int_pts_phys.iter()
-                .map(|&[x, y]| normalize_point(x, y, &config)).collect();
+            int_norm = int_pts_phys
+                .iter()
+                .map(|&[x, y]| normalize_point(x, y, &config))
+                .collect();
             int_pts_dirty = false;
         }
 
         // === Training step (single source of truth in training_core::step_physics) ===
 
         let ctx = StepCtx {
-            config:            &config,
-            engine:            &engine,
-            problem:           &problem,
-            fd:                &fd,
+            config: &config,
+            engine: &engine,
+            problem: &problem,
+            fd: &fd,
             k,
             u_ref,
             ref_energy,
@@ -390,61 +460,84 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
             cx,
             cy,
             ref_div2,
-            int_norm:          &int_norm,  // cached; recomputed only on AMR/phase-change
-            bnd_norm:          &bnd_norm,
-            bnd_nx:            &bnd_nx,
-            bnd_ny:            &bnd_ny,
-            bnd_tx:            &bnd_tx,
-            bnd_ty:            &bnd_ty,
-            trac_idx:          &trac_idx,
-            hole_idx:          &hole_idx,
-            right_idx:         &right_idx,
-            gathered:          &gathered,
-            eq_ring_norm:      &eq_ring_norm,
+            int_norm: &int_norm, // cached; recomputed only on AMR/phase-change
+            bnd_norm: &bnd_norm,
+            bnd_nx: &bnd_nx,
+            bnd_ny: &bnd_ny,
+            bnd_tx: &bnd_tx,
+            bnd_ty: &bnd_ty,
+            trac_idx: &trac_idx,
+            hole_idx: &hole_idx,
+            right_idx: &right_idx,
+            gathered: &gathered,
+            eq_ring_norm: &eq_ring_norm,
             dynamic_lam_h_cap,
             dynamic_lam_d_cap,
-            phase2_active:     phase2_started,
+            phase2_active: phase2_started,
             step,
         };
-        let (new_model, mut out) = if dm_config.enabled
-            && decision_maker.current_tier == OptimizerTier::Converge
-        {
-            // Converge tier: lazy-init frozen context + LBFGS, then run quasi-Newton step.
-            if frozen_lbfgs_ctx.is_none() {
-                frozen_lbfgs_ctx  = Some(LbfgsCtxScalars::from_ctx(&ctx));
-            }
-            let lbfgs = lbfgs_opt.get_or_insert_with(|| make_lbfgs(dm_config.lbfgs_max_iter));
-            let lams = frozen_lbfgs_lams.as_ref().expect("lams must be set when entering Converge");
-            let fctx = frozen_lbfgs_ctx.as_ref().unwrap();
-            let lr = lr_sched.current_lr();
-            let (new_m, loss_f64) = step_lbfgs(model, lbfgs, lr, fctx, &problem, lams, &device);
-            let synthetic_out = StepOutput {
-                e_scalar: 0.0, n_scalar: 0.0, h_scalar: 0.0, d_scalar: 0.0,
-                eq_scalar: 0.0, w_scalar: 0.0, kirsch_scalar: 0.0, const_scalar: 0.0,
-                total_scalar: loss_f64 as f32, lr,
-                lam_e: 0.0, lam_n: 0.0, lam_h: 0.0, lam_d: 0.0, lam_eq: 0.0, lam_kirsch: 0.0,
-                proxy_ratio: 0.0,
-                optimizer_tier: OptimizerTier::Converge.as_u8(),
-                cosine_sim: None,
-                lam_by_name: None,
-                timing: None,
-                // L-BFGS's own multi-iteration inner loop has no single per-step gradient
-                // norm comparable to SGD-family steps' - genuinely not available here, not
-                // an oversight.
-                grad_norm: None,
-                raw_scalar_by_name: None,
-                term_grad_norms: None,
-                gradient_share_report: None,
-                gradient_conflict_report: None,
+        let (new_model, mut out) =
+            if dm_config.enabled && decision_maker.current_tier == OptimizerTier::Converge {
+                // Converge tier: lazy-init frozen context + LBFGS, then run quasi-Newton step.
+                if frozen_lbfgs_ctx.is_none() {
+                    frozen_lbfgs_ctx = Some(LbfgsCtxScalars::from_ctx(&ctx));
+                }
+                let lbfgs = lbfgs_opt.get_or_insert_with(|| make_lbfgs(dm_config.lbfgs_max_iter));
+                let lams = frozen_lbfgs_lams
+                    .as_ref()
+                    .expect("lams must be set when entering Converge");
+                let fctx = frozen_lbfgs_ctx.as_ref().unwrap();
+                let lr = lr_sched.current_lr();
+                let (new_m, loss_f64) = step_lbfgs(model, lbfgs, lr, fctx, &problem, lams, &device);
+                let synthetic_out = StepOutput {
+                    e_scalar: 0.0,
+                    n_scalar: 0.0,
+                    h_scalar: 0.0,
+                    d_scalar: 0.0,
+                    eq_scalar: 0.0,
+                    w_scalar: 0.0,
+                    kirsch_scalar: 0.0,
+                    const_scalar: 0.0,
+                    total_scalar: loss_f64 as f32,
+                    lr,
+                    lam_e: 0.0,
+                    lam_n: 0.0,
+                    lam_h: 0.0,
+                    lam_d: 0.0,
+                    lam_eq: 0.0,
+                    lam_kirsch: 0.0,
+                    proxy_ratio: 0.0,
+                    optimizer_tier: OptimizerTier::Converge.as_u8(),
+                    cosine_sim: None,
+                    lam_by_name: None,
+                    timing: None,
+                    // L-BFGS's own multi-iteration inner loop has no single per-step gradient
+                    // norm comparable to SGD-family steps' - genuinely not available here, not
+                    // an oversight.
+                    grad_norm: None,
+                    raw_scalar_by_name: None,
+                    term_grad_norms: None,
+                    gradient_share_report: None,
+                    gradient_conflict_report: None,
+                };
+                (new_m, synthetic_out)
+            } else {
+                let physics_boost = stiffness_controller.physics_boost();
+                let alpha_lr_mult = stiffness_controller.alpha_lr_mult();
+                step_physics(
+                    model,
+                    &mut optim_w,
+                    &mut optim_b,
+                    &mut optim_gate,
+                    &ctx,
+                    &mut saw,
+                    &mut lr_sched,
+                    &device,
+                    decision_maker.current_tier.as_u8(),
+                    physics_boost,
+                    alpha_lr_mult,
+                )
             };
-            (new_m, synthetic_out)
-        } else {
-            let physics_boost = stiffness_controller.physics_boost();
-            let alpha_lr_mult = stiffness_controller.alpha_lr_mult();
-            step_physics(model, &mut optim_w, &mut optim_b, &mut optim_gate, &ctx, &mut saw,
-                &mut lr_sched, &device, decision_maker.current_tier.as_u8(),
-                physics_boost, alpha_lr_mult)
-        };
         model = new_model;
         trajectory.push(out.total_scalar);
 
@@ -452,7 +545,7 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
         // (never short-circuited) so their internal step counters stay correct regardless
         // of whether the other subsystem is enabled. At most one GradientConflict is
         // computed per step, shared by whichever subsystem's gate fired.
-        let dm_fire    = decision_maker.advance();
+        let dm_fire = decision_maker.advance();
         let stiff_fire = stiffness_controller.advance();
         if dm_fire || stiff_fire {
             let want_conflict = decision_maker.current_tier != OptimizerTier::Converge
@@ -465,13 +558,16 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
             out.cosine_sim = conflict.map(|c| c.cosine_sim);
 
             if dm_fire {
-                if let Some(t) = decision_maker.evaluate(conflict, out.proxy_ratio, phase2_started) {
+                if let Some(t) = decision_maker.evaluate(conflict, out.proxy_ratio, phase2_started)
+                {
                     let old_tier_name = match out.optimizer_tier {
-                        0 => "Explore", 1 => "Align", _ => "Converge",
+                        0 => "Explore",
+                        1 => "Align",
+                        _ => "Converge",
                     };
                     let new_tier_name = match t.new_tier {
-                        OptimizerTier::Explore  => "Explore",
-                        OptimizerTier::Align    => "Align",
+                        OptimizerTier::Explore => "Explore",
+                        OptimizerTier::Align => "Align",
                         OptimizerTier::Converge => "Converge",
                     };
                     println!("\n  [DM@{step}] {old_tier_name} → {new_tier_name}");
@@ -488,7 +584,7 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                             // Keyed by the exact `loss_terms()` names — `lam_const` drops out
                             // of this map entirely: `compute_loss_for_lbfgs` now reads
                             // `ctx.engine.lam_const` directly, same as `step_physics` does.
-                            frozen_lbfgs_ctx  = Some(LbfgsCtxScalars::from_ctx(&ctx));
+                            frozen_lbfgs_ctx = Some(LbfgsCtxScalars::from_ctx(&ctx));
                             frozen_lbfgs_lams = Some(HashMap::from([
                                 ("interior_energy", out.lam_e),
                                 ("neumann_traction", out.lam_n),
@@ -500,7 +596,9 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                             lbfgs_opt = None;
                         }
                         _ => {
-                            frozen_lbfgs_ctx = None; frozen_lbfgs_lams = None; lbfgs_opt = None;
+                            frozen_lbfgs_ctx = None;
+                            frozen_lbfgs_lams = None;
+                            lbfgs_opt = None;
                         }
                     }
                 }
@@ -509,8 +607,11 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
             if stiff_fire {
                 if let Some(c) = conflict {
                     let factor = stiffness_controller.update(&c);
-                    println!("\n  [Stiffness@{step}] factor={factor:.3} boost={:.2} gate_lr_mult={:.2}",
-                        stiffness_controller.physics_boost(), stiffness_controller.alpha_lr_mult());
+                    println!(
+                        "\n  [Stiffness@{step}] factor={factor:.3} boost={:.2} gate_lr_mult={:.2}",
+                        stiffness_controller.physics_boost(),
+                        stiffness_controller.alpha_lr_mult()
+                    );
                 }
             }
         }
@@ -521,10 +622,19 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
             let filled = (pct * BAR_WIDTH as f32) as usize;
             let bar = "█".repeat(filled) + &"░".repeat(BAR_WIDTH - filled);
             let elapsed = start.elapsed().as_secs_f32();
-            let eta = if pct > 0.01 { elapsed / pct - elapsed } else { 0.0 };
-            if out.total_scalar < best_loss { best_loss = out.total_scalar; }
+            let eta = if pct > 0.01 {
+                elapsed / pct - elapsed
+            } else {
+                0.0
+            };
+            if out.total_scalar < best_loss {
+                best_loss = out.total_scalar;
+            }
 
-            print!("\r[{bar}] {:.1}%  {elapsed:.0}s  ETA {eta:.0}s", pct * 100.0);
+            print!(
+                "\r[{bar}] {:.1}%  {elapsed:.0}s  ETA {eta:.0}s",
+                pct * 100.0
+            );
 
             if step % 200 == 0 || step == config.max_steps - 1 {
                 // === Param-level NaN/Inf detection (Option A: full reinit from scratch) ===
@@ -558,7 +668,12 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                                     frozen_lbfgs_ctx: &mut frozen_lbfgs_ctx,
                                     frozen_lbfgs_lams: &mut frozen_lbfgs_lams,
                                 },
-                                new_cap, true, phase2_started, &dm_config, &stiff_config, use_soap_muon,
+                                new_cap,
+                                true,
+                                phase2_started,
+                                &dm_config,
+                                &stiff_config,
+                                use_soap_muon,
                             );
                             model_reinit_count += 1;
                             println!("\n  [PARAM-NAN REINIT #{}] Param-level NaN/Inf in model weights (phase2_started={phase2_started}) → full reinit from scratch (Option A): lr+adam+SAW, lam_caps→{new_cap:.0}",
@@ -573,7 +688,10 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
 
                 let model_val: ElasticityNet<BInner> = model.valid();
                 let kt_opt = probe_kt_shared(&model_val, &config, &engine, &fd, k, u_ref, &device);
-                if let Some(kt) = kt_opt { last_kt = kt_opt; kt_trajectory.push(kt); }
+                if let Some(kt) = kt_opt {
+                    last_kt = kt_opt;
+                    kt_trajectory.push(kt);
+                }
 
                 if phase2_started {
                     if let Some(kt) = kt_opt {
@@ -599,7 +717,12 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                                     frozen_lbfgs_ctx: &mut frozen_lbfgs_ctx,
                                     frozen_lbfgs_lams: &mut frozen_lbfgs_lams,
                                 },
-                                new_cap, true, true, &dm_config, &stiff_config, use_soap_muon,
+                                new_cap,
+                                true,
+                                true,
+                                &dm_config,
+                                &stiff_config,
+                                use_soap_muon,
                             );
                             println!("\n  [CRASH RECOVERY #{}] K_t={kt:.3} collapsed → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
                                 tracker.total_restarts());
@@ -622,7 +745,12 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                                     frozen_lbfgs_ctx: &mut frozen_lbfgs_ctx,
                                     frozen_lbfgs_lams: &mut frozen_lbfgs_lams,
                                 },
-                                new_cap, false, true, &dm_config, &stiff_config, use_soap_muon,
+                                new_cap,
+                                false,
+                                true,
+                                &dm_config,
+                                &stiff_config,
+                                use_soap_muon,
                             );
                             println!("\n  [WARM RESTART #{}] K_t plateau → reset: lr+adam+SAW, lam_caps→{new_cap:.0}",
                                 tracker.total_restarts());
@@ -655,14 +783,20 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
                                 frozen_lbfgs_ctx: &mut frozen_lbfgs_ctx,
                                 frozen_lbfgs_lams: &mut frozen_lbfgs_lams,
                             },
-                            new_cap, true, true, &dm_config, &stiff_config, use_soap_muon,
+                            new_cap,
+                            true,
+                            true,
+                            &dm_config,
+                            &stiff_config,
+                            use_soap_muon,
                         );
                         println!("\n  [STUCK-NAN RECOVERY #{}] {} consecutive missed K_t readings → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
                             tracker.total_restarts(), STUCK_NONE_THRESHOLD);
                     }
                 }
 
-                let kt_str = kt_opt.map(|kt| format!("{kt:>7.3}"))
+                let kt_str = kt_opt
+                    .map(|kt| format!("{kt:>7.3}"))
                     .unwrap_or_else(|| "   N/A ".to_string());
                 println!();
                 println!("{step:>6}  {t:>10.3e}  {e:>9.3e}  {n:>9.3e}  {h:>9.3e}  {d:>9.3e}  {eq:>9.3e}  {k:>9.3e}  {lr:>8.2e}  {kt_str}",
@@ -684,7 +818,11 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
 
         if step % 500 == 0 && step > 0 {
             let elapsed = start.elapsed().as_secs_f32();
-            let phase = if step < engine.phase1_steps { "P1" } else { "P2" };
+            let phase = if step < engine.phase1_steps {
+                "P1"
+            } else {
+                "P2"
+            };
             println!("  [{step}|{phase}]  {:.1} steps/s  best={best_loss:.3e}  lams=[e:{:.1} n:{:.1} h:{:.1} d:{:.1} eq:{:.2} k:{:.2}]  caps=[h:{:.0} d:{:.0}]",
                 step as f32 / elapsed,
                 out.lam_e, out.lam_n, out.lam_h, out.lam_d, out.lam_eq, out.lam_kirsch,
@@ -694,12 +832,19 @@ pub(crate) fn run_headless_inner(config: SolverConfig, initial_model: Option<Ela
 
     let elapsed = start.elapsed().as_secs_f32();
     println!("\n────────────────────────────────────────────────────────────────────────────────────────────────────────");
-    println!("  Done!  {:.0}s  ({:.1} steps/s)", elapsed, config.max_steps as f32 / elapsed);
+    println!(
+        "  Done!  {:.0}s  ({:.1} steps/s)",
+        elapsed,
+        config.max_steps as f32 / elapsed
+    );
     println!("  Final best loss : {best_loss:.4e}");
     if let Some(kt) = last_kt {
         println!("  Achieved K_t   : {:.4}", kt);
     }
-    println!("  Expected K_t    : {:.4} at r={}·r_hole", engine.expected_kt, engine.probe_r_factor);
+    println!(
+        "  Expected K_t    : {:.4} at r={}·r_hole",
+        engine.expected_kt, engine.probe_r_factor
+    );
     println!("════════════════════════════════════════════════════════════════════════════════════════════════════════");
 
     KirschHeadlessResult {
@@ -798,7 +943,6 @@ pub(crate) fn run_headless_pinlug_inner(
     config: SolverConfig,
     initial_models: Option<(ElasticityNet<B>, ElasticityNet<B>)>,
 ) -> PinLugHeadlessResult {
-    use pinn_core::problem::InterfaceParametrization;
     use crate::{
         controllers::{ConvergenceTracker, MetricDirection},
         network::ElasticityNetConfig,
@@ -807,8 +951,11 @@ pub(crate) fn run_headless_pinlug_inner(
             validate_loss_terms, BoundaryValueProblem, DomainOptim, DomainState, DomainStepCtx,
             DomainStepData, FrozenMultiStepCtx, MultiStepCtx, PointSetData,
         },
-        training_core::{compute_gradient_conflict_multi, step_lbfgs_multi, step_physics_multi, TwoDomainModels},
+        training_core::{
+            compute_gradient_conflict_multi, step_lbfgs_multi, step_physics_multi, TwoDomainModels,
+        },
     };
+    use pinn_core::problem::InterfaceParametrization;
 
     /// Bundles every piece of mutable training state that pin-lug's four restart bodies
     /// (Param-NaN reinit, crash, plateau, stuck-nan — see below) reset in lockstep, so the
@@ -893,16 +1040,31 @@ pub(crate) fn run_headless_pinlug_inner(
     crate::execution::apply_performance_profile(&mut config);
 
     let problem = PinLugProblem::new(
-        config.material.clone(), OUTPUT_DIM, PHASE1_STEPS, N_INTERFACE,
-        if config.use_ultimate_strength_scaling { PinLugScalingMode::UltimateStrength } else { PinLugScalingMode::AppliedLoad },
+        config.material.clone(),
+        OUTPUT_DIM,
+        PHASE1_STEPS,
+        N_INTERFACE,
+        if config.use_ultimate_strength_scaling {
+            PinLugScalingMode::UltimateStrength
+        } else {
+            PinLugScalingMode::AppliedLoad
+        },
     );
     validate_loss_terms(&problem);
 
-    println!("  Material : E={:.2} Msi  ν={:.3}", config.material.e / MSI_TO_PA, config.material.nu);
-    println!("  Steps    : {}   Interior: {}  Boundary: {}  Interface pts: {N_INTERFACE}",
-        config.max_steps, config.n_interior, config.n_boundary);
-    println!("  Load     : {:.2} ksi equivalent bearing traction (P=20,000 lbf / (2*r_pin*t))",
-        problem.equivalent_traction_pa() / KSI_TO_PA);
+    println!(
+        "  Material : E={:.2} Msi  ν={:.3}",
+        config.material.e / MSI_TO_PA,
+        config.material.nu
+    );
+    println!(
+        "  Steps    : {}   Interior: {}  Boundary: {}  Interface pts: {N_INTERFACE}",
+        config.max_steps, config.n_interior, config.n_boundary
+    );
+    println!(
+        "  Load     : {:.2} ksi equivalent bearing traction (P=20,000 lbf / (2*r_pin*t))",
+        problem.equivalent_traction_pa() / KSI_TO_PA
+    );
     println!("──────────────────────────────────────────────────────────────────────────────────────────────");
 
     let device = BDevice::default();
@@ -929,7 +1091,8 @@ pub(crate) fn run_headless_pinlug_inner(
             .with_output_dim(OUTPUT_DIM)
             .with_use_piratenet(config.use_piratenet)
     };
-    let (mut model_pin, mut model_lug): (ElasticityNet<B>, ElasticityNet<B>) = match initial_models {
+    let (mut model_pin, mut model_lug): (ElasticityNet<B>, ElasticityNet<B>) = match initial_models
+    {
         Some((pin, lug)) => (pin, lug),
         None => (
             net_cfg(pin_geom.half_w, pin_geom.half_h).init(&device),
@@ -938,11 +1101,23 @@ pub(crate) fn run_headless_pinlug_inner(
     };
 
     let mut optims = vec![
-        DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() },
-        DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() },
+        DomainOptim {
+            weight: WeightOptim::new(config.use_soap_muon),
+            bias: make_bias_optim(),
+            gate: make_gate_optim(),
+        },
+        DomainOptim {
+            weight: WeightOptim::new(config.use_soap_muon),
+            bias: make_bias_optim(),
+            gate: make_gate_optim(),
+        },
     ];
 
-    let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+    let base_weights: Vec<f32> = problem
+        .loss_terms()
+        .iter()
+        .map(|t| problem.base_weight(t.name()))
+        .collect();
     let mut saw = SawBrdr::with_base(base_weights, 0.95);
     let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
 
@@ -957,9 +1132,14 @@ pub(crate) fn run_headless_pinlug_inner(
     let pin_sampling = problem.sampling_strategy(0);
     let lug_sampling = problem.sampling_strategy(1);
 
-    let build_pointset = |pts: &[pinn_core::loading::BoundaryPoint], geom: &pinn_core::geometry::GeometryConfig| -> PointSetData {
+    let build_pointset = |pts: &[pinn_core::loading::BoundaryPoint],
+                          geom: &pinn_core::geometry::GeometryConfig|
+     -> PointSetData {
         PointSetData {
-            norm: pts.iter().map(|p| normalize_point_generic(p.x, p.y, geom)).collect(),
+            norm: pts
+                .iter()
+                .map(|p| normalize_point_generic(p.x, p.y, geom))
+                .collect(),
             nx: pts.iter().map(|p| p.nx as f32).collect(),
             ny: pts.iter().map(|p| p.ny as f32).collect(),
             tx: pts.iter().map(|p| p.tx as f32).collect(),
@@ -1005,9 +1185,9 @@ pub(crate) fn run_headless_pinlug_inner(
     let mut tracker = ConvergenceTracker::for_metric(
         MetricDirection::SmallerIsBetter,
         0.05, // plateau_rel_eps: recent-window min must shrink >=5% relative to the older
-              // window's min or a restart fires.
-        2.0,  // crash_spike_factor: metric >=2x its recent best — smaller-is-better mirror
-              // of K_t's CRASH_DROP_FRACTION=0.5 (1/0.5 = 2.0).
+        // window's min or a restart fires.
+        2.0, // crash_spike_factor: metric >=2x its recent best — smaller-is-better mirror
+        // of K_t's CRASH_DROP_FRACTION=0.5 (1/0.5 = 2.0).
         significant_floor,
     );
     let mut dynamic_lam_h_cap = 50.0_f64;
@@ -1044,8 +1224,14 @@ pub(crate) fn run_headless_pinlug_inner(
         let lug_int = lug_sampling.sample_interior(&lug_geom, config.n_interior);
         let lug_bnd = lug_sampling.sample_boundary(&lug_geom, &config.load, config.n_boundary);
 
-        let pin_int_norm: Vec<[f32; 2]> = pin_int.iter().map(|&[x, y]| normalize_point_generic(x, y, &pin_geom)).collect();
-        let lug_int_norm: Vec<[f32; 2]> = lug_int.iter().map(|&[x, y]| normalize_point_generic(x, y, &lug_geom)).collect();
+        let pin_int_norm: Vec<[f32; 2]> = pin_int
+            .iter()
+            .map(|&[x, y]| normalize_point_generic(x, y, &pin_geom))
+            .collect();
+        let lug_int_norm: Vec<[f32; 2]> = lug_int
+            .iter()
+            .map(|&[x, y]| normalize_point_generic(x, y, &lug_geom))
+            .collect();
 
         // Sized to the known closed set of names each domain's `named_point_sets()` populates
         // (pin: "interface" + optionally "driving"; lug: "interface" + "shank_anchor", plus
@@ -1063,11 +1249,23 @@ pub(crate) fn run_headless_pinlug_inner(
         // Wire the real driving-traction target (equivalent_traction, +x direction) into
         // the pin's "driving" point-set (named_point_sets leaves tx/ty as placeholders).
         if let Some(driving) = pin_named.get_mut("driving") {
-            for t in driving.tx.iter_mut() { *t = equiv_traction as f32; }
+            for t in driving.tx.iter_mut() {
+                *t = equiv_traction as f32;
+            }
         }
 
-        let pin_data = DomainStepData { id: PIN_DOMAIN, int_norm: pin_int_norm, extra_ring_norm: Vec::new(), named: pin_named };
-        let lug_data = DomainStepData { id: LUG_DOMAIN, int_norm: lug_int_norm, extra_ring_norm: Vec::new(), named: lug_named };
+        let pin_data = DomainStepData {
+            id: PIN_DOMAIN,
+            int_norm: pin_int_norm,
+            extra_ring_norm: Vec::new(),
+            named: pin_named,
+        };
+        let lug_data = DomainStepData {
+            id: LUG_DOMAIN,
+            int_norm: lug_int_norm,
+            extra_ring_norm: Vec::new(),
+            named: lug_named,
+        };
 
         let ctx = MultiStepCtx {
             config: &config,
@@ -1075,8 +1273,18 @@ pub(crate) fn run_headless_pinlug_inner(
             fd: &fd,
             k: 1.0,
             domains: vec![
-                DomainStepCtx { data: &pin_data, u_ref, ref_energy, ref_stress2 },
-                DomainStepCtx { data: &lug_data, u_ref, ref_energy, ref_stress2 },
+                DomainStepCtx {
+                    data: &pin_data,
+                    u_ref,
+                    ref_energy,
+                    ref_stress2,
+                },
+                DomainStepCtx {
+                    data: &lug_data,
+                    u_ref,
+                    ref_energy,
+                    ref_stress2,
+                },
             ],
             dynamic_lam_h_cap,
             dynamic_lam_d_cap,
@@ -1114,7 +1322,9 @@ pub(crate) fn run_headless_pinlug_inner(
                 // ever captured (defensive; in practice always Some by the time Converge can
                 // be entered).
                 frozen_lams = Some(prev_lam_by_name.clone().unwrap_or_else(|| {
-                    problem.loss_terms().iter()
+                    problem
+                        .loss_terms()
+                        .iter()
                         .map(|t| (t.name(), problem.base_weight(t.name()) as f64))
                         .collect()
                 }));
@@ -1122,17 +1332,35 @@ pub(crate) fn run_headless_pinlug_inner(
             }
             let lbfgs = lbfgs_opt.get_or_insert_with(|| make_lbfgs(dm_config.lbfgs_max_iter));
             let fctx = frozen_ctx.as_ref().unwrap();
-            let lams = frozen_lams.as_ref().expect("lams must be set when entering Converge");
+            let lams = frozen_lams
+                .as_ref()
+                .expect("lams must be set when entering Converge");
             let lr = lr_sched.current_lr();
-            let models = TwoDomainModels { pin: model_pin, lug: model_lug };
-            let (new_models, loss_f64) = step_lbfgs_multi(models, lbfgs, lr, fctx, &problem, lams, &device);
+            let models = TwoDomainModels {
+                pin: model_pin,
+                lug: model_lug,
+            };
+            let (new_models, loss_f64) =
+                step_lbfgs_multi(models, lbfgs, lr, fctx, &problem, lams, &device);
             model_pin = new_models.pin;
             model_lug = new_models.lug;
             StepOutput {
-                e_scalar: 0.0, n_scalar: 0.0, h_scalar: 0.0, d_scalar: 0.0,
-                eq_scalar: 0.0, w_scalar: 0.0, kirsch_scalar: 0.0, const_scalar: 0.0,
-                total_scalar: loss_f64 as f32, lr,
-                lam_e: 0.0, lam_n: 0.0, lam_h: 0.0, lam_d: 0.0, lam_eq: 0.0, lam_kirsch: 0.0,
+                e_scalar: 0.0,
+                n_scalar: 0.0,
+                h_scalar: 0.0,
+                d_scalar: 0.0,
+                eq_scalar: 0.0,
+                w_scalar: 0.0,
+                kirsch_scalar: 0.0,
+                const_scalar: 0.0,
+                total_scalar: loss_f64 as f32,
+                lr,
+                lam_e: 0.0,
+                lam_n: 0.0,
+                lam_h: 0.0,
+                lam_d: 0.0,
+                lam_eq: 0.0,
+                lam_kirsch: 0.0,
                 proxy_ratio: 0.0,
                 optimizer_tier: OptimizerTier::Converge.as_u8(),
                 cosine_sim: None,
@@ -1155,8 +1383,15 @@ pub(crate) fn run_headless_pinlug_inner(
             // improves accuracy when enabled. Same 1.0/1.0 boost/mult placeholders
             // (pin-in-lug has no StiffnessController).
             let (new_models, out) = step_physics_multi(
-                vec![model_pin, model_lug], &mut optims, &ctx, &mut saw, &mut lr_sched, &device,
-                decision_maker.current_tier.as_u8(), 1.0, 1.0,
+                vec![model_pin, model_lug],
+                &mut optims,
+                &ctx,
+                &mut saw,
+                &mut lr_sched,
+                &device,
+                decision_maker.current_tier.as_u8(),
+                1.0,
+                1.0,
             );
             let mut it = new_models.into_iter();
             model_pin = it.next().unwrap();
@@ -1181,7 +1416,10 @@ pub(crate) fn run_headless_pinlug_inner(
             let want_conflict = decision_maker.current_tier != OptimizerTier::Converge
                 && dm_config.use_exact_cosine;
             let conflict = if want_conflict {
-                let models = TwoDomainModels { pin: model_pin, lug: model_lug };
+                let models = TwoDomainModels {
+                    pin: model_pin,
+                    lug: model_lug,
+                };
                 let c = compute_gradient_conflict_multi(&models, &ctx, &device);
                 model_pin = models.pin;
                 model_lug = models.lug;
@@ -1191,17 +1429,29 @@ pub(crate) fn run_headless_pinlug_inner(
             };
 
             if let Some(t) = decision_maker.evaluate(conflict, out.proxy_ratio, PHASE2_ACTIVE) {
-                let old_tier_name = match out.optimizer_tier { 0 => "Explore", 1 => "Align", _ => "Converge" };
+                let old_tier_name = match out.optimizer_tier {
+                    0 => "Explore",
+                    1 => "Align",
+                    _ => "Converge",
+                };
                 let new_tier_name = match t.new_tier {
-                    OptimizerTier::Explore  => "Explore",
-                    OptimizerTier::Align    => "Align",
+                    OptimizerTier::Explore => "Explore",
+                    OptimizerTier::Align => "Align",
                     OptimizerTier::Converge => "Converge",
                 };
                 println!("\n  [DM@{step}] {old_tier_name} → {new_tier_name}");
                 if t.reset_optim {
                     optims = vec![
-                        DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &t.new_tier), bias: make_bias_optim(), gate: make_gate_optim() },
-                        DomainOptim { weight: WeightOptim::from_tier(config.use_soap_muon, &t.new_tier), bias: make_bias_optim(), gate: make_gate_optim() },
+                        DomainOptim {
+                            weight: WeightOptim::from_tier(config.use_soap_muon, &t.new_tier),
+                            bias: make_bias_optim(),
+                            gate: make_gate_optim(),
+                        },
+                        DomainOptim {
+                            weight: WeightOptim::from_tier(config.use_soap_muon, &t.new_tier),
+                            bias: make_bias_optim(),
+                            gate: make_gate_optim(),
+                        },
                     ];
                 }
                 if t.reset_lr {
@@ -1218,7 +1468,9 @@ pub(crate) fn run_headless_pinlug_inner(
                         frozen_ctx = Some(FrozenMultiStepCtx::from_ctx(&ctx));
                         last_lam_before_converge = out.lam_by_name.clone();
                         frozen_lams = Some(out.lam_by_name.clone().unwrap_or_else(|| {
-                            problem.loss_terms().iter()
+                            problem
+                                .loss_terms()
+                                .iter()
                                 .map(|t| (t.name(), problem.base_weight(t.name()) as f64))
                                 .collect()
                         }));
@@ -1228,7 +1480,9 @@ pub(crate) fn run_headless_pinlug_inner(
                     _ => {
                         // Leaving Converge (or any other transition): clear frozen state so
                         // the next Converge entry re-freezes on fresh collocation points.
-                        frozen_ctx = None; frozen_lams = None; lbfgs_opt = None;
+                        frozen_ctx = None;
+                        frozen_lams = None;
+                        lbfgs_opt = None;
                     }
                 }
             }
@@ -1262,7 +1516,11 @@ pub(crate) fn run_headless_pinlug_inner(
                                 frozen_ctx: &mut frozen_ctx,
                                 frozen_lams: &mut frozen_lams,
                             },
-                            new_cap, true, true, &dm_config, config.use_soap_muon,
+                            new_cap,
+                            true,
+                            true,
+                            &dm_config,
+                            config.use_soap_muon,
                         );
                         model_reinit_count += 1;
                         println!("\n  [PARAM-NAN REINIT #{}] Param-level NaN/Inf in pin/lug model weights → full reinit from scratch (Option A): lr+adam+SAW, lam_caps→{new_cap:.0}",
@@ -1277,8 +1535,20 @@ pub(crate) fn run_headless_pinlug_inner(
             }
 
             let state = vec![
-                DomainState { id: PIN_DOMAIN, model: model_pin.clone(), u_ref, ref_energy, ref_stress2 },
-                DomainState { id: LUG_DOMAIN, model: model_lug.clone(), u_ref, ref_energy, ref_stress2 },
+                DomainState {
+                    id: PIN_DOMAIN,
+                    model: model_pin.clone(),
+                    u_ref,
+                    ref_energy,
+                    ref_stress2,
+                },
+                DomainState {
+                    id: LUG_DOMAIN,
+                    model: model_lug.clone(),
+                    u_ref,
+                    ref_energy,
+                    ref_stress2,
+                },
             ];
             if let Some(rms) = problem.convergence_metric(&state) {
                 metric_probes += 1;
@@ -1305,7 +1575,11 @@ pub(crate) fn run_headless_pinlug_inner(
                             frozen_ctx: &mut frozen_ctx,
                             frozen_lams: &mut frozen_lams,
                         },
-                        new_cap, true, true, &dm_config, config.use_soap_muon,
+                        new_cap,
+                        true,
+                        true,
+                        &dm_config,
+                        config.use_soap_muon,
                     );
                     println!("\n  [CRASH RECOVERY #{}] gap_rms={rms:.3e} collapsed → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
                         tracker.total_restarts());
@@ -1327,7 +1601,11 @@ pub(crate) fn run_headless_pinlug_inner(
                             frozen_ctx: &mut frozen_ctx,
                             frozen_lams: &mut frozen_lams,
                         },
-                        new_cap, false, true, &dm_config, config.use_soap_muon,
+                        new_cap,
+                        false,
+                        true,
+                        &dm_config,
+                        config.use_soap_muon,
                     );
                     println!("\n  [WARM RESTART #{}] gap_rms plateau → reset: lr+adam+SAW, lam_caps→{new_cap:.0}",
                         tracker.total_restarts());
@@ -1353,7 +1631,11 @@ pub(crate) fn run_headless_pinlug_inner(
                         frozen_ctx: &mut frozen_ctx,
                         frozen_lams: &mut frozen_lams,
                     },
-                    new_cap, true, false, &dm_config, config.use_soap_muon,
+                    new_cap,
+                    true,
+                    false,
+                    &dm_config,
+                    config.use_soap_muon,
                 );
                 println!("\n  [STUCK-NAN RECOVERY #{}] {} consecutive missed gap_rms readings → restart: lr+adam+SAW, lam_caps→{new_cap:.0}",
                     tracker.total_restarts(), STUCK_NONE_THRESHOLD);
@@ -1361,7 +1643,10 @@ pub(crate) fn run_headless_pinlug_inner(
         }
 
         if step % 200 == 0 || step == config.max_steps - 1 {
-            println!("{step:>6}  total={:>10.3e}  lr={:>8.2e}", out.total_scalar, out.lr);
+            println!(
+                "{step:>6}  total={:>10.3e}  lr={:>8.2e}",
+                out.total_scalar, out.lr
+            );
         }
     }
 
@@ -1378,11 +1663,15 @@ pub(crate) fn run_headless_pinlug_inner(
     {
         let model_lug_val: ElasticityNet<BInner> = model_lug.valid();
         match crate::contact_export::export_contact_pressure::<BInner>(
-            &model_lug_val, &lug_geom, config.load.px, &device,
+            &model_lug_val,
+            &lug_geom,
+            config.load.px,
+            &device,
         ) {
             Ok(samples) => println!(
                 "  Contact pressure profile: {} samples written to {}",
-                samples.len(), crate::contact_export::DEFAULT_CONTACT_EXPORT_PATH,
+                samples.len(),
+                crate::contact_export::DEFAULT_CONTACT_EXPORT_PATH,
             ),
             Err(e) => eprintln!(
                 "  [WARN] failed to write contact-pressure CSV to {}: {e}",
@@ -1416,7 +1705,10 @@ fn normalize_point_generic(x: f64, y: f64, geom: &pinn_core::geometry::GeometryC
     let (y0, y1) = geom.y_range();
     let dw = x1 - x0;
     let dh = y1 - y0;
-    [(2.0 * (x - x0) / dw - 1.0) as f32, (2.0 * (y - y0) / dh - 1.0) as f32]
+    [
+        (2.0 * (x - x0) / dw - 1.0) as f32,
+        (2.0 * (y - y0) / dh - 1.0) as f32,
+    ]
 }
 
 #[cfg(test)]
@@ -1485,22 +1777,35 @@ mod tests {
         model_pin.visit(&mut TouchVisitor);
         model_lug.visit(&mut TouchVisitor);
 
-        let result_a = run_headless_pinlug_inner(config_off.clone(), Some((model_pin.clone(), model_lug.clone())));
+        let result_a = run_headless_pinlug_inner(
+            config_off.clone(),
+            Some((model_pin.clone(), model_lug.clone())),
+        );
         let result_b = run_headless_pinlug_inner(config_off, Some((model_pin, model_lug)));
 
         assert_eq!(result_a.trajectory.len(), result_b.trajectory.len());
-        assert_eq!(result_a.final_tier, OptimizerTier::Explore,
-            "decision_maker.enabled=false must never transition current_tier away from Explore");
+        assert_eq!(
+            result_a.final_tier,
+            OptimizerTier::Explore,
+            "decision_maker.enabled=false must never transition current_tier away from Explore"
+        );
         assert_eq!(result_b.final_tier, OptimizerTier::Explore);
 
-        for (i, (a, b)) in result_a.trajectory.iter().zip(result_b.trajectory.iter()).enumerate() {
+        for (i, (a, b)) in result_a
+            .trajectory
+            .iter()
+            .zip(result_b.trajectory.iter())
+            .enumerate()
+        {
             let scale = a.abs().max(b.abs()).max(1e-8);
             let rel = (a - b).abs() / scale;
             // This repo's established GPU-float-under-test-contention tolerance (see
             // training_core.rs's `param_l2_sq` regression tests' `1e-4` precedent).
-            assert!(rel < 1e-4,
+            assert!(
+                rel < 1e-4,
                 "step {i}: trajectories diverge beyond tolerance with decision_maker disabled \
-                 (must be a complete no-op): a={a} b={b} rel_err={rel}");
+                 (must be a complete no-op): a={a} b={b} rel_err={rel}"
+            );
         }
     }
 
@@ -1520,10 +1825,14 @@ mod tests {
 
         let result = run_headless_pinlug_inner(config, None);
 
-        assert_ne!(result.final_tier, OptimizerTier::Explore,
+        assert_ne!(
+            result.final_tier,
+            OptimizerTier::Explore,
             "with a permissive conflict_threshold and enabled=true, the decision maker must \
              transition out of Explore within {} steps; final_tier={:?}",
-            60, result.final_tier);
+            60,
+            result.final_tier
+        );
     }
 
     /// The key design decision under test: `dynamic_lam_penetration_cap`/
@@ -1539,7 +1848,11 @@ mod tests {
         use crate::pinlug_problem::{PinLugProblem, PinLugScalingMode};
         use crate::problem::BoundaryValueProblem;
         let problem = PinLugProblem::new(
-            config.material.clone(), 5, usize::MAX, 64, PinLugScalingMode::AppliedLoad,
+            config.material.clone(),
+            5,
+            usize::MAX,
+            64,
+            PinLugScalingMode::AppliedLoad,
         );
         let expected_penetration = problem.base_weight("interface_penetration") as f64;
         let expected_non_tension = problem.base_weight("interface_non_tension") as f64;
@@ -1602,14 +1915,20 @@ mod tests {
     /// here. Until then, this branch's wiring is verified at the unit level only (via
     /// `ConvergenceTracker::note_missed_reading` directly, see the two tests above), not
     /// integration-tested end-to-end through `run_headless_pinlug_inner`.
-    fn nan_pinlug_models(config: &pinn_core::messages::SolverConfig, device: &BDevice) -> (ElasticityNet<B>, ElasticityNet<B>) {
+    fn nan_pinlug_models(
+        config: &pinn_core::messages::SolverConfig,
+        device: &BDevice,
+    ) -> (ElasticityNet<B>, ElasticityNet<B>) {
+        use crate::network::ElasticityNetConfig;
         use burn::module::{Module, ModuleMapper, Param};
         use burn::tensor::Tensor;
-        use crate::network::ElasticityNetConfig;
 
         struct NanMapper;
         impl<Bk: burn::tensor::backend::Backend> ModuleMapper<Bk> for NanMapper {
-            fn map_float<const D: usize>(&mut self, param: Param<Tensor<Bk, D>>) -> Param<Tensor<Bk, D>> {
+            fn map_float<const D: usize>(
+                &mut self,
+                param: Param<Tensor<Bk, D>>,
+            ) -> Param<Tensor<Bk, D>> {
                 param.map(|t| t.zeros_like().add_scalar(f32::NAN))
             }
         }
@@ -1638,9 +1957,15 @@ mod tests {
     #[test]
     fn run_headless_pinlug_stuck_nan_below_threshold_does_not_restart() {
         use crate::controllers::MetricDirection;
-        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 0.0);
+        let mut t =
+            ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 0.0);
         for i in 0..3 {
-            assert_eq!(t.note_missed_reading(), None, "miss #{} (below STUCK_NONE_THRESHOLD) must not restart", i + 1);
+            assert_eq!(
+                t.note_missed_reading(),
+                None,
+                "miss #{} (below STUCK_NONE_THRESHOLD) must not restart",
+                i + 1
+            );
         }
         assert_eq!(t.crash_restarts, 0);
     }
@@ -1650,9 +1975,15 @@ mod tests {
     #[test]
     fn run_headless_pinlug_stuck_nan_integration_fires_restart_at_threshold() {
         use crate::controllers::MetricDirection;
-        let mut t = ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 0.0);
-        for _ in 0..3 { assert_eq!(t.note_missed_reading(), None); }
-        assert!(t.note_missed_reading().is_some(), "4th consecutive missed reading must trip the restart");
+        let mut t =
+            ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, 2.0, 0.0);
+        for _ in 0..3 {
+            assert_eq!(t.note_missed_reading(), None);
+        }
+        assert!(
+            t.note_missed_reading().is_some(),
+            "4th consecutive missed reading must trip the restart"
+        );
         assert_eq!(t.crash_restarts, 1);
     }
 
@@ -1667,11 +1998,15 @@ mod tests {
         let device = BDevice::default();
         let (model_pin, model_lug) = nan_pinlug_models(&config, &device);
         let result = run_headless_pinlug_inner(config, Some((model_pin, model_lug)));
-        assert_eq!(result.model_reinit_count, 1,
+        assert_eq!(
+            result.model_reinit_count, 1,
             "a Param-level NaN observed on the FIRST probe must reinitialize immediately, not \
-             wait for STUCK_NONE_THRESHOLD consecutive misses");
-        assert_eq!(result.metric_probes, 1,
-            "the freshly-reinitialized model must be probed (and read Some) in the SAME iteration");
+             wait for STUCK_NONE_THRESHOLD consecutive misses"
+        );
+        assert_eq!(
+            result.metric_probes, 1,
+            "the freshly-reinitialized model must be probed (and read Some) in the SAME iteration"
+        );
     }
 
     #[test]
@@ -1713,7 +2048,10 @@ mod tests {
             "PirateNet gates must not destabilize pin-lug's Signorini-coupled training into NaN/Inf");
         assert!(!result.trajectory.is_empty());
         for (i, total) in result.trajectory.iter().enumerate() {
-            assert!(total.is_finite(), "step {i}: total_scalar not finite under PirateNet: {total}");
+            assert!(
+                total.is_finite(),
+                "step {i}: total_scalar not finite under PirateNet: {total}"
+            );
         }
         assert!(result.metric_probes > 0,
             "interface-gap RMS convergence metric must remain probeable with PirateNet gates active");
@@ -1732,11 +2070,16 @@ mod tests {
         config.use_piratenet_compute_skip = true;
         let result = run_headless_pinlug_inner(config, None);
 
-        assert_eq!(result.model_reinit_count, 0,
-            "compute-skip must not destabilize pin-lug's Signorini-coupled training into NaN/Inf");
+        assert_eq!(
+            result.model_reinit_count, 0,
+            "compute-skip must not destabilize pin-lug's Signorini-coupled training into NaN/Inf"
+        );
         assert!(!result.trajectory.is_empty());
         for (i, total) in result.trajectory.iter().enumerate() {
-            assert!(total.is_finite(), "step {i}: total_scalar not finite under compute-skip: {total}");
+            assert!(
+                total.is_finite(),
+                "step {i}: total_scalar not finite under compute-skip: {total}"
+            );
         }
     }
 
@@ -1776,7 +2119,8 @@ mod tests {
         model_pin.visit(&mut TouchVisitor);
         model_lug.visit(&mut TouchVisitor);
 
-        let a = run_headless_pinlug_inner(config.clone(), Some((model_pin.clone(), model_lug.clone())));
+        let a =
+            run_headless_pinlug_inner(config.clone(), Some((model_pin.clone(), model_lug.clone())));
         let b = run_headless_pinlug_inner(config, Some((model_pin, model_lug)));
 
         assert_eq!(a.total_restarts, b.total_restarts);
@@ -1787,7 +2131,10 @@ mod tests {
         assert_eq!(a.trajectory.len(), b.trajectory.len());
         for (i, (x, y)) in a.trajectory.iter().zip(b.trajectory.iter()).enumerate() {
             let scale = x.abs().max(y.abs()).max(1e-8);
-            assert!((x - y).abs() / scale < 1e-4, "step {i}: cascade introduced nondeterminism: a={x} b={y}");
+            assert!(
+                (x - y).abs() / scale < 1e-4,
+                "step {i}: cascade introduced nondeterminism: a={x} b={y}"
+            );
         }
     }
 
@@ -1813,7 +2160,8 @@ mod tests {
     }
 
     #[test]
-    fn run_headless_pinlug_decision_maker_enabled_stays_in_align_when_converge_thresholds_unfavorable() {
+    fn run_headless_pinlug_decision_maker_enabled_stays_in_align_when_converge_thresholds_unfavorable(
+    ) {
         let mut config = small_pinlug_config();
         config.max_steps = 60;
         config.decision_maker.enabled = true;
@@ -1836,8 +2184,12 @@ mod tests {
         let config = permissive_converge_config();
         let result = run_headless_pinlug_inner(config, None);
 
-        let last = result.last_lam_before_converge.expect("must have captured a pre-entry snapshot");
-        let entry = result.lbfgs_entry_lams.expect("must have entered Converge and frozen lams");
+        let last = result
+            .last_lam_before_converge
+            .expect("must have captured a pre-entry snapshot");
+        let entry = result
+            .lbfgs_entry_lams
+            .expect("must have entered Converge and frozen lams");
         assert_eq!(last, entry, "L-BFGS's frozen lambdas at entry must be the LIVE SAW+cap-adapted \
             weights from the step immediately before entry, not problem.base_weight()'s static seed");
 
@@ -1846,14 +2198,19 @@ mod tests {
         use crate::pinlug_problem::{PinLugProblem, PinLugScalingMode};
         use crate::problem::BoundaryValueProblem;
         let problem = PinLugProblem::new(
-            pinn_core::material::MaterialProps::steel_4340(), 5, usize::MAX, 64,
+            pinn_core::material::MaterialProps::steel_4340(),
+            5,
+            usize::MAX,
+            64,
             PinLugScalingMode::AppliedLoad,
         );
         let base_free_edge = problem.base_weight("lug_free_edge_traction") as f64;
         let base_penetration = problem.base_weight("interface_penetration") as f64;
         assert!(
-            (entry["lug_free_edge_traction"] - base_free_edge).abs() > 1e-9 * base_free_edge.max(1.0)
-            || (entry["interface_penetration"] - base_penetration).abs() > 1e-9 * base_penetration.max(1.0),
+            (entry["lug_free_edge_traction"] - base_free_edge).abs()
+                > 1e-9 * base_free_edge.max(1.0)
+                || (entry["interface_penetration"] - base_penetration).abs()
+                    > 1e-9 * base_penetration.max(1.0),
             "expected at least one term's SAW-adapted weight to have moved from its static \
              base_weight by Converge entry"
         );
@@ -1883,7 +2240,10 @@ mod tests {
 
         struct NanMapper;
         impl<Bk: burn::tensor::backend::Backend> ModuleMapper<Bk> for NanMapper {
-            fn map_float<const D: usize>(&mut self, param: Param<Tensor<Bk, D>>) -> Param<Tensor<Bk, D>> {
+            fn map_float<const D: usize>(
+                &mut self,
+                param: Param<Tensor<Bk, D>>,
+            ) -> Param<Tensor<Bk, D>> {
                 param.map(|t| t.zeros_like().add_scalar(f32::NAN))
             }
         }
@@ -1907,9 +2267,11 @@ mod tests {
         let device = BDevice::default();
         let model = nan_kirsch_model(&config, &device);
         let result = run_headless_inner(config, Some(model));
-        assert_eq!(result.model_reinit_count, 1,
+        assert_eq!(
+            result.model_reinit_count, 1,
             "a Param-level NaN in Phase 1 must be caught even though the existing K_t cascade \
-             is entirely gated behind phase2_started");
+             is entirely gated behind phase2_started"
+        );
     }
 
     #[test]
@@ -1959,7 +2321,10 @@ mod tests {
         let result_control = run_headless_inner(config_control, None);
 
         for (i, t) in result_growth.trajectory.iter().enumerate() {
-            assert!(t.is_finite(), "growth run total_scalar at step {i} is not finite: {t}");
+            assert!(
+                t.is_finite(),
+                "growth run total_scalar at step {i} is not finite: {t}"
+            );
         }
         assert!(
             !result_growth.kt_trajectory.is_empty(),
@@ -2029,12 +2394,19 @@ mod tests {
         let result_b = run_headless_inner(config, Some(model));
 
         assert_eq!(result_a.trajectory.len(), result_b.trajectory.len());
-        for (i, (a, b)) in result_a.trajectory.iter().zip(result_b.trajectory.iter()).enumerate() {
+        for (i, (a, b)) in result_a
+            .trajectory
+            .iter()
+            .zip(result_b.trajectory.iter())
+            .enumerate()
+        {
             let scale = a.abs().max(b.abs()).max(1e-8);
             let rel = (a - b).abs() / scale;
-            assert!(rel < 1e-4,
+            assert!(
+                rel < 1e-4,
                 "step {i}: trajectories diverge beyond tolerance with width_growth disabled \
-                 (must be a complete no-op): a={a} b={b} rel_err={rel}");
+                 (must be a complete no-op): a={a} b={b} rel_err={rel}"
+            );
         }
     }
 }

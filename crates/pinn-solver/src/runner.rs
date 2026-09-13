@@ -19,7 +19,8 @@ use crate::{
     decision_maker::{OptimizerTier, PinnDecisionMaker},
     engine::EngineParams,
     energy::dem_energy_per_point,
-    fd_stencil::{assemble_stencil, compute_strains, norm_pts_to_tensor, FdConfig},
+    differential_operator::production_strain as compute_strains,
+    fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig},
     kirsch_problem::KirschProblem,
     network::{fwd, ElasticityNet, ElasticityNetConfig},
     optim::{make_bias_optim, make_gate_optim, BiasOptim, GateOptim, WeightOptim},
@@ -1455,6 +1456,9 @@ fn run_user_problem_training_from(
     // `steps_completed` as the checkpoint's own starting point, not `1`.
     let mut last_step = step_offset.saturating_sub(1);
     let mut last_total_loss = 0.0f32;
+    // Last actual post-SAW/BRDR weights. Persisted with checkpoints so Phase 4 reports do
+    // not confuse static base weights with live optimizer weights.
+    let mut last_adaptive_weights: Option<std::collections::BTreeMap<String, f64>> = None;
 
     for step in step_offset..spec.training.max_steps {
         match handle_control_messages(&stop_rx) {
@@ -1777,6 +1781,11 @@ fn run_user_problem_training_from(
         };
 
         last_total_loss = out.total_scalar;
+        if let Some(lambdas) = out.lam_by_name.as_ref() {
+            last_adaptive_weights = Some(lambdas.iter()
+                .map(|(&name, &weight)| (name.to_string(), weight))
+                .collect());
+        }
         let energy_loss = out.e_scalar;
         let neumann_loss = out.total_scalar - energy_loss;
         // `training_core::GradientShareReport` -> `pinn_core::messages::GradientShareSummary` -
@@ -1959,15 +1968,15 @@ fn run_user_problem_training_from(
                     bc_residual_trend: format!("{:?}", convergence_evidence.bc_residual_trend),
                     plausibly_converged: convergence_evidence.plausibly_converged,
                 };
-                let report = crate::provenance::build_authoritative_report(
+                let report = crate::provenance::build_plate_authoritative_report(
+                    &live_spec,
                     provenance.clone(),
-                    live_spec.training.measure_aware_training,
-                    live_spec.training.amr_enabled,
                     last_amr_sweep_step,
                     no_hole_benchmark,
                     Some(energy_balance),
                     Some(reaction_force),
                     Some(convergence_evidence),
+                    last_adaptive_weights.clone(),
                 );
                 let meta = crate::checkpoint::CheckpointMeta {
                     spec: crate::checkpoint::CheckpointSpec::Plate(live_spec),
@@ -2137,14 +2146,14 @@ pub fn serve_loaded_plate_checkpoint(
                 // honestly `None` - no training ran this session, so neither has anything to
                 // report (same "real absence" treatment as `TrainingUpdate.convergence_
                 // evidence` above).
-                let report = crate::provenance::build_authoritative_report(
+                let report = crate::provenance::build_plate_authoritative_report(
+                    &spec,
                     provenance.clone(),
-                    spec.training.measure_aware_training,
-                    spec.training.amr_enabled,
                     None,
                     no_hole_benchmark.as_ref().map(crate::provenance::PersistedNoHoleBenchmark::from),
                     Some(energy_balance),
                     Some(reaction_force),
+                    None,
                     None,
                 );
                 let meta = crate::checkpoint::CheckpointMeta {
@@ -2715,6 +2724,12 @@ mod tests {
         assert!(!report.l5_hole_benchmark_note.is_empty());
         assert!(report.energy_balance.is_some());
         assert!(report.reaction_force.is_some());
+        let objective = report.objective_snapshot.expect("plate checkpoint must persist PH4 mathematical objective");
+        assert!(objective.physical_u.is_some());
+        assert!(objective.physical_w_ext.is_some());
+        assert!(objective.physical_pi.is_some());
+        assert!(!objective.active_terms.is_empty());
+        assert!(objective.reference_energy_j.is_finite() && objective.reference_energy_j > 0.0);
         assert_eq!(report.sampling_mode, if spec_default_amr_enabled() { "AMR" } else { "FixedUniform" });
         assert!(!report.provenance.config_hash.is_empty());
 
@@ -3657,6 +3672,7 @@ mod tests {
         let mut spec = no_hole_plate_spec(15);
         spec.training.derivative_operator_diagnostic = true;
         spec.formulation = FormulationSelection::Variational; // cheap: only 2 base terms active
+        spec.training.measure_aware_training = true;
         let (tx, rx) = crossbeam_channel::unbounded();
         let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
         let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, rx_ctrl));
@@ -3693,6 +3709,7 @@ mod tests {
         use pinn_core::problem_spec::FormulationSelection;
         let mut spec = no_hole_plate_spec(120);
         spec.formulation = FormulationSelection::Variational; // cheap: only 2 base terms active
+        spec.training.measure_aware_training = true;
         let (tx, rx) = crossbeam_channel::unbounded();
         let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
         let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, rx_ctrl));
@@ -3791,6 +3808,7 @@ mod tests {
 
         let mut spec = no_hole_plate_spec(5);
         spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational; // cheap
+        spec.training.measure_aware_training = true;
         assert_eq!(spec.network.model_init_seed, pinn_core::problem_spec::NetworkSpec::default().model_init_seed, "test relies on the real shipped default seed, not a hand-picked one");
 
         let update_a = run_and_capture_step_zero(spec.clone());

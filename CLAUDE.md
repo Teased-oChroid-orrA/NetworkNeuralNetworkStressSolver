@@ -1,5 +1,9 @@
 # PINN Structural Stress Solver
 
+## Response style
+
+Use installed `caveman` skill automatically for every user-facing response in this repository. Default to full mode for the whole session; no activation command required. Follow its auto-clarity and boundary rules. `stop caveman` or `normal mode` disables it immediately.
+
 A physics-informed neural network (PINN) solver for structural boundary-value problems, built
 on `burn` (ML framework) + `egui`/`wgpu` (GUI). Ships two problems: **Kirsch** (a plate with a
 circular hole under remote tension; validation target K_t = 3.0 at the hole boundary) and

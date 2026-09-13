@@ -1,0 +1,131 @@
+{
+  "amr": {
+    "last_sweep": {
+      "points_after": 4426,
+      "points_before": 4123,
+      "residual_rms_after": 3836077.1316438965,
+      "residual_rms_before": 3594261.3303779922,
+      "step": 1200
+    },
+    "sweep_count": 2
+  },
+  "authoritative_report": {
+    "amr_state": {
+      "enabled": true,
+      "last_sweep_step": 1200
+    },
+    "convergence_evidence": null,
+    "energy_balance": {
+      "energy_balance_error": 0.2423138764213663,
+      "external_work": 1.1068814349807792,
+      "internal_energy": 0.8386687037317421
+    },
+    "integration_mode": "LegacyMeanIntegral",
+    "l0_passed": true,
+    "l1_status": "PASS (structural - proven once by differential_operator's own test suite against a manufactured field, not re-evaluated per run)",
+    "l2_status": "PASS (live invariant - field_graph::check_mixed_stress_source_compatibility asserts on every training step; a completed run is proof by construction it never fired)",
+    "l3_status": "PASS (structural - proven once by measure_integral's own test suite: constant-field exactness and AMR-biased-sampling convergence)",
+    "l4_no_hole_benchmark": null,
+    "l5_hole_benchmark_note": "not yet implemented - see issue #62 PH3-15",
+    "provenance": {
+      "backend": "NdArray",
+      "config_hash": "3c5c136691067402",
+      "derivative_backend": "FD",
+      "dtype": "f32",
+      "formulation": "Hybrid([\"interior_energy\", \"equilibrium\", \"outer_traction\", \"external_work\"])",
+      "git_dirty": false,
+      "git_sha": "0500a6ad62c0923378769fbeb9fea4e8c1583919",
+      "interior_sampling_seed": 90210,
+      "model_init_seed": 90211,
+      "model_init_seeded": true,
+      "problem_hash": "75852b0099b43666"
+    },
+    "reaction_force": {
+      "equilibrium_error": 0.0277434695100575,
+      "net_fx": 1679.6641236572198,
+      "net_fy": -918.2976695861817,
+      "reference_force": 69000.0
+    },
+    "sampling_mode": "AMR"
+  },
+  "engineering_results": {
+    "avg_von_mises_pa": 28855334.0,
+    "max_displacement_m": 0.0000645519612589851,
+    "max_principal_stress_pa": 58562720.0,
+    "max_von_mises_pa": 58079388.0,
+    "min_displacement_m": 0.000011398647984606214
+  },
+  "generated_at_unix": 1789264664,
+  "hole_analyses": [
+    {
+      "hole_index": 0,
+      "kt": 0.27234127536231884,
+      "max_von_mises_pa": 18791548.0,
+      "nominal_stress_pa": 69000000.0,
+      "peak_theta_deg": 180.0
+    }
+  ],
+  "model_validity": null,
+  "operational_status": null,
+  "physics_validation": {
+    "bc_residual_max": 38018264.0,
+    "bc_residual_rms": 23479661.29777858,
+    "energy_balance": {
+      "energy_balance_error": 0.2423138764213663,
+      "external_work_j": 1.1068814349807792,
+      "internal_energy_j": 0.8386687037317421
+    },
+    "pde_residual_max": 23515236.0,
+    "pde_residual_p95": 19201186.0,
+    "pde_residual_rms": 9864208.0,
+    "reaction_force": {
+      "equilibrium_error": 0.0277434695100575,
+      "net_fx_n": 1679.6641236572198,
+      "net_fy_n": -918.2976695861817,
+      "reference_force_n": 69000.0
+    }
+  },
+  "problem": {
+    "geometry": {
+      "half_h_m": 0.1,
+      "half_w_m": 0.1,
+      "holes": [
+        {
+          "bc": "Free",
+          "center_m": [
+            0.0,
+            0.0
+          ],
+          "index": 0,
+          "radius_m": 0.02
+        }
+      ],
+      "thickness_m": 0.005
+    },
+    "kind": "Plate",
+    "load": {
+      "px_pa": 69000000.0,
+      "py_pa": 0.0
+    },
+    "material": {
+      "density_kg_m3": 2810.0,
+      "e_pa": 71700000000.0,
+      "nu": 0.33,
+      "ultimate_strength_pa": 503000000.0
+    },
+    "network": {
+      "hidden_dim": 64,
+      "n_hidden": 8
+    }
+  },
+  "spec_path": "/Users/nautilus/Claude/Projects/NeuralNetwork-Stress-Solver/examples/problems/single_hole_plate.toml",
+  "training": {
+    "elapsed_secs": 1963.6629638671875,
+    "final_grad_norm": 4.952734470367432,
+    "final_optimization_loss_energy_term": 0.08283989876508713,
+    "final_total_loss": 1.7502447366714478,
+    "max_steps": 2000,
+    "step": 1998
+  },
+  "unit_system": "USCS"
+}

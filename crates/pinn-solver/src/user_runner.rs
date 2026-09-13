@@ -167,7 +167,10 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
             // root-cause story. `net_cfg`'s `input_dim` (this function's model-construction
             // site) MUST use the same value.
             n_fourier: spec.geometry.n_fourier(),
-            probe_term_gradients: false,
+            // PH4-06: one final live gradient ledger is cheap enough for headless controlled
+            // ladders and prevents a falling total loss from being mistaken for physical
+            // convergence. Earlier steps keep the normal no-extra-backward-pass path.
+            probe_term_gradients: step + 1 == spec.training.max_steps,
             phase2_active: true,
             step,
         };
@@ -179,8 +182,38 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         model = new_model.into_iter().next().unwrap();
         last_total = out.total_scalar;
 
+        if step + 1 == spec.training.max_steps {
+            if let (Some(raw), Some(weights), Some(norms)) = (
+                out.raw_scalar_by_name.as_ref(), out.lam_by_name.as_ref(), out.term_grad_norms.as_ref(),
+            ) {
+                let mut names: Vec<&&str> = raw.keys().collect();
+                names.sort();
+                for name in names {
+                    println!(
+                        "  [diag] PH4 term: {name} raw={:.6e} lambda={:.6e} grad_norm={:.6e}",
+                        raw[name], weights.get(name).copied().unwrap_or(f64::NAN),
+                        norms.get(name).copied().unwrap_or(f32::NAN),
+                    );
+                }
+            }
+        }
+
         if step % (spec.training.max_steps / 10).max(1) == 0 || step + 1 == spec.training.max_steps {
             println!("  step {step:>6}   total_loss={:.6e}   lr={:.3e}", out.total_scalar, out.lr);
+            if matches!(spec.formulation, pinn_core::problem_spec::FormulationSelection::Variational) {
+                let raw = out.raw_scalar_by_name.as_ref()
+                    .and_then(|values| values.get("physical_potential")).copied()
+                    .unwrap_or(f32::NAN);
+                let physical_weight = out.lam_by_name.as_ref()
+                    .and_then(|weights| weights.get("physical_potential")).copied()
+                    .unwrap_or(f64::NAN);
+                let translation = out.raw_scalar_by_name.as_ref()
+                    .and_then(|values| values.get("translation_gauge")).copied()
+                    .unwrap_or(f32::NAN);
+                println!(
+                    "  [diag] PH4 trend: normalized_Pi={raw:.6e} physical_weight={physical_weight:.6e} translation_gauge={translation:.6e}"
+                );
+            }
         }
     }
     sync_device(&device);
@@ -277,6 +310,19 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         // P2-14's job, which owns the full benchmark protocol + P2-13's provenance).
         if n_holes == 0 {
             let energy_balance = crate::user_problem::probe_energy_balance(&model_val, &spec, &device);
+            // Phase 4: print the same physical objective ledger checkpoint/GUI reports
+            // persist. `EnergyBalance.external_work` is half work for U=W/2 validation;
+            // snapshot exposes full prescribed W_ext and Pi=U-W_ext separately.
+            let objective = crate::provenance::mathematical_objective_snapshot(
+                &spec, Some(&energy_balance), None,
+            );
+            println!(
+                "  [diag] PH4 objective: U={:.6e} J  W_ext={:.6e} J  Pi={:.6e} J  normalized_Pi={:.6e}",
+                objective.physical_u.unwrap_or(f64::NAN),
+                objective.physical_w_ext.unwrap_or(f64::NAN),
+                objective.physical_pi.unwrap_or(f64::NAN),
+                objective.normalized_pi.unwrap_or(f64::NAN),
+            );
             let check = crate::verification_ladder::no_hole_health_check(&energy_balance, max_abs_disp as f64);
             if check.passed {
                 println!("  [diag] P2-08 L4 no-hole health check PASSED (energy_balance_error={:.4e})", check.energy_balance_error);
