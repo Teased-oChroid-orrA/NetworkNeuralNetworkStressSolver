@@ -1591,23 +1591,23 @@ not massaged toward a clean pass.
 
 ### Software quality
 
-- [x] **Workspace build passes.** Confirmed this pass: `cargo build -p pinn-solver --tests`
-  clean under BOTH default (wgpu) features and `--features ndarray-backend` — closing the real
-  `error[E0382]: use of moved value: run` compile error that had silently broken the default-
-  features build since PH3-04 (11 consecutive CI failures, root-caused via `gh run view
-  --log-failed` against the real PH3-04/PH3-13/PH3-14 CI runs). PASS as of this fix commit
-  (`0d494df`).
-- [ ] **Workspace tests pass except for explicitly documented unrelated flakes.** PARTIAL,
-  reported honestly: CI was RED for 11 consecutive pushes (PH3-04→PH3-14) from two real,
+- [x] **Workspace build passes.** Confirmed both locally and in CI: `cargo build -p pinn-solver
+  --tests` clean under BOTH default (wgpu) features and `--features ndarray-backend` — closing
+  the real `error[E0382]: use of moved value: run` compile error that had silently broken the
+  default-features build since PH3-04 (11 consecutive CI failures, root-caused via `gh run view
+  --log-failed` against the real PH3-04/PH3-13/PH3-14 CI runs). CI run 34727258868 (commit
+  `0d494df`) confirms both the `build` (wgpu) and `build-ndarray` jobs compile and build clean.
+  PASS.
+- [x] **Workspace tests pass except for explicitly documented unrelated flakes.** PASS, now
+  fully evidenced: CI was RED for 11 consecutive pushes (PH3-04→PH3-14) from two real,
   independently root-caused bugs — (1) the E0382 compile error above, and (2) PH3-10's own
   `run_training_user_problem_reports_real_convergence_evidence_on_the_final_update` using a
   fixed 120s deadline insufficient under CI's full-parallel-suite contention (confirmed failing
-  at the identical panic in both the PH3-13 and PH3-14 CI runs). Both fixed this pass (deadline
-  raised to 300s; `device` cloned instead of moved in the two affected test closures) and
-  verified: the convergence-evidence test passes in 13.76s in a real release build. The fix
-  commit's own CI run was still in progress at the time this section was written — see this
-  item's own status note below for the final outcome once it completes. A separate, real,
-  already-documented flake exists (`powershell_tool/CLAUDE.md`'s own `headless::tests::
+  at the identical panic in both the PH3-13 and PH3-14 CI runs). Both fixed (deadline raised to
+  300s; `device` cloned instead of moved in the two affected test closures). CI run 34727258868
+  (commit `0d494df`) is GREEN on both jobs — `build` in 48m46s, `build-ndarray` in 55m4s — the
+  first fully green run since PH3-03. A separate, real, already-documented flake exists
+  (`powershell_tool/CLAUDE.md`'s own `headless::tests::
   run_headless_width_growth_disabled_is_byte_identical_to_pre_change`, attributed to `burn-
   ndarray`'s `multi-threads` float-summation nondeterminism) — that flake is in `powershell_tool`,
   not this repository, and was independently investigated and left as a documented, understood,
@@ -1629,19 +1629,21 @@ not massaged toward a clean pass.
   record confirms all 3 compatibility switches (`formulation`, `measure_aware_training`,
   `amr_enabled`) remain live, tested, and reachable — none were removed, and none are dead code
   (each is exercised by both its "on" and "off" state in real tests). PASS.
-- [ ] **Manifests are complete.** PARTIAL until this section's own CI-verification sub-item
-  closes (see below) — every PH3-00 through PH3-17 entry is complete and dated; this §24 section
-  itself is now written, but its own "final CI run" requirement was still resolving at write
-  time.
+- [x] **Manifests are complete.** Every PH3-00 through PH3-17 entry is complete and dated; this
+  §24 section is written with the final CI result confirmed below. PASS.
 
 ### Final CI run
 
-The CI-blocking fixes (commit `0d494df`) were pushed after this section's evidence was gathered.
-Per this session's own standing instruction ("CI is only to be run once, at the end, after
-completion" — not manually re-triggered mid-pass), this fix commit's own auto-triggered CI run
-is treated as the mandated "final CI run" for this checklist item. `[RESULT PENDING AT WRITE
-TIME — see the session's own final report to the user for the confirmed outcome; do not treat
-this manifest section as claiming a GREEN run that was not yet observed.]`
+The CI-blocking fixes (commit `0d494df`) were pushed and its own auto-triggered CI run (run
+34727258868, https://github.com/Teased-oChroid-orrA/NetworkNeuralNetworkStressSolver/actions/runs/34727258868)
+was treated as the mandated "final CI run" for this checklist item, per this session's own
+standing instruction not to manually re-trigger CI mid-pass. **Result: GREEN.** Both jobs
+passed — `build` (default/wgpu features) in 48m46s, `build-ndarray` in 55m4s — the first fully
+green CI run since PH3-03 (PH3-04 through PH3-14 were 11 consecutive real failures from the two
+root causes this item fixed; PH3-15/16/17 were mid-investigation when this item started). The
+"workspace tests pass" and "workspace build passes" checklist items above are now upgraded from
+PARTIAL to fully evidenced for both feature configurations this repository ships
+(`--features ndarray-backend`, the app's own shipped backend, and default/wgpu).
 
 ### Overall verdict
 
