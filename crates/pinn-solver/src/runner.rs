@@ -3677,7 +3677,15 @@ mod tests {
         let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
         let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, rx_ctrl));
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        // 900s, not 120s: confirmed via `git stash` (issue #64 investigation session) that this
+        // debug-build run now regularly exceeds 300s in complete isolation (0 other tests
+        // running), pre-dating and unrelated to that session's own changes — the accumulated
+        // Phase 4 diagnostics/coordinate-skip/provenance work made unoptimized-debug per-step
+        // cost meaningfully heavier than when this deadline was set. Confirmed passing in
+        // ~15.78s under `--release`; this generous debug-mode bound only protects against
+        // false failures from build-profile slowness, not a real hang - correctness is
+        // independent of the deadline value.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
         let mut saw_diag: Option<pinn_core::messages::AdFdStrainAgreementSummary> = None;
         let mut saw_done = false;
         while std::time::Instant::now() < deadline && !saw_done {
@@ -3714,13 +3722,20 @@ mod tests {
         let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
         let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, rx_ctrl));
 
-        // 300s, not 120s: CI's full-parallel-suite contention (400+ tests sharing a runner)
+        // 1800s, not 300s: CI's full-parallel-suite contention (400+ tests sharing a runner)
         // pushed a 120s-budgeted 120-step run past its deadline in real CI runs (issue #62
         // PH3-Final CI investigation) even though this same run completes in ~15-20s locally
-        // in isolation. Generous margin under contention, matching this project's own
-        // established precedent for similar timing-sensitive tests (e.g. the PH3-12 comparison
-        // test's 600s budget just below).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        // in isolation. Issue #64's investigation session confirmed (via `git stash`, pre-dating
+        // and unrelated to that session's own changes) this debug-build run now regularly
+        // exceeds even 300s in complete isolation (`--test-threads=1`, ~315s observed) - the
+        // accumulated Phase 4 diagnostics/coordinate-skip/provenance work made unoptimized-
+        // debug per-step cost meaningfully heavier than when the 300s bound was set. Under the
+        // default `--test-threads=4` full-suite run this test shares its 4 cores with up to 3
+        // concurrent sibling tests, which pushed even a 900s bound past its limit once - hence
+        // this much larger margin. Confirmed passing in ~15.78s under `--release`; correctness
+        // is independent of the deadline value, this only protects against build-profile/
+        // scheduling slowness, not a real hang.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
         let mut last_evidence: Option<pinn_core::messages::ConvergenceEvidenceSummary> = None;
         let mut evidence_ticks_seen = 0usize;
         let mut saw_done = false;

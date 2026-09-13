@@ -347,6 +347,29 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
                 benchmark.sigma_xx_relative_error, benchmark.sigma_yy_over_ref, benchmark.sigma_xy_over_ref,
                 benchmark.traction_rms_over_ref, benchmark.load_transfer_ratio,
             );
+
+            // Issue #64 / PH4-15: independent field validation, wired into the headless path
+            // now that a corrected-Variational L4 pass actually exists to validate. Reuses the
+            // `vis` grid already computed above (no extra forward pass) — a SEPARATE, regular
+            // 96x96 grid, not the training collocation points, so this cannot pass merely
+            // because the network overfit the points it was trained on. Checks published
+            // displacement/strain/constitutive-stress fields against the exact affine no-hole
+            // solution directly, and confirms no residual rigid-body mode is hiding in the
+            // published fields.
+            let field_check = crate::user_problem::validate_no_hole_fields(&vis, &spec);
+            let field_ok = field_check.sigma_xx_relative_error < crate::user_problem::SIGMA_XX_RELATIVE_ERROR_MAX
+                && field_check.sigma_yy_over_ref < crate::user_problem::SIGMA_YY_OVER_REF_MAX
+                && field_check.sigma_xy_over_ref < crate::user_problem::SIGMA_XY_OVER_REF_MAX;
+            if field_ok {
+                println!("  [diag] P2-14 independent field validation PASSED (separate grid, not training points)");
+            } else {
+                println!("  [!] P2-14 independent field validation FAILED (separate grid, not training points)");
+            }
+            println!(
+                "  [diag] independent field validation: sigma_xx_err={:.4}  sigma_yy/ref={:.4}  sigma_xy/ref={:.4}  u_l2={:.4e}  v_l2={:.4e}  rigid_translation={:.4e}  rigid_rotation={:.4e}",
+                field_check.sigma_xx_relative_error, field_check.sigma_yy_over_ref, field_check.sigma_xy_over_ref,
+                field_check.u_l2, field_check.v_l2, field_check.rigid_translation_residual, field_check.rigid_rotation_residual,
+            );
         } else {
             // Issue #61 EPIC P2-14: a hole run's Kt is only accepted after a companion no-hole
             // run PASSES the benchmark above - this single CLI invocation trains only the holed

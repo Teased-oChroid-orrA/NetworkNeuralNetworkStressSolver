@@ -1124,9 +1124,15 @@ mod tests {
         let mlp = model.forward(coords.clone());
         let out = model.forward_with_coordinates(coords, raw_coords(&device));
         let added = out.clone().slice([0..2, 0..2]) - mlp.clone().slice([0..2, 0..2]);
+        // Hand-computed `coords @ W + bias` with `W=[[2,-3],[4,5],[0,0]]`, `bias=[1,-2]`,
+        // `coords=[[0.25,-0.5,0.0],[-0.75,0.4,0.0]]` (this file's own `raw_coords` fixture) —
+        // e.g. point0: `u=0.25*2+(-0.5)*4+1=-0.5`, `v=0.25*-3+(-0.5)*5-2=-5.25`. This literal
+        // was stale (pre-dated a `coordinate_skip` weight-layout change) and didn't match what
+        // `forward_with_coordinates_masked`'s own `residual = coordinate_skip.forward(coords)`
+        // actually computes; corrected to the real product, not a behavior change.
         assert_eq!(
             added.into_data().to_vec::<f32>().unwrap(),
-            vec![0.0, -5.25, 0.7, 2.25]
+            vec![-0.5, -5.25, 1.1, 2.25]
         );
         let stress_diff: f32 = (out.slice([0..2, 2..5]) - mlp.slice([0..2, 2..5]))
             .abs()
@@ -1171,8 +1177,12 @@ mod tests {
         assert!(ids.contains(&model.layers[0].weight.id));
         assert!(ids.contains(&model.layers[2].weight.id));
         assert!(ids.contains(&model.out.weight.id));
+        // `coordinate_skip` is unconditionally included (see its own doc comment: it always
+        // participates in the optimizer step regardless of gate state, unlike gated MLP
+        // blocks) — this literal predates that field and was never updated to account for it.
+        assert!(ids.contains(&model.coordinate_skip.weight.id));
         assert!(!ids.contains(&model.layers[1].weight.id));
-        assert_eq!(ids.len(), 3);
+        assert_eq!(ids.len(), 4);
     }
 
     #[test]

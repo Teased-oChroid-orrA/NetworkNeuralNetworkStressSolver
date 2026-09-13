@@ -205,6 +205,82 @@ and full output are `D_variational_atomic_pi/RESTRICTED_AFFINE_NEURAL_NOTES.md` 
 `restricted_affine_neural.log`. Capacity alone is not root cause; optimizer contract is now
 the next controlled candidate, without changing physical objective or benchmarks.
 
+### PH4-06 root cause found and fixed (issue #64): a "resample every step" that never resampled
+
+Status: VERIFIED
+
+Root cause: `UserSamplingStrategy::sample_interior`/`sample_boundary` (`user_problem.rs`) are
+called fresh every training step (`user_runner.rs`'s `for step in 0..max_steps` loop), with
+clear intent to resample collocation points every step. For any no-hole geometry (every no-hole
+example, including `variational_no_hole_plate.toml`) this was a no-op: `sample_interior`'s
+stratified grid was a pure function of `(geometry, n)` with a fixed `+0.5` cell-center offset,
+`contains_for_collocation` always returns true with zero holes so the RNG-based rejection
+fallback (itself reseeded from the same constant `SEED_INTERIOR` every call) was never reached,
+and `sample_boundary` had no randomness at all. So the network trained against one literal,
+unchanging finite point cloud for the entire run. `InteriorEnergyTerm`/`PhysicalPotentialEnergyTerm`'s
+`U` and `ExternalWorkTerm`'s `W_ext` are both plain `mean(f(x_i))` Monte-Carlo estimators
+(`measure_integral::domain_integral_tensor`/`boundary_integral_tensor`) — unbiased only if the
+`x_i` vary across the optimization trajectory. With a static node set, the optimizer could (and
+did) sculpt energy density artificially low AT those frozen nodes while the field diverged
+between them — the textbook Deep Ritz Method "quadrature-node overfitting" failure, and exactly
+what this manifest's own diagnosis already named ("sampled-functional underintegration / neural
+between-sample exploitation"): sampled `Pi` reaching `-1.02` to `-1.05`, below the true
+continuum affine minimum of exactly `-1`, which is impossible for the real convex functional but
+trivial for a biased fixed-sample estimate of it.
+
+Fix: `sample_interior`/`sample_boundary` now draw genuinely different points on every call via
+jittered stratified sampling, seeded from a per-instance atomic call counter mixed into the RNG
+seed (`interior_calls`/`boundary_calls`, `AtomicU64` — `DomainSamplingStrategy: Send + Sync`
+rules out `Cell`). Same stratum/coverage structure, same `ds` quadrature-weight validity, fully
+reproducible run-to-run (same base seed constant -> same full sequence of per-call point sets).
+Does not touch `Pi`, SAW-BRDR weighting, any threshold, or `pinn_core::sampling`/
+`PinLugSamplingStrategy` (Kirsch's frozen path and pin-lug's separately-tuned path, out of
+scope). New tests `sample_interior_resamples_different_points_across_consecutive_calls`/
+`sample_boundary_resamples_different_points_across_consecutive_calls` prove real resampling;
+every pre-existing containment/margin/edge-placement property test still passes unmodified.
+
+Runtime evidence: at the ORIGINAL 2048/512/2000-step config, the fix alone took normalized `Pi`
+to `-0.9998945` and `load_transfer_ratio` from historical `0.60-0.88` to `0.9699`, and cut
+`sigma_xx_relative_error` from `0.12-0.15` to `0.0183` — real, large improvement, but 3 of 5
+hard L4 metrics still narrowly missed threshold. Raising quadrature resolution (more points
+shrink the jittered-stratified estimator's residual variance) and step budget closed the
+remaining gap: `n_interior=4096`, `n_boundary=2048`, `max_steps=3000` (now
+`variational_no_hole_plate.toml`'s shipped config) reached `normalized_Pi=-1.000017` and
+**PASSED all five P2-14 hard thresholds**
+(`sigma_xx_relative_error=0.0010`, `sigma_yy_over_ref=0.0007`, `sigma_xy_over_ref=0.0003`,
+`traction_rms_over_ref=0.0011`, `load_transfer_ratio=0.9991`), confirmed by two independent
+real `cargo run -p pinn-app --release --features ndarray-backend -- --headless --problem-spec
+examples/problems/variational_no_hole_plate.toml` runs
+(`Debug_run/phase4/issue64_resample_fix/higher_res.log`,
+`Debug_run/phase4/issue64_resample_fix/shipped_example_final.log`).
+
+Independent field validation (issue #64/PH4-15's own blocking condition — required a verified
+corrected no-hole L4 companion, which now exists): `validate_no_hole_fields` is now wired into
+`run_headless_user_problem`'s no-hole output, evaluated on a separate 96x96 grid (not the
+training collocation points) using the already-computed vis-diagnostic fields. Both real runs
+above printed `P2-14 independent field validation PASSED`
+(`sigma_xx_err=0.0010 sigma_yy/ref=0.0007 sigma_xy/ref=0.0003`, `rigid_translation=1.69e-8`,
+`rigid_rotation=4.90e-6` — no residual rigid-body mode hiding in the published fields either).
+
+Durable regression proof: `user_problem::tests::
+issue_64_resampling_fix_passes_l4_and_independent_field_validation` (`#[ignore]`d, real
+training loop at the shipped config, matching `toy_beam`'s own expensive-training-loop-test
+precedent) trains a real model and asserts both `run_no_hole_benchmark(...).passed` and the
+independent field check pass — `cargo test -p pinn-solver --release --features ndarray-backend
+-- --ignored user_problem::tests::issue_64_resampling_fix_passes_l4_and_independent_field_validation`,
+confirmed passing (1386.85s).
+
+Full workspace suite after this fix: 457 passed, 0 failed (2 pre-existing, unrelated stale test
+literals in `network.rs` — `awake_mask_matches_awake_weight_ids_classification`,
+`coordinate_skip_represents_affine_displacement_and_leaves_stress_mlp_only` — corrected in the
+same pass; both predate this session's sampling work, confirmed via `git stash`, and were simply
+never updated when the coordinate-skip feature was added).
+
+Remaining PH4 items this unblocks: PH4-15 (independent field validation) is now real evidence,
+not blocked. PH4-09/13/14/16/17 (AMR, hole-boundary Kt, L5, non-square, multi-hole) remain
+correctly BLOCKED — each needs its own dedicated evidence beyond a passing no-hole companion,
+per their own stated blocking conditions; this fix does not itself unblock them.
+
 ## PH4-07 — Gauge/nullspace compatibility
 
 Status: IMPLEMENTED

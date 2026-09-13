@@ -95,6 +95,15 @@ const REJECTION_SAMPLE_ATTEMPTS_FACTOR: usize = 20;
 /// codebase's real, fixed interior-collocation seed as genuine reproducibility metadata,
 /// instead of guessing or omitting it.
 pub const SEED_INTERIOR: u64 = 90_210;
+/// Issue #64: boundary counterpart of [`SEED_INTERIOR`] — [`UserSamplingStrategy::sample_boundary`]
+/// had no RNG at all before this fix (a fixed evenly-spaced grid every call); this seeds its new
+/// per-call jitter.
+pub const SEED_BOUNDARY: u64 = 40_404;
+/// splitmix64's own odd 64-bit mixing constant — mixed into [`SEED_INTERIOR`]/[`SEED_BOUNDARY`]
+/// by [`UserSamplingStrategy`]'s per-call counter so consecutive calls get well-separated seeds
+/// (a plain `seed + call` would work too, but LCG state is sensitive to small seed deltas early
+/// in its sequence — this constant is the standard remedy).
+const CALL_SEED_MIX: u64 = 0x9E3779B97F4A7C15;
 
 /// Safety multiple applied to the FD stencil's physical reach when computing the near-hole
 /// collocation-exclusion margin (see [`UserSamplingStrategy::new`]'s margin computation) —
@@ -130,6 +139,20 @@ pub struct UserSamplingStrategy {
     /// geometric "just outside the hole" concept itself stays useful for Kt measurement (see
     /// `probe_hole_boundary_profile`'s derived-stress-at-margin variant).
     anchor_margin_m: f64,
+    /// Issue #64: call counters mixed into each call's RNG seed so consecutive
+    /// `sample_interior`/`sample_boundary` calls on the same instance draw genuinely different
+    /// points (jittered stratified sampling) instead of the same fixed point cloud every time —
+    /// see each method's own doc comment for why a static point cloud across an entire training
+    /// run let the network overfit the discrete quadrature nodes rather than the continuous
+    /// functional. `AtomicU64`, not a plain field, so the trait's `&self` (not `&mut self`)
+    /// signature doesn't need to change — no ripple into `KirschSamplingStrategy`/
+    /// `PinLugSamplingStrategy`. `DomainSamplingStrategy: Send + Sync` rules out `Cell` (not
+    /// `Sync`); relaxed ordering is fine — this only needs distinct counter values per call,
+    /// never cross-thread visibility of any other state. Still fully reproducible run-to-run:
+    /// same base seed constant ⇒ same full sequence of per-call point sets, only the "identical
+    /// every call" artifact is fixed.
+    interior_calls: std::sync::atomic::AtomicU64,
+    boundary_calls: std::sync::atomic::AtomicU64,
 }
 
 impl UserSamplingStrategy {
@@ -153,7 +176,11 @@ impl UserSamplingStrategy {
             .map(|i| -> &'static str { Box::leak(format!("hole_{i}").into_boxed_str()) })
             .collect();
         let anchor_margin_m = ring_anchor_margin_m(fd_h, &geometry);
-        Self { geometry, hole_names, anchor_margin_m }
+        Self {
+            geometry, hole_names, anchor_margin_m,
+            interior_calls: std::sync::atomic::AtomicU64::new(0),
+            boundary_calls: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     /// Like `UserGeometry::contains`, but excludes a `self.anchor_margin_m`-wide annulus just
@@ -186,14 +213,25 @@ impl UserSamplingStrategy {
 }
 
 impl DomainSamplingStrategy for UserSamplingStrategy {
+    /// Issue #64: jittered stratified sampling — every call draws a genuinely different point
+    /// set (the caller, `user_runner.rs`'s training loop, already calls this fresh every step,
+    /// intending real resampling). Before this fix the stratum center was a fixed `+0.5` offset
+    /// and the rejection fallback reseeded from the same constant every call, so for any
+    /// hole-free geometry (no rejections ever triggered) this returned the byte-identical point
+    /// cloud on every one of thousands of training steps — `InteriorEnergyTerm`/
+    /// `PhysicalPotentialEnergyTerm`'s `U` is a plain `mean(f(x_i))` Monte-Carlo estimator
+    /// (`measure_integral::domain_integral_tensor`), unbiased only if the `x_i` vary across the
+    /// optimization trajectory; with a static node set the optimizer could — and did — sculpt
+    /// energy density artificially low AT those frozen nodes while the field diverged between
+    /// them (see issue #64's own diagnosis: sampled `Π` undercutting the true continuum affine
+    /// minimum of exactly `-1`). Jittering within each stratum preserves the domain-wide
+    /// coverage the stratified grid was added for, while making every call a genuine new draw —
+    /// still fully deterministic/reproducible run-to-run from `SEED_INTERIOR` alone.
     fn sample_interior(&self, _geom: &GeometryConfig, n: usize) -> Vec<[f64; 2]> {
         use pinn_core::LcgRng;
+        let call = self.interior_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut rng = LcgRng::new(SEED_INTERIOR ^ call.wrapping_mul(CALL_SEED_MIX));
         let mut pts = Vec::with_capacity(n);
-        // A plain pseudorandom batch lets a flexible displacement field lower the sampled
-        // energy below the continuum affine minimum between sparse clusters. Start with one
-        // point per deterministic stratum instead: this remains geometry-generic, preserves
-        // rejection around arbitrary holes, and gives the variational functional domain-wide
-        // coverage before the existing rejection fallback fills excluded strata.
         let nx = (n as f64).sqrt().ceil() as usize;
         let ny = n.div_ceil(nx);
         let cells = nx * ny;
@@ -201,15 +239,16 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
             let cell = i * cells / n;
             let ix = cell % nx;
             let iy = cell / nx;
-            let x = -self.geometry.half_w + (ix as f64 + 0.5) * 2.0 * self.geometry.half_w / nx as f64;
-            let y = -self.geometry.half_h + (iy as f64 + 0.5) * 2.0 * self.geometry.half_h / ny as f64;
+            let jitter_x = rng.next_f64();
+            let jitter_y = rng.next_f64();
+            let x = -self.geometry.half_w + (ix as f64 + jitter_x) * 2.0 * self.geometry.half_w / nx as f64;
+            let y = -self.geometry.half_h + (iy as f64 + jitter_y) * 2.0 * self.geometry.half_h / ny as f64;
             if self.contains_for_collocation(x, y) {
                 pts.push([x, y]);
             }
         }
         let mut attempts = 0usize;
         let max_attempts = n * REJECTION_SAMPLE_ATTEMPTS_FACTOR;
-        let mut rng = LcgRng::new(SEED_INTERIOR);
         while pts.len() < n && attempts < max_attempts {
             attempts += 1;
             let x = (rng.next_f64() * 2.0 - 1.0) * self.geometry.half_w;
@@ -223,13 +262,25 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
 
     /// The 4 outer rectangle edges only — hole boundaries come back via
     /// [`Self::named_point_sets`] instead, one named set per hole.
+    ///
+    /// Issue #64: per-point jittered stratified sampling in 1D, same rationale as
+    /// [`Self::sample_interior`] — `ExternalWorkTerm`'s `W_ext` is the same kind of
+    /// `mean(f(x_i))`/`boundary_integral_tensor` Monte-Carlo estimator, and before this fix this
+    /// method had NO randomness at all (a fixed evenly-spaced grid every call), so `W_ext` was
+    /// trained against one frozen boundary point cloud for the entire run. Each point stays
+    /// confined to its own `1/per_edge` stratum, so the `ds_x_normal`/`ds_y_normal` quadrature
+    /// weight computed elsewhere from `per_edge` (assumes equal per-point spacing in
+    /// expectation) stays exactly as valid as the fixed-grid version was.
     fn sample_boundary(&self, _geom: &GeometryConfig, _load: &LoadConfig, n: usize) -> Vec<BoundaryPoint> {
+        use pinn_core::LcgRng;
+        let call = self.boundary_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut rng = LcgRng::new(SEED_BOUNDARY ^ call.wrapping_mul(CALL_SEED_MIX));
         let per_edge = (n / 4).max(1);
         let mut pts = Vec::with_capacity(per_edge * 4);
         let hw = self.geometry.half_w;
         let hh = self.geometry.half_h;
         for i in 0..per_edge {
-            let frac = (i as f64 + 0.5) / per_edge as f64; // (0,1), avoids exact corners
+            let frac = (i as f64 + rng.next_f64()) / per_edge as f64; // stays in (0,1), avoids exact corners
             let along_w = -hw + 2.0 * hw * frac;
             let along_h = -hh + 2.0 * hh * frac;
             pts.push(BoundaryPoint { x: hw, y: along_h, nx: 1.0, ny: 0.0, tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannLoad });
@@ -2588,6 +2639,48 @@ mod tests {
         }
     }
 
+    /// Issue #64: proves the actual bug fixed in this session — before this fix, two
+    /// consecutive `sample_interior` calls on the same strategy instance (exactly what
+    /// `user_runner.rs`'s training loop does every step) returned byte-identical points for any
+    /// hole-free geometry, silently defeating the "resample every step" design intent and
+    /// letting the network overfit one frozen quadrature-node set (see this file's own
+    /// `sample_interior` doc comment for the full mechanism).
+    #[test]
+    fn sample_interior_resamples_different_points_across_consecutive_calls() {
+        let geom = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] };
+        let strategy = UserSamplingStrategy::new(geom, TEST_FD_H);
+        let placeholder = GeometryConfig::kirsch_plate_inches();
+        let first = strategy.sample_interior(&placeholder, 256);
+        let second = strategy.sample_interior(&placeholder, 256);
+        assert_eq!(first.len(), 256);
+        assert_eq!(second.len(), 256);
+        assert_ne!(first, second, "consecutive calls must draw genuinely different points");
+    }
+
+    /// Boundary counterpart of the above — before this fix `sample_boundary` had no RNG at all,
+    /// so it returned the identical evenly-spaced grid on every call, starving `W_ext` of any
+    /// real resampling too.
+    #[test]
+    fn sample_boundary_resamples_different_points_across_consecutive_calls() {
+        let geom = two_hole_geometry();
+        let strategy = UserSamplingStrategy::new(geom.clone(), TEST_FD_H);
+        let placeholder = GeometryConfig::kirsch_plate_inches();
+        let load = LoadConfig::uniaxial_x(1.0);
+        let first = strategy.sample_boundary(&placeholder, &load, 40);
+        let second = strategy.sample_boundary(&placeholder, &load, 40);
+        assert_ne!(
+            first.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>(),
+            second.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>(),
+            "consecutive calls must draw genuinely different points",
+        );
+        // Same edges/normals convention must still hold on the second call too.
+        for p in &second {
+            let on_x_edge = (p.x.abs() - geom.half_w).abs() < 1e-9;
+            let on_y_edge = (p.y.abs() - geom.half_h).abs() < 1e-9;
+            assert!(on_x_edge || on_y_edge, "point ({}, {}) is not on an outer edge", p.x, p.y);
+        }
+    }
+
     #[test]
     fn named_point_sets_returns_one_ring_per_hole_with_expected_point_count() {
         // No more "_anchor" point sets since bugSource-New #12 removed the near-ring
@@ -3754,6 +3847,129 @@ mod tests {
         // everywhere - a real, honest "this correctly fails" check, not assuming success.
         assert!(!result.passed, "an untrained model should not pass the no-hole benchmark: {result:?}");
         assert!(!result.failures.is_empty());
+    }
+
+    /// Issue #64: real, live evidence that the `UserSamplingStrategy` resampling fix (see
+    /// `sample_interior`/`sample_boundary`'s own doc comments) actually resolves the field-
+    /// recovery failure — a real, trained model passes BOTH the training-loss-independent hard
+    /// numeric benchmark (`run_no_hole_benchmark`) AND the independent field validation
+    /// (`validate_no_hole_fields`, evaluated on a separate 96x96 grid, not the training
+    /// collocation points). Same formulation/material/load/geometry/network/training
+    /// configuration as `examples/problems/variational_no_hole_plate.toml` — the one this
+    /// session's own `Debug_run/phase4/issue64_resample_fix/higher_res.log` real headless run
+    /// already confirmed reaches normalized_Pi=-1.000017 and passes all five P2-14 hard
+    /// thresholds. Mirrors `user_runner::run_headless_user_problem`'s own training loop
+    /// (duplicated rather than reused, matching this test module's own established precedent
+    /// for self-contained training-loop tests — see e.g. `runner::tests::term_by_term_raw_
+    /// lambda_weighted_gradient_diagnostic_on_no_hole_plate`). `#[ignore]`d like `toy_beam`'s
+    /// own training-loop tests: real cost (thousands of steps, thousands of collocation
+    /// points), not meant for default `cargo test --workspace` — run explicitly via
+    /// `cargo test -p pinn-solver --release --features ndarray-backend -- --ignored
+    /// issue_64_resampling_fix_passes_l4_and_independent_field_validation`.
+    #[test]
+    #[ignore]
+    fn issue_64_resampling_fix_passes_l4_and_independent_field_validation() {
+        use crate::fd_stencil::FdConfig;
+        use crate::lr_schedule::LrSchedule;
+        use crate::network::ElasticityNetConfig;
+        use crate::optim::{make_bias_optim, make_gate_optim, WeightOptim};
+        use crate::problem::{DomainOptim, DomainStepCtx, DomainStepData, MultiStepCtx, PointSetData};
+        use crate::saw_brdr::SawBrdr;
+        use crate::training_core::{step_physics_multi, BDevice, B};
+        use burn::tensor::backend::Backend;
+        use pinn_core::messages::SolverConfig;
+        use std::collections::HashMap;
+
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] },
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 2048, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = BDevice::default();
+        let half_w = spec.geometry.half_w;
+        let half_h = spec.geometry.half_h;
+        let problem = UserDefinedProblem::new(spec.clone());
+        crate::problem::validate_loss_terms(&problem);
+
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(spec.geometry.net_input_dim())
+            .with_hidden_dim(spec.network.hidden_dim)
+            .with_n_hidden(spec.network.n_hidden)
+            .with_output_dim(5);
+        B::seed(&device, spec.network.model_init_seed);
+        let mut model = net_cfg.init(&device);
+        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+        let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+        let mut saw = SawBrdr::with_base(base_weights, 0.95);
+        let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+        let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+        let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+        let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
+        let config = SolverConfig::default_kirsch();
+        let sampling = problem.sampling_strategy(0);
+        let placeholder = GeometryConfig::kirsch_plate_inches();
+        let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / half_w) as f32, (y / half_h) as f32] };
+        let to_pointset = |pts: &[BoundaryPoint]| -> PointSetData {
+            PointSetData {
+                norm: pts.iter().map(|p| norm_pt(p.x, p.y)).collect(),
+                nx: pts.iter().map(|p| p.nx as f32).collect(), ny: pts.iter().map(|p| p.ny as f32).collect(),
+                tx: pts.iter().map(|p| p.tx as f32).collect(), ty: pts.iter().map(|p| p.ty as f32).collect(),
+            }
+        };
+
+        for step in 0..spec.training.max_steps {
+            // Genuinely resampled every step, thanks to this session's fix — the whole point
+            // under test.
+            let int_pts = sampling.sample_interior(&placeholder, spec.training.n_interior);
+            let bnd_pts = sampling.sample_boundary(&placeholder, &spec.load, spec.training.n_boundary);
+            let mut named = HashMap::new();
+            named.insert("outer_boundary", to_pointset(&bnd_pts));
+            for set in sampling.named_point_sets(&[]) { named.insert(set.name, to_pointset(&set.points)); }
+            let data = DomainStepData {
+                id: USER_DOMAIN,
+                int_norm: int_pts.iter().map(|&[x, y]| norm_pt(x, y)).collect(),
+                extra_ring_norm: Vec::new(), named,
+            };
+            let ctx = MultiStepCtx {
+                config: &config, problem: &problem, fd: &fd, k: 1.0,
+                domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
+                dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+                dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
+                constitutive_consistency_weight: 50.0,
+                n_fourier: spec.geometry.n_fourier(),
+                probe_term_gradients: false,
+                phase2_active: true, step,
+            };
+            let (new_model, _out) = step_physics_multi(
+                vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+            );
+            model = new_model.into_iter().next().unwrap();
+        }
+
+        use burn::module::AutodiffModule;
+        let model_val: crate::network::ElasticityNet<crate::training_core::BInner> = model.valid();
+
+        let benchmark = run_no_hole_benchmark(&model_val, &spec, &device);
+        assert!(benchmark.passed, "P2-14 no-hole benchmark must pass after the resampling fix: {benchmark:?}");
+
+        let diag_int_norm: Vec<[f32; 2]> = sampling.sample_interior(&placeholder, 512).iter()
+            .map(|&[x, y]| norm_pt(x, y)).collect();
+        let vis = evaluate_user_vis_grid(
+            &model_val, &spec.geometry, [96, 96], u_ref, spec.load.px, &spec.material, &fd, &diag_int_norm, &device,
+        );
+        let field_check = validate_no_hole_fields(&vis, &spec);
+        assert!(
+            field_check.sigma_xx_relative_error < SIGMA_XX_RELATIVE_ERROR_MAX
+                && field_check.sigma_yy_over_ref < SIGMA_YY_OVER_REF_MAX
+                && field_check.sigma_xy_over_ref < SIGMA_XY_OVER_REF_MAX,
+            "independent field validation (separate grid, not training points) must pass: {field_check:?}",
+        );
     }
 
     #[test]
