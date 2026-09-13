@@ -1,0 +1,118 @@
+{
+  "spec": {
+    "Plate": {
+      "geometry": {
+        "half_w": 0.1,
+        "half_h": 0.1,
+        "thickness": 0.005,
+        "holes": []
+      },
+      "material": {
+        "e": 71700000000.0,
+        "nu": 0.33,
+        "density": 2810.0,
+        "ultimate_strength_pa": 503000000.0
+      },
+      "load": {
+        "px": 69000000.0,
+        "py": 0.0
+      },
+      "network": {
+        "hidden_dim": 96,
+        "n_hidden": 8,
+        "adaptive": true,
+        "max_hidden_dim": null,
+        "max_n_hidden": null,
+        "auto_stop_on_plateau": true,
+        "model_init_seed": 90211
+      },
+      "training": {
+        "max_steps": 2000,
+        "n_interior": 2048,
+        "n_boundary": 512,
+        "fd_h": 0.001,
+        "lr": 0.001,
+        "measure_aware_training": false,
+        "derivative_operator_diagnostic": false,
+        "amr_enabled": true
+      },
+      "formulation": {
+        "Hybrid": [
+          "interior_energy",
+          "equilibrium",
+          "outer_traction",
+          "external_work"
+        ]
+      }
+    }
+  },
+  "steps_completed": 2000,
+  "final_loss": -0.999395,
+  "saved_at_unix": 1789262550,
+  "provenance": {
+    "git_sha": "0500a6ad62c0923378769fbeb9fea4e8c1583919",
+    "git_dirty": false,
+    "problem_hash": "43518aab9003e685",
+    "interior_sampling_seed": 90210,
+    "model_init_seeded": true,
+    "model_init_seed": 90211,
+    "backend": "NdArray",
+    "dtype": "f32",
+    "derivative_backend": "FD",
+    "formulation": "Hybrid([\"interior_energy\", \"equilibrium\", \"outer_traction\", \"external_work\"])",
+    "config_hash": "b866b16c5280686b"
+  },
+  "report": {
+    "provenance": {
+      "git_sha": "0500a6ad62c0923378769fbeb9fea4e8c1583919",
+      "git_dirty": false,
+      "problem_hash": "43518aab9003e685",
+      "interior_sampling_seed": 90210,
+      "model_init_seeded": true,
+      "model_init_seed": 90211,
+      "backend": "NdArray",
+      "dtype": "f32",
+      "derivative_backend": "FD",
+      "formulation": "Hybrid([\"interior_energy\", \"equilibrium\", \"outer_traction\", \"external_work\"])",
+      "config_hash": "b866b16c5280686b"
+    },
+    "integration_mode": "LegacyMeanIntegral",
+    "sampling_mode": "AMR",
+    "amr_state": {
+      "enabled": true,
+      "last_sweep_step": 1200
+    },
+    "l0_passed": true,
+    "l1_status": "PASS (structural - proven once by differential_operator's own test suite against a manufactured field, not re-evaluated per run)",
+    "l2_status": "PASS (live invariant - field_graph::check_mixed_stress_source_compatibility asserts on every training step; a completed run is proof by construction it never fired)",
+    "l3_status": "PASS (structural - proven once by measure_integral's own test suite: constant-field exactness and AMR-biased-sampling convergence)",
+    "l4_no_hole_benchmark": {
+      "passed": true,
+      "sigma_xx_relative_error": 0.005749828197366257,
+      "sigma_yy_over_ref": 0.005577595146181898,
+      "sigma_xy_over_ref": 0.0031745109878027885,
+      "traction_rms_over_ref": 0.008628420312941235,
+      "load_transfer_ratio": 1.0051635249389208,
+      "failures": []
+    },
+    "l5_hole_benchmark_note": "not yet implemented - see issue #62 PH3-15",
+    "energy_balance": {
+      "internal_energy": 6.661371846199037,
+      "external_work": 6.659288232148622,
+      "energy_balance_error": 0.0003128884015495626
+    },
+    "reaction_force": {
+      "net_fx": 56.69317319917735,
+      "net_fy": 22.329884240150488,
+      "reference_force": 69000.0,
+      "equilibrium_error": 0.0008830761496904794
+    },
+    "convergence_evidence": {
+      "n_samples": 201,
+      "loss_trend": "Improving",
+      "grad_norm_trend": "Improving",
+      "bc_residual_trend": "Improving",
+      "plausibly_converged": true
+    }
+  }
+}

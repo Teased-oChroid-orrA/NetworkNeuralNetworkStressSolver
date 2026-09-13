@@ -1,0 +1,127 @@
+{
+  "amr": {
+    "last_sweep": {
+      "points_after": 784,
+      "points_before": 493,
+      "residual_rms_after": 326182.97315380943,
+      "residual_rms_before": 318514.9853951156,
+      "step": 1200
+    },
+    "sweep_count": 2
+  },
+  "authoritative_report": {
+    "amr_state": {
+      "enabled": true,
+      "last_sweep_step": 1200
+    },
+    "convergence_evidence": {
+      "bc_residual_trend": "Improving",
+      "grad_norm_trend": "Improving",
+      "loss_trend": "Improving",
+      "n_samples": 201,
+      "plausibly_converged": true
+    },
+    "energy_balance": {
+      "energy_balance_error": 0.0003128884015495626,
+      "external_work": 6.659288232148622,
+      "internal_energy": 6.661371846199037
+    },
+    "integration_mode": "LegacyMeanIntegral",
+    "l0_passed": true,
+    "l1_status": "PASS (structural - proven once by differential_operator's own test suite against a manufactured field, not re-evaluated per run)",
+    "l2_status": "PASS (live invariant - field_graph::check_mixed_stress_source_compatibility asserts on every training step; a completed run is proof by construction it never fired)",
+    "l3_status": "PASS (structural - proven once by measure_integral's own test suite: constant-field exactness and AMR-biased-sampling convergence)",
+    "l4_no_hole_benchmark": {
+      "failures": [],
+      "load_transfer_ratio": 1.0051635249389208,
+      "passed": true,
+      "sigma_xx_relative_error": 0.005749828197366257,
+      "sigma_xy_over_ref": 0.0031745109878027885,
+      "sigma_yy_over_ref": 0.005577595146181898,
+      "traction_rms_over_ref": 0.008628420312941235
+    },
+    "l5_hole_benchmark_note": "not yet implemented - see issue #62 PH3-15",
+    "provenance": {
+      "backend": "NdArray",
+      "config_hash": "8c92ffccdcd27e8c",
+      "derivative_backend": "FD",
+      "dtype": "f32",
+      "formulation": "Hybrid([\"interior_energy\", \"equilibrium\", \"outer_traction\", \"external_work\"])",
+      "git_dirty": false,
+      "git_sha": "0500a6ad62c0923378769fbeb9fea4e8c1583919",
+      "interior_sampling_seed": 90210,
+      "model_init_seed": 90211,
+      "model_init_seeded": true,
+      "problem_hash": "f2c32c59ca18ea2a"
+    },
+    "reaction_force": {
+      "equilibrium_error": 0.0008830761496904794,
+      "net_fx": 56.69317319917735,
+      "net_fy": 22.329884240150488,
+      "reference_force": 69000.0
+    },
+    "sampling_mode": "AMR"
+  },
+  "engineering_results": {
+    "avg_von_mises_pa": 69041152.0,
+    "max_displacement_m": 0.00013524778478313237,
+    "max_principal_stress_pa": 69772272.0,
+    "max_von_mises_pa": 69893944.0,
+    "min_displacement_m": 1.2051254998368677e-6
+  },
+  "generated_at_unix": 1789262565,
+  "hole_analyses": [],
+  "model_validity": null,
+  "operational_status": "PASS",
+  "physics_validation": {
+    "bc_residual_max": 1670458.875,
+    "bc_residual_rms": 595361.0015929452,
+    "energy_balance": {
+      "energy_balance_error": 0.0003128884015495626,
+      "external_work_j": 6.659288232148622,
+      "internal_energy_j": 6.661371846199037
+    },
+    "pde_residual_max": 1026656.5,
+    "pde_residual_p95": 320602.21875,
+    "pde_residual_rms": 169760.90625,
+    "reaction_force": {
+      "equilibrium_error": 0.0008830761496904794,
+      "net_fx_n": 56.69317319917735,
+      "net_fy_n": 22.329884240150488,
+      "reference_force_n": 69000.0
+    }
+  },
+  "problem": {
+    "geometry": {
+      "half_h_m": 0.1,
+      "half_w_m": 0.1,
+      "holes": [],
+      "thickness_m": 0.005
+    },
+    "kind": "Plate",
+    "load": {
+      "px_pa": 69000000.0,
+      "py_pa": 0.0
+    },
+    "material": {
+      "density_kg_m3": 2810.0,
+      "e_pa": 71700000000.0,
+      "nu": 0.33,
+      "ultimate_strength_pa": 503000000.0
+    },
+    "network": {
+      "hidden_dim": 64,
+      "n_hidden": 8
+    }
+  },
+  "spec_path": "/Users/nautilus/Claude/Projects/NeuralNetwork-Stress-Solver/examples/problems/no_hole_plate.toml",
+  "training": {
+    "elapsed_secs": 646.5631713867188,
+    "final_grad_norm": 0.10555769503116608,
+    "final_optimization_loss_energy_term": 1.0002057552337646,
+    "final_total_loss": -0.9993950128555298,
+    "max_steps": 2000,
+    "step": 1999
+  },
+  "unit_system": "USCS"
+}
