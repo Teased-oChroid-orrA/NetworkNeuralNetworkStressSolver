@@ -3697,7 +3697,13 @@ mod tests {
         let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
         let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, rx_ctrl));
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        // 300s, not 120s: CI's full-parallel-suite contention (400+ tests sharing a runner)
+        // pushed a 120s-budgeted 120-step run past its deadline in real CI runs (issue #62
+        // PH3-Final CI investigation) even though this same run completes in ~15-20s locally
+        // in isolation. Generous margin under contention, matching this project's own
+        // established precedent for similar timing-sensitive tests (e.g. the PH3-12 comparison
+        // test's 600s budget just below).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         let mut last_evidence: Option<pinn_core::messages::ConvergenceEvidenceSummary> = None;
         let mut evidence_ticks_seen = 0usize;
         let mut saw_done = false;
@@ -4196,7 +4202,14 @@ mod tests {
         let run = |spec: ProblemSpec, model: ElasticityNet<B>| -> (Box<TrainingUpdate>, Option<pinn_core::messages::AmrSweepReport>) {
             let (tx, rx) = crossbeam_channel::unbounded();
             let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
-            let handle = std::thread::spawn(move || run_user_problem_training_from(spec, model, device, 0, tx, rx_ctrl));
+            // Clone (not move) `device` here so `run` itself only needs to BORROW it - a
+            // capture-by-move (forced by moving `device` straight into this inner closure)
+            // would make `run` callable only once whenever `BDevice` isn't `Copy` (true for
+            // `WgpuDevice` under the default feature set - see CLAUDE.md's `Backend::seed`
+            // section for the sibling gotcha this one was found alongside). This closure is
+            // called twice below.
+            let thread_device = device.clone();
+            let handle = std::thread::spawn(move || run_user_problem_training_from(spec, model, thread_device, 0, tx, rx_ctrl));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             let mut last_update: Option<Box<TrainingUpdate>> = None;
             let mut sweep_seen: Option<pinn_core::messages::AmrSweepReport> = None;
@@ -4274,7 +4287,11 @@ mod tests {
         let run = |spec: ProblemSpec, model: ElasticityNet<B>| -> Box<TrainingUpdate> {
             let (tx, rx) = crossbeam_channel::unbounded();
             let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
-            let handle = std::thread::spawn(move || run_user_problem_training_from(spec, model, device, 0, tx, rx_ctrl));
+            // Same fix as the sibling `run` closure above - clone `device` so `run` itself
+            // only borrows, keeping it callable more than once regardless of whether `BDevice`
+            // is `Copy` (see the comment there for the full explanation).
+            let thread_device = device.clone();
+            let handle = std::thread::spawn(move || run_user_problem_training_from(spec, model, thread_device, 0, tx, rx_ctrl));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
             let mut last_update: Option<Box<TrainingUpdate>> = None;
             let mut saw_done = false;
