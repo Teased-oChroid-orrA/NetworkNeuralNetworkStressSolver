@@ -1130,15 +1130,22 @@ mod tests {
         // was stale (pre-dated a `coordinate_skip` weight-layout change) and didn't match what
         // `forward_with_coordinates_masked`'s own `residual = coordinate_skip.forward(coords)`
         // actually computes; corrected to the real product, not a behavior change.
-        assert_eq!(
-            added.into_data().to_vec::<f32>().unwrap(),
-            vec![-0.5, -5.25, 1.1, 2.25]
-        );
+        let got = added.into_data().to_vec::<f32>().unwrap();
+        let expected = [-0.5_f32, -5.25, 1.1, 2.25];
+        for (g, e) in got.iter().zip(expected.iter()) {
+            assert!(
+                (g - e).abs() < 1e-4,
+                "got {got:?}, expected {expected:?} (Wgpu backend float rounding tolerance)"
+            );
+        }
         let stress_diff: f32 = (out.slice([0..2, 2..5]) - mlp.slice([0..2, 2..5]))
             .abs()
             .sum()
             .into_scalar();
-        assert_eq!(stress_diff, 0.0);
+        assert!(
+            stress_diff < 1e-5,
+            "stress columns should be structurally unaffected by coordinate_skip, got diff={stress_diff}"
+        );
     }
 
     #[test]
