@@ -590,3 +590,38 @@ investigated during the same session and found to have the identical "sampled on
 every step" shape — but parametric problems never claimed per-step resampling and are not
 regressed by issue #64 (their pre- and post-#64 behavior is the same: one static point draw for
 the whole run). Left alone, out of scope for #64/#66/#73.
+
+## Issue #63 Phase 4 close-out: what's operational, what isn't, and why L5 is blocked
+
+Phase 4 (issues #64-#73, epic #63) is closed. Full detail lives in
+`docs/PHASE_4_IMPLEMENTATION_MANIFEST.md`, `docs/FORMULATION_SUPPORT_MATRIX.md`, and
+`docs/GENERAL_SOLVER_OPERATIONAL_STATUS.md` — this section is the short pointer for a future
+session, not a duplicate of those documents.
+
+**Operational**: Variational no-hole L4, both square and non-square geometries (real headless
+runs pass all five P2-14 hard thresholds with real margin). **Not operational**: hole/Kt
+numerical accuracy (L5) and AMR+Variational for any geometry — both real, evidenced, and
+explicitly not hidden behind a passing benchmark.
+
+**Why L5 doesn't pass (issue #70) and why it can't be fixed by more training alone**: a small
+hole (radius/half-width ratio ~0.05) gets almost no collocation density near its own boundary
+under uniform Monte-Carlo sampling — confirmed by a zero-cost sampling-only check (no training):
+only ~0.55% of interior points land within 2 hole-radii of the boundary. A real 3000-step,
+4096-point run gets `Kt=1.008` against the theoretical `3.0` (66% relative error) — the network
+simply never sees enough signal near the stress concentration to resolve it, independent of
+training duration. The fix is adaptive density biasing toward the hole boundary — exactly what
+`AdaptiveGrid`/AMR already implements — but AMR+Variational currently crashes past ~1200-2200
+steps (issue #74, still open). **Do not attempt a "just run longer" or "just add more uniform
+points" fix for L5 without first landing #74** — both were considered and are either unproven
+(more steps) or expensive-and-unproven (10-100x more points, untested). The correct next step
+for L5 is fixing #74, then re-running the same `issue_70_real_l5_...` test
+(`user_problem.rs`, `#[ignore]`d) with AMR enabled.
+
+**A pre-existing CI-only flake, found and fixed during this close-out**: CI (not local `wgpu`)
+uses a software/different Wgpu backend than a local machine, and
+`network::tests::coordinate_skip_represents_affine_displacement_and_leaves_stress_mlp_only` used
+to assert exact `f32` equality on a hand-computed matmul+bias result — failing on CI with a
+*different* mismatched value each run (`1.1000001` vs `1.1`, `-0.49999997` vs `-0.5`), proving
+float rounding noise, not a logic bug. Now uses an epsilon-tolerant comparison. If a similarly
+CI-only-flaky test turns up again, check for exact `assert_eq!` on raw `f32`/`Vec<f32>` values
+first before assuming a real regression.
