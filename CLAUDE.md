@@ -593,15 +593,28 @@ the whole run). Left alone, out of scope for #64/#66/#73.
 
 ## Issue #63 Phase 4 close-out: what's operational, what isn't, and why L5 is blocked
 
-Phase 4 (issues #64-#73, epic #63) is closed. Full detail lives in
+Phase 4 (issues #64-#73, epic #63) reached VERIFIED-or-BLOCKED-with-evidence on every item once
+but epic #63 was reopened — per this project's own standard, `BLOCKED` documented with evidence
+is not the same as complete, and #74/#70/#71's remaining gaps are real work, not paperwork.
+Full detail lives in
 `docs/PHASE_4_IMPLEMENTATION_MANIFEST.md`, `docs/FORMULATION_SUPPORT_MATRIX.md`, and
 `docs/GENERAL_SOLVER_OPERATIONAL_STATUS.md` — this section is the short pointer for a future
 session, not a duplicate of those documents.
 
 **Operational**: Variational no-hole L4, both square and non-square geometries (real headless
-runs pass all five P2-14 hard thresholds with real margin). **Not operational**: hole/Kt
-numerical accuracy (L5) and AMR+Variational for any geometry — both real, evidenced, and
-explicitly not hidden behind a passing benchmark.
+runs pass all five P2-14 hard thresholds with real margin). **Not yet operational**: hole/Kt
+numerical accuracy (L5) — real, evidenced, and explicitly not hidden behind a passing benchmark.
+
+**Issue #74 (AMR+Variational autodiff crash) is FIXED and verified** — see
+`training_core::probe_interior_energy_residuals`'s own doc comment and PH4-09's manifest entry
+for the full root-cause/fix record. One-line summary: the probe ran forward passes through the
+live `Autodiff<BInner>` model without ever calling `.backward()`, orphaning autodiff graph nodes
+across repeated AMR sweeps; fixed by routing it through `BInner` via `.valid()`, mirroring
+Kirsch's own already-working AMR sweep in `headless.rs`. The 2200-step reproduction test now
+completes cleanly. AMR still stays OFF for the *canonical no-hole* benchmark specifically — that
+was always a separate, independently-measured quality-regression finding, not the crash, and
+this fix doesn't address it. AMR is now safe to actually try for hole geometries, which was
+always the point (see below).
 
 **Why L5 doesn't pass (issue #70) and why it can't be fixed by more training alone**: a small
 hole (radius/half-width ratio ~0.05) gets almost no collocation density near its own boundary
@@ -610,12 +623,9 @@ only ~0.55% of interior points land within 2 hole-radii of the boundary. A real 
 4096-point run gets `Kt=1.008` against the theoretical `3.0` (66% relative error) — the network
 simply never sees enough signal near the stress concentration to resolve it, independent of
 training duration. The fix is adaptive density biasing toward the hole boundary — exactly what
-`AdaptiveGrid`/AMR already implements — but AMR+Variational currently crashes past ~1200-2200
-steps (issue #74, still open). **Do not attempt a "just run longer" or "just add more uniform
-points" fix for L5 without first landing #74** — both were considered and are either unproven
-(more steps) or expensive-and-unproven (10-100x more points, untested). The correct next step
-for L5 is fixing #74, then re-running the same `issue_70_real_l5_...` test
-(`user_problem.rs`, `#[ignore]`d) with AMR enabled.
+`AdaptiveGrid`/AMR already implements. With #74 fixed, the correct next step for L5 is
+re-running the same `issue_70_real_l5_...` test (`user_problem.rs`, `#[ignore]`d) with AMR
+enabled and seeing whether Kt actually converges closer to 3.0 — not yet done as of this note.
 
 **A pre-existing CI-only flake, found and fixed during this close-out**: CI (not local `wgpu`)
 uses a software/different Wgpu backend than a local machine, and
