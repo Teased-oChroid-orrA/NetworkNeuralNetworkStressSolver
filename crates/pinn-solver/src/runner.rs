@@ -1295,7 +1295,7 @@ fn run_user_problem_training_from(
 ) {
     use crate::architecture_controller::{ArchitectureConfig, ArchitectureController};
     use crate::problem::{
-        BoundaryValueProblem, DomainOptim, DomainStepCtx, DomainStepData, MultiStepCtx, PointSetData,
+        BoundaryValueProblem, DomainOptim, DomainStepCtx, MultiStepCtx,
     };
     use crate::training_core::{probe_interior_energy_residuals, residual_stats, step_physics_multi};
     use crate::user_problem::{evaluate_user_vis_grid, UserDefinedProblem, USER_DOMAIN};
@@ -1397,36 +1397,25 @@ fn run_user_problem_training_from(
     let placeholder_geom = pinn_core::geometry::GeometryConfig::kirsch_plate_inches(); // ignored by UserSamplingStrategy
     let [nx_vis, ny_vis] = config.vis_grid;
 
-    // `UserSamplingStrategy::sample_interior`/`sample_boundary`/`named_point_sets` are pure,
-    // fixed-seed (`LcgRng::new(SEED_INTERIOR)`) functions of `(geometry, load, n)` - all
-    // constant for the lifetime of this run (no warm-start support here, see this function's
-    // doc comment). Computing `data` ONCE before the loop instead of every step is a real,
-    // measured perf fix (rejection-sampling ~n_interior+n_boundary points and rebuilding a
-    // `HashMap` of per-hole point sets from scratch every step, for potentially thousands of
-    // steps, was pure waste - byte-identical output either way since the seed never changes).
+    // Issue #64/#66/#73: `UserSamplingStrategy::sample_interior`/`sample_boundary` were pure,
+    // fixed-seed functions of `(geometry, load, n)` BEFORE issue #64's resampling fix - caching
+    // their output once before the loop was a real, measured, and at-the-time CORRECT perf
+    // optimization (byte-identical output either way, since the seed never varied). Issue #64
+    // made them genuinely vary per call (jittered stratified sampling, seeded from a per-
+    // instance atomic counter) specifically so a training loop that calls them every step gets
+    // real resampling - which is exactly what defeats the "quadrature-node overfitting"
+    // mechanism #64 root-caused. This call site was not updated when that fix landed, silently
+    // reintroducing the same class of bug here. Issue #73 consolidated the per-step resample
+    // into `user_problem::resample_plate_step_data` - the SAME function `user_runner::
+    // run_headless_user_problem`'s loop calls - so both paths draw a genuinely fresh interior/
+    // boundary/named sample every step, called at the top of the loop body below. When an AMR
+    // sweep fires (`spec.training.amr_enabled`, off by default for the shipped canonical
+    // config per issue #63's own PH4-09 policy - see sub-issue #67 for AMR's own dedicated
+    // evidence work), AMR's quadtree-based `sample_points`/`sample_points_with_density`
+    // immediately overwrites `data.int_norm` afterward, same ordering as before this refactor -
+    // AMR never touches boundary/named point sets regardless.
     let sampling = problem.sampling_strategy(0);
-    let int_pts = sampling.sample_interior(&placeholder_geom, spec.training.n_interior);
-    let bnd_pts = sampling.sample_boundary(&placeholder_geom, &spec.load, spec.training.n_boundary);
     let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / half_w) as f32, (y / half_h) as f32] };
-    let int_norm: Vec<[f32; 2]> = int_pts.iter().map(|&[x, y]| norm_pt(x, y)).collect();
-    let to_pointset = |pts: &[pinn_core::loading::BoundaryPoint]| -> PointSetData {
-        PointSetData {
-            norm: pts.iter().map(|p| norm_pt(p.x, p.y)).collect(),
-            nx: pts.iter().map(|p| p.nx as f32).collect(),
-            ny: pts.iter().map(|p| p.ny as f32).collect(),
-            tx: pts.iter().map(|p| p.tx as f32).collect(),
-            ty: pts.iter().map(|p| p.ty as f32).collect(),
-        }
-    };
-
-    // 1 outer_boundary + 2 per hole (traction ring + constitutive-consistency anchor ring -
-    // see `UserSamplingStrategy::named_point_sets`).
-    let mut named = HashMap::with_capacity(1 + 2 * spec.geometry.holes.len());
-    named.insert("outer_boundary", to_pointset(&bnd_pts));
-    for set in sampling.named_point_sets(&[]) {
-        named.insert(set.name, to_pointset(&set.points));
-    }
-    let mut data = DomainStepData { id: USER_DOMAIN, int_norm, extra_ring_norm: Vec::new(), named };
 
     // Generic, problem-agnostic AMR - see `pinn_core::amr::AmrDomain`'s doc comment. Nothing
     // here is gated on "does this geometry have a hole": `spec.geometry.lock_zones()` is
@@ -1468,6 +1457,16 @@ fn run_user_problem_training_from(
             ControlAction::Continue => {}
         }
         last_step = step;
+
+        // Issue #64/#66/#73: genuine per-step resample (interior + boundary + named), shared
+        // with `user_runner::run_headless_user_problem` via `resample_plate_step_data` - see
+        // this function's own doc comment above for why this was previously missing here and
+        // why AMR's own conditional block immediately below is the correct place to override
+        // `data.int_norm` when a sweep fires.
+        let mut data = crate::user_problem::resample_plate_step_data(
+            sampling, &placeholder_geom, &spec.load,
+            spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
+        );
 
         let mut amr_sweep_report = None;
         // Issue #62 PH3-12: real on/off switch - see `TrainingSpec::amr_enabled`'s own doc
@@ -1570,50 +1569,16 @@ fn run_user_problem_training_from(
         // the already-established "expensive, infrequent" cadence costs nothing new in kind,
         // only in the same already-accepted vis-cadence magnitude.
         let send_vis = step % 10 == 0 || step + 1 == spec.training.max_steps;
-        let ctx = MultiStepCtx {
-            config: &config,
-            problem: &problem,
-            fd: &fd,
-            k: 1.0, // IdentityAnsatz ignores k entirely
-            domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
-            // Real root cause of the garbage-Kt/zero-hole-stress bug (see `powershell_tool/
-            // CLAUDE.md`'s Stress Solver section): this path's `hole_traction_loss_direct` term
-            // was left fully UNCAPPED (`f64::MAX`, unlike Kirsch's own real, tested 50→15
-            // cascade), so SAW-BRDR could grow its adapted weight arbitrarily large over a long
-            // run relative to `step_physics_multi`'s fixed `LAM_CONSTITUTIVE_CONSISTENCY` (5.0)
-            // - and an outweighed boundary term has a strictly EASIER minimum available than the
-            // true elasticity solution: drive the direct-stress outputs toward zero everywhere
-            // the boundary term is evaluated (trivially satisfies "traction ≈ 0" without
-            // satisfying "stress matches Hooke's law"). Capped at Kirsch's own starting value
-            // (50.0, a real, already-tuned bound in this codebase, not an arbitrary guess) -
-            // deliberately NOT replicating Kirsch's full plateau-triggered cascade-with-restarts
-            // down to 15.0, which is tuned specifically for Kirsch's own K_t dynamics and a
-            // separate, larger feature this fix doesn't need.
-            dynamic_lam_h_cap: 50.0,
-            dynamic_lam_d_cap: 50.0,
-            dynamic_lam_penetration_cap: f64::MAX,
-            dynamic_lam_non_tension_cap: f64::MAX,
-            // Paired with the `dynamic_lam_h_cap` fix directly above: capping the boundary
-            // term alone (a real, previously-landed fix) measurably reduced the interior PDE
-            // residual but left Kt essentially unmoved - confirmed via a real training run,
-            // not assumed (see `run_training_user_problem_generalized_amr_indicator_
-            // diagnostic`). Raising this to the SAME 50.0 ceiling closes the remaining gap:
-            // `hole_traction` can no longer structurally outweigh constitutive-consistency by
-            // 10x the way it could when one was capped at 50 and the other pinned at 5.
-            constitutive_consistency_weight: 50.0,
-            // Real, evidence-driven fix (see `UserGeometry::n_fourier`'s doc comment for the
-            // full story): after ruling out weighting AND sampling density as the bottleneck
-            // via multiple independent, measured experiments this session, the remaining gap
-            // is representational - Kirsch's own path already uses Fourier positional
-            // encoding for exactly this reason ("corrects spectral bias near hole") and
-            // already achieves real Kt convergence; this path never had it. `net_cfg`'s
-            // `input_dim` (below, at this function's model-construction site) MUST use the
-            // SAME value - see that call site's own comment.
-            n_fourier: spec.geometry.n_fourier(),
-            probe_term_gradients: send_vis,
-            phase2_active: true,
-            step,
-        };
+        // Issue #73: shared with `user_runner::run_headless_user_problem` via
+        // `plate_multi_step_ctx` - the hardcoded 50.0/50.0/50.0/`f64::MAX`/`f64::MAX`/
+        // `phase2_active=true` constants below are exactly what were previously duplicated
+        // between the two loops (see that function's own doc comment, and the historical
+        // comments this replaced, for the full rationale behind each value - unchanged, only
+        // no longer independently maintained in two places).
+        let ctx = crate::user_problem::plate_multi_step_ctx(
+            &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
+            spec.geometry.n_fourier(), send_vis, step,
+        );
 
         let (new_model, out) = step_physics_multi(
             vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, &device,
@@ -3662,6 +3627,95 @@ mod tests {
         }
     }
 
+    /// Issue #73: regression proof that the GUI-streaming path (`run_training_user_problem`)
+    /// and the headless CLI path (`user_runner::run_headless_user_problem`) are genuinely
+    /// unified at the per-step core, not just two call sites that happen to both compile. Both
+    /// now call the exact same `user_problem::resample_plate_step_data`/`plate_multi_step_ctx`
+    /// functions every step (issue #73's own extraction) - this test independently reconstructs
+    /// what step 0 must produce by calling those same two shared functions directly (the exact
+    /// sequence `run_training_user_problem`'s loop performs internally, verifiable by reading
+    /// its source), then asserts the GUI path's OWN real, captured step-0 `total_loss` exactly
+    /// matches that independent computation. AMR/adaptive-architecture/auto-stop are all
+    /// disabled so the GUI path exercises nothing beyond the shared core for this one step.
+    #[test]
+    fn gui_streaming_step_zero_matches_independent_shared_function_computation() {
+        use crate::fd_stencil::FdConfig;
+        use crate::network::ElasticityNetConfig;
+        use crate::optim::{make_bias_optim, make_gate_optim, WeightOptim};
+        use crate::problem::{BoundaryValueProblem, DomainOptim};
+        use crate::saw_brdr::SawBrdr;
+        use crate::training_core::step_physics_multi;
+        use crate::user_problem::{plate_multi_step_ctx, resample_plate_step_data, UserDefinedProblem};
+        use burn::tensor::backend::Backend;
+
+        let mut spec = no_hole_plate_spec(1);
+        spec.training.amr_enabled = false;
+        assert!(!spec.network.adaptive);
+
+        // Independent reference: build everything by hand, call the shared functions directly.
+        let device = BDevice::default();
+        let half_w = spec.geometry.half_w;
+        let half_h = spec.geometry.half_h;
+        let problem = UserDefinedProblem::new(spec.clone());
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(spec.geometry.net_input_dim())
+            .with_hidden_dim(spec.network.hidden_dim)
+            .with_n_hidden(spec.network.n_hidden)
+            .with_output_dim(5)
+            .with_use_piratenet(spec.network.adaptive);
+        B::seed(&device, spec.network.model_init_seed);
+        let model = net_cfg.init(&device);
+        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+        let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+        let mut saw = SawBrdr::with_base(base_weights, 0.95);
+        let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+        let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+        let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+        let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
+        let config = SolverConfig::default_kirsch();
+        let sampling = problem.sampling_strategy(0);
+        let placeholder = pinn_core::geometry::GeometryConfig::kirsch_plate_inches();
+
+        let data = resample_plate_step_data(
+            sampling, &placeholder, &spec.load, spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
+        );
+        let ctx = plate_multi_step_ctx(
+            &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2, spec.geometry.n_fourier(), false, 0,
+        );
+        let (_new_model, reference_out) = step_physics_multi(
+            vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+
+        // Real GUI-streaming run, same spec, captured via its own channel. `run_training_user_
+        // problem` stays alive after `Done` to serve `SaveCheckpoint` requests (Stage H) - must
+        // send `Stop` (or drop `tx_ctrl`) before `handle.join()` or the join deadlocks forever.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, stop_rx) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, stop_rx));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut step_zero: Option<Box<TrainingUpdate>> = None;
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline && !saw_done {
+            match rx.try_recv() {
+                Ok(TrainingMsg::Update(u)) => { if u.step == 0 && step_zero.is_none() { step_zero = Some(u); } }
+                Ok(TrainingMsg::Done) => saw_done = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+        drop(tx_ctrl);
+        let _ = handle.join();
+        let step_zero = step_zero.expect("must have captured the step-0 update");
+
+        assert_eq!(
+            step_zero.total_loss, reference_out.total_scalar,
+            "GUI-streaming path's real step-0 total_loss must exactly match the independent \
+             computation using the same shared resample_plate_step_data/plate_multi_step_ctx \
+             functions - a mismatch here means the two paths have silently diverged again",
+        );
+    }
+
     /// Issue #62 PH3-06: real, live evidence that `ad_fd_strain_diagnostic` actually fires
     /// during an actual training session (not just the isolated `differential_operator::` unit
     /// tests against a synthetic manufactured field) - a short, fast run (past the first
@@ -3841,17 +3895,33 @@ mod tests {
         // pass, unrelated to model initialization and out of this item's scope to fix.
     }
 
-    /// Issue #62 PH3-05: real, full-length (2000-step, matching PH3-01's own frozen legacy
-    /// baseline's step count for a comparable run) training evidence for the shipped `examples/
+    /// Issue #62 PH3-05: real, full-length training evidence for the shipped `examples/
     /// problems/variational_no_hole_plate.toml` production configuration (pure `Variational`
     /// formulation + `measure_aware_training=true`, PH3-04's real switch). Loads the ACTUAL
     /// shipped TOML file (not a hand-built literal) - this is also, structurally, "did the
     /// shipped file train correctly", not just "does this TOML parse". `#[ignore]`d - run
     /// explicitly with `cargo test --release -p pinn-solver --features ndarray-backend
-    /// variational_no_hole_plate_trains -- --ignored --nocapture` (real ~10+ minute wall clock,
-    /// matching PH3-01's own recorded `elapsed_secs: 646.3` for the same network/step size).
+    /// variational_no_hole_plate_trains -- --ignored --nocapture`.
+    ///
+    /// Issue #64/#66 update: the shipped config was raised to 4096/4096/3000 (from 2048/512/
+    /// 2000) to close estimator variance after #64's resampling fix - real ~20-25 minute wall
+    /// clock in release. This is ALSO now sub-issue #66's real checkpoint/
+    /// `MathematicalObjectiveSnapshot` acceptance evidence for PH4-03/05/19: assertions below
+    /// were strengthened from `is_finite()` (all that could honestly be claimed before #64's
+    /// fix) to real PASS/threshold assertions, now that the shipped config genuinely passes.
+    ///
+    /// `n_boundary` specifically was raised again, 2048->4096, after fixing a SEPARATE real bug
+    /// this test's own strengthened assertions caught: `run_user_problem_training_from` (the
+    /// GUI-streaming path this test exercises, distinct from the headless CLI path) cached
+    /// `sample_boundary`'s output once before the loop instead of resampling every step - see
+    /// that function's own doc comment for the full story. After fixing that, `sigma_xx`/
+    /// `sigma_yy`/`sigma_xy`/`traction_rms` passed comfortably but `load_transfer_ratio` landed
+    /// on opposite sides of its `[0.99,1.01]` window across two runs (`0.9990` then `1.0124`) -
+    /// real quadrature variance in `probe_load_transfer`'s own independent post-training
+    /// boundary sample (a fresh `UserSamplingStrategy`, not the training loop's own instance),
+    /// not a logic bug. More boundary points shrink that estimator's variance.
     #[test]
-    #[ignore = "real, full-length (2000-step) production training run - see this test's own doc comment"]
+    #[ignore = "real, full-length (3000-step, ~23min release) production training run - see this test's own doc comment"]
     fn variational_no_hole_plate_trains_and_produces_real_benchmark_evidence() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/problems/variational_no_hole_plate.toml");
         let contents = std::fs::read_to_string(&path).expect("read variational_no_hole_plate.toml");
@@ -3863,7 +3933,12 @@ mod tests {
         let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
         let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, rx_ctrl));
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
+        // 2400s, not 1800s: `n_boundary` doubled (2048->4096) to shrink `load_transfer_ratio`'s
+        // quadrature variance (see this test's own doc comment) raised real per-step cost
+        // enough that a 1800s run hit the deadline mid-run once under concurrent CPU load from
+        // an unrelated build - not a hang (confirmed: same run completed in ~1030-1070s in
+        // isolation at n_boundary=2048 previously), just needs headroom for this heavier config.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2400);
         let mut saw_done = false;
         let mut last_logged_step = usize::MAX;
         let mut last_update: Option<Box<TrainingUpdate>> = None;
@@ -3918,8 +3993,105 @@ mod tests {
         println!("[PH3-05] recomputed energy balance: {energy_balance:?}");
 
         assert!(final_update.total_loss.is_finite());
-        assert!(benchmark.sigma_xx_relative_error.is_finite());
-        assert!(energy_balance.energy_balance_error.is_finite());
+        // Issue #64/#66: strengthened from `is_finite()` to a real PASS assertion now that the
+        // shipped config (post-#64's resampling fix) genuinely passes all five hard thresholds.
+        assert!(benchmark.passed, "shipped variational_no_hole_plate.toml must pass P2-14 after issue #64's fix: {benchmark:?}");
+        assert!(energy_balance.energy_balance_error.is_finite() && energy_balance.energy_balance_error < 1e-2);
+
+        // Issue #66 (PH4-03/05/19): the persisted checkpoint's `MathematicalObjectiveSnapshot`
+        // must let a reviewer reconstruct physical U/W_ext/Pi without reading source code -
+        // confirm the report was actually saved (not just the raw model weights) and that its
+        // physical values are internally consistent (Pi = U - W_ext) and match this real run's
+        // formulation.
+        let report = meta.report.as_ref().expect("checkpoint must persist an AuthoritativeReport");
+        let snapshot = report.objective_snapshot.as_ref().expect("report must carry a MathematicalObjectiveSnapshot");
+        let (u, w, pi) = (
+            snapshot.physical_u.expect("physical_u must be Some for a Variational no-hole run"),
+            snapshot.physical_w_ext.expect("physical_w_ext must be Some"),
+            snapshot.physical_pi.expect("physical_pi must be Some"),
+        );
+        assert!((pi - (u - w)).abs() / pi.abs().max(1e-30) < 1e-6, "Pi={pi} must equal U-W_ext={} ", u - w);
+        assert!(snapshot.active_terms.iter().any(|t| t == "physical_potential"), "{:?}", snapshot.active_terms);
+        assert!(!snapshot.base_weights.is_empty());
+        assert!(snapshot.normalized_pi.expect("normalized_pi must be Some").is_finite());
+
+        let _ = std::fs::remove_file(&written);
+        let mut meta_path = path_ck.clone();
+        meta_path.set_file_name(format!("{}.meta.json", path_ck.file_stem().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_file(meta_path);
+    }
+
+    /// Issue #63 PH4-19/03/05 (sub-issue #66): fast (NOT `#[ignore]`d - seconds, not minutes)
+    /// proof that the checkpoint/`MathematicalObjectiveSnapshot` PERSISTENCE MECHANISM itself
+    /// is correct for a corrected-Variational run - independent of whether that short run has
+    /// numerically converged. The full-convergence acceptance evidence (does the shipped,
+    /// production-scale config actually PASS L4) is a separate concern already covered by
+    /// `variational_no_hole_plate_trains_and_produces_real_benchmark_evidence` immediately
+    /// above; this test exists so that question doesn't have to be re-answered with another
+    /// 20+ minute run just to check the SAVE/LOAD/SNAPSHOT plumbing (issue #65/#66's own
+    /// "avoid a full run when a cheaper method proves the same thing" policy).
+    #[test]
+    fn corrected_variational_checkpoint_persists_a_reconstructable_objective_snapshot() {
+        // Deliberately tiny (16/16 points, 8-wide/1-hidden network) - this test checks the
+        // save/load/snapshot MECHANISM, not numerical convergence, so it should cost seconds,
+        // not minutes, even in an unoptimized debug build (issue #65/#66's own verification-
+        // cost policy: avoid a full run when a cheaper method proves the same thing).
+        let mut spec = no_hole_plate_spec(20);
+        spec.training.n_interior = 16;
+        spec.training.n_boundary = 16;
+        spec.network.hidden_dim = 8;
+        spec.network.n_hidden = 1;
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, rx_ctrl));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline && !saw_done {
+            match rx.try_recv() {
+                Ok(TrainingMsg::Done) => saw_done = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(saw_done, "expected TrainingMsg::Done within the deadline");
+
+        let path_ck = std::env::temp_dir().join(format!("pinn_solver_snapshot_mechanism_{}", std::process::id()));
+        tx_ctrl.send(ControlMsg::SaveCheckpoint { path: path_ck.clone(), saved_at_unix: 0 }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut saved: Option<Result<String, String>> = None;
+        while std::time::Instant::now() < deadline && saved.is_none() {
+            if let Ok(TrainingMsg::CheckpointSaved(r)) = rx.try_recv() { saved = Some(r); }
+            else { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        }
+        let written = saved.expect("must receive a CheckpointSaved response").expect("save must succeed");
+        tx_ctrl.send(ControlMsg::Stop).unwrap();
+        handle.join().unwrap();
+
+        let device = crate::training_core::BDevice::default();
+        let (_model, meta) = crate::checkpoint::load_checkpoint(&path_ck, &device).expect("load just-saved checkpoint");
+        let report = meta.report.as_ref().expect("checkpoint must persist an AuthoritativeReport");
+        let snapshot = report.objective_snapshot.as_ref().expect("report must carry a MathematicalObjectiveSnapshot");
+
+        // A reviewer must be able to reconstruct physical U/W_ext/Pi from the saved artifact
+        // alone (issue #63's own PH4-05 wording) - not just see that SOME numbers exist, but
+        // that they are the RIGHT numbers, internally consistent with the atomic functional's
+        // own definition, regardless of how far training has progressed.
+        let (u, w, pi) = (
+            snapshot.physical_u.expect("physical_u must be Some for a Variational no-hole run"),
+            snapshot.physical_w_ext.expect("physical_w_ext must be Some"),
+            snapshot.physical_pi.expect("physical_pi must be Some"),
+        );
+        assert!((pi - (u - w)).abs() / pi.abs().max(1e-30) < 1e-6, "Pi={pi} must equal U-W_ext={}", u - w);
+        assert!(snapshot.normalized_pi.expect("normalized_pi must be Some").is_finite());
+        assert!(snapshot.active_terms.iter().any(|t| t == "physical_potential"), "{:?}", snapshot.active_terms);
+        assert!(snapshot.active_terms.iter().any(|t| t == "translation_gauge"), "{:?}", snapshot.active_terms);
+        assert!(!snapshot.base_weights.is_empty());
+        assert_eq!(snapshot.formulation, "Variational");
+        assert!(snapshot.reference_energy_j.is_finite() && snapshot.reference_energy_j > 0.0);
+        assert!(snapshot.domain_area_m2 > 0.0);
 
         let _ = std::fs::remove_file(&written);
         let mut meta_path = path_ck.clone();

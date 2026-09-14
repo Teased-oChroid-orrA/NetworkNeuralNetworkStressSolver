@@ -5,8 +5,6 @@
 //! by it) — a plain constant/scheduled-LR AdamW loop, matching `toy_beam`'s own "prove the
 //! formulation converges before adding curriculum machinery" scope discipline.
 
-use std::collections::HashMap;
-
 use burn::tensor::backend::Backend;
 use pinn_core::messages::SolverConfig;
 use pinn_core::problem_spec::ProblemSpec;
@@ -16,25 +14,11 @@ use crate::{
     lr_schedule::LrSchedule,
     network::ElasticityNetConfig,
     optim::{make_bias_optim, make_gate_optim, WeightOptim},
-    problem::{BoundaryValueProblem, DomainOptim, DomainStepCtx, DomainStepData, MultiStepCtx, PointSetData},
+    problem::{BoundaryValueProblem, DomainOptim},
     saw_brdr::SawBrdr,
     training_core::{step_physics_multi, sync_device, BDevice, B},
-    user_problem::{UserDefinedProblem, USER_DOMAIN},
+    user_problem::{plate_normalize_point as normalize_point, resample_plate_step_data, plate_multi_step_ctx, UserDefinedProblem},
 };
-
-fn normalize_point(x: f64, y: f64, half_w: f64, half_h: f64) -> [f32; 2] {
-    [(x / half_w) as f32, (y / half_h) as f32]
-}
-
-fn build_pointset(pts: &[pinn_core::loading::BoundaryPoint], half_w: f64, half_h: f64) -> PointSetData {
-    PointSetData {
-        norm: pts.iter().map(|p| normalize_point(p.x, p.y, half_w, half_h)).collect(),
-        nx: pts.iter().map(|p| p.nx as f32).collect(),
-        ny: pts.iter().map(|p| p.ny as f32).collect(),
-        tx: pts.iter().map(|p| p.tx as f32).collect(),
-        ty: pts.iter().map(|p| p.ty as f32).collect(),
-    }
-}
 
 /// Trains a [`UserDefinedProblem`] built from `spec` headlessly, printing progress. Returns
 /// `true` if the final step's loss is finite (the only generic "did this not blow up"
@@ -131,49 +115,22 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
 
     let mut last_total = f32::NAN;
     for step in 0..spec.training.max_steps {
-        let int_pts = sampling.sample_interior(&placeholder_geom, spec.training.n_interior);
-        let bnd_pts = sampling.sample_boundary(&placeholder_geom, &spec.load, spec.training.n_boundary);
-
-        let int_norm: Vec<[f32; 2]> = int_pts.iter().map(|&[x, y]| normalize_point(x, y, half_w, half_h)).collect();
-
-        // 1 outer_boundary + 2 per hole (traction ring + constitutive-consistency anchor ring
-        // - see `UserSamplingStrategy::named_point_sets`).
-        let mut named = HashMap::with_capacity(1 + 2 * n_holes);
-        named.insert("outer_boundary", build_pointset(&bnd_pts, half_w, half_h));
-        for set in sampling.named_point_sets(&[]) {
-            named.insert(set.name, build_pointset(&set.points, half_w, half_h));
-        }
-
-        let data = DomainStepData { id: USER_DOMAIN, int_norm, extra_ring_norm: Vec::new(), named };
-        let ctx = MultiStepCtx {
-            config: &config,
-            problem: &problem,
-            fd: &fd,
-            k: 1.0, // IdentityAnsatz ignores k entirely — value is inert
-            domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
-            // Same real fix as `runner::run_user_problem_training_from`'s per-step `MultiStepCtx`
-            // (this headless CLI path mirrors that GUI path's training loop) - see that call
-            // site's doc comment for the full root-cause explanation.
-            dynamic_lam_h_cap: 50.0,
-            dynamic_lam_d_cap: 50.0,
-            dynamic_lam_penetration_cap: f64::MAX,
-            dynamic_lam_non_tension_cap: f64::MAX,
-            // Same real fix as `runner::run_user_problem_training_from`'s per-step
-            // `MultiStepCtx` - see that call site's doc comment for the full root-cause
-            // explanation of why this matches `dynamic_lam_h_cap` at 50.0.
-            constitutive_consistency_weight: 50.0,
-            // Same real fix as `runner::run_user_problem_training_from`'s per-step
-            // `MultiStepCtx` - see `UserGeometry::n_fourier`'s doc comment for the full
-            // root-cause story. `net_cfg`'s `input_dim` (this function's model-construction
-            // site) MUST use the same value.
-            n_fourier: spec.geometry.n_fourier(),
+        // Issue #73: shared with `runner::run_user_problem_training_from` - see
+        // `resample_plate_step_data`/`plate_multi_step_ctx`'s own doc comments (user_problem.rs)
+        // for why this must stay a real per-step call, not something cached across steps.
+        let data = resample_plate_step_data(
+            sampling, &placeholder_geom, &spec.load,
+            spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
+        );
+        let ctx = plate_multi_step_ctx(
+            &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
+            spec.geometry.n_fourier(),
             // PH4-06: one final live gradient ledger is cheap enough for headless controlled
             // ladders and prevents a falling total loss from being mistaken for physical
             // convergence. Earlier steps keep the normal no-extra-backward-pass path.
-            probe_term_gradients: step + 1 == spec.training.max_steps,
-            phase2_active: true,
+            step + 1 == spec.training.max_steps,
             step,
-        };
+        );
 
         let (new_model, out) = step_physics_multi(
             vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, &device,

@@ -326,6 +326,132 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
     // for an anchor to close. See `anchor_margin_m`'s doc comment for what's kept.
 }
 
+/// Issue #73: single source of truth for the per-step training logic that was independently
+/// duplicated between `user_runner::run_headless_user_problem` (headless CLI) and
+/// `runner::run_user_problem_training_from` (GUI-streaming) — the exact duplication that let
+/// issue #64's `UserSamplingStrategy` resampling fix land correctly in one copy and silently
+/// not in the other (see `docs/PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-06 follow-up section
+/// for the full incident). Both call sites now call these two functions instead of maintaining
+/// their own copies.
+pub fn plate_normalize_point(x: f64, y: f64, half_w: f64, half_h: f64) -> [f32; 2] {
+    [(x / half_w) as f32, (y / half_h) as f32]
+}
+
+/// Shared `BoundaryPoint` slice -> `PointSetData` conversion — was duplicated identically at
+/// both production call sites (and several test helpers, left alone; see issue #73's own
+/// non-goals).
+pub fn plate_build_pointset(
+    pts: &[BoundaryPoint],
+    half_w: f64,
+    half_h: f64,
+) -> crate::problem::PointSetData {
+    crate::problem::PointSetData {
+        norm: pts.iter().map(|p| plate_normalize_point(p.x, p.y, half_w, half_h)).collect(),
+        nx: pts.iter().map(|p| p.nx as f32).collect(),
+        ny: pts.iter().map(|p| p.ny as f32).collect(),
+        tx: pts.iter().map(|p| p.tx as f32).collect(),
+        ty: pts.iter().map(|p| p.ty as f32).collect(),
+    }
+}
+
+/// Draws a FRESH interior/boundary/named-point-set sample for one training step — the exact
+/// logic issue #64 made genuinely vary per call (jittered stratified sampling), and issue #73
+/// consolidates into one place after finding it silently re-frozen in one of its two call
+/// sites. Every call to this function is a real, independent resample; callers must call it
+/// fresh every step (matching both existing loops' own established per-step cadence) rather
+/// than caching its result — caching was exactly the mistake that reintroduced issue #64's bug
+/// in the GUI-streaming path.
+///
+/// Callers needing AMR's own interior resampling (GUI-streaming path only, gated on
+/// `spec.training.amr_enabled`) should overwrite the returned `DomainStepData.int_norm`
+/// afterward — AMR only ever refines the interior quadtree, never touches boundary or named
+/// point sets, so this function's boundary/named output stays authoritative regardless.
+pub fn resample_plate_step_data(
+    sampling: &dyn DomainSamplingStrategy,
+    placeholder_geom: &GeometryConfig,
+    load: &LoadConfig,
+    n_interior: usize,
+    n_boundary: usize,
+    half_w: f64,
+    half_h: f64,
+) -> crate::problem::DomainStepData {
+    let int_pts = sampling.sample_interior(placeholder_geom, n_interior);
+    let int_norm: Vec<[f32; 2]> = int_pts.iter()
+        .map(|&[x, y]| plate_normalize_point(x, y, half_w, half_h))
+        .collect();
+
+    let bnd_pts = sampling.sample_boundary(placeholder_geom, load, n_boundary);
+    // 1 outer_boundary + 2 per hole (traction ring + constitutive-consistency anchor ring —
+    // see `UserSamplingStrategy::named_point_sets`); exact capacity unknown without querying
+    // the geometry, so this just starts reasonably sized rather than tracking hole count too.
+    let mut named = std::collections::HashMap::with_capacity(4);
+    named.insert("outer_boundary", plate_build_pointset(&bnd_pts, half_w, half_h));
+    for set in sampling.named_point_sets(&[]) {
+        named.insert(set.name, plate_build_pointset(&set.points, half_w, half_h));
+    }
+
+    crate::problem::DomainStepData { id: USER_DOMAIN, int_norm, extra_ring_norm: Vec::new(), named }
+}
+
+/// Builds the `MultiStepCtx` fields BOTH the headless and GUI-streaming plate training loops
+/// use identically — the constants that would previously have needed to change in two places
+/// at once (issue #73). `dynamic_lam_penetration_cap`/`dynamic_lam_non_tension_cap` are always
+/// `f64::MAX` here (inert) since the plate problem has no interface-penetration/non-tension
+/// terms (those are pin-lug-only) — matching both existing call sites exactly.
+///
+/// Rationale for the specific constant values (preserved from the two call sites this
+/// consolidates, not re-derived):
+/// - `dynamic_lam_h_cap`/`dynamic_lam_d_cap = 50.0`: real root cause of the garbage-Kt/zero-
+///   hole-stress bug (see `powershell_tool/CLAUDE.md`'s Stress Solver section) —
+///   `hole_traction_loss_direct` was left fully uncapped (`f64::MAX`, unlike Kirsch's own real,
+///   tested 50→15 cascade), so SAW-BRDR could grow its adapted weight arbitrarily large
+///   relative to `step_physics_multi`'s fixed `LAM_CONSTITUTIVE_CONSISTENCY` (5.0) — and an
+///   outweighed boundary term has a strictly EASIER minimum available than the true elasticity
+///   solution: drive direct-stress outputs toward zero everywhere the boundary term is
+///   evaluated (trivially satisfies "traction ≈ 0" without satisfying "stress matches Hooke's
+///   law"). Capped at Kirsch's own starting value (50.0, a real, already-tuned bound in this
+///   codebase) — deliberately NOT replicating Kirsch's full plateau-triggered cascade down to
+///   15.0, which is tuned specifically for Kirsch's own K_t dynamics.
+/// - `constitutive_consistency_weight = 50.0`: paired with the cap above — capping the boundary
+///   term alone measurably reduced the interior PDE residual but left Kt essentially unmoved
+///   (confirmed via a real training run). Raising this to the SAME 50.0 ceiling closes the
+///   remaining gap: `hole_traction` can no longer structurally outweigh constitutive-consistency
+///   by 10x the way it could when one was capped at 50 and the other pinned at 5.
+/// - `n_fourier`: caller-supplied, always `spec.geometry.n_fourier()` — MUST match the network's
+///   own `input_dim` at construction time (see `UserGeometry::n_fourier`'s doc comment for the
+///   full root-cause story: Kirsch's own path already uses Fourier positional encoding to
+///   correct spectral bias near a hole; the plate path didn't until this was added).
+#[allow(clippy::too_many_arguments)]
+pub fn plate_multi_step_ctx<'a>(
+    config: &'a pinn_core::messages::SolverConfig,
+    problem: &'a dyn crate::problem::BoundaryValueProblem,
+    fd: &'a crate::fd_stencil::FdConfig,
+    data: &'a crate::problem::DomainStepData,
+    u_ref: f32,
+    ref_energy: f32,
+    ref_stress2: f32,
+    n_fourier: usize,
+    probe_term_gradients: bool,
+    step: usize,
+) -> crate::problem::MultiStepCtx<'a> {
+    crate::problem::MultiStepCtx {
+        config,
+        problem,
+        fd,
+        k: 1.0, // IdentityAnsatz ignores k entirely — value is inert
+        domains: vec![crate::problem::DomainStepCtx { data, u_ref, ref_energy, ref_stress2 }],
+        dynamic_lam_h_cap: 50.0,
+        dynamic_lam_d_cap: 50.0,
+        dynamic_lam_penetration_cap: f64::MAX,
+        dynamic_lam_non_tension_cap: f64::MAX,
+        constitutive_consistency_weight: 50.0,
+        n_fourier,
+        probe_term_gradients,
+        phase2_active: true,
+        step,
+    }
+}
+
 /// Mirrors `pinlug_problem::InteriorEnergyTerm` exactly (`dem_energy_loss`, generic, no new
 /// math) — the default `point_sets()` ("interior") applies unchanged.
 ///
@@ -2575,6 +2701,136 @@ mod tests {
         assert!((weighted - expected).abs() / expected.abs() < 1e-6, "{weighted} vs {expected}");
         assert!((weighted - unweighted).abs() / unweighted.abs() > 0.1,
             "compensation must materially change this deliberately biased sample");
+    }
+
+    /// Issue #63 PH4-04 (sub-issue #65): live measure-aware integral unbiasedness proof on the
+    /// real production `InteriorEnergyTerm` path (not a helper-only reconstruction), for a
+    /// KNOWN, spatially NONCONSTANT strain field — `exx(x,y)=a*x`, `eyy(x,y)=b*y`, `exy=0`
+    /// (chosen so the shear term vanishes regardless of engineering-vs-tensor shear-strain
+    /// convention, eliminating that one ambiguity from this proof entirely). `energy.rs`'s own
+    /// `strain_energy_density = 0.5*(sxx*exx+syy*eyy+2*sxy*exy)` reduces, with `exy=0` and
+    /// `compute_stress`'s `sxx=C*(exx+nu*eyy)`/`syy=C*(eyy+nu*exx)` (`C=E/(1-nu^2)`), to
+    /// `0.5*C*(exx^2+eyy^2+2*nu*exx*eyy)`. Substituting and integrating over `[-1,1]x[-1,1]`
+    /// (`integral of x^2 dA = integral of y^2 dA = 4/3`; `integral of x*y dA = 0` by odd-function
+    /// cancellation) gives the closed form `analytical = (2/3)*C*(a^2+b^2)` — hand-derived, not
+    /// a fine-grid numerical stand-in.
+    ///
+    /// Three independently-shaped point distributions are checked against that SAME analytical
+    /// value: a plain uniform grid (measure-aware, unweighted path), a 1D left/right density
+    /// split (80% of points in the left half, 20% in the right, each half still exactly 50% of
+    /// the area), and a 2D corner-refinement split mimicking real AMR behavior (60% of points
+    /// concentrated in one quadrant - 25% of the area - the other 75% of the area sharing the
+    /// remaining 40%). Both nonuniform cases use `domain_integral_weighted_tensor`'s own
+    /// contract (`mean(weight)=1`, weight = true-area-fraction / point-count-fraction) - proving
+    /// the compensation mechanism generalizes across genuinely different nonuniformity shapes,
+    /// not one hand-picked case.
+    ///
+    /// `ExternalWorkTerm`/`W_ext` is deliberately NOT included here: its boundary integral
+    /// already uses the EXACT known per-point arc-length `ds` (`boundary_integral_tensor`), not
+    /// an MC-style density estimator needing AMR compensation weights - `AdaptiveGrid` only
+    /// ever refines the interior quadtree (see `UserSamplingStrategy`'s own doc comments), so
+    /// PH4-04's uniform/nonuniform/AMR distinction is squarely an interior-integral question.
+    #[test]
+    fn ph4_04_interior_energy_integral_agrees_across_uniform_nonuniform_and_amr_like_sampling() {
+        use burn::tensor::TensorData;
+
+        let material = MaterialProps::al7075_t6();
+        let device: crate::training_core::BDevice = Default::default();
+        let e = material.e as f64;
+        let nu = material.nu as f64;
+        let c = e / (1.0 - nu * nu);
+        let a = 1.0e-3_f64;
+        let b = -3.0e-4_f64;
+        let analytical = (2.0 / 3.0) * c * (a * a + b * b);
+
+        let domain_area = 4.0_f64; // [-1,1] x [-1,1]
+        let thickness = 1.0_f64;
+        let ref_energy_absolute = 1.0_f64; // raw Joules out, comparable directly to `analytical`
+
+        let compute = |points: &[(f64, f64)], weights: Option<Vec<f64>>| -> f64 {
+            let n = points.len();
+            let exx: Vec<f32> = points.iter().map(|&(x, _)| (a * x) as f32).collect();
+            let eyy: Vec<f32> = points.iter().map(|&(_, y)| (b * y) as f32).collect();
+            let exx_t = Tensor::<B, 1>::from_data(TensorData::new(exx, vec![n]), &device);
+            let eyy_t = Tensor::<B, 1>::from_data(TensorData::new(eyy, vec![n]), &device);
+            let exy_t = Tensor::<B, 1>::zeros([n], &device);
+            let raw_out = Tensor::<B, 2>::zeros([n, 5], &device);
+            let term = InteriorEnergyTerm {
+                material: material.clone(), ref_energy: 1.0,
+                measure_aware: true, domain_area, thickness, ref_energy_absolute, weights,
+            };
+            term.compute(&[DomainForwardOutputs {
+                domain: USER_DOMAIN, raw_out: &raw_out,
+                strains: Some((exx_t, eyy_t, exy_t)), normals: None, shifted_stress: None, hessian: None,
+            }]).into_data().to_vec::<f32>().unwrap()[0] as f64
+        };
+
+        let grid_in = |x0: f64, x1: f64, y0: f64, y1: f64, nx: usize, ny: usize| -> Vec<(f64, f64)> {
+            let mut pts = Vec::with_capacity(nx * ny);
+            for ix in 0..nx {
+                for iy in 0..ny {
+                    let x = x0 + (ix as f64 + 0.5) * (x1 - x0) / nx as f64;
+                    let y = y0 + (iy as f64 + 0.5) * (y1 - y0) / ny as f64;
+                    pts.push((x, y));
+                }
+            }
+            pts
+        };
+
+        // Uniform: plain 80x80 regular grid over the whole domain, no compensation weights.
+        let uniform_pts = grid_in(-1.0, 1.0, -1.0, 1.0, 80, 80);
+        let integral_uniform = compute(&uniform_pts, None);
+
+        // Nonuniform: 1D left/right split. Left half gets 80% of points (3200 in a 64x50
+        // grid), right half gets 20% (800 in a 32x25 grid) - each half is exactly 50% of the
+        // area, so weight_left = 0.5/0.8 = 0.625, weight_right = 0.5/0.2 = 2.5.
+        let left = grid_in(-1.0, 0.0, -1.0, 1.0, 64, 50);
+        let right = grid_in(0.0, 1.0, -1.0, 1.0, 32, 25);
+        let mut nonuniform_pts = left.clone();
+        nonuniform_pts.extend(right.clone());
+        let mut nonuniform_weights = vec![0.625; left.len()];
+        nonuniform_weights.extend(vec![2.5; right.len()]);
+        assert_eq!(nonuniform_pts.len(), nonuniform_weights.len());
+        let integral_nonuniform = compute(&nonuniform_pts, Some(nonuniform_weights));
+
+        // AMR-like: 2D corner refinement. Top-left quadrant (x<0, y>0 - 25% of the area) is
+        // densely gridded (60x40=2400 points); the other three quadrants (75% of the area,
+        // 25% each) are each identically gridded (30x20=600 points each, 1800 total) - equal
+        // point counts per equal-area sub-quadrant, so the single shared `w_other` weight is
+        // exact, not an approximation. Weights are derived from the ACTUAL realized point-count
+        // fractions (not a hand-picked target ratio), eliminating rounding mismatch entirely:
+        // `w = true_area_fraction / actual_point_fraction`.
+        let refined = grid_in(-1.0, 0.0, 0.0, 1.0, 60, 40);
+        let other_a = grid_in(0.0, 1.0, 0.0, 1.0, 30, 20); // top-right
+        let other_b = grid_in(-1.0, 0.0, -1.0, 0.0, 30, 20); // bottom-left
+        let other_c = grid_in(0.0, 1.0, -1.0, 0.0, 30, 20); // bottom-right
+        let n_other = other_a.len() + other_b.len() + other_c.len();
+        let n_total = refined.len() + n_other;
+        let w_refined = 0.25 / (refined.len() as f64 / n_total as f64);
+        let w_other = 0.75 / (n_other as f64 / n_total as f64);
+        let mut amr_pts = refined.clone();
+        amr_pts.extend(other_a.iter().chain(other_b.iter()).chain(other_c.iter()).copied());
+        let mut amr_weights = vec![w_refined; refined.len()];
+        amr_weights.extend(vec![w_other; n_other]);
+        assert_eq!(amr_pts.len(), amr_weights.len());
+        let integral_amr_like = compute(&amr_pts, Some(amr_weights));
+
+        const REL_TOL: f64 = 0.02; // 2% - grid coarseness margin for a smooth quadratic field
+        for (name, value) in [
+            ("uniform", integral_uniform),
+            ("nonuniform", integral_nonuniform),
+            ("amr_like", integral_amr_like),
+        ] {
+            let rel_err = (value - analytical).abs() / analytical.abs();
+            assert!(
+                rel_err < REL_TOL,
+                "{name}: {value} vs analytical {analytical} (rel_err={rel_err}, tol={REL_TOL})"
+            );
+        }
+        // Pairwise agreement, not just each-vs-analytical - the actual PH4-04 wording
+        // ("integral_uniform ≈ integral_nonuniform ≈ integral_AMR").
+        assert!((integral_uniform - integral_nonuniform).abs() / analytical.abs() < REL_TOL);
+        assert!((integral_uniform - integral_amr_like).abs() / analytical.abs() < REL_TOL);
     }
 
     fn two_hole_geometry() -> UserGeometry {

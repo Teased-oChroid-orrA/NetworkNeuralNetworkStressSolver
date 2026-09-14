@@ -28,6 +28,22 @@
 # `Debug_run/phase4/issue64_resample_fix/` for the full solver logs and
 # `docs/PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-06 entry for the complete writeup.
 #
+# Issue #66 follow-up: the GUI-streaming path (`runner::run_training_user_problem`, distinct
+# from the headless CLI path `run_headless_user_problem`'s own driver) had its own separate bug
+# - `sample_boundary`/`named_point_sets` were cached once before the loop instead of resampled
+# every step (a stale pre-#64 perf optimization never updated for #64's fix - see
+# `run_user_problem_training_from`'s own doc comment). Fixed. Even after that fix, three real
+# runs still landed borderline (one of sigma_xx/traction_rms/load_transfer_ratio narrowly
+# missing its threshold each time) - re-evaluating the SAME trained checkpoints at up to 16x
+# more boundary evaluation points changed nothing (ruled out quadrature/sampling-count noise),
+# but disabling AMR entirely reproduced headless's comfortable pass exactly
+# (sigma_xx=0.0011, traction_rms=0.0012, load_transfer=1.0001). Root cause: AMR is a GUI-
+# streaming-only feature (headless never implements it) and defaults to `amr_enabled=true`;
+# issue #63's own PH4-09 policy already states "AMR = OFF, uniform sampling = ON until the
+# baseline is mathematically correct" - AMR itself has no dedicated evidence yet (issue #63
+# sub-issue #67). `amr_enabled = false` below makes this file actually honor that pre-existing
+# policy, which it was silently violating by inheriting the default.
+#
 # Run with: cargo run -p pinn-app --release -- --headless --problem-spec examples/problems/variational_no_hole_plate.toml
 #
 # All lengths in meters [m], all stresses/moduli in pascals [Pa].
@@ -57,7 +73,11 @@ n_hidden = 8
 [training]
 max_steps = 3000
 n_interior = 4096
-n_boundary = 2048
+n_boundary = 4096
 fd_h = 1e-3
 lr = 1e-3
 measure_aware_training = true
+# Issue #63 PH4-09 policy: AMR stays off for this canonical no-hole benchmark until AMR itself
+# has dedicated evidence (sub-issue #67). Headless CLI training never implements AMR at all;
+# this only matters for the GUI-streaming path, which defaults to `true` otherwise.
+amr_enabled = false

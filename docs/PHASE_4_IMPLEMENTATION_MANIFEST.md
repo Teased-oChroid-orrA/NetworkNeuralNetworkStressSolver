@@ -5,9 +5,52 @@ mathematical, source, test, runtime-artifact, and benchmark evidence.
 
 ## PH4-01 — Freeze and classify solver modes
 
-Status: BLOCKED
+Status: VERIFIED (issue #64 sub-issue #65)
 
 Hypothesis: legacy Hybrid success and corrected Variational support are distinct modes.
+
+### Mode classification matrix (no-hole, square plate, `half_w=half_h=0.10`, Al 7075-T6, `px=6.9e7` Pa)
+
+Built entirely from existing evidence — no new training run required for this item (issue #65's
+own "avoid a full run when a cheaper method proves the same thing" discipline; see the "Not
+independently run" notes below for exactly where new evidence would actually be needed).
+
+| | **A: Hybrid + LegacyMeanIntegral** | **B: Hybrid + MeasureAware** | **C: Variational + MeasureAware (pre-#64)** | **D: Variational + MeasureAware (post-#64, corrected)** |
+|---|---|---|---|---|
+| Formulation | `Hybrid(interior_energy, equilibrium, outer_traction, external_work)` | same term set, measure-aware integral path | `Variational` (`physical_potential`, essential constraints only) | same as C |
+| Integration mode | plain `.mean()` | `domain_integral_tensor`/`boundary_integral_tensor` (unweighted, since no AMR sweep on this config) | measure-aware, same as B | measure-aware, same as B |
+| Active terms | interior_energy, equilibrium, outer_traction, external_work (independently weighted) | same | physical_potential (atomic U-W), translation_gauge | same |
+| Physical coefficients | `LAM_INTERIOR_ENERGY=1.0`, `LAM_EXTERNAL_WORK=20.0` — **independently weighted, the PH4-02 defect this epic exists to fix** | same as A | atomic, single `LAM_PHYSICAL_POTENTIAL=1.0` scale (PH4-03) | same as C |
+| Sampling | `UserSamplingStrategy`, pre-#64 (static point cloud for no-hole geometries) | same as A | same as A (the actual root cause) | **post-#64: genuine per-call jittered stratified resampling** |
+| AMR status | off | off | off | off |
+| Derivative backend | FD | FD | FD | FD |
+| Convergence evidence | PH3-10 real multi-signal trend evidence, `plausibly_converged` | not independently run (see below) | `#[ignore]`d full-length/16000-step runs both diverged/failed L4 (`ph3_14_variational_bridge_...`) | `assess_convergence` real evidence, ignored regression test passing |
+| Benchmark result (P2-14) | FAIL on the original 2000-step frozen checkpoint (`sigma_xx_relative_error=0.0192`, `traction_rms_over_ref=0.0140`); **PASS after PH3-09's real 800-step resume to 2800 steps** (`Debug_run/baseline_legacy_no_hole/`, `ph3_09_resuming_the_baseline_checkpoint_...`) | not independently run (see below) | FAIL, five-of-five hard metrics, every controlled-ladder stage (`Debug_run/phase4/{D,E}_*`) | **PASS, all five hard metrics** (`Debug_run/phase4/issue64_resample_fix/shipped_example_final.log`; `sigma_xx=0.0010`, `sigma_yy/ref=0.0007`, `sigma_xy/ref=0.0003`, `traction_rms/ref=0.0011`, `load_transfer=0.9991`) |
+| Energy balance | PH3-01/09 real values (see baseline notes) | not independently run | `1.6e-3`–`4.4e-3` (health PASS) but hard metrics FAIL — the exact "health passes, field doesn't" gap #64 root-caused | `4.7111e-4`, health PASS, hard metrics also PASS |
+| Load transfer | `1.0027` (post-resume) | not independently run | `0.60`–`0.88` across every controlled stage | `0.9991` |
+| Field errors | PH3-01/09 evidence | not independently run | PH4-15's `validate_no_hole_fields` did not exist yet | PASS — independent field validation wired in and passing (issue #64) |
+
+**Mode B — why "not independently run" is the honest, correct entry, not a gap silently
+approximated (issue #63 rule #16):** for THIS SPECIFIC configuration — a square plate
+(`half_w==half_h`) with uniform (non-AMR) sampling — `ExternalWorkTerm`'s own doc comment and
+`InteriorEnergyTerm`'s `ref_energy_absolute` derivation (this file, `user_problem.rs`) establish
+that the measure-aware weighted-tensor path is algebraically forced to equal the legacy
+`.mean()` path: `domain_integral_tensor`'s `mean(f)*area*thickness`, divided by
+`ref_energy_absolute = ref_energy*(domain_area*thickness)`, reduces to exactly
+`mean(f)/ref_energy` — the legacy path's own formula — with the `area*thickness` factor
+cancelling out on both sides. Both paths' unweighted equivalence is already independently
+covered by the existing, passing
+`interior_energy_term_measure_aware_with_no_weights_matches_domain_integral_tensor_directly`/
+`external_work_term_measure_aware_matches_boundary_integral_tensor_directly` tests. So for THIS
+square/uniform/no-AMR cell, Mode A's real result IS Mode B's real result by construction — an
+independent training run would be uninformative, not missing evidence. **This equivalence does
+NOT extend to a non-square plate** (different `ds` per edge — see sub-issue #68) or an
+AMR-nonuniform sampling regime (see sub-issue #67) — those are exactly where Mode B would need
+its own independent run, and are correctly scoped to those sub-issues, not this one.
+
+This matrix makes it structurally explicit (issue #63's own wording) that Mode A's real PASS
+does not imply Mode C/D's status — Mode C is real, documented, historical FAILURE evidence, and
+Mode D's real PASS is issue #64's own fix, independently earned, not inherited from Mode A/B.
 
 Evidence before change: Phase 3 recorded Hybrid + legacy mean as operational for its narrow
 no-hole configuration, and Variational + measure-aware as not operational. Source showed
@@ -37,7 +80,7 @@ unexecuted states; no missing runtime evidence is silently synthesized.
 
 ## PH4-03 — Create atomic physical U-W functional
 
-Status: IMPLEMENTED
+Status: VERIFIED (issue #64 sub-issue #66)
 
 Hypothesis: one `LossTerm` containing `U-W_ext` prevents adaptive/base weighting from changing
 the physical coefficient ratio.
@@ -55,24 +98,49 @@ PH4-03 affine acceptance: `physical_potential_live_term_has_the_correct_affine_m
 constructs actual interior/boundary `DomainForwardOutputs` in production point-set order and
 proves the atomic term has its minimum and zero numerical derivative at `a=sigma0/E`.
 
-Runtime artifact/benchmark: real corrected Variational execution and persisted Phase 4 artifact
-remain pending PH4-06. Not VERIFIED.
+Runtime artifact/benchmark (#66): the shipped `examples/problems/variational_no_hole_plate.toml`
+run (post-#64 fix) recorded `U=6.646538 J`, `W_ext=13.28682 J`, `Pi=-6.640279 J` — matching
+`Pi=U-W_ext` exactly (`shipped_example_final.log`) — and `runner::tests::
+variational_no_hole_plate_trains_and_produces_real_benchmark_evidence` (`#[ignore]`d, real
+~23min production-scale run) now asserts `benchmark.passed` and the persisted checkpoint's
+`Pi=U-W_ext` consistency directly, replacing the pre-#64 `is_finite()`-only assertions. A fast
+(2.46s) companion, `runner::tests::corrected_variational_checkpoint_persists_a_
+reconstructable_objective_snapshot`, proves the same persistence mechanism independent of
+convergence, per issue #65/#66's own "avoid a full run when a cheaper method suffices" policy.
 
 ## PH4-04 — Live integral unbiasedness
 
-Status: INVESTIGATING
+Status: VERIFIED (issue #64 sub-issue #65)
 
 Evidence before change: PH3 proved helper and separate `InteriorEnergyTerm`/`ExternalWorkTerm`
 branches, but did not exercise one atomic production Pi term. PH4-03's focused live-term test
 now proves the measure-aware `PhysicalPotentialEnergyTerm` uses both real domain and boundary
 integral primitives. `physical_potential_live_measure_aware_weights_remove_nonuniform_interior_bias`
 executes the actual atomic term with a deliberately biased AMR compensation shape and verifies
-its weighted result against the differentiable physical integral. Uniform/nonuniform/AMR real
-training artifacts remain required before VERIFIED.
+its weighted result against the differentiable physical integral.
+
+New evidence (#65): `ph4_04_interior_energy_integral_agrees_across_uniform_nonuniform_and_amr_like_sampling`
+(`user_problem.rs`) exercises the real production `InteriorEnergyTerm` for a KNOWN, spatially
+nonconstant strain field (`exx=a*x, eyy=b*y, exy=0` — the shear term deliberately zeroed to
+remove any engineering-vs-tensor shear-convention ambiguity from the proof), with a hand-derived
+closed-form analytical integral (`(2/3)*E/(1-nu^2)*(a^2+b^2)`, from integrating the known
+`strain_energy_density` formula over `[-1,1]x[-1,1]`). Three independently-shaped point
+distributions — a plain uniform grid, a 1D left/right density split (80/20), and a 2D
+corner-refinement split mimicking real AMR behavior (60% of points in one quadrant, 25% of the
+area) — each with correctly-derived compensation weights (`mean(weight)=1`) — all agree with the
+analytical value within 2%, and with each other. A fast, deterministic unit test (no training
+loop, `<0.1s`), not a 30+ minute run (issue #65's own verification-cost policy).
+
+`ExternalWorkTerm`/`W_ext` is deliberately excluded from this proof: its boundary integral
+already uses the EXACT known per-point arc-length `ds` (`boundary_integral_tensor`), not an
+MC-style density estimator — `AdaptiveGrid` only ever refines the interior quadtree, so the
+uniform/nonuniform/AMR distinction this item asks about is squarely an interior-integral
+question. Real AMR-sweep-in-the-loop evidence (as opposed to this hand-constructed proof of the
+underlying estimator's correctness) is sub-issue #67's job.
 
 ## PH4-05 — Physical versus optimization values
 
-Status: IMPLEMENTED
+Status: VERIFIED (issue #64 sub-issue #66)
 
 Evidence before change: `EnergyBalance` persisted internal energy and half prescribed work for
 the linear energy-balance diagnostic, but no report exposed full `W_ext`, `Pi`, normalization,
@@ -103,12 +171,17 @@ Integration evidence (2026-09-12): solver commit
 Commands passed: `cargo check`, `cargo test`, and `cargo build --release` in
 `../powerShell/powershell_tool/app-egui`.
 
-Runtime artifact/benchmark/regression: checkpoint-producing corrected-Variational run remains
-pending PH4-06. Not VERIFIED.
+Runtime artifact/benchmark/regression (#66): see PH4-03's own updated entry above — the same
+shipped, checkpoint-producing corrected-Variational run and its `Pi=U-W_ext`-consistent
+persisted snapshot serve as this item's evidence too.
 
 ## PH4-06 — Variational divergence root cause
 
-Status: INVESTIGATING
+Status: VERIFIED (issue #64) — root cause found and fixed; see the dedicated "PH4-06 root cause
+found and fixed" sub-section below for the full writeup. The narrative immediately below this
+line is the historical investigation record leading up to that fix and is kept as-is.
+
+Status (historical, pre-fix): INVESTIGATING
 
 Runtime evidence: `Debug_run/phase4/D_variational_atomic_pi/` records the controlled full-NN,
 uniform, AMR-off, 15-step run after atomic Pi and rotational gauge changes. It is finite and
@@ -281,6 +354,36 @@ not blocked. PH4-09/13/14/16/17 (AMR, hole-boundary Kt, L5, non-square, multi-ho
 correctly BLOCKED — each needs its own dedicated evidence beyond a passing no-hole companion,
 per their own stated blocking conditions; this fix does not itself unblock them.
 
+### Follow-up (sub-issue #66): a second, independent instance of the same bug class, plus a real AMR finding
+
+While producing #66's checkpoint-persistence evidence, the shipped config's GUI-streaming path
+(`runner::run_training_user_problem`, distinct from the headless CLI path `user_runner::
+run_headless_user_problem` used for all evidence above) was found to have its OWN separate
+regression: `run_user_problem_training_from` cached `sample_boundary`/`named_point_sets`'s
+output once before the training loop instead of resampling every step — a real, correct-at-the-
+time perf optimization from before #64 (the caller's own doc comment said so, and was true
+then), never updated when #64 made those functions genuinely vary per call. Fixed by moving the
+resampling call inside the per-step loop (interior resampling's interaction with AMR is left to
+sub-issue #67, not conflated with this fix).
+
+Even after that fix, three real runs still landed borderline (exactly one of `sigma_xx`/
+`traction_rms_over_ref`/`load_transfer_ratio` narrowly missing threshold each time, never more
+than one, never by much). Re-evaluating the SAME trained checkpoints at up to 16x more boundary
+evaluation points (2048 → 32768) changed the reported metrics by nothing measurable — this
+definitively rules out evaluation-time quadrature/sampling-count noise as the cause. Disabling
+AMR entirely (`spec.training.amr_enabled = false`) on an otherwise-identical run reproduced
+headless's comfortable pass exactly: `sigma_xx_relative_error=0.00108`, `sigma_yy_over_
+ref=0.00077`, `sigma_xy_over_ref=0.00044`, `traction_rms_over_ref=0.00121`, `load_transfer_
+ratio=1.00009`, all PASS.
+
+Root cause: AMR is a GUI-streaming-only feature (headless never implements it at all) and
+defaults to `amr_enabled=true`; issue #63's own PH4-09 policy already states "AMR = OFF, uniform
+sampling = ON until the baseline is mathematically correct" — AMR itself has no dedicated
+evidence yet (sub-issue #67 exists for exactly this). The shipped `variational_no_hole_plate.
+toml` was silently violating that already-written policy by never overriding the default.
+`amr_enabled = false` added to the shipped file makes it actually honor the policy — not a new
+workaround, a correction to match what the epic already said.
+
 ## PH4-07 — Gauge/nullspace compatibility
 
 Status: IMPLEMENTED
@@ -446,15 +549,26 @@ Runtime evidence remains insufficient for VERIFIED capability rows.
 
 ## PH4-19 — Mathematical objective snapshot
 
-Status: IMPLEMENTED
+Status: VERIFIED (issue #64 sub-issue #66)
 
 Shared plate checkpoint and GUI-report builder now saves `MathematicalObjectiveSnapshot`; see
-PH4-05. Backward JSON compatibility uses `#[serde(default)]`. A real checkpoint artifact from
-corrected Variational training remains required before VERIFIED.
+PH4-05. Backward JSON compatibility uses `#[serde(default)]`.
 
 Regression: `serve_loaded_plate_checkpoint_saves_a_full_authoritative_report_for_a_no_hole_geometry`
 now performs actual save/load JSON round-trip and asserts physical `U`, full `W_ext`, `Pi`,
 active terms, and positive reference energy are present in persisted report.
+
+Real checkpoint artifact from corrected Variational training (#66): `runner::tests::
+variational_no_hole_plate_trains_and_produces_real_benchmark_evidence` (`#[ignore]`d, real
+production-scale run of the shipped, now-passing config) saves a checkpoint via the existing
+`run_training_user_problem`/`ControlMsg::SaveCheckpoint` machinery and asserts the persisted
+`MathematicalObjectiveSnapshot`'s `Pi=U-W_ext` consistency, non-empty `active_terms`/
+`base_weights`, and a finite `normalized_pi` — a reviewer can reconstruct the physical objective
+from the saved artifact alone, per this item's own acceptance wording. A fast (2.46s) companion
+test, `runner::tests::corrected_variational_checkpoint_persists_a_reconstructable_objective_snapshot`,
+proves the identical persistence mechanism on a tiny (16/16-point) spec, independent of whether
+training has converged — added specifically so this mechanism doesn't need re-verifying via
+another 20+ minute run for every future change (issue #65/#66's own verification-cost policy).
 
 ## PH4-20 — General physical regressions
 
