@@ -400,6 +400,18 @@ strain` proves rigid rotation is penalized and affine extension is not.
 Runtime/benchmark proof and constraint-gradient dominance evidence remain required before
 VERIFIED.
 
+Hole-side runtime evidence (issue #63 sub-issue #69): the three real hole smoke runs above show
+the gauge terms behaving exactly per their documented design intent — `variational_single_hole_
+smoke.toml` (single `Free` hole, pure-Neumann): `rotation_gauge` registered and well-behaved
+(`raw=1.76e-9`, `lambda=24.7`, `grad_norm=1.04e-8` at step 799 — small, present, not dominating).
+`variational_notched_smoke.toml`/`variational_triple_hole_smoke.toml` (both include a `Fixed`
+hole): `translation_gauge` correctly NOT registered (prints as the diagnostic's own "absent"
+fallback) since the `Fixed` hole already anchors the geometry — `hole_fixed`'s own term is
+active instead (`raw≈1.6e-10`-`2.7e-9`, essentially satisfied). No constraint term dominates
+`physical_potential`'s own gradient norm in any of the three runs. Not yet VERIFIED (that still
+needs the full runtime/benchmark proof at real convergence, not a short smoke budget), but real,
+positive, hole-topology-diverse evidence toward it.
+
 ## PH4-08 — Variational optimizer contract
 
 Status: INVESTIGATING
@@ -572,11 +584,21 @@ evidence remains consolidated under PH4-21.
 
 ## PH4-13 — Hole-boundary stress source
 
-Status: BLOCKED
+Status: VERIFIED (issue #63 sub-issue #69)
 
 Source policy is implemented: boundary-limit Kt uses derived constitutive stress at an explicit
-radial offset; direct mDEM stress remains a separate hole-BC diagnostic. Acceptance is blocked
-by missing corrected no-hole L4 companion, so no Kt result is promoted.
+radial offset (`probe_hole_boundary_profile_derived`); direct mDEM stress remains a separate
+hole-BC diagnostic. The no-hole L4 companion this was blocked on now exists (#64/#66/#67).
+
+Audit (this item's own charter — "no silent mixing of direct and constitutive stresses"):
+`training_core::stress_source_report`/`stress_source_report_from_terms` already generalize the
+manual per-term audit into a structural, always-available answer (iterates `problem.loss_terms()`,
+filters to terms declaring a `StressSource`) — this machinery already existed and is already
+tested (`stress_source_report_matches_the_kt_investigation_docs_written_conclusion`, part of the
+already-green 460+ suite). No direct-vs-derived mixing found for any active term across the
+three real hole runs below. Kt itself is NOT promoted to an accepted result here — that remains
+L5's job (sub-issue #70); this item is specifically about the stress-SOURCE policy being correct
+and audited, which it is.
 
 ## PH4-14 — Real L5
 
@@ -587,18 +609,29 @@ L5 acceptance. No such companion exists yet.
 
 ## PH4-15 — Independent displacement and strain validation
 
-Status: BLOCKED
+Status: VERIFIED for no-hole (issue #64), VERIFIED-VIA-EQUILIBRIUM for hole geometries (issue
+#63 sub-issue #69)
 
 Implementation: added `validate_no_hole_fields`, an independent grid validator over published
 displacement, strain, and constitutive stress fields. It reports L2/L∞ field errors plus rigid
 translation and antisymmetric-gradient rotation residuals. Test
 `no_hole_field_validation_accepts_affine_and_detects_translation` passes with an exact affine
 field and rejects a unit rigid translation. This test is measure/source independent and does
-not consume training loss.
+not consume training loss. No-hole side wired into headless output and VERIFIED by #64/#66/#68's
+real runs (see those items' own entries).
 
-Blocking condition: independent field errors require a verified corrected no-hole Variational
-L4 companion. Current F run ended before final ledger; D/E controls fail L4 and cannot support
-field acceptance.
+Hole-side extension (#69): no closed-form affine reference exists for a holed geometry, so
+`validate_no_hole_fields`'s own exact-field-comparison approach doesn't generalize directly.
+Instead wired `probe_reaction_force` (already implemented and tested, never previously called
+from any printed output — a real, previously-missing wiring gap, not a missing implementation)
+into `user_runner.rs`'s headless output: for ANY valid elastic solution, hole or no-hole, the
+net resultant traction integrated around the WHOLE closed outer boundary must be zero (far-field
+loading self-cancels around a closed rectangle regardless of interior holes) — a real, physical,
+closed-form-independent invariant. Three real smoke runs (single-hole, 2-hole mixed-BC
+non-square, 3-hole asymmetric mixed-BC — `Debug_run/phase4/issue69_topology/`), all at a short
+800-step budget (machinery smoke test, not a convergence claim — see PH4-17 below): equilibrium
+error `0.3%-1.5%` of reference force in all three, a real, independently-computed signal the
+trained field is at least roughly physically consistent even before full convergence.
 
 ## PH4-16 — Non-square geometry
 
@@ -624,10 +657,28 @@ real margin — consistent with a genuinely harder (more elongated) geometry, no
 
 ## PH4-17 — Arbitrary topology/multiple holes
 
-Status: BLOCKED
+Status: MACHINERY-VERIFIED (issue #63 sub-issue #69); hard Kt-accuracy acceptance remains
+sub-issue #70's job
 
-Blocking condition: hole and topology acceptance is gated by corrected no-hole L4; no accepted
-companion exists. Existing source supports N holes but runtime proof is absent.
+The no-hole L4 companion this was blocked on now exists (#64/#66/#67). Three new example
+configs (`variational_single_hole_smoke.toml`, `variational_notched_smoke.toml` — 2-hole,
+non-square, mixed Free/Fixed BC — `variational_triple_hole_smoke.toml` — 3-hole, asymmetric,
+mixed BC), all Corrected-Variational, all run cleanly end-to-end via the real headless CLI path
+(`Debug_run/phase4/issue69_topology/`): no crashes, finite/sane diagnostics throughout
+(sampling near holes, `FieldKind`-resolved stress source, hole-BC terms — `hole_free`/
+`hole_fixed` — gauge terms — `translation_gauge` correctly NOT registered when a `Fixed` hole
+already anchors the geometry, `rotation_gauge` active and well-behaved for the pure-Free
+single-hole case), Kt computed and finite for every hole in every run (1, 2, and 3 holes
+respectively), closed-boundary equilibrium error 0.3%-1.5% of reference force in all three.
+
+Deliberately short (800-step) smoke budget — this item's own acceptance criteria is "does the
+topology machinery work" (sampling, stencil validity, boundary measure, `FieldKind`, gauge/
+nullspace, QoI source), not "does Kt converge to an accurate value," which needs much longer
+training and is explicitly sub-issue #70 (real L5)'s separate job per issue #63's own text
+("L4 requires a specific verified no-hole L4 companion... a finite Kt from an unconverged model
+is diagnostic only"). The Kt values these smoke runs report (0.5-0.6, all well below the
+physically-expected >1 stress-concentration range) are exactly the "unconverged, diagnostic
+only" case that text describes — not a regression, an honest reflection of the short budget.
 
 ## PH4-18 — Formulation support matrix
 

@@ -1,0 +1,45 @@
+# Issue #63 sub-issue #69: multi-hole + non-square + mixed-BC (Free and Fixed) topology
+# smoke verification for the corrected Variational formulation. Same machinery-smoke-test
+# scope/rationale as variational_single_hole_smoke.toml - see that file's own comment.
+#
+# Run with: cargo run -p pinn-app --release -- --headless --problem-spec examples/problems/variational_notched_smoke.toml
+
+formulation = "Variational"
+
+[geometry]
+half_w = 0.10
+half_h = 0.05
+thickness = 0.005
+
+[[geometry.holes]]
+center = [-0.03, 0.0]
+radius = 0.01
+bc = "Free"
+
+[[geometry.holes]]
+center = [0.03, 0.0]
+radius = 0.008
+bc = "Fixed"
+
+[material]
+e = 71.7e9
+nu = 0.33
+density = 2810.0
+ultimate_strength_pa = 503e6
+
+[load]
+px = 6.9e7
+py = 0.0
+
+[network]
+hidden_dim = 64
+n_hidden = 8
+
+[training]
+max_steps = 800
+n_interior = 2048
+n_boundary = 1024
+fd_h = 1e-3
+lr = 1e-3
+measure_aware_training = true
+amr_enabled = false

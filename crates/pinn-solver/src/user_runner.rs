@@ -236,6 +236,20 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
             println!("  [!] P2-09 trivial-solution warning: only {:.1}% of the prescribed load is being transferred - likely a collapsed/trivial solution.", load_transfer.load_transfer_ratio * 100.0);
         }
 
+        // Issue #63 sub-issue #69 (PH4-15 hole-side): a real, independent field-validation
+        // signal that works for ANY geometry, hole or no-hole, with no closed-form reference
+        // needed - for a valid elastic solution, the net resultant traction integrated around
+        // the WHOLE closed outer boundary must be zero (far-field loading self-cancels around a
+        // closed rectangle, hole(s) or not). `probe_reaction_force` already existed (tested,
+        // never wired into any printed output) - this closes that gap, giving hole geometries
+        // the same "independently-computed, not training-loss-derived" validation no-hole
+        // geometries already get from `validate_no_hole_fields`.
+        let reaction_force = crate::user_problem::probe_reaction_force(&model_val, &spec, &device);
+        println!(
+            "  [diag] reaction force (closed-boundary equilibrium): net=({:.3e},{:.3e}) N  reference={:.3e} N  equilibrium_error={:.4e}",
+            reaction_force.net_fx, reaction_force.net_fy, reaction_force.reference_force, reaction_force.equilibrium_error,
+        );
+
         let nominal_stress = spec.load.px.abs().max(spec.load.py.abs());
         // Derived-stress-at-margin, not direct σ at the exact boundary - see
         // `probe_hole_boundary_profile_derived`'s doc comment.
