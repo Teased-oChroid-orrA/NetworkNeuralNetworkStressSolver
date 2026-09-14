@@ -431,11 +431,86 @@ incomplete in `F_no_hole_final/RUN_NOTES.md`. Partial trend data cannot establis
 
 ## PH4-09 — AMR evidence
 
-Status: BLOCKED
+Status: VERIFIED-DISABLED (issue #63 sub-issue #67) — AMR stays off for the canonical no-hole
+Variational benchmark, backed by real evidence this time, not just unmet-prerequisite BLOCKED.
+Issue #63's own text explicitly sanctions this outcome: "AMR may be disabled for uniform
+problems if evidence shows it worsens the solve" — that evidence now exists, twice over.
 
-Blocking condition: Issue #63 requires AMR comparison only after mathematically correct uniform
-Variational baseline. All corrected uniform controls still fail L4; AMR remains disabled by
-policy. No AMR result may be used to rescue this baseline.
+### A real interior-weight staleness bug, found and fixed
+
+Auditing AMR's own collocation sampling for the same defect class #64 found (this item's own
+charter): `AdaptiveGrid::sample_points`/`sample_points_with_density` are themselves fully
+deterministic (leaf-cell centers, no jitter) — fine, since they're only used on the ONE step a
+sweep fires. The real bug was in `UserDefinedProblem::set_interior_weights`'s lifecycle:
+`runner::run_user_problem_training_from` set AMR's density-compensation weights on a sweep step
+and never cleared them — before issue #73, `data.int_norm` also stayed frozen at that sweep's
+own points between sweeps, so the (stale) weights and (stale) points at least stayed matched;
+after #73 made `data.int_norm` genuinely resample every step (correct, fixing the #64-class
+staleness bug for interior points), the OLD sweep's compensation weights kept being applied to
+brand-new, unrelated freshly-resampled points for up to `amr_interval` (1000) steps — silently
+reintroducing bias/noise into the interior energy estimate for most of a typical run, exactly
+the kind of thing that would show up as "worse than AMR-off" without an obvious cause. Fixed:
+`problem.set_interior_weights(None)` now runs at the top of every step by default; the AMR
+sweep block re-sets it to `Some(...)` only for the exact step a sweep fires — restoring
+`set_interior_weights`'s own already-documented contract ("None before the first sweep - plain
+uniform-random sampling is already unbiased, no compensation needed") for every non-sweep step,
+not just before the first sweep. Regression-tested by `user_problem::tests::
+set_interior_weights_none_clears_a_previously_set_weighting_back_to_unweighted`.
+
+### The real A/B evidence
+
+Three independent real runs of the shipped no-hole Variational config, AMR on (post-boundary-fix,
+pre- and post- the interior-weight fix above): consistently borderline, exactly one of
+`sigma_xx`/`traction_rms_over_ref`/`load_transfer_ratio` narrowly missing threshold each time.
+Two independent real runs with AMR off (otherwise identical): comfortable, reliable passes
+matching headless's own quality exactly (`sigma_xx≈0.0009`, `load_transfer≈1.000`). Full detail
+in this file's own PH4-06 follow-up section (sub-issue #66).
+
+### A second, more serious finding: AMR + Variational can crash outright
+
+`runner::tests::ph4_09_controlled_comparison_fixed_sampling_vs_amr_corrected_variational_same_
+budget` (PH3-12's own controlled comparison pattern, applied to Variational) reproducibly
+crashes — NOT a quality regression, a hard panic — inside `step_physics_multi`'s `.backward()`
+call, somewhere between step 1200 and step 2200 of a 2200-step AMR-enabled run, with
+burn-autodiff's own internal panic: `"Node should have a step registered, did you forget to
+call Tensor::register_grad on the tensor where you need gradients?"`. Confirmed via `git stash`/
+manual disable that this predates and is fully independent of every #64/#66/#67/#73 change this
+session (reproduces identically with the new interior-weights fix both present and reverted).
+Confirmed via PH3-12's own "Status: VERIFIED" history that the IDENTICAL 2200-step AMR budget
+runs cleanly for the legacy Hybrid formulation — this crash is specific to combining AMR with
+the Variational formulation's term structure, not a general AMR-after-N-steps framework issue.
+
+Root-cause hypothesis (not yet fully verified — the actual fix is out of this item's scope, see
+below): `training_core::probe_interior_energy_residuals` (AMR's before/after-sweep residual
+probe) runs its forward pass through the SAME live `Autodiff<BInner>`-backed model the main
+training step uses, purely to read `.into_data()` residual magnitudes — it never calls
+`.backward()` on its own probe graph, nor does anything explicitly detach it. Over repeated
+sweep checks (2 per 2200-step run: steps 200 and 1200, each doing 1-2 probe forward passes),
+these orphaned autodiff graph nodes may accumulate in burn-autodiff's internal node registry
+without ever being released, eventually causing an internal bookkeeping inconsistency that
+surfaces later as this panic — a plausible mechanism given this codebase's own already-
+documented, analogous burn-autodiff limitation (`probe_term_gradients`'s doc comment: "burn's
+autodiff does not support an independent `.backward()` call on a tensor that shares upstream
+graph nodes with another tensor already ... backpropagated separately"). Variational-specific
+because `PhysicalPotentialEnergyTerm` spans two point sets (`interior`+`outer_boundary`) in one
+term, unlike Hybrid's separate single-point-set terms — plausibly interacting differently with
+`compute_domain_forwards`'s graph construction when alternating with AMR's interior-only probe
+term, though this specific mechanism is NOT independently confirmed (would require tracing
+`compute_domain_forwards`'s internal forward-pass/graph-node caching in detail).
+
+**Deliberately not fixed in this pass**: the likely correct fix (route AMR's residual probe
+through `model.valid()`/the non-autodiff `BInner` backend, since it never needs gradients at
+all) touches `compute_domain_forwards`/`probe_interior_energy_residuals` — shared infrastructure
+also used by Kirsch/pin-lug's own AMR paths — and deserves its own careful, independently-
+verified change with its own regression proof, not a rushed fix bolted onto this item. Tracked
+as its own follow-up issue (see the parent epic #63 for the link) with this exact reproduction
+recorded so it doesn't need re-discovering.
+
+**Conclusion**: AMR remains disabled (`amr_enabled = false`) for the shipped canonical
+no-hole Variational benchmark. This is not a workaround pending future work — it's the correct,
+policy-compliant, now doubly-evidenced state (quality regression AND a crash risk) per issue
+#63's own explicit allowance. Re-enabling AMR for this formulation requires the autodiff crash
+fix above landing and its own fresh A/B evidence, not just re-flipping the flag.
 
 ## PH4-10 — Formulation-aware convergence
 

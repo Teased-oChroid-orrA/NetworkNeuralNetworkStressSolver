@@ -2527,6 +2527,62 @@ mod tests {
         );
     }
 
+    /// Issue #63 sub-issue #67: proves `UserDefinedProblem::set_interior_weights(None)` actually
+    /// clears a previously-set `Some(weights)` back to the documented "plain uniform-random
+    /// sampling is already unbiased, no compensation needed" state — the exact mechanism
+    /// `runner::run_user_problem_training_from`'s new per-step reset (issue #67) relies on to
+    /// stop a stale AMR sweep's compensation weights from being misapplied to the next several
+    /// hundred steps' worth of freshly-resampled (issue #64/#73), unrelated interior points.
+    /// Uses the real production `loss_terms()` API (not a hand-constructed `InteriorEnergyTerm`)
+    /// so this is a genuine end-to-end proof of the mutex round-trip, not just the term's own
+    /// `compute()` formula (already covered by the test immediately above).
+    #[test]
+    fn set_interior_weights_none_clears_a_previously_set_weighting_back_to_unweighted() {
+        use burn::tensor::TensorData;
+        let device: crate::training_core::BDevice = Default::default();
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(),
+            training: pinn_core::problem_spec::TrainingSpec { measure_aware_training: true, ..Default::default() },
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        let problem = UserDefinedProblem::new(spec);
+
+        let n = 3;
+        let exx = Tensor::<B, 1>::from_data(TensorData::new(vec![0.001_f32, 0.005, 0.0015], vec![n]), &device);
+        let eyy = Tensor::<B, 1>::from_data(TensorData::new(vec![-0.0003_f32, -0.0015, -0.0005], vec![n]), &device);
+        let exy = Tensor::<B, 1>::from_data(TensorData::new(vec![0.0_f32, 0.0002, -0.0001], vec![n]), &device);
+        let raw_out = Tensor::<B, 2>::zeros([n, 5], &device);
+        let inputs = |exx: Tensor<B, 1>, eyy: Tensor<B, 1>, exy: Tensor<B, 1>| vec![DomainForwardOutputs {
+            domain: USER_DOMAIN, raw_out: &raw_out, strains: Some((exx, eyy, exy)),
+            normals: None, shifted_stress: None, hessian: None,
+        }];
+        let interior_energy = |terms: &[Box<dyn LossTerm>], exx: Tensor<B, 1>, eyy: Tensor<B, 1>, exy: Tensor<B, 1>| -> f64 {
+            terms.iter().find(|t| t.name() == "interior_energy").expect("interior_energy term must exist")
+                .compute(&inputs(exx, eyy, exy)).into_data().to_vec::<f32>().unwrap()[0] as f64
+        };
+
+        // Simulate an AMR sweep having fired: set deliberately non-uniform weights (mean == 1.0,
+        // matching `compensation_weights`'s own contract).
+        problem.set_interior_weights(Some(vec![0.2, 2.5, 0.3]));
+        let weighted = interior_energy(&problem.loss_terms(), exx.clone(), eyy.clone(), exy.clone());
+
+        // The fix under test: reset back to `None` (what issue #67's new per-step call site does
+        // every step by default, before AMR's conditional block re-sets it only for the exact
+        // step a sweep fires).
+        problem.set_interior_weights(None);
+        let unweighted = interior_energy(&problem.loss_terms(), exx, eyy, exy);
+
+        assert_ne!(
+            weighted, unweighted,
+            "resetting to None must genuinely change InteriorEnergyTerm's behavior back to the \
+             plain unweighted mean - if this ever equals `weighted`, the reset silently stopped \
+             taking effect and stale AMR weights would leak into unrelated future steps again",
+        );
+    }
+
     #[test]
     fn external_work_term_measure_aware_matches_boundary_integral_tensor_directly() {
         use burn::tensor::TensorData;
