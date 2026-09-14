@@ -4284,6 +4284,105 @@ mod tests {
         );
     }
 
+    /// Issue #63 sub-issue #70 (real L5): a genuine converged single-hole Kt result against a
+    /// real, verified no-hole L4 companion - not a finite-but-unconverged number (issue #63's
+    /// own explicit "a finite Kt from an unconverged model is diagnostic only" rule). Trains
+    /// TWO real models: the exact validated no-hole companion (`examples/problems/
+    /// variational_no_hole_plate.toml`'s own configuration) and a small-hole variant (hole
+    /// radius/half-width ratio 0.05, well under `HOLE_TO_HALF_WIDTH_INFINITE_APPROX_MAX_RATIO`
+    /// (0.10) so the classical infinite-plate `Kt=3.0` reference actually applies), both via
+    /// `user_problem::resample_plate_step_data`/`plate_multi_step_ctx` (issue #73's shared
+    /// functions - this is also real, additional evidence those functions work correctly for a
+    /// holed geometry, not just the no-hole case they were originally extracted from). Does NOT
+    /// force a Kt≈3.0 assertion (issue #63 rule: "no benchmark-specific hacks to force a pass")
+    /// - reports the real result honestly via `run_hole_benchmark`'s own PASS/FAIL classification.
+    /// `#[ignore]`d - real cost, two full training runs (~15-25 min each in release).
+    #[test]
+    #[ignore]
+    fn issue_70_real_l5_single_hole_kt_against_verified_no_hole_companion() {
+        use crate::fd_stencil::FdConfig;
+        use crate::lr_schedule::LrSchedule;
+        use crate::network::ElasticityNetConfig;
+        use crate::optim::{make_bias_optim, make_gate_optim, WeightOptim};
+        use crate::problem::{BoundaryValueProblem, DomainOptim};
+        use crate::saw_brdr::SawBrdr;
+        use crate::training_core::{step_physics_multi, BDevice, B};
+        use burn::module::AutodiffModule;
+        use burn::tensor::backend::Backend;
+        use pinn_core::messages::SolverConfig;
+
+        fn train(spec: &ProblemSpec, device: &crate::training_core::BDevice) -> crate::network::ElasticityNet<crate::training_core::BInner> {
+            let half_w = spec.geometry.half_w;
+            let half_h = spec.geometry.half_h;
+            let problem = UserDefinedProblem::new(spec.clone());
+            crate::problem::validate_loss_terms(&problem);
+            let net_cfg = ElasticityNetConfig::new()
+                .with_input_dim(spec.geometry.net_input_dim())
+                .with_hidden_dim(spec.network.hidden_dim)
+                .with_n_hidden(spec.network.n_hidden)
+                .with_output_dim(5);
+            B::seed(device, spec.network.model_init_seed);
+            let mut model = net_cfg.init(device);
+            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+            let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+            let mut saw = SawBrdr::with_base(base_weights, 0.95);
+            let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+            let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+            let scales = crate::training_core::compute_reference_scales_for_plate(spec);
+            let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
+            let config = SolverConfig::default_kirsch();
+            let sampling = problem.sampling_strategy(0);
+            let placeholder = GeometryConfig::kirsch_plate_inches();
+
+            for step in 0..spec.training.max_steps {
+                let data = resample_plate_step_data(
+                    sampling, &placeholder, &spec.load, spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
+                );
+                let ctx = plate_multi_step_ctx(
+                    &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
+                    spec.geometry.n_fourier(), false, step,
+                );
+                let (new_model, _out) = step_physics_multi(
+                    vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, device, 0, 1.0, 1.0,
+                );
+                model = new_model.into_iter().next().unwrap();
+            }
+            model.valid()
+        }
+
+        let device = BDevice::default();
+
+        let no_hole_spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] },
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        println!("=== training no-hole companion ===");
+        let no_hole_model = train(&no_hole_spec, &device);
+        let no_hole_result = run_no_hole_benchmark(&no_hole_model, &no_hole_spec, &device);
+        println!("[L5] no-hole companion benchmark: {no_hole_result:?}");
+        assert!(no_hole_result.passed, "L5 requires a verified no-hole companion, got: {no_hole_result:?}");
+
+        let mut hole_spec = no_hole_spec.clone();
+        hole_spec.geometry.holes = vec![HoleSpec { center: [0.0, 0.0], radius: 0.005, bc: HoleBc::Free }];
+        println!("=== training single-hole (infinite-approx-eligible, ratio=0.05) ===");
+        let hole_model = train(&hole_spec, &device);
+
+        let hole_result = run_hole_benchmark(&hole_model, &hole_spec, 0, &no_hole_result, &device)
+            .expect("run_hole_benchmark must accept a verified-passing no-hole companion");
+        println!("[L5] hole benchmark: {hole_result:?}");
+
+        assert!(hole_result.kt.is_finite() && hole_result.kt > 0.0, "{hole_result:?}");
+        assert_eq!(hole_result.reference_kind, HoleReferenceKind::InfiniteApprox, "ratio=0.05 must classify as InfiniteApprox: {hole_result:?}");
+        assert!(hole_result.relative_error_vs_infinite_theory.is_some(), "{hole_result:?}");
+    }
+
     #[test]
     #[should_panic(expected = "only valid for a plate with NO holes")]
     fn run_no_hole_benchmark_panics_on_a_holed_geometry() {

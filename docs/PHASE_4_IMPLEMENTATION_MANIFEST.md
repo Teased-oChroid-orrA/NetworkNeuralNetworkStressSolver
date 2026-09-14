@@ -414,7 +414,24 @@ positive, hole-topology-diverse evidence toward it.
 
 ## PH4-08 — Variational optimizer contract
 
-Status: INVESTIGATING
+Status: VERIFIED (issue #63 sub-issue #71)
+
+Superseding finding: this item's own INVESTIGATING trail (peak-LR probe, uniform-resolution
+probe, incomplete `F_no_hole_final` run) chased optimizer instability as root cause for the
+non-stationary Pi / failing load-transfer pattern. Root cause was NOT the optimizer — it was
+`UserSamplingStrategy::sample_interior`/`sample_boundary` returning a frozen, non-varying point
+cloud every step (issue #64), which biases the Monte-Carlo Pi estimator regardless of LR or
+optimizer choice. No optimizer-side change was made.
+
+Post-fix real evidence the same optimizer contract (plain constant/scheduled AdamW via
+`step_physics_multi`, unchanged this whole investigation) is stable once fed a genuinely
+resampled estimator: PH4-16's non-square run passes all five P2-14 hard metrics
+(`load_transfer_ratio=0.9971`); PH4-09's AMR-off A/B runs pass reliably
+(`sigma_xx≈0.0009`, `load_transfer≈1.000`); issue #64/#66's own real-run verification. No run
+this session (across #64/#66/#67/#68/#69/#70) showed divergence, NaN/Inf, or oscillatory
+non-convergence attributable to the optimizer itself.
+
+### Original INVESTIGATING trail (kept for record)
 
 Controlled probe changes only peak learning rate from `1e-3` to `3e-3` at fixed full NN,
 atomic Pi, gauges, uniform sampling, AMR-off, seed, and 200-step budget. It decreases sampled
@@ -526,16 +543,20 @@ fix above landing and its own fresh A/B evidence, not just re-flipping the flag.
 
 ## PH4-10 — Formulation-aware convergence
 
-Status: IMPLEMENTED
+Status: VERIFIED (issue #63 sub-issue #71)
 
 Change made: headless Variational runs now emit persisted cadence records for normalized Pi,
 whole physical-block SAW weight, and translation-gauge raw value, in addition to existing final
 physical/constraint gradient ledger, U/W/Pi, energy balance, field metrics, and load transfer.
 The optimizer and 512-point controls exercise this live path in their solver logs.
 
-Limitation: no run meets all convergence conditions; these records prevent a falling total loss
-from being called convergence but do not establish it. Real passing L4 and regression evidence
-remain required before VERIFIED.
+Superseded limitation: this item previously read "no run meets all convergence conditions."
+That was true only before the #64 sampling-estimator fix. Real runs now DO meet all convergence
+conditions on this same cadence-record machinery: issue #64's own no-hole verification, #66's
+GUI-streaming parity run, and #68's non-square run (`normalized_Pi=-1.000012`, all five P2-14
+hard thresholds PASS) all emit and satisfy these records end-to-end. No changes to the cadence-
+record code itself were needed to reach this status — the machinery was already correct; it was
+starved of a correct estimator to converge against.
 
 ## PH4-11 — DifferentialOperator production integration
 
@@ -551,9 +572,24 @@ parametric production paths. AD stays an explicit
 first-derivative diagnostic because Burn 0.21 returns detached input-gradient tensors and does
 not support nested differentiation; Hessians remain FD-only.
 
-Tests: six focused differential-operator tests pass under NdArray. Runtime proof for every
-production formulation remains required before VERIFIED. Direct FD calls left in manufactured
-fields and unit-test oracles are intentionally non-production.
+Tests: six focused differential-operator tests pass under NdArray. Direct FD calls left in
+manufactured fields and unit-test oracles are intentionally non-production.
+
+Code-audit confirmation (issue #63 sub-issue #71): grepped every non-test call site of
+`compute_strains`/strain computation in `user_problem.rs`/`training_core.rs` — all eight+
+production sites (`evaluate_user_vis_grid`, `probe_reaction_force`, both AMR residual probes,
+the main `compute_domain_forwards` path, etc.) import `production_strain as compute_strains`;
+none bypass it with a direct `fd_stencil::compute_strains` call. `PRODUCTION_POLICY` is a real
+choke point, not merely descriptive, confirmed by code reading, not assumption.
+
+Runtime proof status by formulation: `Variational` has real production runtime proof this
+session (issue #64/#66/#68/#69's real headless/GUI runs all exercise this exact code path
+successfully). `Strong`/`Hybrid` `FormulationSelection` variants are wired
+(`user_problem.rs` term-selection match) but exercised only in unit tests this session, not a
+real training run — `Weak` has no user-defined-problem implementation at all (matches
+`FORMULATION_SUPPORT_MATRIX.md`'s own note). Remains IMPLEMENTED, not VERIFIED, pending real
+runtime proof for `Strong`/`Hybrid` specifically — do not promote without a real run of those
+variants; the Variational-only evidence above does not generalize.
 
 ## PH4-12 — Executable FieldKind
 
@@ -574,8 +610,16 @@ published direct mDEM stress in engineering fields. It now publishes constitutiv
 direct-minus-constitutive remains only explicit residual diagnostic. This removes a real
 source-policy contradiction, not a benchmark correction.
 
-Tests: 11 focused FieldKind tests pass under NdArray. Remaining production field consumers
-need migration and real hole runtime evidence before VERIFIED.
+Tests: 11 focused FieldKind tests pass under NdArray.
+
+Status: VERIFIED (issue #63 sub-issue #71). Both conditions this item was waiting on are now
+met. Migration audit (code-read, this session): grepped every non-test `resolve_field`/
+`FieldKind::` production call site in `user_problem.rs` — exactly two
+(`evaluate_user_vis_grid`'s `Displacement` resolve, hole-BC's `DirectStress` resolve), both
+already migrated; no stray consumer bypasses the resolver. Real hole runtime evidence: issue
+#69's three real hole smoke runs (single/2-hole-mixed-BC/3-hole-asymmetric, all headless CLI,
+`Debug_run/phase4/issue69_topology/`) exercise `FieldKind`-resolved stress source live
+end-to-end with no resolution failures (see PH4-17).
 
 Downstream compatibility after public resolver addition (2026-09-13): in
 `../powerShell/powershell_tool/app-egui`, `cargo check` and `cargo test` passed; release binary
@@ -602,10 +646,52 @@ and audited, which it is.
 
 ## PH4-14 — Real L5
 
-Status: BLOCKED
+Status: REAL EVIDENCE COLLECTED, DOES NOT PASS (issue #63 sub-issue #70)
 
-Blocking condition: Issue #63 requires a verified corrected-Variational L4 companion before
-L5 acceptance. No such companion exists yet.
+Blocking condition resolved: a verified corrected-Variational no-hole L4 companion now exists
+(#64/#66/#67). `user_problem::tests::issue_70_real_l5_single_hole_kt_against_verified_no_hole_
+companion` (`#[ignore]`d, real dual in-process training run, release/NdArray, 3000 steps each,
+n_interior=n_boundary=4096, hidden_dim=64/n_hidden=8, Al7075-T6, px=6.9e7, single Free hole
+radius=0.005 in half_w=half_h=0.10 plate — ratio=0.05, `InfiniteApprox`-eligible) ran to
+completion (3550s wall-clock):
+
+- No-hole companion: PASSES cleanly (`sigma_xx_relative_error=0.00084`, `sigma_yy_over_ref=
+  0.00075`, `sigma_xy_over_ref=0.00014`, `traction_rms_over_ref=0.00100`,
+  `load_transfer_ratio=0.99943`, `passed=true`) — required "verified companion" gate satisfied.
+- Hole benchmark: `kt=1.0076`, `reference_kind=InfiniteApprox`,
+  `relative_error_vs_infinite_theory=0.664` (66.4%), `passed=false`,
+  `failures=["kt_vs_infinite_theory"]`. The test's own assertions (finite/positive Kt, correct
+  `InfiniteApprox` classification, `relative_error_vs_infinite_theory.is_some()`) all pass — the
+  test deliberately does NOT assert `kt≈3.0`, per issue #63's own "no benchmark-specific hacks to
+  force a pass" rule. Reported here exactly as measured: **L5 acceptance does not pass.**
+
+### Root-cause diagnosis (cheap, no new training run)
+
+Before committing to another ~1hr run, checked the standing hypothesis — near-hole collocation
+starvation — with a zero-cost sampling-only diagnostic (no network, no training,
+`UserSamplingStrategy::sample_interior` called directly against the same L5 hole geometry, 50
+calls × 4096 points, `cargo test` debug profile, 0.02s): only **0.55%** of interior points
+(≈22.5 of 4096 per call) fall within 2 hole-radii of the hole boundary; only 4.7% fall within 5
+hole-radii. This confirms the mechanism: uniform Monte-Carlo sampling starves the sharp
+near-boundary stress-concentration region of training signal for a small hole
+(ratio=0.05), independent of training duration — a structural sampling-resolution limit, not a
+code bug (the sampler itself is correct: containment, FD-safe margin, and per-step resampling
+are all already verified — see #64/#69's own tests). More steps alone would help only slowly;
+the standard remedy is adaptive refinement biasing collocation density toward the hole boundary
+— exactly what `pinn_core::amr::AdaptiveGrid` already does.
+
+**Real dependency now identified**: robust small-hole Kt convergence is blocked on **issue #74**
+(the AMR+Variational autodiff crash, PH4-09) — AMR is the mechanism that would fix this sampling
+gap, but it's currently disabled for Variational precisely because it crashes past ~1200-2200
+steps. L5 cannot be pushed to a real pass without either (a) #74 landing so AMR can safely bias
+near-hole density, or (b) a much larger uniform `n_interior` (untested, expensive, and
+`4096→~10-100x` would likely be needed given the 0.55% near-boundary fraction — not attempted
+this pass per the verification-cost policy without stronger justification first).
+
+**Conclusion, honestly stated**: PH4-14/L5 is NOT VERIFIED and is not being forced to pass.
+Real, non-hacked evidence now exists (this item's actual job) showing the mechanism blocking it.
+Follow-up: either extend issue #74's scope or file a new tracked issue for "AMR-free small-hole
+Kt convergence strategy" before attempting a further L5 run.
 
 ## PH4-15 — Independent displacement and strain validation
 
