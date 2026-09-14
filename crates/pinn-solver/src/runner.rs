@@ -4608,18 +4608,28 @@ mod tests {
     /// their own hard-threshold acceptance (this test's own question - "does AMR measurably
     /// help or hurt" - doesn't need full convergence to answer honestly).
     ///
-    /// **Known to currently panic, not `#[should_panic]`'d on purpose**: this exact comparison
-    /// (AMR + Variational, same budget PH3-12 already runs cleanly with Hybrid) reproducibly
-    /// crashes inside `step_physics_multi`'s `.backward()` call somewhere between step 1200 and
-    /// step 2200 with burn-autodiff's own internal `"Node should have a step registered"` panic
-    /// - a real, pre-existing bug (confirmed via `git stash`/manual disable to predate and be
-    /// independent of every #64/#66/#67/#73 change this session), root-cause hypothesis and full
-    /// repro recorded in `docs/PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-09 entry. Left as a
-    /// real (not silenced) failing `#[ignore]`d test rather than `#[should_panic]` - the LATTER
-    /// would celebrate the crash as expected behavior, which it is not; this documents a known,
-    /// tracked, unfixed defect instead.
+    /// **Formerly crashed - fixed by issue #74.** This exact comparison (AMR + Variational,
+    /// same budget PH3-12 already runs cleanly with Hybrid) used to reproducibly crash inside
+    /// `step_physics_multi`'s `.backward()` call somewhere between step 1200 and step 2200 with
+    /// burn-autodiff's own internal `"Node should have a step registered"` panic. Root cause
+    /// (confirmed, not just hypothesized): `training_core::probe_interior_energy_residuals`
+    /// (AMR's before/after-sweep residual probe) ran forward passes through the SAME live
+    /// `Autodiff<BInner>`-backed model the main training step used, purely to read residual
+    /// scalars via `.into_data()`, and never called `.backward()` on its own probe graph -
+    /// orphaned autodiff graph nodes accumulated in burn-autodiff's internal registry across
+    /// repeated sweep checks, eventually corrupting the NEXT real step's `.backward()` call.
+    /// Fixed by routing the probe through `BInner` (the plain, non-autodiff backend) instead -
+    /// exactly mirroring Kirsch's own frozen AMR sweep in `headless.rs`, which already did this
+    /// (`model.valid()` before its hand-rolled residual forward pass) and is why Kirsch's own
+    /// AMR path never hit this bug despite running the identical 2200-step budget cleanly
+    /// (PH3-12). See `compute_domain_forwards`'s new `Bk: Backend` generic parameter and
+    /// `probe_interior_energy_residuals`'s own doc comment in `training_core.rs` for the fix
+    /// itself; full root-cause and fix record in `docs/PHASE_4_IMPLEMENTATION_MANIFEST.md`'s
+    /// PH4-09 entry. Still `#[ignore]`d - not because it fails, but because a real 2200-step
+    /// double training run costs ~8 minutes even in release, matching this project's existing
+    /// precedent (`toy_beam`, issue #70's L5 test) for real-training-cost `#[ignore]`s.
     #[test]
-    #[ignore = "known to panic - see this test's own doc comment and PH4-09's manifest entry"]
+    #[ignore = "real training cost (~8 min release) - not a failure, see this test's own doc comment"]
     fn ph4_09_controlled_comparison_fixed_sampling_vs_amr_corrected_variational_same_budget() {
         let device = crate::training_core::BDevice::default();
         let steps = 2200;

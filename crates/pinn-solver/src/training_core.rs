@@ -1354,20 +1354,20 @@ pub fn step_physics(
 /// backs a `DomainForwardOutputs<'_, B>` borrow. Kept in a stable `Vec` (see
 /// `compute_domain_forwards`'s doc comment) so borrowing `DomainForwardOutputs` built from it
 /// remain valid for as long as the `Vec` itself is alive.
-struct Computed {
+struct Computed<Bk: Backend> {
     key: (pinn_core::problem::DomainId, &'static str),
-    raw_out: Tensor<B, 2>,
-    strains: Option<(Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>)>,
-    normals: Option<(Tensor<B, 1>, Tensor<B, 1>)>,
+    raw_out: Tensor<Bk, 2>,
+    strains: Option<(Tensor<Bk, 1>, Tensor<Bk, 1>, Tensor<Bk, 1>)>,
+    normals: Option<(Tensor<Bk, 1>, Tensor<Bk, 1>)>,
     /// Direct mDEM stress at the 4 FD-shifted stencil positions - see
     /// `crate::problem::ShiftedStress`'s doc comment. `Some` only for mDEM (`output_dim==5`)
     /// domains; populated from the SAME stencil rows already computed for `strains` below, no
     /// extra forward pass.
-    shifted_stress: Option<crate::problem::ShiftedStress<B>>,
+    shifted_stress: Option<crate::problem::ShiftedStress<Bk>>,
     /// Displacement Hessian - see `crate::problem::HessianData`'s doc comment. `Some` ONLY
     /// for `(domain, point_set)` pairs some active `LossTerm::needs_hessian()==true` term
     /// requests - a genuinely new 9-point forward pass, NOT free like `shifted_stress`.
-    hessian: Option<crate::problem::HessianData<B>>,
+    hessian: Option<crate::problem::HessianData<Bk>>,
 }
 
 /// Enumerate which `(DomainId, point_set_name)` pairs at least one of `active_terms` needs,
@@ -1380,13 +1380,13 @@ struct Computed {
 /// strains/normals), returned as a `Vec<Computed>` — Rust's borrow checker requires the
 /// owning Vec to be fully populated (and therefore stable) before any `&Tensor` into it is
 /// taken, so callers build their borrowing `DomainForwardOutputs` map from the returned Vec.
-fn compute_domain_forwards(
+fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
     ctx: &crate::problem::MultiStepCtx,
-    models: &[&ElasticityNet<B>],
+    models: &[&ElasticityNet<Bk>],
     active_terms: &[Box<dyn LossTerm>],
     device: &BDevice,
     forward_masks: &[Option<&[bool]>],
-) -> Vec<Computed> {
+) -> Vec<Computed<Bk>> {
     use pinn_core::problem::DomainId;
 
     // Multi-domain problems use no hard Dirichlet ansatz - boundary conditions are enforced
@@ -1430,7 +1430,7 @@ fn compute_domain_forwards(
         }
     }
 
-    let mut computed: Vec<Computed> = Vec::with_capacity(needed.len());
+    let mut computed: Vec<Computed<Bk>> = Vec::with_capacity(needed.len());
 
     for &(domain_id, ps_name) in &needed {
         let dctx = ctx.domains.iter().find(|d| d.data.id == domain_id)
@@ -1449,14 +1449,14 @@ fn compute_domain_forwards(
         let is_mdem = spec.output_dim == 5;
         let px = ctx.config.load.px;
 
-        type NormalsPair = (Tensor<B, 1>, Tensor<B, 1>);
-        let (norm_pts, normals): (&[[f32; 2]], Option<NormalsPair>) =
+        type NormalsPair<Bk> = (Tensor<Bk, 1>, Tensor<Bk, 1>);
+        let (norm_pts, normals): (&[[f32; 2]], Option<NormalsPair<Bk>>) =
             if ps_name == "interior" {
                 (&dctx.data.int_norm, None)
             } else {
                 let ps = dctx.data.named(ps_name);
-                let to_t = |v: &[f32]| -> Tensor<B, 1> {
-                    Tensor::<B, 1>::from_data(TensorData::new(v.to_vec(), vec![v.len()]), device)
+                let to_t = |v: &[f32]| -> Tensor<Bk, 1> {
+                    Tensor::<Bk, 1>::from_data(TensorData::new(v.to_vec(), vec![v.len()]), device)
                 };
                 (&ps.norm, Some((to_t(&ps.nx), to_t(&ps.ny))))
             };
@@ -1485,19 +1485,19 @@ fn compute_domain_forwards(
             }
         }
 
-        let pts_t = norm_pts_to_tensor::<B>(norm_pts, device);
-        let stencil = assemble_stencil::<B>(&pts_t, ctx.fd, device);
+        let pts_t = norm_pts_to_tensor::<Bk>(norm_pts, device);
+        let stencil = assemble_stencil::<Bk>(&pts_t, ctx.fd, device);
 
         // Apply this domain's Dirichlet ansatz pointwise (columns 0,1 = u,v) via the
         // per-point (dx, dy) scale factors `DirichletAnsatz::eval` returns, then scale to
         // physical units exactly as `step_physics`'s `scale_out` does: displacement cols by
         // u_ref [m], and (mDEM only) stress cols 2..5 by Px [Pa].
-        let raw_net = fwd_masked::<B>(
+        let raw_net = fwd_masked::<Bk>(
             model, stencil, n_fourier, device, forward_masks[model_idx],
         );
         debug_assert_eq!(raw_net.dims()[0], m, "stencil row count must match 5*n_pts");
-        let dx_t = Tensor::<B, 2>::from_data(TensorData::new(dx_v, vec![m, 1]), device);
-        let dy_t = Tensor::<B, 2>::from_data(TensorData::new(dy_v, vec![m, 1]), device);
+        let dx_t = Tensor::<Bk, 2>::from_data(TensorData::new(dx_v, vec![m, 1]), device);
+        let dy_t = Tensor::<Bk, 2>::from_data(TensorData::new(dy_v, vec![m, 1]), device);
         let u_col = raw_net.clone().slice([0..m, 0..1]) * dx_t;
         let v_col = raw_net.clone().slice([0..m, 1..2]) * dy_t;
         let ansatz_out = if is_mdem {
@@ -1522,8 +1522,8 @@ fn compute_domain_forwards(
         // 0,1 from. Row layout matches `assemble_stencil`'s documented order (center, x+hx,
         // x-hx, y+hy, y-hy). See `EquilibriumTerm`/`crate::problem::ShiftedStress`'s doc
         // comment for why this exists and what it's for.
-        let shifted_stress: Option<crate::problem::ShiftedStress<B>> = if is_mdem {
-            let block = |r0: usize| -> (Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) {
+        let shifted_stress: Option<crate::problem::ShiftedStress<Bk>> = if is_mdem {
+            let block = |r0: usize| -> (Tensor<Bk, 1>, Tensor<Bk, 1>, Tensor<Bk, 1>) {
                 let s = raw.clone().slice([r0..r0 + n_pts, 2..5]);
                 (
                     s.clone().slice([0..n_pts, 0..1]).reshape([n_pts]), // sxx
@@ -1544,14 +1544,14 @@ fn compute_domain_forwards(
         // comment) - a genuinely NEW 9-point forward pass, only run when some active term
         // actually needs it for this (domain, point_set) pair (zero cost otherwise, matching
         // `shifted_stress`'s and every other conditional field's precedent).
-        let hessian: Option<crate::problem::HessianData<B>> = if needs_hessian.contains(&(domain_id, ps_name)) {
+        let hessian: Option<crate::problem::HessianData<Bk>> = if needs_hessian.contains(&(domain_id, ps_name)) {
             // Wider FD step than `ctx.fd` - see `hessian_fd_config`'s doc comment for why the
             // second-order stencil needs this (real, measured f32 cancellation noise at
             // `ctx.fd`'s step, not a hypothetical concern).
             let fd2 = crate::fd_stencil::hessian_fd_config(ctx.fd);
             let m9 = 9 * n_pts;
-            let stencil2 = crate::fd_stencil::assemble_second_order_stencil::<B>(&pts_t, &fd2, device);
-            let raw_net2 = fwd_masked::<B>(model, stencil2, n_fourier, device, forward_masks[model_idx]);
+            let stencil2 = crate::fd_stencil::assemble_second_order_stencil::<Bk>(&pts_t, &fd2, device);
+            let raw_net2 = fwd_masked::<Bk>(model, stencil2, n_fourier, device, forward_masks[model_idx]);
             debug_assert_eq!(raw_net2.dims()[0], m9, "second-order stencil row count must match 9*n_pts");
 
             let mut dx2_v = Vec::with_capacity(m9);
@@ -1567,17 +1567,17 @@ fn compute_domain_forwards(
                     dy2_v.push(dy);
                 }
             }
-            let dx2_t = Tensor::<B, 2>::from_data(TensorData::new(dx2_v, vec![m9, 1]), device);
-            let dy2_t = Tensor::<B, 2>::from_data(TensorData::new(dy2_v, vec![m9, 1]), device);
+            let dx2_t = Tensor::<Bk, 2>::from_data(TensorData::new(dx2_v, vec![m9, 1]), device);
+            let dy2_t = Tensor::<Bk, 2>::from_data(TensorData::new(dy2_v, vec![m9, 1]), device);
             let u2_col = (raw_net2.clone().slice([0..m9, 0..1]) * dx2_t).mul_scalar(u_ref_f64);
             let v2_col = (raw_net2.slice([0..m9, 1..2]) * dy2_t).mul_scalar(u_ref_f64);
             let raw2 = Tensor::cat(vec![u2_col, v2_col], 1);
-            Some(crate::fd_stencil::compute_hessian::<B>(raw2, n_pts, &fd2))
+            Some(crate::fd_stencil::compute_hessian::<Bk>(raw2, n_pts, &fd2))
         } else {
             None
         };
 
-        let (eps_xx, eps_yy, eps_xy) = compute_strains::<B>(raw, n_pts, ctx.fd);
+        let (eps_xx, eps_yy, eps_xy) = compute_strains::<Bk>(raw, n_pts, ctx.fd);
 
         computed.push(Computed {
             key: (domain_id, ps_name),
@@ -1648,21 +1648,44 @@ impl LossTerm for InteriorProbeTerm {
 /// solver (it's the same per-point quantity the training objective itself is built from), and
 /// is kept as-is. The mDEM-specific constitutive-residual alternative above is the concrete
 /// candidate for a future, benchmarked change — not a vague "consider gradients someday" note.
+/// Runs AMR's residual probe through `BInner` (the plain, non-autodiff backend), never `B`
+/// (`Autodiff<BInner>`) — even though callers hold live `B`-typed models mid-training. This
+/// mirrors Kirsch's own frozen AMR sweep in `headless.rs` (`let model_val: ElasticityNet<BInner>
+/// = model.valid();` before its own hand-rolled residual forward pass), which has run cleanly
+/// for 2200+ AMR-enabled steps (PH3-12) — this probe never needed gradients at all (it only
+/// ever reads `.into_data()`/scalars out), so building an autodiff graph for it was always
+/// unnecessary work, not just unnecessary risk.
+///
+/// This is issue #74's fix: repeated forward passes through the SAME live autodiff-tracked
+/// model, purely to read residual magnitudes and never followed by `.backward()` on that probe
+/// graph, left orphaned graph nodes in burn-autodiff's internal registry across AMR's multiple
+/// sweep checks per run. Over enough sweeps (2200-step budget, ~2 sweeps at the default
+/// interval) this surfaced as `"Node should have a step registered"` inside the NEXT real
+/// training step's `.backward()` call — specific to the Variational formulation's term
+/// structure (`PhysicalPotentialEnergyTerm` spanning two point sets in one term) interacting
+/// with the probe's graph differently than Hybrid's separate single-point-set terms did, which
+/// is why Kirsch's Hybrid-formulation AMR path never observably hit it despite being the same
+/// general shape of bug class. Routing through `BInner` means the probe never enters the
+/// autodiff graph at all, so there is nothing left to orphan.
 pub(crate) fn probe_interior_energy_residuals(
     ctx: &crate::problem::MultiStepCtx,
     models: &[&ElasticityNet<B>],
     device: &BDevice,
 ) -> HashMap<pinn_core::problem::DomainId, Vec<f32>> {
+    use burn::module::AutodiffModule;
+    let models_val: Vec<ElasticityNet<BInner>> = models.iter().map(|m| (*m).valid()).collect();
+    let models_val_refs: Vec<&ElasticityNet<BInner>> = models_val.iter().collect();
+
     let domain_ids: Vec<pinn_core::problem::DomainId> = ctx.problem.domains().iter().map(|d| d.id).collect();
     let probe_terms: Vec<Box<dyn LossTerm>> = vec![Box::new(InteriorProbeTerm { domains: domain_ids })];
-    let forward_masks: Vec<Option<&[bool]>> = models.iter().map(|_| None).collect();
-    let computed = compute_domain_forwards(ctx, models, &probe_terms, device, &forward_masks);
+    let forward_masks: Vec<Option<&[bool]>> = models_val_refs.iter().map(|_| None).collect();
+    let computed = compute_domain_forwards::<BInner>(ctx, &models_val_refs, &probe_terms, device, &forward_masks);
 
     let mut out = HashMap::new();
     for c in computed {
         let Some((exx, eyy, exy)) = c.strains.clone() else { continue };
         let Some(spec) = ctx.problem.domains().iter().find(|d| d.id == c.key.0) else { continue };
-        let energy_residuals: Vec<f32> = crate::energy::dem_energy_per_point::<B>(exx.clone(), eyy.clone(), exy.clone(), &spec.material)
+        let energy_residuals: Vec<f32> = crate::energy::dem_energy_per_point::<BInner>(exx.clone(), eyy.clone(), exy.clone(), &spec.material)
             .into_data().to_vec::<f32>().unwrap_or_default()
             .into_iter().map(|e| e.abs()).collect();
 
@@ -1693,7 +1716,7 @@ pub(crate) fn probe_interior_energy_residuals(
             let sxx_net = c.raw_out.clone().slice([0..n_pts, 2..3]).reshape([n_pts]);
             let syy_net = c.raw_out.clone().slice([0..n_pts, 3..4]).reshape([n_pts]);
             let sxy_net = c.raw_out.clone().slice([0..n_pts, 4..5]).reshape([n_pts]);
-            let (sxx_fd, syy_fd, sxy_fd) = crate::energy::compute_stress::<B>(exx, eyy, exy, &spec.material);
+            let (sxx_fd, syy_fd, sxy_fd) = crate::energy::compute_stress::<BInner>(exx, eyy, exy, &spec.material);
             let dxx: Vec<f32> = (sxx_net - sxx_fd).into_data().to_vec::<f32>().unwrap_or_default();
             let dyy: Vec<f32> = (syy_net - syy_fd).into_data().to_vec::<f32>().unwrap_or_default();
             let dxy: Vec<f32> = (sxy_net - sxy_fd).into_data().to_vec::<f32>().unwrap_or_default();

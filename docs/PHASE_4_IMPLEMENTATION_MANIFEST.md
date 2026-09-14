@@ -460,10 +460,13 @@ incomplete in `F_no_hole_final/RUN_NOTES.md`. Partial trend data cannot establis
 
 ## PH4-09 — AMR evidence
 
-Status: VERIFIED-DISABLED (issue #63 sub-issue #67) — AMR stays off for the canonical no-hole
-Variational benchmark, backed by real evidence this time, not just unmet-prerequisite BLOCKED.
-Issue #63's own text explicitly sanctions this outcome: "AMR may be disabled for uniform
-problems if evidence shows it worsens the solve" — that evidence now exists, twice over.
+Status: VERIFIED-DISABLED for the canonical no-hole benchmark specifically (real quality
+evidence below still supports this, independent of the crash fix); the CRASH itself is now
+FIXED (issue #74, verified — see the new section below). These are two separate findings this
+item made and they resolve on two separate timelines: the quality regression is a real,
+standing reason to keep AMR off for the no-hole case; the crash was a separate implementation
+bug that no longer blocks using AMR at all, including for hole geometries where it was always
+the intended fix (see PH4-14/issue #70's re-attempt with AMR now enabled).
 
 ### A real interior-weight staleness bug, found and fixed
 
@@ -527,19 +530,57 @@ term, unlike Hybrid's separate single-point-set terms — plausibly interacting 
 term, though this specific mechanism is NOT independently confirmed (would require tracing
 `compute_domain_forwards`'s internal forward-pass/graph-node caching in detail).
 
-**Deliberately not fixed in this pass**: the likely correct fix (route AMR's residual probe
-through `model.valid()`/the non-autodiff `BInner` backend, since it never needs gradients at
-all) touches `compute_domain_forwards`/`probe_interior_energy_residuals` — shared infrastructure
-also used by Kirsch/pin-lug's own AMR paths — and deserves its own careful, independently-
-verified change with its own regression proof, not a rushed fix bolted onto this item. Tracked
-as its own follow-up issue (see the parent epic #63 for the link) with this exact reproduction
-recorded so it doesn't need re-discovering.
+### Issue #74 fix — VERIFIED, root cause confirmed (not just hypothesized)
 
-**Conclusion**: AMR remains disabled (`amr_enabled = false`) for the shipped canonical
-no-hole Variational benchmark. This is not a workaround pending future work — it's the correct,
-policy-compliant, now doubly-evidenced state (quality regression AND a crash risk) per issue
-#63's own explicit allowance. Re-enabling AMR for this formulation requires the autodiff crash
-fix above landing and its own fresh A/B evidence, not just re-flipping the flag.
+The hypothesis above is confirmed correct, via direct comparison rather than inference alone:
+Kirsch's own frozen AMR sweep (`headless.rs`) already converts to `BInner` before its residual
+forward pass (`let model_val: ElasticityNet<BInner> = model.valid();`) — the exact mechanism
+hypothesized as the fix — and has run cleanly for the identical 2200-step budget (PH3-12,
+Hybrid formulation) the whole time. `training_core::probe_interior_energy_residuals` (the
+shared function pin-lug and the Variational/user-plate path use) did NOT do this — it ran the
+probe forward pass through the live `Autodiff<BInner>`-backed model directly, building and then
+abandoning an autodiff graph every sweep check with no `.backward()` ever called on it.
+
+**Fix**: `training_core::compute_domain_forwards` (private) is now generic over
+`Bk: Backend<Device = BDevice>` (was hardcoded to `B = Autodiff<BInner>`) — the private
+`Computed` struct, `ShiftedStress<Bk>`/`HessianData<Bk>` (already generic type aliases, unused
+before), and every internal helper call (`norm_pts_to_tensor`, `assemble_stencil`,
+`fwd_masked`, `compute_strains`, `compute_hessian`) now take the turbofish `Bk` instead of a
+hardcoded `B`. This is a zero-behavior-change genericization for the real training step: every
+existing call site (`step_physics_multi`, `compute_gradient_conflict_multi`,
+`compute_loss_for_lbfgs_multi`) passes live `&[&ElasticityNet<B>]` models and Rust infers
+`Bk = B` automatically — none of those call sites needed to change at all, confirmed by a clean
+`cargo build --workspace` with zero other edits. `probe_interior_energy_residuals` is the ONLY
+call site that changed behavior: it now converts its `B`-typed models to `BInner` via
+`.valid()` (mirroring Kirsch's own established pattern exactly) and calls
+`compute_domain_forwards::<BInner>` explicitly, so the probe never enters the autodiff graph at
+all — there is nothing left to orphan. `LossTerm`/`DomainForwardOutputs` (both used for the real
+gradient-requiring step) were NOT touched — they stay hardcoded to `B`, which is correct since
+they genuinely need gradients; only the probe-only, always-`unreachable!()`-bodied
+`InteriorProbeTerm` was ever driving this through the wrong backend.
+
+**Verification** (not merely "compiles"): `runner::tests::ph4_09_controlled_comparison_fixed_
+sampling_vs_amr_corrected_variational_same_budget` — the exact test that used to reproducibly
+crash — now runs the full 2200 steps to completion with no panic (483.9s wall-clock, release,
+NdArray). Real honest numbers reported (test does not force a pass, per issue #63's own rule):
+fixed-sampling `sigma_xx_relative_error=0.01093`, AMR-enabled `sigma_xx_relative_error=0.01125`
+— both narrowly miss the 0.01 threshold at this shorter 2200-step budget, consistent with (not
+contradicting) the quality-regression evidence above; this test's own job was never to prove
+AMR wins, only that the comparison itself completes safely, which it now does. Full workspace
+`cargo build` (default Wgpu + `ndarray-backend`) clean. Full fast (non-`#[ignore]`d) suite:
+461/462 passed — the one failure (`runner::tests::gui_streaming_step_zero_matches_independent_
+shared_function_computation`) is the ALREADY-documented contention-flaky test from earlier this
+epic (see CLAUDE.md's Phase 4 close-out section), confirmed non-regressive by an isolated
+single-threaded re-run (`... --test-threads=1`), which passed cleanly. No pin-lug or Kirsch
+regression — both share `compute_domain_forwards`/`probe_interior_energy_residuals` and neither
+showed any new failure in the full-suite run.
+
+**Conclusion**: the crash is fixed and verified, not merely patched-and-hoped. AMR is now safe
+to use with Variational for real, including on hole geometries — see PH4-14/issue #70 for the
+re-attempt this unblocks. AMR still stays OFF for the canonical no-hole benchmark specifically,
+because that decision was never about the crash — it was about the independently-measured
+quality regression (three real AMR-on runs, consistently borderline-worse than AMR-off), which
+this fix does not address and was never meant to.
 
 ## PH4-10 — Formulation-aware convergence
 
