@@ -4736,4 +4736,58 @@ mod tests {
         let mut translated = fields.clone(); translated.disp_u += 1.0;
         assert!(validate_no_hole_fields(&translated, &spec).rigid_translation_residual > 0.1);
     }
+
+    /// Issue #63 sub-issue #72 (PH4-20 consolidated regression fixture): non-square plate,
+    /// zero-cost variant of the real #68 headless run. `half_w != half_h` (aspect ratio
+    /// 1.875:1, matching `variational_no_hole_plate_nonsquare.toml`'s own real config) with an
+    /// exact affine field constructed over the true non-square grid extent - proves
+    /// `validate_no_hole_fields` (and the measure-aware machinery it exercises) reads
+    /// `geometry.half_w`/`half_h` independently rather than assuming a square domain, without
+    /// spending a real training run to prove it. Runs by default (not `#[ignore]`d).
+    #[test]
+    fn no_hole_field_validation_accepts_affine_on_a_non_square_plate() {
+        use ndarray::Array2;
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.15, half_h: 0.08, thickness: 0.006, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+        };
+        let (ny, nx) = (5, 7);
+        let a = spec.load.px / spec.material.e;
+        let mut u = Array2::zeros((ny, nx));
+        let mut v = Array2::zeros((ny, nx));
+        for iy in 0..ny {
+            for ix in 0..nx {
+                let x = -spec.geometry.half_w + 2.0 * spec.geometry.half_w * ix as f64 / (nx - 1) as f64;
+                let y = -spec.geometry.half_h + 2.0 * spec.geometry.half_h * iy as f64 / (ny - 1) as f64;
+                u[(iy, ix)] = (a * x) as f32;
+                v[(iy, ix)] = (-spec.material.nu * a * y) as f32;
+            }
+        }
+        let z = || Array2::zeros((ny, nx));
+        let fields = pinn_core::messages::VisFields {
+            von_mises: z(),
+            sigma_xx: Array2::from_elem((ny, nx), spec.load.px as f32),
+            sigma_yy: z(),
+            sigma_xy: z(),
+            disp_u: u,
+            disp_v: v,
+            eps_xx: Array2::from_elem((ny, nx), a as f32),
+            eps_yy: Array2::from_elem((ny, nx), (-spec.material.nu * a) as f32),
+            eps_xy: z(),
+            pde_residual: z(),
+            amr_score: z(),
+            collocation_density: z(),
+        };
+        let ok = validate_no_hole_fields(&fields, &spec);
+        assert!(
+            ok.u_linf < 1e-12 && ok.v_linf < 1e-12 && ok.strain_linf < 1e-7
+                && ok.rigid_translation_residual < 1e-12 && ok.rigid_rotation_residual < 1e-12,
+            "non-square affine field validation must pass with the same tolerance as the \
+             square case, got: {ok:?}"
+        );
+    }
 }
