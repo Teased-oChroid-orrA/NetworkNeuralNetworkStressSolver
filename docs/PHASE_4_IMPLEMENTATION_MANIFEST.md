@@ -602,10 +602,25 @@ field acceptance.
 
 ## PH4-16 — Non-square geometry
 
-Status: BLOCKED
+Status: VERIFIED (issue #63 sub-issue #68)
 
-Blocking condition: generalized geometry acceptance requires corrected no-hole field baseline;
-only affine measure-level tests exist, so no non-square trained result is accepted.
+The corrected no-hole field baseline this item was blocked on now exists (#64/#66/#67). New
+example `examples/problems/variational_no_hole_plate_nonsquare.toml`: identical formulation/
+material/load/network/training configuration to the validated square baseline, `half_w=0.15`/
+`half_h=0.08` (aspect ratio 1.875:1, deliberately far from square so a latent square-domain
+assumption would show up clearly rather than being masked by a near-1 ratio). No code changes
+were needed — `run_no_hole_benchmark`/`validate_no_hole_fields`/`ExternalWorkTerm`'s measure-
+aware boundary integral already read `geometry.half_w`/`half_h` independently (the codebase's
+own prior audit already confirmed the non-square `ds` gap was closed for the measure-aware path
+specifically), so this item was purely a missing runtime artifact, not a missing fix.
+
+Real headless CLI run (`Debug_run/phase4/issue68_nonsquare/solver.log`): `normalized_Pi=
+-1.000012` (matches the true continuum affine minimum), all five P2-14 hard thresholds PASS
+(`sigma_xx_relative_error=0.0016`, `sigma_yy_over_ref=0.0009`, `sigma_xy_over_ref=0.0006`,
+`traction_rms_over_ref=0.0026`, `load_transfer_ratio=0.9971`), independent field validation
+(separate grid, not training points) also PASSES. Quality is slightly lower than the square
+case's own numbers (e.g. `sigma_xx=0.0016` vs `0.0010`) but comfortably within threshold with
+real margin — consistent with a genuinely harder (more elongated) geometry, not a latent bug.
 
 ## PH4-17 — Arbitrary topology/multiple holes
 

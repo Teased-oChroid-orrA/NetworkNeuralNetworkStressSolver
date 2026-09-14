@@ -1,0 +1,46 @@
+# Issue #63 sub-issue #68: non-square no-hole geometry validation. Identical formulation/
+# material/load/network/training configuration to `variational_no_hole_plate.toml` (the
+# validated square baseline, issue #64/#66/#67) - this file differs ONLY in `half_w`/`half_h`,
+# deliberately a strongly non-square aspect ratio (half_w:half_h = 1.875:1) rather than a near-
+# square one, so any latent square-domain assumption (e.g. a hardcoded shared `ds` between
+# x-spanning and y-spanning edges) would show up clearly rather than being masked by a ratio
+# close to 1.0.
+#
+# The exact affine no-hole reference solution (sigma_xx=px, sigma_yy=0, sigma_xy=0 everywhere;
+# u=(px/E)x, v=-nu(px/E)y) is aspect-ratio-independent for a rectangular domain under pure
+# far-field traction - `run_no_hole_benchmark`/`validate_no_hole_fields` already read
+# `geometry.half_w`/`half_h` independently (no shared/hardcoded length constant), so no code
+# changes were needed to exercise this case, only this config.
+#
+# Run with: cargo run -p pinn-app --release -- --headless --problem-spec examples/problems/variational_no_hole_plate_nonsquare.toml
+
+formulation = "Variational"
+
+[geometry]
+half_w = 0.15
+half_h = 0.08
+thickness = 0.005
+holes = []
+
+[material]
+e = 71.7e9               # Al 7075-T6
+nu = 0.33
+density = 2810.0
+ultimate_strength_pa = 503e6
+
+[load]
+px = 6.9e7
+py = 0.0
+
+[network]
+hidden_dim = 64
+n_hidden = 8
+
+[training]
+max_steps = 3000
+n_interior = 4096
+n_boundary = 4096
+fd_h = 1e-3
+lr = 1e-3
+measure_aware_training = true
+amr_enabled = false
