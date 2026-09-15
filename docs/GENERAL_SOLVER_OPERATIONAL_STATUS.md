@@ -45,36 +45,47 @@ stress-concentration range and are explicitly diagnostic-only, not a convergence
 
 ## Corrected-Variational, hole/Kt accuracy (L5)
 
-**NOT_OPERATIONAL.**
+**NOT_OPERATIONAL** — real, understood, and NOT resolved by fixing the AMR crash (issue #74).
 
-A real, much longer run (issue #70: 3000 steps, n_interior=n_boundary=4096, single hole
-ratio=0.05, against a verified-passing no-hole companion) gives `kt=1.0076` against the
-theoretical infinite-plate value of `3.0` — a 66.4% relative error. Reported exactly as
-measured; no benchmark-specific correction was applied to force a pass (issue #63's own rule).
+Two real attempts, both reported exactly as measured (no benchmark-specific correction, issue
+#63's own rule): without AMR, `kt=1.0076` vs theoretical `3.0` (66.4% relative error); WITH AMR
+enabled (after #74's fix made this safe to try), `kt=1.0088` (66.37% relative error) — a 0.13%
+change, not a meaningful improvement, despite AMR genuinely re-densifying the point set across
+three sweeps (`4096→706→1381→2281` points) and a companion zero-cost fixture confirming AMR's
+refinement mechanism itself works correctly (>3x density increase in a synthetic near-hole
+residual band).
 
-Root cause is diagnosed, not merely observed: a zero-cost sampling-only check shows only 0.55%
-of interior collocation points land within 2 hole-radii of the boundary at this ratio — uniform
-Monte-Carlo sampling structurally starves the sharp near-boundary stress-concentration region of
-training signal. This is a real, understood limitation, not an unexplained failure. The known
-fix (density biasing toward the hole boundary) is exactly what AMR already implements, but
-AMR+Variational currently crashes past ~1200-2200 steps (issue #74) and is disabled for that
-reason. **L5 is blocked on issue #74**, not on further tuning of the current approach.
+Root cause of the underlying undersampling is diagnosed, not merely observed: a zero-cost
+sampling-only check shows only 0.55% of interior collocation points land within 2 hole-radii of
+the boundary at this ratio under uniform sampling. But AMR's residual-driven refinement did not
+translate that fixed mechanism into Kt accuracy at this training budget — plausibly because its
+signal (`|dem_energy_per_point|`) reflects where the CURRENT network's residual happens to be
+large, not literally "distance to the hole," so early sweeps (before the network has learned
+much) may not concentrate density where it will matter later. This is a hypothesis, not a
+confirmed mechanism. **L5 is a real, open numerical-accuracy problem, not merely blocked on a
+crash fix** — #74 landing removed one candidate blocker and the accuracy gap remained.
 
 ## AMR + Variational
 
-**NOT_OPERATIONAL** (deliberately disabled, not merely broken).
+**OPERATIONAL** (crash fixed, verified) for running AMR at all; still NOT sufficient on its own
+to close the L5 accuracy gap above.
 
-Two independent findings this epic (issue #67/#74): (1) a real interior-weight staleness bug was
-found and fixed (stale AMR density-compensation weights applied to freshly-resampled, unrelated
-points for up to 1000 steps) — fixed and regression-tested; (2) even after that fix, AMR
-combined with the Variational formulation's term structure reproducibly crashes inside
-`.backward()` with a burn-autodiff internal panic, somewhere between step 1200 and 2200 of a
-2200-step run. A root-cause hypothesis exists (an AMR residual probe running forward passes
-through the live autodiff graph without ever calling `.backward()` on them) but is not
-independently confirmed, and the fix was deliberately deferred — it touches shared AMR
-infrastructure also used by Kirsch/pin-lug and needs its own careful, independently-verified
-change. AMR stays off (`amr_enabled=false`) for every shipped Variational config as the correct,
-evidenced, policy-compliant state, not a workaround pending later cleanup.
+Three findings across this epic: (1) issue #67 — a real interior-weight staleness bug (stale
+AMR density-compensation weights applied to freshly-resampled, unrelated points for up to 1000
+steps), fixed and regression-tested; (2) issue #74 — AMR combined with the Variational
+formulation's term structure used to reproducibly crash inside `.backward()` with a burn-
+autodiff internal panic between step 1200 and 2200 of a 2200-step run, root-caused (confirmed,
+not just hypothesized, by direct comparison against Kirsch's own already-working AMR sweep) to
+`probe_interior_energy_residuals` running forward passes through the live autodiff graph without
+ever calling `.backward()` on them, and fixed by routing the probe through the non-autodiff
+`BInner` backend instead — verified by the exact reproduction test now completing all 2200 steps
+cleanly, an independent adversarial review of the fix's soundness, and a clean isolated re-run of
+pin-lug's own AMR test suite (no regression on shared infrastructure); (3) even with the crash
+fixed, AMR-enabled training still does not meaningfully improve L5's Kt accuracy (see above) —
+AMR stays off (`amr_enabled=false`) for the canonical no-hole benchmark specifically for an
+UNRELATED, independently-measured quality-regression reason (three real AMR-on runs consistently
+borderline-worse than AMR-off there), which this crash fix never addressed and was never meant
+to.
 
 ## Strong / Hybrid / Weak `FormulationSelection` (user-defined problems)
 

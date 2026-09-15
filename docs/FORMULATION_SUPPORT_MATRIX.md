@@ -14,7 +14,7 @@ source availability or a unit test alone is not enough.
 | AMR | SUPPORTED_WITH_LIMITATION | SUPPORTED_WITH_LIMITATION | VERIFIED_DISABLED (issue #67/#74 - crashes past ~1200-2200 steps, kept off) | SUPPORTED_WITH_LIMITATION |
 | L4 no-hole (square) | SUPPORTED_WITH_LIMITATION | EXPLICITLY_UNSUPPORTED | VERIFIED (issue #64/#66) | VERIFIED only for legacy Hybrid artifact |
 | L4 no-hole (non-square) | SUPPORTED_WITH_LIMITATION | EXPLICITLY_UNSUPPORTED | VERIFIED (issue #68) | SUPPORTED_WITH_LIMITATION |
-| L5 hole/Kt | EXPLICITLY_UNSUPPORTED | EXPLICITLY_UNSUPPORTED | SUPPORTED_WITH_LIMITATION (issue #70 - mechanism works, real attempt gives kt=1.01 vs theoretical 3.0; accuracy blocked on #74) | EXPLICITLY_UNSUPPORTED |
+| L5 hole/Kt | EXPLICITLY_UNSUPPORTED | EXPLICITLY_UNSUPPORTED | SUPPORTED_WITH_LIMITATION (issue #70 - mechanism works; real attempts without AND with AMR both give kt~1.01 vs theoretical 3.0, ~66% error either way - #74 fixed but did not close the accuracy gap) | EXPLICITLY_UNSUPPORTED |
 | Multi-hole topology (machinery only) | EXPLICITLY_UNSUPPORTED | EXPLICITLY_UNSUPPORTED | SUPPORTED_WITH_LIMITATION (issue #69 - runs cleanly, Kt accuracy not claimed) | EXPLICITLY_UNSUPPORTED |
 | FieldKind enforcement | SUPPORTED_WITH_LIMITATION | SUPPORTED_WITH_LIMITATION | VERIFIED (issue #69 - real hole runtime evidence) | SUPPORTED_WITH_LIMITATION |
 | QoI stress source | SUPPORTED_WITH_LIMITATION | EXPLICITLY_UNSUPPORTED | VERIFIED (issue #69) | SUPPORTED_WITH_LIMITATION |

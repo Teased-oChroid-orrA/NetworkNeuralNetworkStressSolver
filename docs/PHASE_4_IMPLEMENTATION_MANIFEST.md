@@ -721,18 +721,49 @@ are all already verified — see #64/#69's own tests). More steps alone would he
 the standard remedy is adaptive refinement biasing collocation density toward the hole boundary
 — exactly what `pinn_core::amr::AdaptiveGrid` already does.
 
-**Real dependency now identified**: robust small-hole Kt convergence is blocked on **issue #74**
-(the AMR+Variational autodiff crash, PH4-09) — AMR is the mechanism that would fix this sampling
-gap, but it's currently disabled for Variational precisely because it crashes past ~1200-2200
-steps. L5 cannot be pushed to a real pass without either (a) #74 landing so AMR can safely bias
-near-hole density, or (b) a much larger uniform `n_interior` (untested, expensive, and
-`4096→~10-100x` would likely be needed given the 0.55% near-boundary fraction — not attempted
-this pass per the verification-cost policy without stronger justification first).
+**Real dependency identified at the time**: robust small-hole Kt convergence was believed to be
+blocked on **issue #74** (the AMR+Variational autodiff crash) — AMR being the mechanism that
+would fix this sampling gap, but disabled for Variational because it crashed past ~1200-2200
+steps.
 
-**Conclusion, honestly stated**: PH4-14/L5 is NOT VERIFIED and is not being forced to pass.
-Real, non-hacked evidence now exists (this item's actual job) showing the mechanism blocking it.
-Follow-up: either extend issue #74's scope or file a new tracked issue for "AMR-free small-hole
-Kt convergence strategy" before attempting a further L5 run.
+### Re-attempt after #74's fix — AMR does NOT meaningfully improve Kt (honest negative result)
+
+Issue #74 landed and was independently verified (see PH4-09). This unblocked a real re-attempt:
+`user_problem::tests::issue_70_real_l5_with_amr_enabled_after_issue_74_fix` — identical
+configuration to the test above, `amr_enabled: true` for the hole training, inline AMR sweep
+logic mirroring `runner::run_user_problem_training_from`'s own block exactly (3 sweeps fire at
+steps 200/1200/2200, each genuinely re-densifying the point set: `4096→706→1381→2281` points as
+training progresses and the residual signal sharpens).
+
+**Result: `kt=1.0088` with AMR vs `kt=1.0076` without — a 0.13% relative change, i.e. no
+meaningful improvement** (`relative_error_vs_infinite_theory=0.6637` with AMR vs `0.6641`
+without — both ≈66% error against the theoretical `3.0`). AMR is confirmed functionally correct
+and doing real work — a companion zero-cost fixture (`adaptive_grid_density_near_l5_hole_rises_
+above_uniform_baseline_after_synthetic_residual_sweep`, no training, proves `AdaptiveGrid::adapt`
+genuinely raises near-hole point density by >3x once its residual signal indicates a concentration
+there) confirms the refinement mechanism itself works — it just isn't converging Kt in this
+configuration.
+
+**Why AMR-as-implemented likely isn't enough, honestly hypothesized (not yet verified)**: AMR's
+refinement signal is `|dem_energy_per_point|` (+ constitutive-consistency residual), which
+reflects where the CURRENT network's residual is large — not literally "distance to the hole."
+Early in training (step 200, the first sweep) the network has barely learned the true field yet,
+so its residual signal may not yet correlate tightly with the true stress-concentration location;
+by the time later sweeps (step 1200, 2200) have more physically meaningful residual signal to
+work from, a large fraction of the 3000-step budget is already spent. This is a plausible
+chicken-and-egg mechanism, not a confirmed root cause — distinguishing it from "just needs a
+finer initial resolution" or "just needs more/earlier sweeps" would need its own controlled
+experiment, not assumed here.
+
+**Conclusion, honestly stated**: PH4-14/L5 is NOT VERIFIED and is not being forced to pass, with
+or without AMR. Issue #74 (the crash) is genuinely fixed — that part of the original hypothesis
+was correct. But fixing the crash did not, by itself, solve L5's underlying Kt accuracy problem,
+which is a real, more nuanced finding than "L5 is blocked on #74." Real non-hacked evidence
+exists for both attempts. Candidate next steps for a future session (none attempted here,
+per the verification-cost policy without stronger justification first): earlier/more frequent
+AMR sweeps within the same budget, a much larger uniform `n_interior` as an AMR-free alternative,
+or a hybrid initial-density bias (structural, not residual-driven) seeded from hole geometry
+directly rather than waiting for the network's own residual to discover it.
 
 ## PH4-15 — Independent displacement and strain validation
 
