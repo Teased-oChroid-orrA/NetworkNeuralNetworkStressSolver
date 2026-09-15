@@ -1058,3 +1058,49 @@ list. With density now ruled out, the next candidates per that list are:
 Given more density didn't help, (3)/(4) — a real mismatch between what the loss trains against
 (direct stress at the ring) and what Kt measures (derived stress at an offset) — is the most
 promising next lead, not yet investigated with real evidence as of this note.
+
+### Follow-up real experiment — Strong formulation (explicit hole-boundary loss) + persistent AMR
+
+Reading `UserDefinedProblem::loss_terms()` after the null density result above found a real,
+code-grounded reason it might not be surprising: `hole_free_active = !matches!(formulation,
+Variational)` — every L5 attempt so far used `Variational`, for which a `Free` hole registers
+**no `HoleBcTerm` at all**. Traction-free at the hole is enforced only implicitly through the
+energy functional's natural boundary condition, not as an explicit local loss. `Strong`
+formulation is structurally different: it registers an explicit `HoleBcTerm::Free` (direct-
+stress traction-free penalty, evaluated locally at the hole ring) alongside `EquilibriumTerm`/
+`OuterTractionTerm`, and had already proven it passes the no-hole L4 benchmark cleanly (#71).
+
+`user_problem::tests::issue_75_real_l5_strong_formulation_with_persistent_amr` (`#[ignore]`d,
+real dual training run, Strong formulation combined with persistent AMR, same L5 hole
+configuration): no-hole companion passes cleanly again (`sigma_xx_relative_error=0.00223`,
+`load_transfer_ratio=1.00227` — identical to #71's own measured Strong result, a real
+consistency check). Hole result: **`kt=0.1057`, `relative_error_vs_infinite_theory=0.9648`
+(96.5% error) — WORSE than every prior attempt, not better.**
+
+**Updated real comparison table, all four attempts on the identical L5 hole configuration:**
+
+| Configuration | Kt | Relative error |
+| --- | --- | --- |
+| Variational, uniform sampling (no AMR) | 1.0076 | 66.4% |
+| Variational, old sweep-only AMR | 1.0088 | 66.4% |
+| Variational, persistent geometry-aware AMR | 1.0023 | 66.6% |
+| **Strong (explicit hole loss) + persistent AMR** | **0.1057** | **96.5%** |
+
+Two real, code-grounded hypotheses have now been tested and disproven with real evidence in
+this epic: (1) sampling density alone (workstreams A-D, the epic's own central mechanism) — no
+meaningful effect; (2) adding an explicit local hole-boundary loss term (`Strong` formulation)
+— actively worse, not better. `HoleBcTerm::Free` operates on the fixed `"hole_i"` named ring
+point set (unaffected by the interior-sampling changes in this epic), so this regression is not
+an AMR/HoleBcTerm interaction artifact — it reflects Strong's own optimization dynamics for
+this specific hole problem being worse than Variational's, independent of AMR.
+
+**Honest status, per this epic's own "Definition of done" condition 7**: L5 remains explicitly
+open with real measured evidence and a narrowed set of ruled-out causes, not a passing result.
+Issue #75's own prioritized "Risks and follow-up hypotheses" list items 1-4 (independent FEM/
+high-resolution reference for this finite geometry; constitutive-consistency error in the near-
+hole annulus; hole traction residual via DERIVED not direct stress; whether direct and derived
+stress representations agree near the hole at all) are DIAGNOSTIC measurements on an already-
+trained model, not more formulation/sampling experiments — a fundamentally different, more
+targeted next step than the two real training-based hypotheses just tested, and a natural point
+to pause the active real-experiment phase and report comprehensively rather than continue
+guessing at formulation/mechanism changes without a new, specific, evidenced hypothesis to test.

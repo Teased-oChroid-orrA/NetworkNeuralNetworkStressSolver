@@ -5039,6 +5039,157 @@ mod tests {
         assert!(hole_result.relative_error_vs_infinite_theory.is_some(), "{hole_result:?}");
     }
 
+    /// Issue #75 follow-up: persistent geometry-aware AMR (this file's own `issue_75_real_l5_
+    /// with_persistent_geometry_aware_amr`, above) gave `kt=1.0023` - essentially unchanged
+    /// from uniform sampling despite a real, verified ~20x near-hole density increase. Reading
+    /// `UserDefinedProblem::loss_terms()` afterward found a real structural reason this specific
+    /// null result isn't surprising: `hole_free_active = !matches!(formulation, Variational)` -
+    /// for EVERY L5 attempt so far (all `Variational`), a `Free` hole registers NO `HoleBcTerm`
+    /// at all. Traction-free at the hole is enforced only IMPLICITLY through the energy
+    /// functional's own natural boundary condition - there is no explicit, local,
+    /// hole-boundary-specific loss signal for Variational at all, so denser sampling near the
+    /// hole only sharpens the domain-integrated energy ESTIMATE, not necessarily the network's
+    /// incentive to produce a genuinely sharp local field there (Deep-Ritz/DEM methods are
+    /// documented in the literature to under-resolve sharp local features via pure
+    /// energy-integral minimization - a representational/optimization limitation, not a
+    /// quadrature one). `Strong` formulation is structurally different: it registers an
+    /// EXPLICIT `HoleBcTerm::Free` (direct-stress traction-free penalty, evaluated locally at
+    /// the hole ring) alongside `EquilibriumTerm`/`OuterTractionTerm` - a genuinely different
+    /// training signal at the hole boundary, not just a denser sample of the same signal. This
+    /// test combines persistent AMR (already proven to increase near-hole density) with Strong
+    /// formulation (already proven to pass the no-hole L4 benchmark cleanly, issue #71) to test
+    /// this specific, code-grounded hypothesis with real evidence, honestly - does NOT assert
+    /// `kt≈3.0` (issue #63's own no-benchmark-hacking rule). `#[ignore]`d - two real training
+    /// runs, Strong's own `EquilibriumTerm` needs a real Hessian forward pass (materially more
+    /// expensive per step than Variational - see issue #71's own real measured runtime).
+    #[test]
+    #[ignore]
+    fn issue_75_real_l5_strong_formulation_with_persistent_amr() {
+        use crate::fd_stencil::FdConfig;
+        use crate::lr_schedule::LrSchedule;
+        use crate::network::ElasticityNetConfig;
+        use crate::optim::{make_bias_optim, make_gate_optim, WeightOptim};
+        use crate::problem::{BoundaryValueProblem, DomainOptim, DomainStepCtx, MultiStepCtx};
+        use crate::saw_brdr::SawBrdr;
+        use crate::training_core::{probe_interior_energy_residuals, step_physics_multi, BDevice, B};
+        use burn::module::AutodiffModule;
+        use burn::tensor::backend::Backend;
+        use pinn_core::amr::{derive_amr_config, AdaptiveGrid, AmrDomain};
+        use pinn_core::messages::SolverConfig;
+        use pinn_core::problem_spec::FormulationSelection;
+
+        const AMR_WARMUP_STEPS: usize = 200;
+
+        fn train(spec: &ProblemSpec, use_persistent_amr: bool, device: &crate::training_core::BDevice) -> crate::network::ElasticityNet<crate::training_core::BInner> {
+            let half_w = spec.geometry.half_w;
+            let half_h = spec.geometry.half_h;
+            let problem = UserDefinedProblem::new(spec.clone());
+            crate::problem::validate_loss_terms(&problem);
+            let net_cfg = ElasticityNetConfig::new()
+                .with_input_dim(spec.geometry.net_input_dim())
+                .with_hidden_dim(spec.network.hidden_dim)
+                .with_n_hidden(spec.network.n_hidden)
+                .with_output_dim(5);
+            B::seed(device, spec.network.model_init_seed);
+            let mut model = net_cfg.init(device);
+            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+            let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+            let mut saw = SawBrdr::with_base(base_weights, 0.95);
+            let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+            let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+            let scales = crate::training_core::compute_reference_scales_for_plate(spec);
+            let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
+            let config = SolverConfig::default_kirsch();
+            let sampling = problem.sampling_strategy(0);
+            let placeholder = GeometryConfig::kirsch_plate_inches();
+
+            let collocation_margin_m = ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+            let collocation_geometry = spec.geometry.inflated_for_collocation(collocation_margin_m);
+            let amr_cfg = derive_amr_config((-half_w, half_w, -half_h, half_h), &collocation_geometry.lock_zones());
+            let amr_interval = amr_cfg.interval_steps;
+            let mut amr_grid = AdaptiveGrid::<UserGeometry>::new(&collocation_geometry, amr_cfg);
+
+            for step in 0..spec.training.max_steps {
+                let mut data = resample_plate_step_data(
+                    sampling, &placeholder, &spec.load, spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
+                );
+
+                if use_persistent_amr && step >= AMR_WARMUP_STEPS && (step - AMR_WARMUP_STEPS) % amr_interval == 0 {
+                    let probe_ctx = MultiStepCtx {
+                        config: &config, problem: &problem, fd: &fd, k: 1.0,
+                        domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
+                        dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
+                        dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
+                        constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
+                        n_fourier: spec.geometry.n_fourier(), probe_term_gradients: false,
+                        phase2_active: true, step,
+                    };
+                    if let Some(residuals) = probe_interior_energy_residuals(&probe_ctx, &[&model], device).remove(&USER_DOMAIN) {
+                        amr_grid.update_residuals(&residuals);
+                        if amr_grid.should_adapt(&residuals) {
+                            amr_grid.adapt();
+                        }
+                    }
+                }
+
+                let (source, weights) = if use_persistent_amr {
+                    apply_persistent_adaptive_interior_sample(
+                        &mut data, &spec.geometry, spec.training.fd_h, half_w, half_h, Some(&mut amr_grid), step,
+                    )
+                } else {
+                    (InteriorSampleSource::Uniform, None)
+                };
+                if source == InteriorSampleSource::PersistentAdaptive {
+                    problem.set_interior_weights(weights);
+                } else {
+                    problem.set_interior_weights(None);
+                }
+
+                let ctx = plate_multi_step_ctx(
+                    &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
+                    spec.geometry.n_fourier(), false, step,
+                );
+                let (new_model, _out) = step_physics_multi(
+                    vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, device, 0, 1.0, 1.0,
+                );
+                model = new_model.into_iter().next().unwrap();
+            }
+            model.valid()
+        }
+
+        let device = BDevice::default();
+
+        let no_hole_spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] },
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
+            },
+            formulation: FormulationSelection::Strong,
+        };
+        println!("=== training Strong no-hole companion ===");
+        let no_hole_model = train(&no_hole_spec, false, &device);
+        let no_hole_result = run_no_hole_benchmark(&no_hole_model, &no_hole_spec, &device);
+        println!("[L5+Strong] no-hole companion benchmark: {no_hole_result:?}");
+        assert!(no_hole_result.passed, "L5 requires a verified no-hole companion, got: {no_hole_result:?}");
+
+        let mut hole_spec = no_hole_spec.clone();
+        hole_spec.geometry.holes = vec![HoleSpec { center: [0.0, 0.0], radius: 0.005, bc: HoleBc::Free }];
+        println!("=== training single-hole Strong formulation + persistent AMR (ratio=0.05) ===");
+        let hole_model = train(&hole_spec, true, &device);
+
+        let hole_result = run_hole_benchmark(&hole_model, &hole_spec, 0, &no_hole_result, &device)
+            .expect("run_hole_benchmark must accept a verified-passing no-hole companion");
+        println!("[L5+Strong] hole benchmark: {hole_result:?}");
+
+        assert!(hole_result.kt.is_finite() && hole_result.kt > 0.0, "{hole_result:?}");
+        assert_eq!(hole_result.reference_kind, HoleReferenceKind::InfiniteApprox, "ratio=0.05 must classify as InfiniteApprox: {hole_result:?}");
+        assert!(hole_result.relative_error_vs_infinite_theory.is_some(), "{hole_result:?}");
+    }
+
     /// Complements (does not duplicate) this session's earlier zero-cost diagnostic that found
     /// only ~0.55% of interior points land within 2 hole-radii of a ratio=0.05 hole's boundary
     /// under `UserSamplingStrategy`'s UNIFORM Monte-Carlo sampling (see the `issue_70_real_l5_*`
