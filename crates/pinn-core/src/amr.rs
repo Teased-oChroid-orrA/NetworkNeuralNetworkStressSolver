@@ -10,6 +10,7 @@
 ///   - Phase 2: AMR::adapt() called every interval_steps; sample_points() replaces int_pts_phys
 
 use crate::geometry::{GeometryConfig, HoleType};
+use crate::sampling::LcgRng;
 use crate::user_geometry::UserGeometry;
 
 /// A 2D domain `AdaptiveGrid` can refine collocation points over — generalizes the single
@@ -350,6 +351,46 @@ impl QuadNode {
             }
         }
     }
+
+    /// Same DFS traversal and leaf-INCLUSION test as `collect_points_with_area` (a leaf only
+    /// ever contributes a sample if its own CENTER passes `geom.contains` - the topology/leaf-
+    /// set stays identical to every other collection method here), but the emitted point is a
+    /// fresh, uniformly-jittered draw within that leaf's own `[x0,x1]×[y0,y1]` bounds instead
+    /// of the deterministic center - see `AdaptiveGrid::sample_points_jittered_with_density`'s
+    /// own doc comment for why (issue #75 workstream A). A jittered draw that fails
+    /// `geom.contains` (only possible for a leaf whose bounds still straddle the domain's own
+    /// edge or a hole at its current refinement level - the center passed, but a corner of the
+    /// cell may not have) retries within the same leaf up to `MAX_JITTER_RETRIES` times, then
+    /// falls back to the leaf's own center - already proven valid by the containment check
+    /// above - so this can never emit an out-of-domain point and never emits fewer points than
+    /// `collect_points_with_area` does for the same tree.
+    fn collect_points_jittered<G: AmrDomain>(
+        &self,
+        geom: &G,
+        rng: &mut LcgRng,
+        out: &mut Vec<DensitySample>,
+    ) {
+        const MAX_JITTER_RETRIES: usize = 8;
+        match &self.children {
+            Some(ch) => { for c in ch.iter() { c.collect_points_jittered(geom, rng, out); } }
+            None => {
+                let (cx, cy) = (self.cx(), self.cy());
+                if !geom.contains(cx, cy) {
+                    return;
+                }
+                let mut chosen = [cx, cy];
+                for _ in 0..MAX_JITTER_RETRIES {
+                    let jx = self.x0 + (self.x1 - self.x0) * rng.next_f64();
+                    let jy = self.y0 + (self.y1 - self.y0) * rng.next_f64();
+                    if geom.contains(jx, jy) {
+                        chosen = [jx, jy];
+                        break;
+                    }
+                }
+                out.push(DensitySample { point: chosen, leaf_area: self.area() });
+            }
+        }
+    }
 }
 
 /// A sampled point paired with the physical area of the quadtree leaf it was drawn from -
@@ -387,6 +428,67 @@ pub fn compensation_weights(samples: &[DensitySample]) -> Vec<f64> {
     samples.iter().map(|s| s.leaf_area * n as f64 / total_area).collect()
 }
 
+// ─── Geometry-seeded hole annulus quadrature (issue #75 workstream B) ────────
+
+/// One annular-quadrature sample near a hole, paired with the physical area it represents -
+/// see `sample_hole_annulus`'s own doc comment. Deliberately the same shape as `DensitySample`
+/// (`point` + an area-like field) so downstream code that already knows how to consume a
+/// `DensitySample` (`compensation_weights`, measure-aware loss terms) can treat an annular
+/// stratum's points identically to a quadtree leaf's, without a second parallel code path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnnulusSample {
+    pub point: [f64; 2],
+    /// Physical area this ONE point represents - `stratum_total_area / n`, i.e. already
+    /// divided by the sample count for this call, matching `DensitySample::leaf_area`'s own
+    /// "one point, its own area" contract directly (not the annulus's total area).
+    pub area_share: f64,
+}
+
+/// Geometry-seeded, uniform-by-AREA (not by-radius) annular quadrature around one circular
+/// hole - issue #75 workstream B. Sampling uniformly by radius over-concentrates points near
+/// the inner circumference (the annulus's differential area element is `r·dr·dθ`, not
+/// `dr·dθ`), which would distort the intended near-hole quadrature density; drawing
+/// `r² ~ Uniform(inner_r², outer_r²)` instead makes the resulting point set uniform per unit
+/// AREA across the whole annulus - the "Preferred: stratified quadrature" scheme issue #75
+/// itself specifies (`weight = annulus area / annulus sample count`).
+///
+/// `n` fresh points drawn every call - mixes `call_counter` into `seed` via the same
+/// splitmix64-style constant `sample_points_jittered_with_density`/`UserSamplingStrategy`
+/// already use for their own per-call jitter, so this is never a frozen ring reused across
+/// steps (issue #64's invariant applies here too). `inner_r` must already include any FD-safe
+/// exclusion margin the caller wants - this function has no opinion on FD stencil half-width
+/// (a `pinn-solver` concept); it only guarantees every emitted point satisfies
+/// `inner_r <= r <= outer_r`. Degenerate inputs (`n == 0`, `outer_r <= inner_r`, or a negative
+/// `inner_r`) return an empty `Vec` rather than panicking or dividing by zero.
+pub fn sample_hole_annulus(
+    center: [f64; 2],
+    inner_r: f64,
+    outer_r: f64,
+    n: usize,
+    seed: u64,
+    call_counter: u64,
+) -> Vec<AnnulusSample> {
+    const CALL_SEED_MIX: u64 = 0x9E3779B97F4A7C15;
+    if n == 0 || outer_r <= inner_r || inner_r < 0.0 {
+        return Vec::new();
+    }
+    let mut rng = LcgRng::new(seed ^ call_counter.wrapping_mul(CALL_SEED_MIX));
+    let total_area = std::f64::consts::PI * (outer_r * outer_r - inner_r * inner_r);
+    let area_share = total_area / n as f64;
+    let r2_lo = inner_r * inner_r;
+    let r2_hi = outer_r * outer_r;
+    (0..n)
+        .map(|_| {
+            let theta = 2.0 * std::f64::consts::PI * rng.next_f64();
+            let r = (r2_lo + (r2_hi - r2_lo) * rng.next_f64()).sqrt();
+            AnnulusSample {
+                point: [center[0] + r * theta.cos(), center[1] + r * theta.sin()],
+                area_share,
+            }
+        })
+        .collect()
+}
+
 // ─── Adaptive grid ────────────────────────────────────────────────────────────
 
 pub struct AdaptiveGrid<G: AmrDomain = GeometryConfig> {
@@ -396,6 +498,14 @@ pub struct AdaptiveGrid<G: AmrDomain = GeometryConfig> {
     adapt_count: usize,
     global_mean: f64,
     prev_global: f64,
+    /// Issue #75 workstream A: incremented by every `sample_points_jittered_with_density`
+    /// call, mixed into that call's RNG seed exactly like `UserSamplingStrategy::{interior,
+    /// boundary}_calls` (`pinn-solver`) mixes its own per-call counter - so consecutive calls
+    /// against an UNCHANGED tree draw genuinely different jittered coordinates (issue #64's
+    /// own invariant: never a frozen point set reused across steps), while a given
+    /// `(sample_seed, call index)` pair remains fully reproducible. `adapt()`/`update_residuals`
+    /// never touch this - topology changes and sample-call count are independent axes.
+    sample_call_counter: u64,
 }
 
 impl<G: AmrDomain + Clone> AdaptiveGrid<G> {
@@ -412,6 +522,7 @@ impl<G: AmrDomain + Clone> AdaptiveGrid<G> {
             adapt_count: 0,
             global_mean: 0.0,
             prev_global: 0.0,
+            sample_call_counter: 0,
         };
         grid.enforce_hole_zone();
         grid
@@ -444,6 +555,33 @@ impl<G: AmrDomain + Clone> AdaptiveGrid<G> {
     pub fn sample_points_with_density(&self) -> Vec<DensitySample> {
         let mut out = Vec::with_capacity(self.cfg.pts_per_cell * self.active_count());
         self.root.collect_points_with_area(&self.geom, &mut out);
+        out
+    }
+
+    /// Issue #75 workstream A: the persistent-AMR sampling primitive. Same leaf SET (topology)
+    /// as `sample_points_with_density` - same active cells, same DFS order, same paired
+    /// physical `leaf_area` - but each point is a FRESH, uniformly-jittered draw within its own
+    /// leaf's bounds, not the deterministic center. This is what makes it safe to call every
+    /// training step while the adaptive grid's TOPOLOGY stays fixed between `adapt()` sweeps:
+    /// the coordinates still genuinely vary call-to-call (issue #64's own invariant - the
+    /// optimizer must never be handed the same finite point cloud step after step), exactly
+    /// mirroring `pinn_solver::user_problem::UserSamplingStrategy`'s existing per-call-counter
+    /// jitter pattern for plain uniform sampling.
+    ///
+    /// `seed` should be a fixed per-problem constant (the caller's own, e.g. a "which sampler"
+    /// discriminator); this call's own `sample_call_counter` (incremented every call) is mixed
+    /// in via the same splitmix64-style constant `UserSamplingStrategy` uses, so
+    /// `(seed, call index)` is fully reproducible while consecutive real calls draw distinct
+    /// points. `&mut self` because the counter is genuinely part of this grid's own mutable
+    /// sampling state - not interior-mutability-hidden, since `AdaptiveGrid` is single-threaded
+    /// per training run (no `Send+Sync` trait-object requirement `UserSamplingStrategy` has).
+    pub fn sample_points_jittered_with_density(&mut self, seed: u64) -> Vec<DensitySample> {
+        const CALL_SEED_MIX: u64 = 0x9E3779B97F4A7C15;
+        let call = self.sample_call_counter;
+        self.sample_call_counter = self.sample_call_counter.wrapping_add(1);
+        let mut rng = LcgRng::new(seed ^ call.wrapping_mul(CALL_SEED_MIX));
+        let mut out = Vec::with_capacity(self.cfg.pts_per_cell * self.active_count());
+        self.root.collect_points_jittered(&self.geom, &mut rng, &mut out);
         out
     }
 
@@ -1672,6 +1810,182 @@ mod tests {
         for (p, d) in pts.iter().zip(&densities) {
             assert_eq!(*p, d.point);
             assert!(d.leaf_area > 0.0, "leaf_area must be positive, got {}", d.leaf_area);
+        }
+    }
+
+    // ─── Issue #75 workstream A: sample_points_jittered_with_density ─────────────
+
+    #[test]
+    fn jittered_sampling_same_topology_yields_different_coordinates_across_consecutive_calls() {
+        let geom = test_geom();
+        let cfg = AmrtConfig::default();
+        let mut grid = AdaptiveGrid::new(&geom, cfg);
+        let first = grid.sample_points_jittered_with_density(1234);
+        let second = grid.sample_points_jittered_with_density(1234);
+        assert_eq!(first.len(), second.len(), "topology unchanged between calls - leaf count must match");
+        let differ = first.iter().zip(&second).any(|(a, b)| a.point != b.point);
+        assert!(differ, "consecutive jittered calls returned byte-identical points - issue #64's own invariant violated");
+    }
+
+    #[test]
+    fn jittered_sampling_is_reproducible_for_the_same_seed_and_call_sequence() {
+        let geom = test_geom();
+        let cfg = AmrtConfig::default();
+        let mut grid_a = AdaptiveGrid::new(&geom, cfg.clone());
+        let mut grid_b = AdaptiveGrid::new(&geom, cfg);
+        // Same seed, same call index (both grids' first call) -> must match exactly.
+        let a = grid_a.sample_points_jittered_with_density(777);
+        let b = grid_b.sample_points_jittered_with_density(777);
+        assert_eq!(a.len(), b.len());
+        for (pa, pb) in a.iter().zip(&b) {
+            assert_eq!(pa.point, pb.point, "identical (seed, call index) must reproduce identical coordinates");
+            assert_eq!(pa.leaf_area, pb.leaf_area);
+        }
+    }
+
+    #[test]
+    fn jittered_sampling_points_stay_inside_the_valid_domain() {
+        let geom = test_geom();
+        let cfg = AmrtConfig::default();
+        let mut grid = AdaptiveGrid::new(&geom, cfg);
+        let (x0, x1) = geom.x_range();
+        let (y0, y1) = geom.y_range();
+        for call in 0..5 {
+            let samples = grid.sample_points_jittered_with_density(42);
+            for s in &samples {
+                let [x, y] = s.point;
+                assert!(x >= x0 && x <= x1 && y >= y0 && y <= y1,
+                    "call {call}: point ({x},{y}) outside domain bounds [{x0},{x1}]x[{y0},{y1}]");
+                assert!(geom.contains(x, y), "call {call}: point ({x},{y}) fails geom.contains - must never emit an out-of-domain point");
+            }
+        }
+    }
+
+    #[test]
+    fn jittered_sampling_leaf_area_metadata_matches_the_center_based_sampler_for_the_same_topology() {
+        // Same leaf SET/topology (no adapt() called between the two calls) -> leaf_area
+        // multiset must match exactly between the deterministic-center and jittered samplers,
+        // even though the point coordinates themselves differ - proves density metadata stays
+        // correctly paired with the leaf a jittered point was actually drawn from.
+        let geom = test_geom();
+        let cfg = AmrtConfig::default();
+        let mut grid = AdaptiveGrid::new(&geom, cfg);
+        let centered = grid.sample_points_with_density();
+        let jittered = grid.sample_points_jittered_with_density(9);
+        assert_eq!(centered.len(), jittered.len());
+        let mut centered_areas: Vec<f64> = centered.iter().map(|s| s.leaf_area).collect();
+        let mut jittered_areas: Vec<f64> = jittered.iter().map(|s| s.leaf_area).collect();
+        centered_areas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        jittered_areas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for (c, j) in centered_areas.iter().zip(&jittered_areas) {
+            assert!((c - j).abs() < 1e-12, "leaf area multiset mismatch: {c} vs {j}");
+        }
+    }
+
+    #[test]
+    fn jittered_sampling_hole_lock_zone_density_exceeds_domain_average_after_jittered_draw() {
+        // AMR's own hole-zone floor must show up in the JITTERED sampler's density too, not
+        // just the deterministic-center one - a caller switching from sample_points_with_
+        // density to the jittered variant must not silently lose the near-hole refinement
+        // guarantee.
+        let geom = test_geom(); // hole radius 0.003175 in a 0.127 half-width domain
+        let cfg = AmrtConfig { min_level_hole: 6, hole_zone_factor: DEFAULT_HOLE_ZONE_FACTOR, ..AmrtConfig::default() };
+        let mut grid = AdaptiveGrid::new(&geom, cfg);
+        let samples = grid.sample_points_jittered_with_density(55);
+        let domain_mean_density = samples.len() as f64 / samples.iter().map(|s| s.leaf_area).sum::<f64>();
+        let r_zone = 0.003175 * DEFAULT_HOLE_ZONE_FACTOR;
+        let near_hole: Vec<&DensitySample> = samples.iter().filter(|s| {
+            let [x, y] = s.point;
+            (x * x + y * y).sqrt() < r_zone
+        }).collect();
+        assert!(!near_hole.is_empty(), "no jittered points fell within the hole lock zone");
+        let near_hole_density = near_hole.len() as f64 / near_hole.iter().map(|s| s.leaf_area).sum::<f64>();
+        assert!(near_hole_density > domain_mean_density,
+            "hole-zone density ({near_hole_density}) must exceed domain-mean density ({domain_mean_density})");
+    }
+
+    // ─── Issue #75 workstream B: sample_hole_annulus ──────────────────────────────
+
+    #[test]
+    fn hole_annulus_samples_stay_within_the_correct_radial_range() {
+        let center = [0.02, -0.01];
+        let (inner_r, outer_r) = (0.005, 0.015);
+        let samples = sample_hole_annulus(center, inner_r, outer_r, 500, 11, 0);
+        assert_eq!(samples.len(), 500);
+        for s in &samples {
+            let dx = s.point[0] - center[0];
+            let dy = s.point[1] - center[1];
+            let r = (dx * dx + dy * dy).sqrt();
+            assert!(r >= inner_r - 1e-12 && r <= outer_r + 1e-12,
+                "point at r={r} outside [{inner_r},{outer_r}]");
+        }
+    }
+
+    #[test]
+    fn hole_annulus_sampling_is_uniform_by_area_not_by_radius() {
+        // r^2 must be approximately UNIFORMLY distributed over [inner_r^2, outer_r^2] - i.e.
+        // mean(r^2) should sit near the midpoint of that range, not skewed toward inner_r
+        // (which a naive uniform-by-radius sampler would produce, over-weighting the inner
+        // circumference where the true differential area element r*dr*dtheta is smallest).
+        let center = [0.0, 0.0];
+        let (inner_r, outer_r) = (1.0, 3.0); // wide range makes any by-radius skew obvious
+        let samples = sample_hole_annulus(center, inner_r, outer_r, 20_000, 99, 0);
+        let mean_r2: f64 = samples.iter().map(|s| s.point[0].powi(2) + s.point[1].powi(2)).sum::<f64>()
+            / samples.len() as f64;
+        let expected_mean_r2 = (inner_r * inner_r + outer_r * outer_r) / 2.0;
+        let rel_err = (mean_r2 - expected_mean_r2).abs() / expected_mean_r2;
+        assert!(rel_err < 0.02,
+            "mean(r^2)={mean_r2} should be near the uniform-by-area expectation {expected_mean_r2} (rel_err={rel_err})");
+    }
+
+    #[test]
+    fn hole_annulus_area_shares_sum_to_the_true_annulus_area() {
+        let center = [0.0, 0.0];
+        let (inner_r, outer_r) = (0.005, 0.02);
+        let n = 200;
+        let samples = sample_hole_annulus(center, inner_r, outer_r, n, 3, 0);
+        let true_area = std::f64::consts::PI * (outer_r * outer_r - inner_r * inner_r);
+        let summed_area: f64 = samples.iter().map(|s| s.area_share).sum();
+        assert!((summed_area - true_area).abs() < 1e-12,
+            "summed area_share {summed_area} must equal the true annulus area {true_area}");
+    }
+
+    #[test]
+    fn hole_annulus_sampling_resamples_fresh_points_across_consecutive_call_indices() {
+        let center = [0.0, 0.0];
+        let a = sample_hole_annulus(center, 0.005, 0.02, 50, 7, 0);
+        let b = sample_hole_annulus(center, 0.005, 0.02, 50, 7, 1);
+        let differ = a.iter().zip(&b).any(|(x, y)| x.point != y.point);
+        assert!(differ, "consecutive call indices must draw different points, matching issue #64's own invariant");
+    }
+
+    #[test]
+    fn hole_annulus_sampling_is_reproducible_for_the_same_seed_and_call_index() {
+        let center = [0.01, 0.02];
+        let a = sample_hole_annulus(center, 0.005, 0.02, 50, 123, 5);
+        let b = sample_hole_annulus(center, 0.005, 0.02, 50, 123, 5);
+        assert_eq!(a, b, "identical (seed, call_counter) must reproduce identical samples");
+    }
+
+    #[test]
+    fn hole_annulus_sampling_degenerate_inputs_return_empty_not_panic() {
+        assert!(sample_hole_annulus([0.0, 0.0], 0.01, 0.02, 0, 1, 0).is_empty());
+        assert!(sample_hole_annulus([0.0, 0.0], 0.02, 0.02, 10, 1, 0).is_empty(), "outer_r == inner_r");
+        assert!(sample_hole_annulus([0.0, 0.0], 0.03, 0.02, 10, 1, 0).is_empty(), "outer_r < inner_r");
+        assert!(sample_hole_annulus([0.0, 0.0], -0.01, 0.02, 10, 1, 0).is_empty(), "negative inner_r");
+    }
+
+    #[test]
+    fn jittered_sampling_works_for_a_no_hole_user_geometry_with_zero_lock_zones() {
+        use crate::user_geometry::UserGeometry;
+        let geom = UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] };
+        let cfg = AmrtConfig::default();
+        let mut grid = AdaptiveGrid::<UserGeometry>::new(&geom, cfg);
+        let samples = grid.sample_points_jittered_with_density(3);
+        assert!(!samples.is_empty());
+        for s in &samples {
+            let [x, y] = s.point;
+            assert!(geom.contains(x, y), "point ({x},{y}) outside a feature-less UserGeometry");
         }
     }
 }

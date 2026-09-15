@@ -1526,6 +1526,15 @@ fn run_user_problem_training_from(
                     let domain_density_before = points_before as f64 / domain_area;
 
                     amr_grid.adapt();
+                    // Issue #75: hole-bearing geometries get their interior points from the
+                    // NEW persistent-adaptive block below (runs every step, not just here) -
+                    // this legacy overwrite is specifically the no-hole path now, preserving
+                    // its pre-#75 sweep-only behavior byte-for-byte (issue #75's own "Preserve
+                    // baseline behavior" section: "amr_enabled=true with no holes: existing AMR
+                    // behavior may remain residual-driven"). Still runs `adapt()` above and
+                    // still updates `amr_grid`'s own topology either way - only the "which
+                    // block actually writes `data.int_norm`/weights" decision changes.
+                    //
                     // Issue #62 PH3-04: when measure-aware training is on, resample WITH density
                     // info (`sample_points_with_density`) instead of bare points, and hand the
                     // resulting compensation weights to `problem` so the NEXT `loss_terms()`
@@ -1535,14 +1544,24 @@ fn run_user_problem_training_from(
                     // `sample_points()` call, zero added cost) - `problem.set_interior_weights`
                     // is never called at all in that case, so `InteriorEnergyTerm`'s `weights`
                     // stays `None` for the whole run, matching its pre-PH3-04 behavior exactly.
-                    if spec.training.measure_aware_training {
-                        let density_samples = amr_grid.sample_points_with_density();
-                        data.int_norm = density_samples.iter().map(|s| norm_pt(s.point[0], s.point[1])).collect();
-                        problem.set_interior_weights(Some(pinn_core::amr::compensation_weights(&density_samples)));
+                    let points_after = if spec.geometry.holes.is_empty() {
+                        if spec.training.measure_aware_training {
+                            let density_samples = amr_grid.sample_points_with_density();
+                            data.int_norm = density_samples.iter().map(|s| norm_pt(s.point[0], s.point[1])).collect();
+                            problem.set_interior_weights(Some(pinn_core::amr::compensation_weights(&density_samples)));
+                        } else {
+                            data.int_norm = amr_grid.sample_points().iter().map(|&[x, y]| norm_pt(x, y)).collect();
+                        }
+                        // Byte-for-byte identical to this block's pre-#75 diagnostic value -
+                        // no-hole legacy path is untouched by issue #75.
+                        data.int_norm.len()
                     } else {
-                        data.int_norm = amr_grid.sample_points().iter().map(|&[x, y]| norm_pt(x, y)).collect();
-                    }
-                    let points_after = data.int_norm.len();
+                        // Hole-bearing geometry: `data.int_norm` is NOT overwritten in this
+                        // block any more (the new persistent-adaptive block below owns it) -
+                        // `active_count()` reports the real topology size adapt() just produced
+                        // instead of a stale/unrelated point count.
+                        amr_grid.active_count()
+                    };
 
                     // "After" DOES need a fresh probe - the point set (and therefore the
                     // residual signal at it) genuinely changed.
@@ -1574,6 +1593,52 @@ fn run_user_problem_training_from(
                         domain_mean_density_after: points_after as f64 / domain_area,
                     });
                 }
+            }
+        }
+
+        // Issue #75: persistent, geometry-aware adaptive interior sampling for hole-bearing
+        // geometries - runs EVERY step (not gated on the sweep interval above), overwriting
+        // whatever `resample_plate_step_data` drew for `data.int_norm` moments ago. This is
+        // the actual fix the epic's own "Design principles" section describes: the sweep block
+        // above still tracks residuals and adapts `amr_grid`'s TOPOLOGY at the normal interval
+        // (unconditionally, regardless of hole presence - unchanged from before #75), but for
+        // a hole-bearing geometry the topology is no longer the only thing that matters -
+        // between sweeps, this block keeps drawing FRESH points from whatever the CURRENT
+        // topology is (quadtree jitter + a geometry-seeded annulus per hole, active from step
+        // 0 - never waiting on the network's own residual signal to discover a hole needs
+        // density), instead of `resample_plate_step_data`'s own plain uniform draw silently
+        // winning back every non-sweep step the way it did before this fix (PH4-14's own real
+        // A/B evidence for why enabling the OLD sweep-only AMR left Kt essentially unchanged).
+        // No-op (`InteriorSampleSource::Uniform`, `data.int_norm` untouched) whenever
+        // `amr_enabled=false` or the geometry has no holes - see `apply_persistent_adaptive_
+        // interior_sample`'s own doc comment for the exact preserved-baseline conditions.
+        let amr_grid_for_step = if spec.training.amr_enabled && !spec.geometry.holes.is_empty() {
+            Some(&mut amr_grid)
+        } else {
+            None
+        };
+        let (interior_source, persistent_weights) = crate::user_problem::apply_persistent_adaptive_interior_sample(
+            &mut data, &spec.geometry, spec.training.fd_h, half_w, half_h, amr_grid_for_step, step,
+        );
+        if interior_source == crate::user_problem::InteriorSampleSource::PersistentAdaptive {
+            problem.set_interior_weights(persistent_weights);
+            // Issue #75 workstream E (telemetry, minimal slice): print periodically, not every
+            // step - real signal, not log spam.
+            if step % 10 == 0 {
+                let near_hole = data.int_norm.iter().filter(|&&[xn, yn]| {
+                    let x = xn as f64 * half_w;
+                    let y = yn as f64 * half_h;
+                    spec.geometry.holes.iter().any(|h| {
+                        let dx = x - h.center[0];
+                        let dy = y - h.center[1];
+                        (dx * dx + dy * dy).sqrt() < 2.0 * h.radius
+                    })
+                }).count();
+                println!(
+                    "  [persistent-AMR step {step}] source=adaptive points={} near_hole(<2r)={near_hole} ({:.2}%)",
+                    data.int_norm.len(),
+                    100.0 * near_hole as f64 / data.int_norm.len().max(1) as f64,
+                );
             }
         }
 
@@ -4497,6 +4562,80 @@ mod tests {
         // destabilize training.
         assert!(legacy_final.total_loss.is_finite());
         assert!(measure_aware_final.total_loss.is_finite());
+    }
+
+    /// Issue #75 workstream D: real end-to-end smoke test proving the persistent, geometry-
+    /// aware adaptive interior sampling wiring holds together through the ACTUAL production
+    /// training loop (`run_user_problem_training_from`), not just the unit-level
+    /// `apply_persistent_adaptive_interior_sample` tests in `user_problem.rs`. Single hole
+    /// (matches the L5 config's own ratio), `amr_enabled=true`, short budget (300 steps -
+    /// past `AMR_WARMUP_STEPS`=200 plus a sweep-interval margin, so both the legacy residual-
+    /// probe/adapt() bookkeeping AND the new persistent per-step overwrite get real exercise).
+    /// This is the specific configuration this whole epic exists to make safe - hole geometry +
+    /// AMR + Variational previously crashed before issue #74's fix, and even after that fix,
+    /// this exact persistent-sampling wiring is new code with its own real regression risk on
+    /// shared training-loop infrastructure. `#[ignore]`d - real training cost, run explicitly.
+    #[test]
+    #[ignore = "real ~300-step training run - see this test's own doc comment"]
+    fn issue_75_persistent_adaptive_amr_survives_a_real_hole_bearing_training_run() {
+        use pinn_core::loading::LoadConfig;
+        use pinn_core::material::MaterialProps;
+        use pinn_core::problem_spec::{NetworkSpec, TrainingSpec};
+        use pinn_core::user_geometry::{HoleBc, HoleSpec, UserGeometry};
+
+        let device = crate::training_core::BDevice::default();
+        let steps = 300;
+        let spec = ProblemSpec {
+            geometry: UserGeometry {
+                half_w: 0.10, half_h: 0.10, thickness: 0.005,
+                holes: vec![HoleSpec { center: [0.0, 0.0], radius: 0.005, bc: HoleBc::Free }],
+            },
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: NetworkSpec { hidden_dim: 64, n_hidden: 3, ..Default::default() },
+            training: TrainingSpec {
+                max_steps: steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(spec.geometry.net_input_dim())
+            .with_hidden_dim(spec.network.hidden_dim)
+            .with_n_hidden(spec.network.n_hidden)
+            .with_output_dim(5);
+        let model = net_cfg.init(&device);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let thread_device = device.clone();
+        let handle = std::thread::spawn(move || run_user_problem_training_from(spec, model, thread_device, 0, tx, rx_ctrl));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let mut last_update: Option<Box<TrainingUpdate>> = None;
+        let mut sweep_seen: Option<pinn_core::messages::AmrSweepReport> = None;
+        let mut all_finite = true;
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline && !saw_done {
+            match rx.try_recv() {
+                Ok(TrainingMsg::Update(u)) => {
+                    if let Some(s) = &u.amr_sweep { sweep_seen = Some(s.clone()); }
+                    all_finite &= u.total_loss.is_finite();
+                    last_update = Some(u);
+                }
+                Ok(TrainingMsg::Done) => saw_done = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(saw_done, "expected TrainingMsg::Done within the deadline - the persistent-AMR wiring must not hang or crash the training thread");
+        drop(tx_ctrl);
+        let _ = handle.join();
+
+        let final_update = last_update.expect("must have received at least one Update");
+        println!("[issue #75 smoke] final total_loss={:.6e} amr_sweep_seen={}", final_update.total_loss, sweep_seen.is_some());
+        assert!(all_finite, "every received update's total_loss must stay finite throughout the run");
+        assert!(final_update.total_loss.is_finite());
+        assert!(sweep_seen.is_some(), "a 300-step run past AMR_WARMUP_STEPS=200 must have experienced at least one AMR sweep");
     }
 
     /// Issue #62 PH3-12: real, controlled "fixed sampling vs AMR, same training budget"

@@ -393,6 +393,116 @@ pub fn resample_plate_step_data(
     crate::problem::DomainStepData { id: USER_DOMAIN, int_norm, extra_ring_norm: Vec::new(), named }
 }
 
+/// Issue #75: whether a step's interior points came from plain uniform sampling or the
+/// persistent, geometry-aware adaptive source (`apply_persistent_adaptive_interior_sample`).
+/// Purely informational telemetry — callers branch on `Option<Vec<f64>>` (the actual weights),
+/// not this enum, for behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteriorSampleSource {
+    Uniform,
+    PersistentAdaptive,
+}
+
+/// Fixed discriminator seed for `apply_persistent_adaptive_interior_sample`'s own RNG draws —
+/// mixed with each call's `step` index exactly like `SEED_INTERIOR`/`SEED_BOUNDARY` are mixed
+/// with `UserSamplingStrategy`'s own per-call counters. A plain constant (not derived from the
+/// problem spec) because this function already receives a distinct, real per-step `step` index
+/// to mix in — no separate atomic call-counter is needed the way `UserSamplingStrategy` needs
+/// one (that struct's `&self`-only trait signature forces interior mutability; this free
+/// function already takes `step` as an explicit parameter).
+const PERSISTENT_AMR_SEED: u64 = 750_075;
+
+/// Per-hole annulus sample count for one step: a bounded fraction of the step's own interior
+/// point budget, not a fixed constant — scales with the problem's own resolution instead of
+/// silently starving a large-`n_interior` run or over-spending a small one. Clamped to
+/// `[ANNULUS_MIN_POINTS, ANNULUS_MAX_POINTS]` so a pathologically tiny or huge `n_interior`
+/// still gets a sane annulus budget. `ANNULUS_FRACTION` (1/8) is a first-pass, documented-not-
+/// tuned choice (issue #75 workstream B's own text: `c`/budget parameters need "a documented
+/// physical and numerical rationale, then evaluated through controlled experiments" — this is
+/// the rationale: the uniform-sampling diagnostic this epic is built on found only ~0.55% of a
+/// 4096-point uniform batch (≈22 points) land within 2 hole-radii of a ratio=0.05 hole; 1/8 of
+/// the SAME budget (≈512) is roughly a 20x increase in near-hole density for a single hole,
+/// the right order of magnitude to test whether density alone (not residual-driven discovery
+/// timing) was the missing ingredient, without spending the entire interior budget on one
+/// hole's annulus for a multi-hole geometry).
+const ANNULUS_FRACTION: f64 = 1.0 / 8.0;
+const ANNULUS_MIN_POINTS: usize = 64;
+const ANNULUS_MAX_POINTS: usize = 512;
+
+fn annulus_point_budget(n_interior: usize) -> usize {
+    ((n_interior as f64 * ANNULUS_FRACTION) as usize).clamp(ANNULUS_MIN_POINTS, ANNULUS_MAX_POINTS)
+}
+
+/// Issue #75 workstream C: the single source of truth for whether and how THIS step's interior
+/// points come from a persistent, geometry-aware adaptive source instead of the plain uniform
+/// sample `resample_plate_step_data` already drew into `data.int_norm` — the "AMR overwrite"
+/// step that function's own doc comment already described as the correct seam for an
+/// AMR-aware caller, now consolidated into one function instead of being reimplemented ad hoc
+/// at each such call site (the exact duplication class issue #73 exists to prevent).
+///
+/// `amr: None` (headless's current behavior; the GUI-streaming path before AMR activates, when
+/// `amr_enabled=false`, or for a no-hole geometry — persistent geometry-aware sampling is
+/// specifically for HOLE-bearing geometries, per issue #75's own "Preserve baseline behavior"
+/// section) leaves `data.int_norm` untouched and returns `None` weights, matching
+/// `UserDefinedProblem::set_interior_weights`'s own pre-existing "`None` = already unbiased, no
+/// compensation needed" contract exactly.
+///
+/// `amr: Some(grid)` draws PERSISTENT geometry-aware adaptive samples on EVERY call, not just
+/// on an AMR sweep step (issue #75's whole point — the pre-existing sweep-only mechanism fired
+/// 3 times in a 3000-step run and was overwritten by uniform resampling every other step,
+/// PH4-14's own real evidence for why enabling AMR alone left Kt essentially unchanged): a
+/// fresh quadtree draw via `AdaptiveGrid::sample_points_jittered_with_density` (topology
+/// persists between `adapt()` sweeps; coordinates still genuinely vary every call, issue #64's
+/// invariant) PLUS one geometry-seeded annulus per hole via `pinn_core::amr::sample_hole_
+/// annulus` — seeded from KNOWN hole geometry from step 0, not waiting on the network's own
+/// (initially uninformative) residual signal to discover the hole needs density. Overwrites
+/// `data.int_norm` and returns matching compensation weights computed from the combined point
+/// set in the SAME call, so a caller can never apply one call's weights to a different call's
+/// points (issue #75's own required invariant).
+pub fn apply_persistent_adaptive_interior_sample(
+    data: &mut crate::problem::DomainStepData,
+    geometry: &UserGeometry,
+    fd_h: f32,
+    half_w: f64,
+    half_h: f64,
+    amr: Option<&mut pinn_core::amr::AdaptiveGrid<UserGeometry>>,
+    step: usize,
+) -> (InteriorSampleSource, Option<Vec<f64>>) {
+    let Some(grid) = amr else {
+        return (InteriorSampleSource::Uniform, None);
+    };
+    if geometry.holes.is_empty() {
+        // Persistent geometry-aware sampling is specifically for hole-bearing geometries —
+        // see this function's own doc comment. A caller that still wants residual-driven-only
+        // AMR for a no-hole geometry should keep using the pre-#75 sweep-only mechanism, not
+        // this function.
+        return (InteriorSampleSource::Uniform, None);
+    }
+
+    let n_before = data.int_norm.len().max(1);
+    let margin = ring_anchor_margin_m(fd_h, geometry);
+    let mut samples: Vec<pinn_core::amr::DensitySample> =
+        grid.sample_points_jittered_with_density(PERSISTENT_AMR_SEED);
+    let n_annulus_per_hole = annulus_point_budget(n_before);
+    for hole in &geometry.holes {
+        let inner_r = hole.radius + margin;
+        let outer_r = hole.radius * (1.0 + pinn_core::amr::DEFAULT_HOLE_ZONE_FACTOR);
+        let annulus = pinn_core::amr::sample_hole_annulus(
+            hole.center, inner_r, outer_r, n_annulus_per_hole, PERSISTENT_AMR_SEED, step as u64,
+        );
+        samples.extend(annulus.into_iter().map(|a| pinn_core::amr::DensitySample {
+            point: a.point,
+            leaf_area: a.area_share,
+        }));
+    }
+
+    let weights = pinn_core::amr::compensation_weights(&samples);
+    data.int_norm = samples.iter()
+        .map(|s| plate_normalize_point(s.point[0], s.point[1], half_w, half_h))
+        .collect();
+    (InteriorSampleSource::PersistentAdaptive, Some(weights))
+}
+
 /// Builds the `MultiStepCtx` fields BOTH the headless and GUI-streaming plate training loops
 /// use identically — the constants that would previously have needed to change in two places
 /// at once (issue #73). `dynamic_lam_penetration_cap`/`dynamic_lam_non_tension_cap` are always
@@ -2370,6 +2480,146 @@ mod tests {
     /// Representative `fd_h` for tests that don't otherwise have a `ProblemSpec.training.fd_h`
     /// in scope — matches the default most real TOML specs use (e.g. `single_hole_plate.toml`).
     const TEST_FD_H: f32 = 1e-3;
+
+    // ─── Issue #75 workstream C: apply_persistent_adaptive_interior_sample ───────
+
+    fn l5_geometry() -> UserGeometry {
+        UserGeometry {
+            half_w: 0.10, half_h: 0.10, thickness: 0.005,
+            holes: vec![HoleSpec { center: [0.0, 0.0], radius: 0.005, bc: HoleBc::Free }],
+        }
+    }
+
+    fn uniform_int_norm(n: usize) -> Vec<[f32; 2]> {
+        // Deterministic placeholder "uniform" point set for tests that only need SOME baseline
+        // data.int_norm to exist before the function under test may overwrite it.
+        (0..n).map(|i| {
+            let frac = i as f32 / n as f32;
+            [frac * 2.0 - 1.0, (frac * 3.0).fract() * 2.0 - 1.0]
+        }).collect()
+    }
+
+    #[test]
+    fn apply_persistent_adaptive_interior_sample_none_amr_leaves_data_untouched() {
+        let geometry = l5_geometry();
+        let original = uniform_int_norm(100);
+        let mut data = crate::problem::DomainStepData {
+            id: USER_DOMAIN, int_norm: original.clone(), extra_ring_norm: Vec::new(),
+            named: std::collections::HashMap::new(),
+        };
+        let (source, weights) = apply_persistent_adaptive_interior_sample(
+            &mut data, &geometry, TEST_FD_H, geometry.half_w, geometry.half_h, None, 0,
+        );
+        assert_eq!(source, InteriorSampleSource::Uniform);
+        assert!(weights.is_none());
+        assert_eq!(data.int_norm, original, "int_norm must be untouched when amr is None");
+    }
+
+    #[test]
+    fn apply_persistent_adaptive_interior_sample_no_holes_stays_uniform_even_with_a_grid() {
+        let geometry = UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] };
+        let cfg = pinn_core::amr::derive_amr_config(
+            (-geometry.half_w, geometry.half_w, -geometry.half_h, geometry.half_h),
+            &pinn_core::amr::AmrDomain::lock_zones(&geometry),
+        );
+        let mut grid = pinn_core::amr::AdaptiveGrid::<UserGeometry>::new(&geometry, cfg);
+        let original = uniform_int_norm(100);
+        let mut data = crate::problem::DomainStepData {
+            id: USER_DOMAIN, int_norm: original.clone(), extra_ring_norm: Vec::new(),
+            named: std::collections::HashMap::new(),
+        };
+        let (source, weights) = apply_persistent_adaptive_interior_sample(
+            &mut data, &geometry, TEST_FD_H, geometry.half_w, geometry.half_h, Some(&mut grid), 0,
+        );
+        assert_eq!(source, InteriorSampleSource::Uniform, "persistent adaptive sampling is hole-specific");
+        assert!(weights.is_none());
+        assert_eq!(data.int_norm, original);
+    }
+
+    #[test]
+    fn apply_persistent_adaptive_interior_sample_with_holes_returns_matching_points_and_weights() {
+        let geometry = l5_geometry();
+        let cfg = pinn_core::amr::derive_amr_config(
+            (-geometry.half_w, geometry.half_w, -geometry.half_h, geometry.half_h),
+            &pinn_core::amr::AmrDomain::lock_zones(&geometry),
+        );
+        let mut grid = pinn_core::amr::AdaptiveGrid::<UserGeometry>::new(&geometry, cfg);
+        let mut data = crate::problem::DomainStepData {
+            id: USER_DOMAIN, int_norm: uniform_int_norm(4096), extra_ring_norm: Vec::new(),
+            named: std::collections::HashMap::new(),
+        };
+        let (source, weights) = apply_persistent_adaptive_interior_sample(
+            &mut data, &geometry, TEST_FD_H, geometry.half_w, geometry.half_h, Some(&mut grid), 0,
+        );
+        assert_eq!(source, InteriorSampleSource::PersistentAdaptive);
+        let weights = weights.expect("hole-bearing geometry with Some(grid) must return weights");
+        assert_eq!(weights.len(), data.int_norm.len(), "points and weights must be created together, same length");
+        for w in &weights {
+            assert!(w.is_finite() && *w > 0.0, "weight {w} must be finite and positive");
+        }
+        for [x, y] in &data.int_norm {
+            assert!(*x >= -1.0 && *x <= 1.0 && *y >= -1.0 && *y <= 1.0, "normalized point ({x},{y}) out of [-1,1]");
+        }
+    }
+
+    #[test]
+    fn apply_persistent_adaptive_interior_sample_draws_fresh_points_across_consecutive_steps() {
+        let geometry = l5_geometry();
+        let cfg = pinn_core::amr::derive_amr_config(
+            (-geometry.half_w, geometry.half_w, -geometry.half_h, geometry.half_h),
+            &pinn_core::amr::AmrDomain::lock_zones(&geometry),
+        );
+        let mut grid = pinn_core::amr::AdaptiveGrid::<UserGeometry>::new(&geometry, cfg);
+        let mut data_a = crate::problem::DomainStepData {
+            id: USER_DOMAIN, int_norm: uniform_int_norm(512), extra_ring_norm: Vec::new(),
+            named: std::collections::HashMap::new(),
+        };
+        let (_, _) = apply_persistent_adaptive_interior_sample(
+            &mut data_a, &geometry, TEST_FD_H, geometry.half_w, geometry.half_h, Some(&mut grid), 0,
+        );
+        let mut data_b = crate::problem::DomainStepData {
+            id: USER_DOMAIN, int_norm: uniform_int_norm(512), extra_ring_norm: Vec::new(),
+            named: std::collections::HashMap::new(),
+        };
+        let (_, _) = apply_persistent_adaptive_interior_sample(
+            &mut data_b, &geometry, TEST_FD_H, geometry.half_w, geometry.half_h, Some(&mut grid), 1,
+        );
+        assert_eq!(data_a.int_norm.len(), data_b.int_norm.len(), "topology unchanged between step 0 and step 1 (no adapt() called)");
+        let differ = data_a.int_norm.iter().zip(&data_b.int_norm).any(|(a, b)| a != b);
+        assert!(differ, "consecutive steps must draw genuinely different points (issue #64's own invariant)");
+    }
+
+    #[test]
+    fn apply_persistent_adaptive_interior_sample_gives_far_higher_near_hole_density_than_plain_uniform() {
+        // Real numerical acceptance criterion from issue #75: persistent adaptive sampling
+        // must sustain measurably higher near-hole density than uniform sampling for the L5
+        // geometry - this session's own earlier diagnostic found only ~0.55% of a uniform
+        // 4096-point batch (~22 points) land within 2 hole-radii of this exact hole.
+        let geometry = l5_geometry();
+        let cfg = pinn_core::amr::derive_amr_config(
+            (-geometry.half_w, geometry.half_w, -geometry.half_h, geometry.half_h),
+            &pinn_core::amr::AmrDomain::lock_zones(&geometry),
+        );
+        let mut grid = pinn_core::amr::AdaptiveGrid::<UserGeometry>::new(&geometry, cfg);
+        let mut data = crate::problem::DomainStepData {
+            id: USER_DOMAIN, int_norm: uniform_int_norm(4096), extra_ring_norm: Vec::new(),
+            named: std::collections::HashMap::new(),
+        };
+        apply_persistent_adaptive_interior_sample(
+            &mut data, &geometry, TEST_FD_H, geometry.half_w, geometry.half_h, Some(&mut grid), 0,
+        );
+        let r_hole = geometry.holes[0].radius;
+        let near_hole = data.int_norm.iter().filter(|&&[xn, yn]| {
+            let x = xn as f64 * geometry.half_w;
+            let y = yn as f64 * geometry.half_h;
+            (x * x + y * y).sqrt() < 2.0 * r_hole
+        }).count();
+        let near_hole_fraction = near_hole as f64 / data.int_norm.len() as f64;
+        assert!(near_hole_fraction > 0.05,
+            "persistent adaptive near-hole fraction {near_hole_fraction:.4} should be far above \
+             uniform sampling's own measured ~0.0055 for this exact geometry - got {near_hole} \
+             of {} points", data.int_norm.len());
+    }
 
     /// Zero-cost analytical check (no training, no network) for the newly added
     /// `ExternalWorkTerm` (bugSource-New #3/#13's missing `-W_ext` piece of `Π=U-W_ext`) -
@@ -4644,6 +4894,145 @@ mod tests {
         let hole_result = run_hole_benchmark(&hole_model, &hole_spec, 0, &no_hole_result, &device)
             .expect("run_hole_benchmark must accept a verified-passing no-hole companion");
         println!("[L5+AMR] hole benchmark (AMR enabled): {hole_result:?}");
+
+        assert!(hole_result.kt.is_finite() && hole_result.kt > 0.0, "{hole_result:?}");
+        assert_eq!(hole_result.reference_kind, HoleReferenceKind::InfiniteApprox, "ratio=0.05 must classify as InfiniteApprox: {hole_result:?}");
+        assert!(hole_result.relative_error_vs_infinite_theory.is_some(), "{hole_result:?}");
+    }
+
+    /// Issue #75: the decisive real re-attempt. `issue_70_real_l5_with_amr_enabled_after_
+    /// issue_74_fix` (above) used the OLD sweep-only AMR mechanism (data.int_norm overwritten
+    /// only on the 3 steps a sweep fires in a 3000-step run, uniform resampling winning back
+    /// every other step) and found it made essentially no difference (`kt=1.0088` vs `1.0076`
+    /// without AMR at all). This test uses issue #75's actual fix instead: `apply_persistent_
+    /// adaptive_interior_sample` called EVERY step (quadtree jitter + geometry-seeded hole
+    /// annulus, active from step 0 - never waiting on the network's own residual signal),
+    /// mirroring `runner.rs`'s real production wiring exactly (not a simplified reimplementation
+    /// - same AMR_WARMUP_STEPS/interval/probe/adapt() sequence). Same discipline as every other
+    /// benchmark test in this file: does NOT assert `kt≈3.0` (issue #63's own no-benchmark-
+    /// hacking rule) - reports whatever persistent geometry-aware AMR actually achieves,
+    /// honestly. `#[ignore]`d - two real training runs (~15-30 min each in release).
+    #[test]
+    #[ignore]
+    fn issue_75_real_l5_with_persistent_geometry_aware_amr() {
+        use crate::fd_stencil::FdConfig;
+        use crate::lr_schedule::LrSchedule;
+        use crate::network::ElasticityNetConfig;
+        use crate::optim::{make_bias_optim, make_gate_optim, WeightOptim};
+        use crate::problem::{BoundaryValueProblem, DomainOptim, DomainStepCtx, MultiStepCtx};
+        use crate::saw_brdr::SawBrdr;
+        use crate::training_core::{probe_interior_energy_residuals, step_physics_multi, BDevice, B};
+        use burn::module::AutodiffModule;
+        use burn::tensor::backend::Backend;
+        use pinn_core::amr::{derive_amr_config, AdaptiveGrid, AmrDomain};
+        use pinn_core::messages::SolverConfig;
+
+        const AMR_WARMUP_STEPS: usize = 200;
+
+        fn train(spec: &ProblemSpec, use_persistent_amr: bool, device: &crate::training_core::BDevice) -> crate::network::ElasticityNet<crate::training_core::BInner> {
+            let half_w = spec.geometry.half_w;
+            let half_h = spec.geometry.half_h;
+            let problem = UserDefinedProblem::new(spec.clone());
+            crate::problem::validate_loss_terms(&problem);
+            let net_cfg = ElasticityNetConfig::new()
+                .with_input_dim(spec.geometry.net_input_dim())
+                .with_hidden_dim(spec.network.hidden_dim)
+                .with_n_hidden(spec.network.n_hidden)
+                .with_output_dim(5);
+            B::seed(device, spec.network.model_init_seed);
+            let mut model = net_cfg.init(device);
+            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+            let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+            let mut saw = SawBrdr::with_base(base_weights, 0.95);
+            let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+            let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+            let scales = crate::training_core::compute_reference_scales_for_plate(spec);
+            let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
+            let config = SolverConfig::default_kirsch();
+            let sampling = problem.sampling_strategy(0);
+            let placeholder = GeometryConfig::kirsch_plate_inches();
+
+            let collocation_margin_m = ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+            let collocation_geometry = spec.geometry.inflated_for_collocation(collocation_margin_m);
+            let amr_cfg = derive_amr_config((-half_w, half_w, -half_h, half_h), &collocation_geometry.lock_zones());
+            let amr_interval = amr_cfg.interval_steps;
+            let mut amr_grid = AdaptiveGrid::<UserGeometry>::new(&collocation_geometry, amr_cfg);
+
+            for step in 0..spec.training.max_steps {
+                let mut data = resample_plate_step_data(
+                    sampling, &placeholder, &spec.load, spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
+                );
+
+                if use_persistent_amr && step >= AMR_WARMUP_STEPS && (step - AMR_WARMUP_STEPS) % amr_interval == 0 {
+                    let probe_ctx = MultiStepCtx {
+                        config: &config, problem: &problem, fd: &fd, k: 1.0,
+                        domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
+                        dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
+                        dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
+                        constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
+                        n_fourier: spec.geometry.n_fourier(), probe_term_gradients: false,
+                        phase2_active: true, step,
+                    };
+                    if let Some(residuals) = probe_interior_energy_residuals(&probe_ctx, &[&model], device).remove(&USER_DOMAIN) {
+                        amr_grid.update_residuals(&residuals);
+                        if amr_grid.should_adapt(&residuals) {
+                            amr_grid.adapt();
+                        }
+                    }
+                }
+
+                let (source, weights) = if use_persistent_amr {
+                    apply_persistent_adaptive_interior_sample(
+                        &mut data, &spec.geometry, spec.training.fd_h, half_w, half_h, Some(&mut amr_grid), step,
+                    )
+                } else {
+                    (InteriorSampleSource::Uniform, None)
+                };
+                if source == InteriorSampleSource::PersistentAdaptive {
+                    problem.set_interior_weights(weights);
+                } else {
+                    problem.set_interior_weights(None);
+                }
+
+                let ctx = plate_multi_step_ctx(
+                    &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
+                    spec.geometry.n_fourier(), false, step,
+                );
+                let (new_model, _out) = step_physics_multi(
+                    vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, device, 0, 1.0, 1.0,
+                );
+                model = new_model.into_iter().next().unwrap();
+            }
+            model.valid()
+        }
+
+        let device = BDevice::default();
+
+        let no_hole_spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] },
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        println!("=== training no-hole companion (persistent AMR is hole-specific - unaffected) ===");
+        let no_hole_model = train(&no_hole_spec, false, &device);
+        let no_hole_result = run_no_hole_benchmark(&no_hole_model, &no_hole_spec, &device);
+        println!("[L5+persistent-AMR] no-hole companion benchmark: {no_hole_result:?}");
+        assert!(no_hole_result.passed, "L5 requires a verified no-hole companion, got: {no_hole_result:?}");
+
+        let mut hole_spec = no_hole_spec.clone();
+        hole_spec.geometry.holes = vec![HoleSpec { center: [0.0, 0.0], radius: 0.005, bc: HoleBc::Free }];
+        println!("=== training single-hole WITH PERSISTENT geometry-aware AMR (ratio=0.05) ===");
+        let hole_model = train(&hole_spec, true, &device);
+
+        let hole_result = run_hole_benchmark(&hole_model, &hole_spec, 0, &no_hole_result, &device)
+            .expect("run_hole_benchmark must accept a verified-passing no-hole companion");
+        println!("[L5+persistent-AMR] hole benchmark: {hole_result:?}");
 
         assert!(hole_result.kt.is_finite() && hole_result.kt > 0.0, "{hole_result:?}");
         assert_eq!(hole_result.reference_kind, HoleReferenceKind::InfiniteApprox, "ratio=0.05 must classify as InfiniteApprox: {hole_result:?}");

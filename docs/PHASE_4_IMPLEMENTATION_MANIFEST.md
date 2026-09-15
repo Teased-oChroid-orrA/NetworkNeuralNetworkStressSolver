@@ -958,3 +958,103 @@ affine_displacement_and_leaves_stress_mlp_only`). CI is the authoritative full-s
 this project's own "CI over local runs" convention; a full local run was avoided where CI
 coverage sufficed. Clippy `-D warnings` pre-existing `pinn-core` warnings are unrelated to this
 epic's scope and not treated as Phase 4 proof either way.
+
+## PH4-22 — Issue #75: persistent geometry-aware AMR for small-hole Kt convergence
+
+Status: CORE MECHANISM VERIFIED AND WORKING; HYPOTHESIS DISPROVEN BY REAL EVIDENCE (L5 still
+NOT_OPERATIONAL). Issue #75's own "Definition of done" condition 7 explicitly allows this
+outcome: "L5 passes against a valid reference, OR remains explicitly open with measured evidence
+and a narrowed next hypothesis" — this section delivers the latter, honestly, not the former.
+
+### What was built (workstreams A-D, all implemented and tested)
+
+- **Workstream A** (`pinn-core/src/amr.rs`): `AdaptiveGrid::sample_points_jittered_with_density`
+  — same leaf topology/DFS order as the existing deterministic-center samplers, but each point
+  is a fresh, uniformly-jittered draw within its own leaf's bounds every call (issue #64's
+  invariant extended to AMR). 6 new fast tests (topology-preserving freshness, seed
+  reproducibility, containment, density-metadata pairing, hole-zone density, no-hole geometry).
+- **Workstream B** (`pinn-core/src/amr.rs`): `sample_hole_annulus` — geometry-seeded, uniform-
+  BY-AREA (not by-radius; `r² ~ Uniform(inner_r², outer_r²)`) quadrature in an annulus around
+  each hole, active from training step 0 without waiting on the network's own residual signal.
+  6 new fast tests (radial range, statistical uniform-by-area distribution, area-share sum,
+  freshness, reproducibility, degenerate-input safety).
+- **Workstream C** (`pinn-solver/src/user_problem.rs`): `apply_persistent_adaptive_interior_
+  sample` — the single source of truth for "uniform vs persistent geometry-aware adaptive"
+  interior sampling, combining A+B, always returning points and matching compensation weights
+  from the same call (never stale). No-op (pass `amr: None`, or a no-hole geometry) preserves
+  every existing caller's behavior exactly. 5 new fast tests, including a real numerical
+  acceptance check: near-hole fraction after this function jumps from uniform sampling's
+  measured ~0.55% to consistently >5% (real observed: 9-14%, see below).
+- **Workstream D** (`pinn-solver/src/runner.rs`, `run_user_problem_training_from`): wired
+  persistent sampling into the real production training loop. The pre-existing sweep-only AMR
+  block (probe residuals, `update_residuals`, `adapt()`) still runs at the normal interval,
+  unconditionally — topology tracking is unchanged. What changed: for a HOLE-bearing geometry
+  with `amr_enabled=true`, the legacy block's own `data.int_norm` overwrite is skipped (a new
+  block below it calls `apply_persistent_adaptive_interior_sample` every step instead, not just
+  sweep steps); for a no-hole geometry, the legacy sweep-only path is completely unchanged
+  (byte-for-byte — verified below).
+
+### Real verification (not just "compiles")
+
+- `runner::tests::issue_75_persistent_adaptive_amr_survives_a_real_hole_bearing_training_run`
+  (`#[ignore]`d, 300 real steps, release): completes without panic, `total_loss` finite
+  throughout, at least one AMR sweep fires. Real telemetry confirms the mechanism works exactly
+  as designed: near-hole density (within 2 hole-radii) stays at **9-14% throughout the entire
+  run**, active from step 0 — compare uniform sampling's own measured ~0.55% for the identical
+  geometry. Point count grows 632→932 after the step-200 sweep, density staying strong.
+- `runner::tests::ph4_09_controlled_comparison_fixed_sampling_vs_amr_corrected_variational_same_
+  budget` (the no-hole, 2200-step crash-reproduction/regression test) re-run after this change:
+  completes cleanly, numbers consistent with pre-#75 runs (`sigma_xx≈0.011` both branches) —
+  confirms the legacy no-hole AMR path is genuinely unaffected by this change.
+- Full fast suite: 467 passed (up from 462, confirming the new fast tests run and pass), 1
+  known pre-existing contention-flaky test (`gui_streaming_step_zero_matches_independent_
+  shared_function_computation` — third distinct failure value across three separate full-suite
+  runs this session, confirmed non-regressive by isolated re-run every time).
+
+### The decisive real experiment — and the honest negative result
+
+`user_problem::tests::issue_75_real_l5_with_persistent_geometry_aware_amr` (`#[ignore]`d, real
+dual training run, identical L5 configuration to every prior L5 attempt this epic: 3000 steps,
+`n_interior=n_boundary=4096`, ratio=0.05 hole, against a verified-passing no-hole companion):
+
+- No-hole companion: passes cleanly (`sigma_xx_relative_error=0.00084`, `load_transfer_ratio=
+  0.99943`) — identical to every prior run of this exact config, confirming persistent AMR
+  (hole-specific) has zero effect on the no-hole path, as designed.
+- Hole benchmark: **`kt=1.0023`**, `relative_error_vs_infinite_theory=0.6659` (66.6%).
+
+**Compare all three real L5 attempts this epic, same configuration throughout:**
+
+| Sampling strategy | Kt | Relative error |
+| --- | --- | --- |
+| Uniform (no AMR) | 1.0076 | 66.4% |
+| Old sweep-only AMR (post-#74 fix) | 1.0088 | 66.4% |
+| **Persistent geometry-aware AMR (#75)** | **1.0023** | **66.6%** |
+
+**Despite a real, verified, sustained ~20x increase in near-hole collocation density (0.55% →
+9-14%), geometry-seeded from step 0, Kt did not move in any meaningful direction.** This is a
+genuine, important, honestly-reported negative result for the epic's central hypothesis — not a
+bug, not an implementation defect (the mechanism itself is proven correct and working by every
+test above), and not something to hide, force, or explain away with a benchmark-specific
+correction. Sampling density alone is now disproven as the (or at least the dominant) bottleneck.
+
+### Narrowed next hypothesis (per issue #75's own prioritized "Risks and follow-up hypotheses")
+
+Issue #75's own text anticipated exactly this outcome and gave a priority-ordered investigation
+list. With density now ruled out, the next candidates per that list are:
+
+1. Compare against an independent finite-element/high-resolution numerical reference for this
+   exact finite square geometry (not yet done — `Kt=3.0` is the infinite-plate value; this
+   finite, `ratio=0.05` square plate's TRUE reference value has never been independently
+   established in this codebase).
+2. Measure constitutive-consistency error specifically in the FD-safe annulus outside the hole.
+3. Measure hole traction residual using DERIVED stress, not only direct mDEM stress.
+4. Evaluate whether direct stress satisfies hole traction while derived stress remains
+   physically incorrect near the boundary (this codebase's free-hole traction term acts on
+   DIRECT mDEM stress at the hole ring — see `HoleBcTerm` — while Kt itself is measured from
+   DERIVED constitutive stress at an offset; if these two representations disagree near the
+   hole specifically, satisfying one loss term would not guarantee the other is physically
+   correct, independent of how many collocation points are nearby).
+
+Given more density didn't help, (3)/(4) — a real mismatch between what the loss trains against
+(direct stress at the ring) and what Kt measures (derived stress at an offset) — is the most
+promising next lead, not yet investigated with real evidence as of this note.
