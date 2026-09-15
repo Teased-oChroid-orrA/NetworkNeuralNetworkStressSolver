@@ -616,16 +616,23 @@ was always a separate, independently-measured quality-regression finding, not th
 this fix doesn't address it. AMR is now safe to actually try for hole geometries, which was
 always the point (see below).
 
-**Why L5 doesn't pass (issue #70) and why it can't be fixed by more training alone**: a small
-hole (radius/half-width ratio ~0.05) gets almost no collocation density near its own boundary
-under uniform Monte-Carlo sampling — confirmed by a zero-cost sampling-only check (no training):
-only ~0.55% of interior points land within 2 hole-radii of the boundary. A real 3000-step,
-4096-point run gets `Kt=1.008` against the theoretical `3.0` (66% relative error) — the network
-simply never sees enough signal near the stress concentration to resolve it, independent of
-training duration. The fix is adaptive density biasing toward the hole boundary — exactly what
-`AdaptiveGrid`/AMR already implements. With #74 fixed, the correct next step for L5 is
-re-running the same `issue_70_real_l5_...` test (`user_problem.rs`, `#[ignore]`d) with AMR
-enabled and seeing whether Kt actually converges closer to 3.0 — not yet done as of this note.
+**Why L5 doesn't pass (issue #70), and why AMR alone doesn't fix it either**: a small hole
+(radius/half-width ratio ~0.05) gets almost no collocation density near its own boundary under
+uniform Monte-Carlo sampling — confirmed by a zero-cost sampling-only check (no training): only
+~0.55% of interior points land within 2 hole-radii of the boundary. A real 3000-step, 4096-point
+run gets `Kt=1.008` against the theoretical `3.0` (66% relative error). With #74 fixed, the same
+config was re-run WITH AMR enabled (`issue_70_real_l5_with_amr_enabled_after_issue_74_fix`,
+`user_problem.rs`, `#[ignore]`d) — AMR genuinely re-densified the point set across 3 sweeps
+(`4096→706→1381→2281`, confirmed working by a companion zero-cost fixture proving the refinement
+mechanism itself is sound) but Kt barely moved: `1.0088`, essentially unchanged. **Don't assume
+"fix #74, enable AMR" solves L5 — it doesn't, at least not with AMR's current residual-driven
+refinement strategy.** Working hypothesis (NOT verified): AMR's signal reflects where the
+CURRENT network's residual is large, which may not correlate with the true stress concentration
+early in training, so refinement may be concentrating in the wrong place, or too late in the
+budget, to help. A future attempt should test this hypothesis directly (e.g. earlier/more
+frequent sweeps, or a structural initial-density bias seeded from hole geometry rather than
+waiting on the network's own residual) rather than assuming more of the same AMR config will
+eventually converge.
 
 **A pre-existing CI-only flake, found and fixed during this close-out**: CI (not local `wgpu`)
 uses a software/different Wgpu backend than a local machine, and
