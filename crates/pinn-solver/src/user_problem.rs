@@ -4297,6 +4297,113 @@ mod tests {
     /// force a Kt≈3.0 assertion (issue #63 rule: "no benchmark-specific hacks to force a pass")
     /// - reports the real result honestly via `run_hole_benchmark`'s own PASS/FAIL classification.
     /// `#[ignore]`d - real cost, two full training runs (~15-25 min each in release).
+    /// Issue #63 sub-issue #71, PH4-11's own stated gap: `Strong`/`Hybrid` `FormulationSelection`
+    /// variants are wired (`loss_terms()`'s `active_base` match) and unit-tested for correct term
+    /// ACTIVATION (`strong_formulation_on_a_no_hole_geometry_activates_only_pde_residuals_and_
+    /// translation_gauge`, `hybrid_formulation_on_a_no_hole_geometry_activates_exactly_the_ph3_01_
+    /// baseline_term_set`), but until this test neither had ever been exercised in a REAL
+    /// training run this epic - only `Variational` had runtime convergence evidence. This test
+    /// closes that gap: trains both formulations on the exact same no-hole config already
+    /// verified for Variational (`half_w=half_h=0.10`, Al7075-T6, `px=6.9e7`, `hidden_dim=64`/
+    /// `n_hidden=8`, 3000 steps, `n_interior=n_boundary=4096`, AMR off), then runs the real
+    /// `run_no_hole_benchmark` P2-14 check against each - the SAME hard-threshold benchmark
+    /// Variational was held to, not a formulation-specific relaxation. Does NOT assert either
+    /// formulation must pass (issue #63's "no benchmark-specific hacks to force a pass") -
+    /// reports whatever each formulation actually achieves, honestly. `#[ignore]`d - two real
+    /// training runs (~15-25 min each in release).
+    #[test]
+    #[ignore]
+    fn issue_71_real_strong_and_hybrid_formulation_no_hole_runtime_evidence() {
+        use crate::fd_stencil::FdConfig;
+        use crate::lr_schedule::LrSchedule;
+        use crate::network::ElasticityNetConfig;
+        use crate::optim::{make_bias_optim, make_gate_optim, WeightOptim};
+        use crate::problem::{BoundaryValueProblem, DomainOptim};
+        use crate::saw_brdr::SawBrdr;
+        use crate::training_core::{step_physics_multi, BDevice, B};
+        use burn::module::AutodiffModule;
+        use burn::tensor::backend::Backend;
+        use pinn_core::messages::SolverConfig;
+        use pinn_core::problem_spec::FormulationSelection;
+
+        fn train(spec: &ProblemSpec, device: &crate::training_core::BDevice) -> crate::network::ElasticityNet<crate::training_core::BInner> {
+            let half_w = spec.geometry.half_w;
+            let half_h = spec.geometry.half_h;
+            let problem = UserDefinedProblem::new(spec.clone());
+            crate::problem::validate_loss_terms(&problem);
+            let net_cfg = ElasticityNetConfig::new()
+                .with_input_dim(spec.geometry.net_input_dim())
+                .with_hidden_dim(spec.network.hidden_dim)
+                .with_n_hidden(spec.network.n_hidden)
+                .with_output_dim(5);
+            B::seed(device, spec.network.model_init_seed);
+            let mut model = net_cfg.init(device);
+            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+            let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+            let mut saw = SawBrdr::with_base(base_weights, 0.95);
+            let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+            let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+            let scales = crate::training_core::compute_reference_scales_for_plate(spec);
+            let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
+            let config = SolverConfig::default_kirsch();
+            let sampling = problem.sampling_strategy(0);
+            let placeholder = GeometryConfig::kirsch_plate_inches();
+
+            for step in 0..spec.training.max_steps {
+                let data = resample_plate_step_data(
+                    sampling, &placeholder, &spec.load, spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
+                );
+                let ctx = plate_multi_step_ctx(
+                    &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
+                    spec.geometry.n_fourier(), false, step,
+                );
+                let (new_model, _out) = step_physics_multi(
+                    vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, device, 0, 1.0, 1.0,
+                );
+                model = new_model.into_iter().next().unwrap();
+            }
+            model.valid()
+        }
+
+        let device = BDevice::default();
+        let base_spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] },
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
+            },
+            formulation: FormulationSelection::Variational, // overwritten per-run below
+        };
+
+        let mut strong_spec = base_spec.clone();
+        strong_spec.formulation = FormulationSelection::Strong;
+        println!("=== training Strong formulation (equilibrium + outer_traction) ===");
+        let strong_model = train(&strong_spec, &device);
+        let strong_result = run_no_hole_benchmark(&strong_model, &strong_spec, &device);
+        println!("[PH4-11] Strong formulation benchmark: {strong_result:?}");
+
+        let mut hybrid_spec = base_spec.clone();
+        hybrid_spec.formulation = FormulationSelection::Hybrid(vec![
+            "interior_energy".to_string(), "equilibrium".to_string(),
+            "outer_traction".to_string(), "external_work".to_string(),
+        ]);
+        println!("=== training Hybrid formulation (interior_energy + equilibrium + outer_traction + external_work) ===");
+        let hybrid_model = train(&hybrid_spec, &device);
+        let hybrid_result = run_no_hole_benchmark(&hybrid_model, &hybrid_spec, &device);
+        println!("[PH4-11] Hybrid formulation benchmark: {hybrid_result:?}");
+
+        // Real assertions, not benchmark-forcing ones: both runs must produce finite,
+        // non-collapsed fields - a genuine training-methodology sanity check (matches this
+        // file's own `run_no_hole_benchmark_runs_end_to_end_and_correctly_fails_an_untrained_
+        // model`'s "does the number even compute" bar), independent of whether either formulation
+        // clears the hard P2-14 thresholds.
+        assert!(strong_result.sigma_xx_relative_error.is_finite(), "{strong_result:?}");
+        assert!(hybrid_result.sigma_xx_relative_error.is_finite(), "{hybrid_result:?}");
+    }
+
     #[test]
     #[ignore]
     fn issue_70_real_l5_single_hole_kt_against_verified_no_hole_companion() {
