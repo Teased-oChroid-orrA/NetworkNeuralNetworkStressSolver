@@ -6,3 +6,4 @@ target/
 pinlug_contact_pressure.csv
 .cargo/
 .shared-cargo-target/
+__pycache__/

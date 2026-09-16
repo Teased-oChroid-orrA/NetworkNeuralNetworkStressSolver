@@ -26,7 +26,7 @@ pub use loading::{BoundaryKind, BoundaryPoint, LoadConfig};
 pub use material::{LameConsts, MaterialProps};
 pub use messages::{
     AmrSweepReport, BeamTrainingUpdate, ControlMsg, DecisionMakerConfig, DiagnosticsConfig,
-    ExecutionConfig, ExecutionMode, HoleAnalysis, HoleBoundaryPoint, ParametricInferenceResult,
+    ExecutionConfig, ExecutionMode, HoleAnalysis, HoleBoundaryPoint, HoleStressDiagnostic, ParametricInferenceResult,
     ParametricTrainingUpdate, PerformanceProfile, PinLugTrainingUpdate, PinLugVisFields,
     ProblemKind, SolverConfig, StiffnessConfig, StressConcentration, TrainingMsg, TrainingUpdate,
     VisFields,

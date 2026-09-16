@@ -25,6 +25,13 @@ pub trait AmrDomain {
     fn x_range(&self) -> (f64, f64);
     fn y_range(&self) -> (f64, f64);
     fn contains(&self, x: f64, y: f64) -> bool;
+    /// Physical domain area inside `(x0, x1, y0, y1)`. This owns the geometry clipping
+    /// needed by fixed-budget quadrature; lock zones are not necessarily excluded regions.
+    /// The fallback is 64-by-64 midpoint quadrature and may miss features below that
+    /// resolution. The built-in nonoverlapping circular-hole domains override it analytically.
+    fn area_in_rect(&self, bounds: (f64, f64, f64, f64)) -> f64 {
+        numerical_rectangle_area(self, bounds)
+    }
     /// Zero or more `(center_x, center_y, radius)` zones that must stay refined to at least
     /// `AmrtConfig::min_level_hole` regardless of residual signal — generalizes the single
     /// implicit hole-at-origin zone `GeometryConfig`-based AMR has always enforced.
@@ -35,6 +42,16 @@ impl AmrDomain for GeometryConfig {
     fn x_range(&self) -> (f64, f64) { GeometryConfig::x_range(self) }
     fn y_range(&self) -> (f64, f64) { GeometryConfig::y_range(self) }
     fn contains(&self, x: f64, y: f64) -> bool { GeometryConfig::contains(self, x, y) }
+    fn area_in_rect(&self, bounds: (f64, f64, f64, f64)) -> f64 {
+        let bounds = clip_rectangle(bounds, self.x_range(), self.y_range());
+        let area = rectangle_area(bounds);
+        match self.hole {
+            HoleType::None => area,
+            HoleType::Circular { radius } => {
+                (area - circle_rectangle_area(bounds, [0.0, 0.0], radius)).max(0.0)
+            }
+        }
+    }
     /// One zone from this geometry's existing single `HoleType`, at the origin — a 1:1
     /// restatement of what `enforce_hole_zone` already hardcoded before this generalization,
     /// so every existing Kirsch/pin-lug caller's behavior is provably unchanged.
@@ -50,11 +67,96 @@ impl AmrDomain for UserGeometry {
     fn x_range(&self) -> (f64, f64) { (-self.half_w, self.half_w) }
     fn y_range(&self) -> (f64, f64) { (-self.half_h, self.half_h) }
     fn contains(&self, x: f64, y: f64) -> bool { UserGeometry::contains(self, x, y) }
+    fn area_in_rect(&self, bounds: (f64, f64, f64, f64)) -> f64 {
+        let bounds = clip_rectangle(bounds, self.x_range(), self.y_range());
+        let holes: Vec<_> = self.holes.iter().filter(|hole| {
+            circle_rectangle_area(bounds, hole.center, hole.radius) > 0.0
+        }).collect();
+        // Containment excludes the UNION of holes. Overlap is not currently prohibited
+        // by UserGeometry, so subtracting individual areas would count overlap twice.
+        for (i, hole) in holes.iter().enumerate() {
+            if holes[..i].iter().any(|other| {
+                (hole.center[0] - other.center[0]).hypot(hole.center[1] - other.center[1])
+                    < hole.radius + other.radius
+            }) {
+                return numerical_rectangle_area(self, bounds);
+            }
+        }
+        (rectangle_area(bounds) - holes.iter().map(|hole| {
+            circle_rectangle_area(bounds, hole.center, hole.radius)
+        }).sum::<f64>()).max(0.0)
+    }
     /// One zone per hole, at that hole's own center — the N-hole generalization of
     /// `GeometryConfig`'s single origin-centered zone.
     fn lock_zones(&self) -> Vec<(f64, f64, f64)> {
         self.holes.iter().map(|h| (h.center[0], h.center[1], h.radius)).collect()
     }
+}
+
+fn clip_rectangle(
+    bounds: (f64, f64, f64, f64),
+    x_range: (f64, f64),
+    y_range: (f64, f64),
+) -> (f64, f64, f64, f64) {
+    (bounds.0.max(x_range.0), bounds.1.min(x_range.1),
+     bounds.2.max(y_range.0), bounds.3.min(y_range.1))
+}
+
+fn rectangle_area(bounds: (f64, f64, f64, f64)) -> f64 {
+    (bounds.1 - bounds.0).max(0.0) * (bounds.3 - bounds.2).max(0.0)
+}
+
+fn numerical_rectangle_area<G: AmrDomain + ?Sized>(
+    geom: &G,
+    bounds: (f64, f64, f64, f64),
+) -> f64 {
+    const SIDE: usize = 64;
+    let bounds = clip_rectangle(bounds, geom.x_range(), geom.y_range());
+    let area = rectangle_area(bounds);
+    if area == 0.0 { return 0.0; }
+    let mut inside = 0;
+    for ix in 0..SIDE {
+        for iy in 0..SIDE {
+            let x = bounds.0 + (ix as f64 + 0.5) * (bounds.1 - bounds.0) / SIDE as f64;
+            let y = bounds.2 + (iy as f64 + 0.5) * (bounds.3 - bounds.2) / SIDE as f64;
+            inside += usize::from(geom.contains(x, y));
+        }
+    }
+    area * inside as f64 / (SIDE * SIDE) as f64
+}
+
+/// Analytic circle/axis-aligned-rectangle intersection. The signed primitive integrates
+/// from the circle center to each rectangle corner; inclusion/exclusion gives the area.
+fn circle_rectangle_area(
+    bounds: (f64, f64, f64, f64),
+    center: [f64; 2],
+    radius: f64,
+) -> f64 {
+    let area = rectangle_area(bounds);
+    if area == 0.0 || radius <= 0.0 { return 0.0; }
+    let (x0, x1, y0, y1) = (
+        bounds.0 - center[0], bounds.1 - center[0],
+        bounds.2 - center[1], bounds.3 - center[1],
+    );
+    let near_x = 0.0_f64.clamp(x0, x1);
+    let near_y = 0.0_f64.clamp(y0, y1);
+    if near_x.hypot(near_y) >= radius { return 0.0; }
+    if x0.abs().max(x1.abs()).hypot(y0.abs().max(y1.abs())) <= radius {
+        return area;
+    }
+    let primitive = |x: f64, y: f64| {
+        let sign = x.signum() * y.signum();
+        let x = x.abs().min(radius);
+        let y = y.abs().min(radius);
+        let crossing = (radius * radius - y * y).max(0.0).sqrt();
+        let arc = |u: f64| {
+            0.5 * (u * (radius * radius - u * u).max(0.0).sqrt()
+                + radius * radius * (u / radius).clamp(-1.0, 1.0).asin())
+        };
+        sign * if x <= crossing { x * y } else { crossing * y + arc(x) - arc(crossing) }
+    };
+    (primitive(x1, y1) - primitive(x0, y1) - primitive(x1, y0) + primitive(x0, y0))
+        .clamp(0.0, area)
 }
 
 /// Derives an `AmrtConfig` from a domain's own bounds and lock zones — generic replacement
@@ -582,6 +684,60 @@ impl<G: AmrDomain + Clone> AdaptiveGrid<G> {
         let mut rng = LcgRng::new(seed ^ call.wrapping_mul(CALL_SEED_MIX));
         let mut out = Vec::with_capacity(self.cfg.pts_per_cell * self.active_count());
         self.root.collect_points_jittered(&self.geom, &mut rng, &mut out);
+        out
+    }
+
+    /// Fresh, fixed-budget quadrature from the current adaptive leaves.
+    ///
+    /// Every active leaf is sampled the same number of times (plus one sample for a stable
+    /// prefix when `n` is not divisible by the leaf count). Each retained sample carries its
+    /// leaf area divided by that leaf's retained sample count. Consequently the returned
+    /// `DensitySample::leaf_area` values still sum to the represented domain area: increasing
+    /// the requested point budget improves quadrature resolution without duplicating any
+    /// physical area. This is deliberately different from appending a second overlapping point
+    /// set, which would make `compensation_weights` describe a different objective.
+    ///
+    /// The adaptive tree can contain more active leaves than a caller's requested budget. In
+    /// that unsupported case this returns one point per leaf rather than silently omitting a
+    /// region of the domain; callers that require an exact fixed budget must cap refinement at
+    /// or below that budget.
+    pub fn sample_points_jittered_with_density_budget(
+        &mut self,
+        n: usize,
+        seed: u64,
+    ) -> Vec<DensitySample> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let first = self.sample_points_jittered_with_density(seed);
+        let leaves = first.len();
+        if leaves == 0 {
+            return first;
+        }
+        if n <= leaves {
+            return first;
+        }
+
+        let whole_rounds = n / leaves;
+        let remainder = n % leaves;
+        let samples_per_leaf: Vec<usize> = (0..leaves)
+            .map(|i| whole_rounds + usize::from(i < remainder))
+            .collect();
+        let mut out = Vec::with_capacity(n);
+        let mut append_round = |round: Vec<DensitySample>, take: usize| {
+            for (i, mut sample) in round.into_iter().take(take).enumerate() {
+                sample.leaf_area /= samples_per_leaf[i] as f64;
+                out.push(sample);
+            }
+        };
+        append_round(first, leaves);
+        for _ in 1..whole_rounds {
+            append_round(self.sample_points_jittered_with_density(seed), leaves);
+        }
+        if remainder != 0 {
+            append_round(self.sample_points_jittered_with_density(seed), remainder);
+        }
+        debug_assert_eq!(out.len(), n);
         out
     }
 
@@ -1841,6 +1997,33 @@ mod tests {
             assert_eq!(pa.point, pb.point, "identical (seed, call index) must reproduce identical coordinates");
             assert_eq!(pa.leaf_area, pb.leaf_area);
         }
+    }
+
+    #[test]
+    fn budgeted_jittered_sampling_preserves_leaf_measure_and_requested_count() {
+        let geom = test_geom();
+        let cfg = AmrtConfig::default();
+        let reference_grid = AdaptiveGrid::new(&geom, cfg.clone());
+        let represented_area: f64 = reference_grid
+            .sample_points_with_density()
+            .iter()
+            .map(|s| s.leaf_area)
+            .sum();
+        let leaf_count = reference_grid.active_count();
+
+        let mut grid = AdaptiveGrid::new(&geom, cfg);
+        let target = leaf_count * 3 + 5;
+        let samples = grid.sample_points_jittered_with_density_budget(target, 444);
+        assert_eq!(samples.len(), target, "fixed-budget sampler must not change training work");
+        let sample_area: f64 = samples.iter().map(|s| s.leaf_area).sum();
+        assert!(
+            (sample_area - represented_area).abs() < 1e-12,
+            "splitting a leaf across several fresh samples must preserve its measure: \
+             samples={sample_area}, leaves={represented_area}"
+        );
+        let weights = compensation_weights(&samples);
+        let mean_weight: f64 = weights.iter().sum::<f64>() / weights.len() as f64;
+        assert!((mean_weight - 1.0).abs() < 1e-12, "compensation weights must remain normalized");
     }
 
     #[test]

@@ -434,6 +434,19 @@ pub struct StressConcentration {
     pub domain_classification: &'static str,
 }
 
+/// Comparison of mDEM's direct stress output with constitutive stress at one FD-safe ring.
+/// Both fields are evaluated at identical coordinates. This is a diagnostic, never a loss.
+#[derive(Debug, Clone, Copy)]
+pub struct HoleStressDiagnostic {
+    pub radial_offset_m: f64,
+    pub direct_stress_rms: f64,
+    pub derived_stress_rms: f64,
+    pub stress_mismatch_rms: f64,
+    pub stress_mismatch_max: f64,
+    pub direct_traction_rms: f64,
+    pub derived_traction_rms: f64,
+}
+
 /// One hole's full stress analysis, bundled for transport in a `TrainingUpdate` (Phase 16,
 /// "Final Results Dashboard", of the "Neural-Network-Wide Adaptive Collocation" epic).
 #[derive(Debug, Clone)]
@@ -443,6 +456,8 @@ pub struct HoleAnalysis {
     pub hole_index: usize,
     pub profile: Vec<HoleBoundaryPoint>,
     pub concentration: StressConcentration,
+    /// `None` when this solver path cannot evaluate both stress representations.
+    pub stress_diagnostic: Option<HoleStressDiagnostic>,
 }
 
 /// Transport-side mirror of `pinn_solver::training_core::GradientShareReport` — a separate
