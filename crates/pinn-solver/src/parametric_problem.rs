@@ -737,7 +737,7 @@ fn hole_analyses_at(
     geometry.holes.iter().enumerate().map(|(hole_index, hole)| {
         let profile = probe_hole_profile_parametric(model, hole, HOLE_RING_POINTS, fd, scales, e_n, nu_n, p_n, device);
         let concentration = stress_concentration(&profile, px.abs());
-        HoleAnalysis { hole_index, profile, concentration }
+        HoleAnalysis { hole_index, profile, concentration, stress_diagnostic: None }
     }).collect()
 }
 

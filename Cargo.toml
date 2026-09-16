@@ -11,6 +11,16 @@ members = [
 serde             = { version = "1.0", features = ["derive"] }
 anyhow            = "1.0"
 ndarray           = { version = "0.16", features = ["std"] }
+# Issue #74 re-investigation: 0.21.0 has a real, confirmed upstream race in burn-autodiff's
+# cross-thread graph cleanup (tracel-ai/burn#5573, "A concurrent `backward()` frees another
+# thread's autodiff steps") that reproduces in this codebase as "Node should have a step
+# registered" - fixed by tracel-ai/burn#5647, merged 2026-09-11, but NOT in any published
+# release yet. Tried pinning to that commit via git (rev 6212b88) - burn's `main` has since
+# undergone a much larger `Tensor<B, D>` API shape change beyond that one fix, producing 118+
+# compile errors across this codebase; a full migration is wildly disproportionate to fixing
+# one concurrency bug, so this stays on the published 0.21.0 and mitigates in our own code
+# instead (see `training_core.rs`'s own notes on avoiding cross-thread `.backward()` calls).
+# Revisit once a stable release contains commit 6212b88 or later.
 burn              = { version = "0.21", default-features = false, features = ["std", "autodiff", "wgpu", "fusion"] }
 nalgebra          = "0.33"
 egui              = "0.29"

@@ -412,27 +412,6 @@ pub enum InteriorSampleSource {
 /// function already takes `step` as an explicit parameter).
 const PERSISTENT_AMR_SEED: u64 = 750_075;
 
-/// Per-hole annulus sample count for one step: a bounded fraction of the step's own interior
-/// point budget, not a fixed constant — scales with the problem's own resolution instead of
-/// silently starving a large-`n_interior` run or over-spending a small one. Clamped to
-/// `[ANNULUS_MIN_POINTS, ANNULUS_MAX_POINTS]` so a pathologically tiny or huge `n_interior`
-/// still gets a sane annulus budget. `ANNULUS_FRACTION` (1/8) is a first-pass, documented-not-
-/// tuned choice (issue #75 workstream B's own text: `c`/budget parameters need "a documented
-/// physical and numerical rationale, then evaluated through controlled experiments" — this is
-/// the rationale: the uniform-sampling diagnostic this epic is built on found only ~0.55% of a
-/// 4096-point uniform batch (≈22 points) land within 2 hole-radii of a ratio=0.05 hole; 1/8 of
-/// the SAME budget (≈512) is roughly a 20x increase in near-hole density for a single hole,
-/// the right order of magnitude to test whether density alone (not residual-driven discovery
-/// timing) was the missing ingredient, without spending the entire interior budget on one
-/// hole's annulus for a multi-hole geometry).
-const ANNULUS_FRACTION: f64 = 1.0 / 8.0;
-const ANNULUS_MIN_POINTS: usize = 64;
-const ANNULUS_MAX_POINTS: usize = 512;
-
-fn annulus_point_budget(n_interior: usize) -> usize {
-    ((n_interior as f64 * ANNULUS_FRACTION) as usize).clamp(ANNULUS_MIN_POINTS, ANNULUS_MAX_POINTS)
-}
-
 /// Issue #75 workstream C: the single source of truth for whether and how THIS step's interior
 /// points come from a persistent, geometry-aware adaptive source instead of the plain uniform
 /// sample `resample_plate_step_data` already drew into `data.int_norm` — the "AMR overwrite"
@@ -451,18 +430,21 @@ fn annulus_point_budget(n_interior: usize) -> usize {
 /// on an AMR sweep step (issue #75's whole point — the pre-existing sweep-only mechanism fired
 /// 3 times in a 3000-step run and was overwritten by uniform resampling every other step,
 /// PH4-14's own real evidence for why enabling AMR alone left Kt essentially unchanged): a
-/// fresh quadtree draw via `AdaptiveGrid::sample_points_jittered_with_density` (topology
-/// persists between `adapt()` sweeps; coordinates still genuinely vary every call, issue #64's
-/// invariant) PLUS one geometry-seeded annulus per hole via `pinn_core::amr::sample_hole_
-/// annulus` — seeded from KNOWN hole geometry from step 0, not waiting on the network's own
-/// (initially uninformative) residual signal to discover the hole needs density. Overwrites
-/// `data.int_norm` and returns matching compensation weights computed from the combined point
-/// set in the SAME call, so a caller can never apply one call's weights to a different call's
-/// points (issue #75's own required invariant).
+/// fresh fixed-budget quadtree draw via
+/// `AdaptiveGrid::sample_points_jittered_with_density_budget` (topology persists between
+/// `adapt()` sweeps; coordinates still genuinely vary every call, issue #64's invariant).
+/// Hole lock zones are geometry-seeded before step zero, so this retains a structural near-hole
+/// density bias without appending a second, overlapping annular quadrature set. Overwrites
+/// `data.int_norm` and returns matching compensation weights in the SAME call, so a caller can
+/// never apply one call's weights to a different call's points.
+///
+/// Annular samples remain available as a core primitive, but are deliberately not combined
+/// here until a disjoint-strata or full mixture-density estimator exists. Appending them to a
+/// quadtree that already represents the same physical area double-counts a nonconstant field.
 pub fn apply_persistent_adaptive_interior_sample(
     data: &mut crate::problem::DomainStepData,
     geometry: &UserGeometry,
-    fd_h: f32,
+    _fd_h: f32,
     half_w: f64,
     half_h: f64,
     amr: Option<&mut pinn_core::amr::AdaptiveGrid<UserGeometry>>,
@@ -480,27 +462,32 @@ pub fn apply_persistent_adaptive_interior_sample(
     }
 
     let n_before = data.int_norm.len().max(1);
-    let margin = ring_anchor_margin_m(fd_h, geometry);
-    let mut samples: Vec<pinn_core::amr::DensitySample> =
-        grid.sample_points_jittered_with_density(PERSISTENT_AMR_SEED);
-    let n_annulus_per_hole = annulus_point_budget(n_before);
-    for hole in &geometry.holes {
-        let inner_r = hole.radius + margin;
-        let outer_r = hole.radius * (1.0 + pinn_core::amr::DEFAULT_HOLE_ZONE_FACTOR);
-        let annulus = pinn_core::amr::sample_hole_annulus(
-            hole.center, inner_r, outer_r, n_annulus_per_hole, PERSISTENT_AMR_SEED, step as u64,
-        );
-        samples.extend(annulus.into_iter().map(|a| pinn_core::amr::DensitySample {
-            point: a.point,
-            leaf_area: a.area_share,
-        }));
-    }
+    let samples = grid.sample_points_jittered_with_density_budget(n_before, PERSISTENT_AMR_SEED ^ step as u64);
 
     let weights = pinn_core::amr::compensation_weights(&samples);
     data.int_norm = samples.iter()
         .map(|s| plate_normalize_point(s.point[0], s.point[1], half_w, half_h))
         .collect();
     (InteriorSampleSource::PersistentAdaptive, Some(weights))
+}
+
+/// Build one residual-probe point per adaptive leaf represented by the grid's sampler, preserving DFS order.
+/// `AdaptiveGrid::update_residuals` assigns residuals by that exact order; probing an unrelated
+/// uniform cloud would associate each residual with the wrong leaf.
+pub fn adaptive_grid_probe_data(
+    data: &crate::problem::DomainStepData,
+    half_w: f64,
+    half_h: f64,
+    grid: &mut pinn_core::amr::AdaptiveGrid<UserGeometry>,
+    step: usize,
+) -> crate::problem::DomainStepData {
+    let samples = grid.sample_points_jittered_with_density(PERSISTENT_AMR_SEED ^ step as u64);
+    let mut probe = data.clone();
+    probe.int_norm = samples
+        .iter()
+        .map(|s| plate_normalize_point(s.point[0], s.point[1], half_w, half_h))
+        .collect();
+    probe
 }
 
 /// Builds the `MultiStepCtx` fields BOTH the headless and GUI-streaming plate training loops
@@ -2129,6 +2116,24 @@ pub fn probe_hole_boundary_profile(
     px_pa: f64,
     device: &crate::training_core::BDevice,
 ) -> Vec<HoleBoundaryPoint> {
+    probe_hole_stress_profile_direct_at_radius(
+        model, geometry, hole, n_theta, fd, u_ref, px_pa, hole.radius, device,
+    )
+}
+
+/// Direct mDEM stress at an FD-safe radial offset. Kept separate from the exact-boundary
+/// probe so diagnostics can compare direct and derived stress at identical coordinates.
+pub fn probe_hole_stress_profile_direct_at_radius(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    geometry: &UserGeometry,
+    hole: &HoleSpec,
+    n_theta: usize,
+    fd: &crate::fd_stencil::FdConfig,
+    u_ref: f32,
+    px_pa: f64,
+    radius: f64,
+    device: &crate::training_core::BDevice,
+) -> Vec<HoleBoundaryPoint> {
     use crate::differential_operator::production_strain as compute_strains;
     use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor};
     use crate::network::fwd;
@@ -2143,8 +2148,8 @@ pub fn probe_hole_boundary_profile(
     for i in 0..n {
         let theta_deg = 360.0 * i as f64 / n as f64;
         let theta = theta_deg.to_radians();
-        let x = hole.center[0] + hole.radius * theta.cos();
-        let y = hole.center[1] + hole.radius * theta.sin();
+        let x = hole.center[0] + radius * theta.cos();
+        let y = hole.center[1] + radius * theta.sin();
         thetas.push(theta_deg);
         pts_phys.push((x, y));
         pts_norm.push([(x / half_w) as f32, (y / half_h) as f32]);
@@ -2308,6 +2313,67 @@ pub fn probe_hole_boundary_profile_derived(
             sxx, syy, sxy, von_mises: vm,
         }
     }).collect()
+}
+
+/// Measure direct-versus-derived stress at the same FD-safe ring. The direct boundary profile
+/// cannot answer this question because its coordinates lie on `r=R`, while derived stress needs
+/// a margin so its finite-difference stencil stays outside the hole.
+pub fn probe_hole_stress_diagnostic(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    geometry: &UserGeometry,
+    hole: &HoleSpec,
+    n_theta: usize,
+    fd: &crate::fd_stencil::FdConfig,
+    u_ref: f32,
+    px_pa: f64,
+    material: &MaterialProps,
+    margin: f64,
+    device: &crate::training_core::BDevice,
+) -> pinn_core::messages::HoleStressDiagnostic {
+    let radius = hole.radius + margin;
+    let direct = probe_hole_stress_profile_direct_at_radius(
+        model, geometry, hole, n_theta, fd, u_ref, px_pa, radius, device,
+    );
+    let derived = probe_hole_boundary_profile_derived(
+        model, geometry, hole, n_theta, fd, u_ref, px_pa, material, margin, device,
+    );
+    let n = direct.len().min(derived.len()).max(1) as f64;
+    let mut direct_stress2 = 0.0;
+    let mut derived_stress2 = 0.0;
+    let mut mismatch2 = 0.0;
+    let mut mismatch_max: f64 = 0.0;
+    let mut direct_traction2 = 0.0;
+    let mut derived_traction2 = 0.0;
+    for (d, c) in direct.iter().zip(&derived) {
+        let theta = d.theta_deg.to_radians();
+        let (nx, ny) = (theta.cos(), theta.sin());
+        let direct_norm2 = (d.sxx as f64).powi(2) + (d.syy as f64).powi(2) + 2.0 * (d.sxy as f64).powi(2);
+        let derived_norm2 = (c.sxx as f64).powi(2) + (c.syy as f64).powi(2) + 2.0 * (c.sxy as f64).powi(2);
+        let dsxx = d.sxx as f64 - c.sxx as f64;
+        let dsyy = d.syy as f64 - c.syy as f64;
+        let dsxy = d.sxy as f64 - c.sxy as f64;
+        let mismatch = (dsxx * dsxx + dsyy * dsyy + 2.0 * dsxy * dsxy).sqrt();
+        let traction2 = |p: &HoleBoundaryPoint| {
+            let tx = p.sxx as f64 * nx + p.sxy as f64 * ny;
+            let ty = p.sxy as f64 * nx + p.syy as f64 * ny;
+            tx * tx + ty * ty
+        };
+        direct_stress2 += direct_norm2;
+        derived_stress2 += derived_norm2;
+        mismatch2 += mismatch * mismatch;
+        mismatch_max = mismatch_max.max(mismatch);
+        direct_traction2 += traction2(d);
+        derived_traction2 += traction2(c);
+    }
+    pinn_core::messages::HoleStressDiagnostic {
+        radial_offset_m: margin,
+        direct_stress_rms: (direct_stress2 / n).sqrt(),
+        derived_stress_rms: (derived_stress2 / n).sqrt(),
+        stress_mismatch_rms: (mismatch2 / n).sqrt(),
+        stress_mismatch_max: mismatch_max,
+        direct_traction_rms: (direct_traction2 / n).sqrt(),
+        derived_traction_rms: (derived_traction2 / n).sqrt(),
+    }
 }
 
 /// Stress-concentration summary derived from a hole-boundary profile. `nominal_stress` is
@@ -2553,6 +2619,7 @@ mod tests {
         );
         assert_eq!(source, InteriorSampleSource::PersistentAdaptive);
         let weights = weights.expect("hole-bearing geometry with Some(grid) must return weights");
+        assert_eq!(data.int_norm.len(), 4096, "persistent AMR must keep L5's fixed interior budget");
         assert_eq!(weights.len(), data.int_norm.len(), "points and weights must be created together, same length");
         for w in &weights {
             assert!(w.is_finite() && *w > 0.0, "weight {w} must be finite and positive");
@@ -2560,6 +2627,23 @@ mod tests {
         for [x, y] in &data.int_norm {
             assert!(*x >= -1.0 && *x <= 1.0 && *y >= -1.0 && *y <= 1.0, "normalized point ({x},{y}) out of [-1,1]");
         }
+    }
+
+    #[test]
+    fn adaptive_grid_probe_data_matches_grid_sampler_count() {
+        let geometry = l5_geometry();
+        let cfg = pinn_core::amr::derive_amr_config(
+            (-geometry.half_w, geometry.half_w, -geometry.half_h, geometry.half_h),
+            &pinn_core::amr::AmrDomain::lock_zones(&geometry),
+        );
+        let mut grid = pinn_core::amr::AdaptiveGrid::<UserGeometry>::new(&geometry, cfg);
+        let data = crate::problem::DomainStepData {
+            id: USER_DOMAIN, int_norm: uniform_int_norm(4096), extra_ring_norm: Vec::new(),
+            named: std::collections::HashMap::new(),
+        };
+        let probe = adaptive_grid_probe_data(&data, geometry.half_w, geometry.half_h, &mut grid, 0);
+        assert_eq!(probe.int_norm.len(), grid.sample_points().len());
+        assert_eq!(probe.named.len(), data.named.len(), "probe must preserve boundary point sets");
     }
 
     #[test]
@@ -3963,6 +4047,35 @@ mod tests {
             );
             assert!(p.ux.is_finite() && p.uy.is_finite() && p.eps_xx.is_finite(), "all fields must be finite for a freshly-initialized model");
         }
+    }
+
+    #[test]
+    fn hole_stress_diagnostic_compares_identical_fd_safe_coordinates() {
+        let device = crate::training_core::BDevice::default();
+        let model = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
+            .init(&device);
+        let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] };
+        let hole = HoleSpec { center: [0.0, 0.0], radius: 0.02, bc: HoleBc::Free };
+        let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+        let margin = 0.003;
+        let direct = probe_hole_stress_profile_direct_at_radius(
+            &model, &geometry, &hole, 16, &fd, 1.0, 1.0, hole.radius + margin, &device,
+        );
+        let derived = probe_hole_boundary_profile_derived(
+            &model, &geometry, &hole, 16, &fd, 1.0, 1.0, &MaterialProps::al7075_t6(), margin, &device,
+        );
+        assert_eq!(direct.len(), derived.len());
+        for (d, c) in direct.iter().zip(&derived) {
+            assert!((d.x - c.x).abs() < 1e-12 && (d.y - c.y).abs() < 1e-12,
+                "direct and derived stress must be sampled at identical coordinates");
+        }
+        let diagnostic = probe_hole_stress_diagnostic(
+            &model, &geometry, &hole, 16, &fd, 1.0, 1.0, &MaterialProps::al7075_t6(), margin, &device,
+        );
+        assert_eq!(diagnostic.radial_offset_m, margin);
+        assert!(diagnostic.stress_mismatch_rms.is_finite() && diagnostic.stress_mismatch_max.is_finite());
+        assert!(diagnostic.direct_traction_rms.is_finite() && diagnostic.derived_traction_rms.is_finite());
     }
 
     #[test]

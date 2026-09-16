@@ -1490,12 +1490,22 @@ fn run_user_problem_training_from(
         // comparison was previously impossible - AMR fired unconditionally with no fixed-
         // sampling control arm reachable at all).
         if spec.training.amr_enabled && step >= AMR_WARMUP_STEPS && (step - AMR_WARMUP_STEPS) % amr_interval == 0 {
+            // A residual must be assigned to the leaf that produced its probe point. Hole
+            // training uses persistent fixed-budget quadrature, whose repeated samples cannot
+            // satisfy that one-residual-per-leaf contract, so probe once per active leaf here.
+            // Keep no-hole's established sweep path byte-for-byte unchanged.
+            let probe_data = (!spec.geometry.holes.is_empty()).then(|| {
+                crate::user_problem::adaptive_grid_probe_data(
+                    &data, half_w, half_h, &mut amr_grid, step,
+                )
+            });
+            let probe_data = probe_data.as_ref().unwrap_or(&data);
             let probe_ctx = MultiStepCtx {
                 config: &config,
                 problem: &problem,
                 fd: &fd,
                 k: 1.0,
-                domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
+                domains: vec![DomainStepCtx { data: probe_data, u_ref, ref_energy, ref_stress2 }],
                 dynamic_lam_h_cap: f64::MAX,
                 dynamic_lam_d_cap: f64::MAX,
                 dynamic_lam_penetration_cap: f64::MAX,
@@ -1519,7 +1529,7 @@ fn run_user_problem_training_from(
                     // before` are captured from the SAME probe that fed `should_adapt` above
                     // (no extra forward pass needed for the "before" half).
                     let sweep_start = std::time::Instant::now();
-                    let points_before = data.int_norm.len();
+                    let points_before = probe_data.int_norm.len();
                     let (rms_before, max_before) = residual_stats(&residuals);
                     let domain_area = 4.0 * half_w * half_h;
                     let hole_density_before = amr_grid.lock_zone_density();
@@ -1544,7 +1554,7 @@ fn run_user_problem_training_from(
                     // `sample_points()` call, zero added cost) - `problem.set_interior_weights`
                     // is never called at all in that case, so `InteriorEnergyTerm`'s `weights`
                     // stays `None` for the whole run, matching its pre-PH3-04 behavior exactly.
-                    let points_after = if spec.geometry.holes.is_empty() {
+                    let after_probe_data = if spec.geometry.holes.is_empty() {
                         if spec.training.measure_aware_training {
                             let density_samples = amr_grid.sample_points_with_density();
                             data.int_norm = density_samples.iter().map(|s| norm_pt(s.point[0], s.point[1])).collect();
@@ -1554,20 +1564,20 @@ fn run_user_problem_training_from(
                         }
                         // Byte-for-byte identical to this block's pre-#75 diagnostic value -
                         // no-hole legacy path is untouched by issue #75.
-                        data.int_norm.len()
+                        None
                     } else {
-                        // Hole-bearing geometry: `data.int_norm` is NOT overwritten in this
-                        // block any more (the new persistent-adaptive block below owns it) -
-                        // `active_count()` reports the real topology size adapt() just produced
-                        // instead of a stale/unrelated point count.
-                        amr_grid.active_count()
+                        Some(crate::user_problem::adaptive_grid_probe_data(
+                            &data, half_w, half_h, &mut amr_grid, step,
+                        ))
                     };
+                    let after_probe_data = after_probe_data.as_ref().unwrap_or(&data);
+                    let points_after = after_probe_data.int_norm.len();
 
                     // "After" DOES need a fresh probe - the point set (and therefore the
                     // residual signal at it) genuinely changed.
                     let after_ctx = MultiStepCtx {
                         config: &config, problem: &problem, fd: &fd, k: 1.0,
-                        domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
+                        domains: vec![DomainStepCtx { data: after_probe_data, u_ref, ref_energy, ref_stress2 }],
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
@@ -1720,7 +1730,13 @@ fn run_user_problem_training_from(
                     concentration.angular_refinement_relative_change = Some(kt_convergence.angular_relative_change);
                     concentration.radial_offset_refinement_relative_change = Some(kt_convergence.radial_relative_change);
                     concentration.refinement_converged = Some(kt_convergence.converged);
-                    pinn_core::messages::HoleAnalysis { hole_index, profile, concentration }
+                    let stress_diagnostic = crate::user_problem::probe_hole_stress_diagnostic(
+                        &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
+                        &spec.material, hole_margin, &device,
+                    );
+                    pinn_core::messages::HoleAnalysis {
+                        hole_index, profile, concentration, stress_diagnostic: Some(stress_diagnostic),
+                    }
                 })
                 .collect();
             // `enhancement.txt` items 4/C ("BC residual RMS/max") - same vis cadence as
@@ -2090,7 +2106,13 @@ pub fn serve_loaded_plate_checkpoint(
             concentration.angular_refinement_relative_change = Some(kt_convergence.angular_relative_change);
             concentration.radial_offset_refinement_relative_change = Some(kt_convergence.radial_relative_change);
             concentration.refinement_converged = Some(kt_convergence.converged);
-            pinn_core::messages::HoleAnalysis { hole_index, profile, concentration }
+            let stress_diagnostic = crate::user_problem::probe_hole_stress_diagnostic(
+                &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
+                &spec.material, hole_margin, &device,
+            );
+            pinn_core::messages::HoleAnalysis {
+                hole_index, profile, concentration, stress_diagnostic: Some(stress_diagnostic),
+            }
         }).collect();
     let (bc_residual_rms, bc_residual_max) = crate::user_problem::probe_boundary_residuals(&model, &spec, &device);
     let reaction_force = crate::user_problem::probe_reaction_force(&model, &spec, &device);
@@ -3779,31 +3801,40 @@ mod tests {
             vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
         );
 
-        // Real GUI-streaming run, same spec, captured via its own channel. `run_training_user_
-        // problem` stays alive after `Done` to serve `SaveCheckpoint` requests (Stage H) - must
-        // send `Stop` (or drop `tx_ctrl`) before `handle.join()` or the join deadlocks forever.
+        // Real GUI-streaming run, same spec, captured via its own channel.
+        //
+        // Issue #74 re-investigation: this used to run on a SEPARATE `std::thread::spawn`'d
+        // thread while the "independent reference" above had ALREADY called `step_physics_
+        // multi` (a real `.backward()`) in this test's own main thread moments earlier - two
+        // different threads each driving their own `Autodiff` graph in the same process. That
+        // "one after another" ordering looks safe but isn't: `burn-ndarray`'s own persistent,
+        // process-global rayon thread pool can still have trailing work in flight from the
+        // reference computation's own backward pass (including burn-autodiff's own process-
+        // global post-backward cleanup sweep) at the exact moment the spawned thread registers
+        // its own first nodes - a real, confirmed, currently-unreleased upstream race
+        // (`tracel-ai/burn` issue #5573; fixed by PR #5647, not yet in any published release).
+        // This is very likely the actual, previously undiagnosed cause of this test's own long-
+        // documented "contention-flaky under full-suite load" behavior this session repeatedly
+        // treated as benign floating-point nondeterminism - #5573's OTHER failure mode besides a
+        // hard panic is exactly "gradient present but wrong," which is indistinguishable from
+        // float noise until you know to look for it. Calling `run_training_user_problem`
+        // directly, synchronously, in this test's own single thread (same thread that already
+        // computed the reference above) makes it structurally impossible for a second thread to
+        // ever call `.backward()` while this one is mid-graph.
         let (tx, rx) = crossbeam_channel::unbounded();
         let (tx_ctrl, stop_rx) = crossbeam_channel::unbounded();
-        let handle = std::thread::spawn(move || run_training_user_problem(spec, tx, stop_rx));
-        // 300s, not 60s: this single step-0 update is fast in isolation (~18s observed), but
-        // under full-suite `--test-threads=4` contention it can miss a short deadline the same
-        // way this codebase's other timing-sensitive tests already document (debug-build
-        // per-step cost is not constant under concurrent CPU load) - correctness is independent
-        // of the deadline value.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        drop(tx_ctrl);
+        run_training_user_problem(spec, tx, stop_rx);
         let mut step_zero: Option<Box<TrainingUpdate>> = None;
         let mut saw_done = false;
-        while std::time::Instant::now() < deadline && !saw_done {
-            match rx.try_recv() {
-                Ok(TrainingMsg::Update(u)) => { if u.step == 0 && step_zero.is_none() { step_zero = Some(u); } }
-                Ok(TrainingMsg::Done) => saw_done = true,
-                Ok(_) => {}
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                TrainingMsg::Update(u) => { if u.step == 0 && step_zero.is_none() { step_zero = Some(u); } }
+                TrainingMsg::Done => saw_done = true,
+                _ => {}
             }
         }
-        assert!(saw_done, "expected TrainingMsg::Done within the deadline");
-        drop(tx_ctrl);
-        let _ = handle.join();
+        assert!(saw_done, "expected TrainingMsg::Done to have been sent");
         let step_zero = step_zero.expect("must have captured the step-0 update");
 
         assert_eq!(
@@ -4496,56 +4527,66 @@ mod tests {
             .with_hidden_dim(base_spec.network.hidden_dim)
             .with_n_hidden(base_spec.network.n_hidden)
             .with_output_dim(5);
-        let initial_model = net_cfg.init(&device);
+        // Issue #74 re-investigation, second cause: build an INDEPENDENTLY-initialized model
+        // per arm (same seed, so both start from numerically identical weights) instead of
+        // `.clone()`-ing one shared `initial_model` into arm 1 while moving the original into
+        // arm 2. Cloning a `Module`/`Tensor` in burn is a cheap clone - it shares the same
+        // underlying autodiff `NodeId`, it does not mint a fresh leaf. Arm 1 then drives that
+        // shared identity through many real `.backward()` calls; arm 2 touching the SAME
+        // identity afterward is exactly the "a leaf reused after an earlier `backward()`"
+        // trigger `tracel-ai/burn` issue #5573 describes (see `ph4_09_controlled_comparison_
+        // ...`'s own fuller explanation, below, for the full citation).
+        let seed = base_spec.network.model_init_seed;
+        let make_model = || {
+            B::seed(&device, seed);
+            net_cfg.init(&device)
+        };
 
         // Returns (final update, the AmrSweepReport from whichever update actually carried one -
         // `amr_sweep` is `Some` ONLY on the exact step a sweep fires, not on every update after,
         // so checking only the LAST update would miss it entirely once training runs past step
         // 200).
+        //
+        // Issue #74 re-investigation: this closure previously spawned a fresh OS thread per
+        // call (`std::thread::spawn`), so with two sequential calls the process had two
+        // DIFFERENT threads each independently driving an `Autodiff` graph and calling
+        // `.backward()` - a real, confirmed, currently-unreleased upstream burn-autodiff race
+        // (`tracel-ai/burn` issue #5573: a concurrent `backward()` can free another thread's
+        // still-being-registered graph node via the library's own process-global post-backward
+        // cleanup sweep; fixed by burn PR #5647, not yet in any published release). Calling
+        // `run_user_problem_training_from` directly, synchronously, in this test's own single
+        // thread for both calls in strict sequence makes it structurally impossible for two
+        // threads to ever call `.backward()` at the same time - see the identical fix and its
+        // fuller rationale on `ph4_09_controlled_comparison_...`'s own `run` closure, below.
         let run = |spec: ProblemSpec, model: ElasticityNet<B>| -> (Box<TrainingUpdate>, Option<pinn_core::messages::AmrSweepReport>) {
             let (tx, rx) = crossbeam_channel::unbounded();
             let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
-            // Clone (not move) `device` here so `run` itself only needs to BORROW it - a
-            // capture-by-move (forced by moving `device` straight into this inner closure)
-            // would make `run` callable only once whenever `BDevice` isn't `Copy` (true for
-            // `WgpuDevice` under the default feature set - see CLAUDE.md's `Backend::seed`
-            // section for the sibling gotcha this one was found alongside). This closure is
-            // called twice below.
-            let thread_device = device.clone();
-            let handle = std::thread::spawn(move || run_user_problem_training_from(spec, model, thread_device, 0, tx, rx_ctrl));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            drop(tx_ctrl);
+            run_user_problem_training_from(spec, model, device.clone(), 0, tx, rx_ctrl);
             let mut last_update: Option<Box<TrainingUpdate>> = None;
             let mut sweep_seen: Option<pinn_core::messages::AmrSweepReport> = None;
             let mut saw_done = false;
-            while std::time::Instant::now() < deadline && !saw_done {
-                match rx.try_recv() {
-                    Ok(TrainingMsg::Update(u)) => {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    TrainingMsg::Update(u) => {
                         if let Some(s) = &u.amr_sweep { sweep_seen = Some(s.clone()); }
                         last_update = Some(u);
                     }
-                    Ok(TrainingMsg::Done) => saw_done = true,
-                    Ok(_) => {}
-                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    TrainingMsg::Done => saw_done = true,
+                    _ => {}
                 }
             }
-            assert!(saw_done, "expected TrainingMsg::Done within the deadline");
-            // `run_user_problem_training_from` stays alive after `Done`, blocking on `stop_rx.
-            // recv()` to serve `SaveCheckpoint` requests - drop the sender explicitly BEFORE
-            // `join()` (not after, which would deadlock: `join()` would wait for the thread,
-            // which waits for this drop, which only happens once `run()` returns) so `recv()`
-            // returns `Err` and the thread exits promptly.
-            drop(tx_ctrl);
-            let _ = handle.join();
+            assert!(saw_done, "expected TrainingMsg::Done to have been sent");
             (last_update.expect("must have received at least one Update"), sweep_seen)
         };
 
         let mut legacy_spec = base_spec.clone();
         legacy_spec.training.measure_aware_training = false;
-        let (legacy_final, legacy_sweep) = run(legacy_spec, initial_model.clone());
+        let (legacy_final, legacy_sweep) = run(legacy_spec, make_model());
 
         let mut measure_aware_spec = base_spec.clone();
         measure_aware_spec.training.measure_aware_training = true;
-        let (measure_aware_final, measure_aware_sweep) = run(measure_aware_spec, initial_model);
+        let (measure_aware_final, measure_aware_sweep) = run(measure_aware_spec, make_model());
 
         println!("[PH3-04] legacy final: total_loss={:.6e} energy_loss={:.6e} sweep={:?}",
             legacy_final.total_loss, legacy_final.energy_loss, legacy_sweep);
@@ -4659,30 +4700,36 @@ mod tests {
             .with_hidden_dim(base_spec.network.hidden_dim)
             .with_n_hidden(base_spec.network.n_hidden)
             .with_output_dim(5);
-        let initial_model = net_cfg.init(&device);
+        // Issue #74 re-investigation: same two fixes as `ph4_09_controlled_comparison_...`
+        // (its own doc comment below has the full citation/rationale) - (1) build an
+        // independently-initialized model per arm instead of `.clone()`-ing/moving one shared
+        // model (a burn `Module`/`Tensor` clone shares the same underlying autodiff `NodeId`;
+        // arm 2 touching that same identity after arm 1 drove it through 2200 real
+        // `.backward()` calls is exactly `tracel-ai/burn` issue #5573's "leaf reused after an
+        // earlier backward()" trigger), and (2) call `run_user_problem_training_from` directly,
+        // synchronously, in this test's own single thread rather than spawning a fresh OS
+        // thread per arm.
+        let seed = base_spec.network.model_init_seed;
+        let make_model = || {
+            B::seed(&device, seed);
+            net_cfg.init(&device)
+        };
 
         let run = |spec: ProblemSpec, model: ElasticityNet<B>| -> Box<TrainingUpdate> {
             let (tx, rx) = crossbeam_channel::unbounded();
             let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
-            // Same fix as the sibling `run` closure above - clone `device` so `run` itself
-            // only borrows, keeping it callable more than once regardless of whether `BDevice`
-            // is `Copy` (see the comment there for the full explanation).
-            let thread_device = device.clone();
-            let handle = std::thread::spawn(move || run_user_problem_training_from(spec, model, thread_device, 0, tx, rx_ctrl));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            drop(tx_ctrl);
+            run_user_problem_training_from(spec, model, device.clone(), 0, tx, rx_ctrl);
             let mut last_update: Option<Box<TrainingUpdate>> = None;
             let mut saw_done = false;
-            while std::time::Instant::now() < deadline && !saw_done {
-                match rx.try_recv() {
-                    Ok(TrainingMsg::Update(u)) => last_update = Some(u),
-                    Ok(TrainingMsg::Done) => saw_done = true,
-                    Ok(_) => {}
-                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    TrainingMsg::Update(u) => last_update = Some(u),
+                    TrainingMsg::Done => saw_done = true,
+                    _ => {}
                 }
             }
-            assert!(saw_done, "expected TrainingMsg::Done within the deadline");
-            drop(tx_ctrl);
-            let _ = handle.join();
+            assert!(saw_done, "expected TrainingMsg::Done to have been sent");
             last_update.expect("must have received at least one Update")
         };
 
@@ -4715,11 +4762,11 @@ mod tests {
 
         let mut fixed_spec = base_spec.clone();
         fixed_spec.training.amr_enabled = false;
-        let fixed_final = run(fixed_spec, initial_model.clone());
+        let fixed_final = run(fixed_spec, make_model());
 
         let mut amr_spec = base_spec.clone();
         amr_spec.training.amr_enabled = true;
-        let amr_final = run(amr_spec, initial_model);
+        let amr_final = run(amr_spec, make_model());
 
         let fixed_disp_err = fixed_final.vis.as_ref().map(|v| displacement_rms_relative_error(v, half_w, half_h, e, nu, px));
         let amr_disp_err = amr_final.vis.as_ref().map(|v| displacement_rms_relative_error(v, half_w, half_h, e, nu, px));
@@ -4734,6 +4781,49 @@ mod tests {
         // test's own doc comment.
         assert!(fixed_final.total_loss.is_finite());
         assert!(amr_final.total_loss.is_finite());
+    }
+
+    /// Exercise the production diagnostic cadence and a topology-changing sweep without a
+    /// large convergence run. A disconnected worker must expose its panic immediately.
+    #[test]
+    fn variational_amr_diagnostics_survive_repeated_backward_passes() {
+        let device = BDevice::default();
+        let mut spec = no_hole_plate_spec(221);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        spec.training.amr_enabled = true;
+        spec.training.n_interior = 32;
+        spec.training.n_boundary = 32;
+        spec.network.hidden_dim = 8;
+        spec.network.n_hidden = 2;
+        spec.network.auto_stop_on_plateau = false;
+        let model = ElasticityNetConfig::new().with_input_dim(3)
+            .with_hidden_dim(8).with_n_hidden(2).with_output_dim(5).init(&device);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || run_user_problem_training_from(spec, model, device, 0, tx, rx_ctrl));
+        let mut last_step = None;
+        let mut saw_sweep = false;
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+                Ok(TrainingMsg::Update(u)) => {
+                    last_step = Some(u.step);
+                    saw_sweep |= u.amr_sweep.is_some();
+                    assert!(u.total_loss.is_finite());
+                }
+                Ok(TrainingMsg::Done) => break,
+                Ok(_) => {}
+                Err(err) => {
+                    drop(tx_ctrl);
+                    if let Err(panic) = handle.join() { std::panic::resume_unwind(panic); }
+                    panic!("training ended {err:?} after step {last_step:?}");
+                }
+            }
+        }
+        drop(tx_ctrl);
+        handle.join().expect("worker failed");
+        assert_eq!(last_step, Some(220));
+        assert!(saw_sweep);
     }
 
     /// Issue #63 sub-issue #67: PH3-12's own controlled "fixed sampling vs AMR, same training
@@ -4780,37 +4870,98 @@ mod tests {
             .with_hidden_dim(base_spec.network.hidden_dim)
             .with_n_hidden(base_spec.network.n_hidden)
             .with_output_dim(5);
-        let initial_model = net_cfg.init(&device);
+        // Issue #74 re-investigation, second and likely primary cause: this used to build ONE
+        // `initial_model` and hand `.clone()` to arm 1 while moving the ORIGINAL into arm 2.
+        // Cloning a `Module`/`Tensor` in burn is a CHEAP clone - it does not mint a fresh
+        // autodiff leaf, it shares the same underlying `NodeId`/graph identity (the same reason
+        // `Tensor::clone()` is safe to use freely within ONE computation graph without breaking
+        // gradient flow). Arm 1 then ran 2200 real `.backward()` calls against that shared
+        // identity; arm 2 then built its OWN first graph from the ORIGINAL handle to the SAME
+        // identity - exactly the "a leaf reused after an earlier `backward()`" trigger
+        // `tracel-ai/burn` issue #5573 describes, independent of any thread/process boundary
+        // (that issue's own report focuses on the concurrent case, but the underlying "stale
+        // graph-locator entry for a reused leaf" mechanism it documents does not require
+        // concurrency to matter here - only that arm 2 touch the same identity arm 1 already
+        // drove through many backward passes). Building two INDEPENDENTLY-initialized models
+        // from the same seed (matching the pattern `issue_70_real_l5_*`/`issue_75_real_l5_*`/
+        // `issue_71_real_strong_and_hybrid_*` already use, which is why those real Kt results
+        // were never at risk from either mechanism) gives both arms numerically identical
+        // starting weights with NO shared autodiff identity at all.
+        let seed = base_spec.network.model_init_seed;
+        let make_model = || {
+            B::seed(&device, seed);
+            net_cfg.init(&device)
+        };
 
+        // Issue #74 re-investigation: this comparison used to ALSO spawn a fresh OS thread per
+        // arm (`std::thread::spawn(move || run_user_problem_training_from(...))`), so with two
+        // sequential `run()` calls the process saw TWO DIFFERENT threads each independently
+        // drive an `Autodiff` graph and call `.backward()`, even though - from THIS test's own
+        // logical flow - arm 1 fully completes and its thread is joined before arm 2 starts.
+        // That "sequential-looking" pattern is NOT actually safe: `burn-ndarray`'s own
+        // `multi-threads` (rayon) feature keeps a PROCESS-GLOBAL thread pool alive across the
+        // whole process, independent of any one `std::thread::spawn`'d worker's own lifetime -
+        // trailing rayon-dispatched work from arm 1's last step(s) can still be in flight
+        // (including burn-autodiff's own post-backward cleanup sweep, which is itself
+        // process-global, not scoped to the graph that just backpropagated - see
+        // `tracel-ai/burn` issue #5573, "A concurrent `backward()` frees another thread's
+        // autodiff steps") at the exact moment arm 2's freshly-spawned thread registers its own
+        // first nodes. This is a genuine, confirmed, currently-unreleased upstream race (fixed
+        // by burn PR #5647, "retain input nodes until child registration", merged 2026-09-11 -
+        // not yet in any published burn/burn-autodiff release as of this writing), NOT the
+        // AMR-probe-ownership mechanism issue #74 originally (incorrectly) diagnosed: the crash
+        // this test reproduces fires on arm 2's very FIRST `.backward()` call, before AMR's own
+        // warmup period even ends, so no AMR residual probe has ever run at the point of
+        // failure - the earlier "route the probe through BInner" fix was a real, harmless
+        // improvement (removes one genuine forward-without-backward graph leak) but was never
+        // the actual cause of THIS crash.
+        //
+        // Fix scoped to what we control without an unreleased burn upgrade: eliminate the
+        // multi-thread trigger entirely for this comparison. `run_user_problem_training_from`
+        // only needs a background thread so a caller can concurrently poll its channel while
+        // training runs (the real GUI-streaming use case); a synchronous, single-arm-at-a-time
+        // test doesn't need that. Calling it directly, in this test's own one and only thread,
+        // for both arms in strict sequence, makes it structurally impossible for two threads to
+        // ever call `.backward()` at the same time - the race's own precondition never occurs,
+        // independent of rayon's own internal scheduling. `tx`/`rx` stay unbounded so every
+        // `Update`/`Done` message the (now synchronous) call pushes is simply buffered for this
+        // function to drain afterward; `tx_ctrl` is dropped BEFORE the call (not after) so the
+        // function's own post-`Done` `stop_rx.recv()` wait (serving `SaveCheckpoint` requests
+        // from a live GUI) sees an immediately-disconnected channel and returns right away
+        // instead of blocking forever waiting for a controller this synchronous caller will
+        // never provide.
         let run = |spec: ProblemSpec, model: ElasticityNet<B>| -> Box<TrainingUpdate> {
+            let amr_enabled = spec.training.amr_enabled;
+            eprintln!("[PH4-09] starting arm amr={amr_enabled}");
             let (tx, rx) = crossbeam_channel::unbounded();
             let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
-            let thread_device = device.clone();
-            let handle = std::thread::spawn(move || run_user_problem_training_from(spec, model, thread_device, 0, tx, rx_ctrl));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+            drop(tx_ctrl);
+            run_user_problem_training_from(spec, model, device.clone(), 0, tx, rx_ctrl);
             let mut last_update: Option<Box<TrainingUpdate>> = None;
             let mut saw_done = false;
-            while std::time::Instant::now() < deadline && !saw_done {
-                match rx.try_recv() {
-                    Ok(TrainingMsg::Update(u)) => last_update = Some(u),
-                    Ok(TrainingMsg::Done) => saw_done = true,
-                    Ok(_) => {}
-                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    TrainingMsg::Update(u) => {
+                        if u.step % 100 == 0 {
+                            eprintln!("[PH4-09] amr={amr_enabled} step={} loss={:.6e}", u.step, u.total_loss);
+                        }
+                        last_update = Some(u);
+                    }
+                    TrainingMsg::Done => saw_done = true,
+                    _ => {}
                 }
             }
-            assert!(saw_done, "expected TrainingMsg::Done within the deadline");
-            drop(tx_ctrl);
-            let _ = handle.join();
+            assert!(saw_done, "expected TrainingMsg::Done to have been sent");
             last_update.expect("must have received at least one Update")
         };
 
         let mut fixed_spec = base_spec.clone();
         fixed_spec.training.amr_enabled = false;
-        let fixed_final = run(fixed_spec, initial_model.clone());
+        let fixed_final = run(fixed_spec, make_model());
 
         let mut amr_spec = base_spec.clone();
         amr_spec.training.amr_enabled = true;
-        let amr_final = run(amr_spec, initial_model);
+        let amr_final = run(amr_spec, make_model());
 
         println!("[PH4-09] fixed sampling: total_loss={:.6e} benchmark={:?} energy_balance={:?}",
             fixed_final.total_loss, fixed_final.no_hole_benchmark, fixed_final.energy_balance);

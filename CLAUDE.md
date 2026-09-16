@@ -605,16 +605,41 @@ session, not a duplicate of those documents.
 runs pass all five P2-14 hard thresholds with real margin). **Not yet operational**: hole/Kt
 numerical accuracy (L5) — real, evidenced, and explicitly not hidden behind a passing benchmark.
 
-**Issue #74 (AMR+Variational autodiff crash) is FIXED and verified** — see
-`training_core::probe_interior_energy_residuals`'s own doc comment and PH4-09's manifest entry
-for the full root-cause/fix record. One-line summary: the probe ran forward passes through the
-live `Autodiff<BInner>` model without ever calling `.backward()`, orphaning autodiff graph nodes
-across repeated AMR sweeps; fixed by routing it through `BInner` via `.valid()`, mirroring
-Kirsch's own already-working AMR sweep in `headless.rs`. The 2200-step reproduction test now
-completes cleanly. AMR still stays OFF for the *canonical no-hole* benchmark specifically — that
-was always a separate, independently-measured quality-regression finding, not the crash, and
-this fix doesn't address it. AMR is now safe to actually try for hole geometries, which was
-always the point (see below).
+**Issue #74 (AMR+Variational autodiff crash) is FIXED and verified — via a DIFFERENT root cause
+than first diagnosed.** See PH4-23 in the manifest for the full, corrected record; PH4-09's own
+entry documents the original (real but incomplete) diagnosis for history. One-line summary: the
+`probe_interior_energy_residuals`-through-`BInner` fix (routing the AMR residual probe through
+the non-autodiff backend) is a genuine, valid improvement but was **not** the actual cause of
+this crash — the crash fires on a fresh model's very first `.backward()` call, before AMR's own
+warmup period even ends. The REAL cause is a confirmed, currently-unreleased upstream burn-
+autodiff bug (`tracel-ai/burn` issue #5573 - a concurrent `backward()` can free another thread's
+still-being-registered graph node via the library's own process-global post-backward cleanup
+sweep; fixed by burn PR #5647, not yet in any published release), triggered in OUR OWN test
+harnesses by two compounding causes: spawning a separate OS thread per comparison arm, and
+building one `initial_model` then handing `.clone()` to one arm while moving the original into
+the other - **a burn `Module`/`Tensor` clone is cheap and shares the same underlying autodiff
+`NodeId`, it does not mint a fresh leaf**, so the second arm ends up reusing an identity the
+first arm already drove through thousands of real backward passes. Fixed in
+`ph4_09_controlled_comparison_...`/`ph3_12_controlled_comparison_...`/`gui_streaming_step_zero_
+...` by (a) calling the training function synchronously in the test's own thread instead of
+spawning one per arm, and (b) building independently-`.init()`'d models from the same seed
+instead of clone/move. This is also the likely real explanation for `gui_streaming_step_zero_
+...`'s long-documented "contention-flaky" behavior this whole epic attributed to vague floating-
+point nondeterminism. AMR still stays OFF for the *canonical no-hole* benchmark specifically —
+that was always a separate, independently-measured quality-regression finding, unrelated to
+either crash mechanism.
+
+**A `cargo test` run WITHOUT `--test-threads=1` (cargo's own default) can still occasionally
+show `gui_streaming_step_zero_...` fail** - this is the SAME upstream bug at the cross-test-
+function level (some unrelated, concurrently-running test's own training thread racing with
+this one), not a new or unfixed issue. **CI is unaffected**: `.github/workflows/rust.yml`
+already runs every job with `--test-threads=1` for an unrelated, pre-existing GPU/lavapipe-
+contention reason. Use `--test-threads=1` for a reliable full-suite run locally too.
+
+**Durable lesson**: a burn `Module`/`Tensor` `.clone()` is a cheap, identity-sharing clone, not
+a deep copy that mints a fresh autodiff leaf. Any future test wanting two genuinely independent
+training runs from "the same starting weights" must build them via two separate `.init()` calls
+under the same seed, never via `.clone()`/move of one shared instance.
 
 **Why L5 doesn't pass (issue #70), and why AMR alone doesn't fix it either**: a small hole
 (radius/half-width ratio ~0.05) gets almost no collocation density near its own boundary under

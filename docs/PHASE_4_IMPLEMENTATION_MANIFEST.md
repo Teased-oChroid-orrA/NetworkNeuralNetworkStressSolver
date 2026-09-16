@@ -1104,3 +1104,102 @@ trained model, not more formulation/sampling experiments — a fundamentally dif
 targeted next step than the two real training-based hypotheses just tested, and a natural point
 to pause the active real-experiment phase and report comprehensively rather than continue
 guessing at formulation/mechanism changes without a new, specific, evidenced hypothesis to test.
+
+## PH4-23 — Correction to PH4-09/issue #74: the real root cause and fix
+
+Status: VERIFIED. This corrects (does not merely supplement) PH4-09's own "Issue #74 fix"
+section above — that diagnosis was real but incomplete, and its "FIXED and verified" claim on
+issue #74 was based on insufficient evidence (two clean runs of an intermittent crash).
+
+### What was actually wrong with the original diagnosis
+
+The original fix (routing `probe_interior_energy_residuals` through `BInner` instead of the
+live `Autodiff` graph) is a real, valid improvement — it removes a genuine forward-without-
+backward graph leak — but it was **not** the cause of the crash `ph4_09_controlled_comparison_
+fixed_sampling_vs_amr_corrected_variational_same_budget` reproduces. Direct evidence: the crash
+fires on a fresh model's very first `.backward()` call, immediately after the prior arm
+finishes — before AMR's own `AMR_WARMUP_STEPS` (200) even elapses, so no AMR residual probe has
+ever run at the point of failure.
+
+### Real root cause (confirmed via upstream source and issue tracker, not inferred)
+
+This is a **real, confirmed, currently-unreleased upstream burn-autodiff bug**:
+[`tracel-ai/burn` issue #5573](https://github.com/tracel-ai/burn/issues/5573), "A concurrent
+`backward()` frees another thread's autodiff steps, silently losing a gradient" — fixed by
+[PR #5647](https://github.com/tracel-ai/burn/pull/5647) ("retain input nodes until child
+registration"), merged 2026-09-11. Not in any published release (0.21.0 predates it; 0.22.0 is
+still pre-release).
+
+Mechanism, read directly from burn-autodiff 0.21.0's own source
+(`burn-autodiff/src/runtime/graph.rs`): `AutodiffServer` state lives behind a **process-global**
+`static STATE: Mutex<Option<GraphLocator>>`. Every `.backward()` call anywhere in the process
+triggers `GraphCleaner::cleanup_orphaned_entries()`, sweeping **every** graph currently tracked
+process-wide via an unsound liveness check (`Arc::strong_count > 1`). A node can be live-but-
+momentarily-unreferenced during normal op internals (e.g. mid-`float_cat`, per #5573's own
+detailed trace); a concurrent sweep from a *different* thread's backward() can free it in that
+window.
+
+Two independent, compounding triggers were found in **our own test harnesses** (not production
+training code):
+
+1. `ph4_09_controlled_comparison_...`/`ph3_12_controlled_comparison_...` spawned a **separate OS
+   thread per comparison arm**. Even though arm 1 fully joins before arm 2 starts, `burn-
+   ndarray`'s persistent process-global rayon thread pool can leave trailing work in flight -
+   genuine cross-thread overlap despite the sequential-looking test structure.
+2. The same two tests built one `initial_model` and handed `.clone()` to arm 1 while moving the
+   *original* into arm 2. **Cloning a burn `Module`/`Tensor` is a cheap clone that shares the
+   same underlying autodiff `NodeId`** - it does not mint a fresh leaf. Arm 1 drives that shared
+   identity through ~2200 real `.backward()` calls; arm 2 touching the same identity afterward
+   is exactly #5573's own "leaf reused after an earlier `backward()`" trigger, independent of
+   any thread boundary at all.
+
+`gui_streaming_step_zero_matches_independent_shared_function_computation`'s long-documented
+"contention-flaky under full-suite load" behavior (attributed all epic to vague floating-point
+nondeterminism) has the same shape as trigger (1): a real `.backward()` call in the test's main
+thread (the "independent reference" computation) immediately followed by a separately-spawned
+training thread. This is very likely the actual, previously-undiagnosed cause.
+
+### Fix
+
+`crates/pinn-solver/src/runner.rs`: for all three tests, (a) call `run_user_problem_training_
+from`/`run_training_user_problem` directly, synchronously, in the test's own single thread
+instead of spawning a background thread per call, and (b) where a shared model previously fed
+both arms via `.clone()`/move, build two **independently-initialized** models from the same
+seed (`B::seed` + `.init()`) instead - matching the pattern `issue_70_real_l5_*`/`issue_75_
+real_l5_*`/`issue_71_real_strong_and_hybrid_*` already used (which is why those real Kt results
+were never at risk from either mechanism - they never share a model identity or a second
+thread).
+
+**Also attempted, reverted**: pinned `burn`/`burn-ndarray` to the exact post-#5647 commit via a
+git dependency. Burn's `main` has since undergone a much larger `Tensor<B, D>` API shape change
+beyond that one fix, producing 118+ compile errors across this codebase - a full migration is
+wildly disproportionate to fixing one concurrency bug in our own test harnesses. Reverted to the
+published `version = "0.21"`; see the dependency's own comment in the workspace `Cargo.toml` for
+when to revisit.
+
+### Verification (real, not just "compiles" or "one clean run")
+
+- Both `ph4_09`/`ph3_12` re-run under **forced concurrency** (2-3 concurrent release processes
+  competing for CPU, the same condition that reliably reproduced the crash before the fix): all
+  passed cleanly. The two independent `ph4_09` processes produced **byte-identical** final
+  results (`sigma_xx_relative_error=0.011453909629973476` in both) - real evidence of genuine
+  determinism restored, not just absence of a crash this one time.
+- `gui_streaming_step_zero_...` passes 10/10 in isolation with stable timing (no more left/right
+  divergence across runs).
+- Full `cargo test -p pinn-solver --features ndarray-backend -- --test-threads=1` (the exact CI
+  invocation): **471 passed, 0 failed, 34 ignored** - clean, no flaky-test failure at all.
+- A `cargo test` run WITHOUT `--test-threads=1` (cargo's own default, multiple test *functions*
+  running concurrently) can still occasionally show `gui_streaming_step_zero_...` fail - this is
+  the SAME upstream bug at the cross-test-function level (a completely different, unrelated test
+  function's own training thread racing with this one), not a new or unfixed issue. **CI is
+  unaffected**: `.github/workflows/rust.yml` already runs every job with `--test-threads=1` (for
+  an unrelated, pre-existing GPU/lavapipe-contention reason, documented in its own comment) -
+  different test functions never run concurrently there. For a reliable full-suite run locally,
+  use `--test-threads=1`.
+
+### Durable lesson
+
+A burn `Module`/`Tensor` `.clone()` is a **cheap, identity-sharing clone**, not a deep copy that
+mints a fresh autodiff leaf. Any future test (or production code) that wants two genuinely
+independent training runs/graphs from "the same starting weights" must construct them via two
+separate `.init()` calls under the same seed, never via `.clone()`/move of one shared instance.
