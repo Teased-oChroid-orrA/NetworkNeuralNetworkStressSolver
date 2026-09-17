@@ -925,6 +925,7 @@ pub fn run_training_pinlug(
                 dynamic_lam_non_tension_cap: 100.0,
                 constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                 n_fourier: 0,
+                coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
                 probe_term_gradients: false,
                 phase2_active: false,
                 step,
@@ -959,6 +960,7 @@ pub fn run_training_pinlug(
                         dynamic_lam_penetration_cap: 500.0, dynamic_lam_non_tension_cap: 100.0,
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                         n_fourier: 0,
+                        coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
                         probe_term_gradients: false,
                         phase2_active: false, step,
                     };
@@ -1003,6 +1005,7 @@ pub fn run_training_pinlug(
                         dynamic_lam_penetration_cap: 500.0, dynamic_lam_non_tension_cap: 100.0,
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                         n_fourier: 0,
+                        coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
                         probe_term_gradients: false,
                         phase2_active: false, step,
                     };
@@ -1049,6 +1052,7 @@ pub fn run_training_pinlug(
             // now-real `dynamic_lam_h_cap` cap.
             constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
             probe_term_gradients: false,
             phase2_active: false,
             step,
@@ -1143,6 +1147,10 @@ pub fn run_training_user_problem(
     tx: Sender<TrainingMsg>,
     stop_rx: Receiver<ControlMsg>,
 ) {
+    if crate::user_problem::AnnularDecompositionProblem::supports(&spec) {
+        run_training_annular_decomposition(spec, tx, stop_rx);
+        return;
+    }
     let device = BDevice::default();
     let net_cfg = ElasticityNetConfig::new()
         // See `UserGeometry::n_fourier`'s doc comment - was hardcoded `3` (no Fourier
@@ -1169,6 +1177,70 @@ pub fn run_training_user_problem(
     B::seed(&device, spec.network.model_init_seed);
     let model = net_cfg.init(&device);
     run_user_problem_training_from(spec, model, device, 0, tx, stop_rx);
+}
+
+/// Production dispatch for #77's annular/global pair. The existing `TrainingUpdate` has one
+/// visualization field, so this first production slice reports live optimization telemetry but
+/// deliberately sends no misleading one-model field image. Checkpoint/resume stays disabled:
+/// one-model checkpoint records cannot faithfully restore a bonded model pair.
+fn run_training_annular_decomposition(
+    spec: ProblemSpec,
+    tx: Sender<TrainingMsg>,
+    stop_rx: Receiver<ControlMsg>,
+) {
+    let device = BDevice::default();
+    let problem = crate::user_problem::AnnularDecompositionProblem::new(spec.clone());
+    validate_loss_terms(&problem);
+    let stress_source_report: Vec<(&'static str, &'static str)> = crate::training_core::stress_source_report(&problem).into_iter()
+        .map(|(name, source)| (name, match source {
+            crate::problem::StressSource::Direct => "Direct",
+            crate::problem::StressSource::Derived => "Derived",
+            crate::problem::StressSource::Both => "Both",
+        })).collect();
+    let boundary_operator_report: Vec<(&'static str, &'static str)> = crate::training_core::boundary_operator_report(&problem).into_iter()
+        .map(|(name, kind)| (name, match kind {
+            crate::problem::BoundaryOperatorKind::Dirichlet => "Dirichlet",
+            crate::problem::BoundaryOperatorKind::Neumann => "Neumann",
+            crate::problem::BoundaryOperatorKind::Robin => "Robin",
+            crate::problem::BoundaryOperatorKind::Periodic => "Periodic",
+            crate::problem::BoundaryOperatorKind::Symmetry => "Symmetry",
+            crate::problem::BoundaryOperatorKind::Interface => "Interface",
+        })).collect();
+    let derivative_order_report: Vec<(&'static str, &'static str)> = crate::training_core::derivative_order_report(&problem).into_iter()
+        .map(|(name, order)| (name, match order {
+            crate::problem::DerivativeOrder::First => "First",
+            crate::problem::DerivativeOrder::Second => "Second",
+        })).collect();
+    let formulation_kind_report: Vec<(&'static str, &'static str)> = crate::training_core::formulation_kind_report(&problem).into_iter()
+        .map(|(name, kind)| (name, match kind {
+            crate::problem::FormulationKind::Strong => "Strong",
+            crate::problem::FormulationKind::Weak => "Weak",
+        })).collect();
+    let constraint_report: Vec<(&'static str, &'static str)> = crate::training_core::constraint_report(&problem).into_iter()
+        .map(|(name, kind)| (name, match kind {
+            crate::problem::ConstraintKind::Unconstrained => "Unconstrained",
+            crate::problem::ConstraintKind::PenaltyInequality => "PenaltyInequality",
+        })).collect();
+    let _ = crate::user_runner::run_annular_decomposition_training(spec, device, |step, total_loss, lr, n_colloc| {
+        let stop = matches!(stop_rx.try_recv(), Ok(ControlMsg::Stop) | Err(crossbeam_channel::TryRecvError::Disconnected));
+        let update = TrainingUpdate {
+            step, total_loss, energy_loss: total_loss, neumann_loss: 0.0, lr: lr as f32,
+            lam_energy: 1.0, lam_neumann: 0.0, n_colloc, kt_estimate: None, vis: None,
+            amr_sweep: None, hole_analyses: Vec::new(), grad_norm: None,
+            bc_residual_rms: 0.0, bc_residual_max: 0.0, reaction_force: None,
+            energy_balance: None, network_snapshot: None, architecture_event: None,
+            gradient_share_report: None, gradient_conflict_report: None,
+            stress_source_report: stress_source_report.clone(),
+            boundary_operator_report: boundary_operator_report.clone(),
+            derivative_order_report: derivative_order_report.clone(),
+            formulation_kind_report: formulation_kind_report.clone(),
+            constraint_report: constraint_report.clone(), no_hole_benchmark: None,
+            ad_fd_strain_diagnostic: None, convergence_evidence: None,
+        };
+        let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
+        stop
+    });
+    let _ = tx.send(TrainingMsg::Done);
 }
 
 /// Graceful-stop-and-resume: loads a checkpoint's weights into a fresh TRAINABLE model and
@@ -1209,6 +1281,12 @@ pub fn run_training_user_problem_resume(
     };
     let steps_completed = meta.steps_completed;
     spec.training.max_steps = steps_completed.saturating_add(additional_steps);
+    if crate::user_problem::AnnularDecompositionProblem::supports(&spec) {
+        let _ = tx.send(TrainingMsg::Error(
+            "#77 annular decomposition uses two models; one-model checkpoints cannot resume it yet.".to_string(),
+        ));
+        return;
+    }
     run_user_problem_training_from(spec, model, device, steps_completed, tx, stop_rx);
 }
 
@@ -1512,6 +1590,7 @@ fn run_user_problem_training_from(
                 dynamic_lam_non_tension_cap: f64::MAX,
                 constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                 n_fourier: spec.geometry.n_fourier(),
+                coordinate_embedding: spec.geometry.coordinate_embedding(),
                 probe_term_gradients: false,
                 phase2_active: true,
                 step,
@@ -1582,6 +1661,7 @@ fn run_user_problem_training_from(
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                         n_fourier: spec.geometry.n_fourier(),
+                        coordinate_embedding: spec.geometry.coordinate_embedding(),
                         probe_term_gradients: false,
                         phase2_active: true, step,
                     };
@@ -1668,7 +1748,7 @@ fn run_user_problem_training_from(
         // no longer independently maintained in two places).
         let ctx = crate::user_problem::plate_multi_step_ctx(
             &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
-            spec.geometry.n_fourier(), send_vis, step,
+            spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), send_vis, step,
         );
 
         let (new_model, out) = step_physics_multi(
@@ -2041,6 +2121,7 @@ fn run_user_problem_training_from(
                     last_adaptive_weights.clone(),
                 );
                 let meta = crate::checkpoint::CheckpointMeta {
+                    input_dim: None,
                     spec: crate::checkpoint::CheckpointSpec::Plate(live_spec),
                     steps_completed: last_step + 1,
                     final_loss: last_total_loss,
@@ -2225,6 +2306,7 @@ pub fn serve_loaded_plate_checkpoint(
                     None,
                 );
                 let meta = crate::checkpoint::CheckpointMeta {
+                    input_dim: None,
                     spec: crate::checkpoint::CheckpointSpec::Plate(spec.clone()),
                     // Loaded, not (re)trained this session - honestly 0, not fabricated from
                     // the original checkpoint's own step count (this session did no training).
@@ -2873,6 +2955,7 @@ mod tests {
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                 constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                 n_fourier: 0,
+                coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
                 probe_term_gradients: false,
                 phase2_active: true, step,
             };
@@ -2956,6 +3039,7 @@ mod tests {
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                 constitutive_consistency_weight: 50.0,
                 n_fourier: 0,
+                coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
                 probe_term_gradients: probe_now,
                 phase2_active: true, step,
             };
@@ -3074,6 +3158,7 @@ mod tests {
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                 constitutive_consistency_weight: 50.0,
                 n_fourier: 0,
+                coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
                 probe_term_gradients: probe_now,
                 phase2_active: true, step,
             };
@@ -3795,7 +3880,7 @@ mod tests {
             sampling, &placeholder, &spec.load, spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
         );
         let ctx = plate_multi_step_ctx(
-            &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2, spec.geometry.n_fourier(), false, 0,
+            &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2, spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, 0,
         );
         let (_new_model, reference_out) = step_physics_multi(
             vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
@@ -4837,26 +4922,14 @@ mod tests {
     /// their own hard-threshold acceptance (this test's own question - "does AMR measurably
     /// help or hurt" - doesn't need full convergence to answer honestly).
     ///
-    /// **Formerly crashed - fixed by issue #74.** This exact comparison (AMR + Variational,
-    /// same budget PH3-12 already runs cleanly with Hybrid) used to reproducibly crash inside
-    /// `step_physics_multi`'s `.backward()` call somewhere between step 1200 and step 2200 with
-    /// burn-autodiff's own internal `"Node should have a step registered"` panic. Root cause
-    /// (confirmed, not just hypothesized): `training_core::probe_interior_energy_residuals`
-    /// (AMR's before/after-sweep residual probe) ran forward passes through the SAME live
-    /// `Autodiff<BInner>`-backed model the main training step used, purely to read residual
-    /// scalars via `.into_data()`, and never called `.backward()` on its own probe graph -
-    /// orphaned autodiff graph nodes accumulated in burn-autodiff's internal registry across
-    /// repeated sweep checks, eventually corrupting the NEXT real step's `.backward()` call.
-    /// Fixed by routing the probe through `BInner` (the plain, non-autodiff backend) instead -
-    /// exactly mirroring Kirsch's own frozen AMR sweep in `headless.rs`, which already did this
-    /// (`model.valid()` before its hand-rolled residual forward pass) and is why Kirsch's own
-    /// AMR path never hit this bug despite running the identical 2200-step budget cleanly
-    /// (PH3-12). See `compute_domain_forwards`'s new `Bk: Backend` generic parameter and
-    /// `probe_interior_energy_residuals`'s own doc comment in `training_core.rs` for the fix
-    /// itself; full root-cause and fix record in `docs/PHASE_4_IMPLEMENTATION_MANIFEST.md`'s
-    /// PH4-09 entry. Still `#[ignore]`d - not because it fails, but because a real 2200-step
-    /// double training run costs ~8 minutes even in release, matching this project's existing
-    /// precedent (`toy_beam`, issue #70's L5 test) for real-training-cost `#[ignore]`s.
+    /// **Formerly crashed because of upstream Burn #5573.** This comparison used to panic with
+    /// `"Node should have a step registered"`. Routing AMR probes through `BInner` remains
+    /// correct hardening, but later evidence proved it was not the crash cause: failure could
+    /// occur before AMR warmup. Burn 0.21 has a process-global concurrent-backward race, fixed
+    /// upstream by unreleased #5647. This test now avoids the trigger by running both arms
+    /// synchronously and initializing independent models from the same seed. Full evidence is
+    /// in `docs/PHASE_4_IMPLEMENTATION_MANIFEST.md`. It stays ignored only for real training
+    /// cost (~8 minutes release).
     #[test]
     #[ignore = "real training cost (~8 min release) - not a failure, see this test's own doc comment"]
     fn ph4_09_controlled_comparison_fixed_sampling_vs_amr_corrected_variational_same_budget() {

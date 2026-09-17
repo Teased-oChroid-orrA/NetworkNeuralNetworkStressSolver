@@ -1295,6 +1295,7 @@ pub(crate) fn run_headless_pinlug_inner(
             // plate-path-only (a documented, deliberate scope cut, not an oversight).
             constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
             probe_term_gradients: false,
             // NOTE: `MultiStepCtx::phase2_active` and the `PHASE2_ACTIVE` const below are two
             // INDEPENDENT booleans that happen to share a value by coincidence, not

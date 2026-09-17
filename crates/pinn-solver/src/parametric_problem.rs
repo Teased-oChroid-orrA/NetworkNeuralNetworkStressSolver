@@ -929,6 +929,7 @@ fn serve_parametric_inference(
                 live_spec.network.n_hidden = current_n_hidden;
                 let provenance = crate::provenance::compute_run_provenance(&live_spec, None, Some(live_spec.network.model_init_seed), &live_spec.network, &live_spec.training);
                 let meta = crate::checkpoint::CheckpointMeta {
+                    input_dim: None,
                     spec: crate::checkpoint::CheckpointSpec::Parametric(live_spec),
                     steps_completed: last_step + 1,
                     final_loss: last_total_loss,

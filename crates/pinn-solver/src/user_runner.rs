@@ -6,6 +6,7 @@
 //! formulation converges before adding curriculum machinery" scope discipline.
 
 use burn::tensor::backend::Backend;
+use serde::Serialize;
 use pinn_core::messages::SolverConfig;
 use pinn_core::problem_spec::ProblemSpec;
 
@@ -16,15 +17,249 @@ use crate::{
     optim::{make_bias_optim, make_gate_optim, WeightOptim},
     problem::{BoundaryValueProblem, DomainOptim},
     saw_brdr::SawBrdr,
-    training_core::{step_physics_multi, sync_device, BDevice, B},
-    user_problem::{plate_normalize_point as normalize_point, resample_plate_step_data, plate_multi_step_ctx, UserDefinedProblem},
+    training_core::{step_physics_multi, sync_device, BDevice, B, StepOutput},
+    user_problem::{
+        plate_normalize_point as normalize_point, resample_plate_step_data, plate_multi_step_ctx,
+        plate_multi_domain_step_ctx, resample_domain_step_data, AnnularDecompositionProblem,
+        UserDefinedProblem,
+    },
 };
+
+/// One deterministic L5 checkpoint. Values are deliberately derived from displacement or
+/// loss tensors; direct mDEM stress never supplies the acceptance Kt.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnnularL5Diagnostic {
+    pub step: usize,
+    pub total_loss: f32,
+    pub learning_rate: f64,
+    pub kt_derived_fd_vm: f64,
+    pub direct_stress_rms: f64,
+    pub derived_stress_rms: f64,
+    pub direct_derived_mismatch_rms: f64,
+    pub derived_traction_rms: f64,
+    pub terms: Vec<AnnularTermDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnnularTermDiagnostic {
+    pub name: String,
+    pub raw: f32,
+    pub effective_weight: f64,
+    pub gradient_norm: Option<f32>,
+    pub gradient_share: Option<f32>,
+}
+
+fn annular_l5_diagnostic(
+    step: usize,
+    out: &StepOutput,
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    spec: &ProblemSpec,
+    fd: &FdConfig,
+    device: &BDevice,
+) -> AnnularL5Diagnostic {
+    let scales = crate::training_core::compute_reference_scales_for_plate(spec);
+    let hole = &spec.geometry.holes[0];
+    let margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+    let profile = crate::user_problem::probe_hole_boundary_profile_derived(
+        model, &spec.geometry, hole, 144, fd, scales.u_ref, scales.stress_ref,
+        &spec.material, margin, device,
+    );
+    let kt = crate::user_problem::stress_concentration_from_profile(&profile, spec.load.px.abs()).kt;
+    let stress = crate::user_problem::probe_hole_stress_diagnostic(
+        model, &spec.geometry, hole, 144, fd, scales.u_ref, scales.stress_ref,
+        &spec.material, margin, device,
+    );
+    let raw = out.raw_scalar_by_name.as_ref();
+    let weights = out.lam_by_name.as_ref();
+    let norms = out.term_grad_norms.as_ref();
+    let shares = out.gradient_share_report.as_ref();
+    let mut names: Vec<&str> = raw.into_iter().flat_map(|m| m.keys().copied()).collect();
+    names.sort_unstable();
+    let terms = names.into_iter().map(|name| AnnularTermDiagnostic {
+        name: name.to_owned(),
+        raw: raw.and_then(|m| m.get(name)).copied().unwrap_or(f32::NAN),
+        effective_weight: weights.and_then(|m| m.get(name)).copied().unwrap_or(f64::NAN),
+        gradient_norm: norms.and_then(|m| m.get(name)).copied(),
+        gradient_share: shares.and_then(|s| s.shares.get(name)).copied(),
+    }).collect();
+    AnnularL5Diagnostic {
+        step, total_loss: out.total_scalar, learning_rate: out.lr, kt_derived_fd_vm: kt,
+        direct_stress_rms: stress.direct_stress_rms, derived_stress_rms: stress.derived_stress_rms,
+        direct_derived_mismatch_rms: stress.stress_mismatch_rms,
+        derived_traction_rms: stress.derived_traction_rms, terms,
+    }
+}
+
+/// Emit deterministic L5 diagnostics as JSON. Caller owns output path; normal training never
+/// writes files implicitly.
+pub fn write_annular_l5_diagnostics_json(
+    path: impl AsRef<std::path::Path>,
+    diagnostics: &[AnnularL5Diagnostic],
+) -> std::io::Result<()> {
+    let text = serde_json::to_string_pretty(diagnostics)
+        .expect("AnnularL5Diagnostic contains only serializable finite-or-null fields");
+    std::fs::write(path, text)
+}
+
+/// Train #77's bonded annular/global model pair. Kept public so GUI production dispatch and
+/// L5 use identical optimizer, sampling, and loss wiring rather than maintaining two loops.
+fn run_annular_decomposition_training_inner(
+    spec: ProblemSpec,
+    device: BDevice,
+    mut on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+    diagnostic_steps: &[usize],
+    diagnostics: &mut Vec<AnnularL5Diagnostic>,
+) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
+    let problem = AnnularDecompositionProblem::new(spec.clone());
+    crate::problem::validate_loss_terms(&problem);
+    let mut config = SolverConfig::default_kirsch();
+    config.load = spec.load;
+    let chart_cfg = ElasticityNetConfig::new()
+        .with_input_dim(spec.geometry.coordinate_embedding().input_dim())
+        .with_hidden_dim(spec.network.hidden_dim)
+        .with_n_hidden(spec.network.n_hidden)
+        .with_output_dim(5);
+    let raw_cfg = ElasticityNetConfig::new()
+        .with_input_dim(3)
+        .with_hidden_dim(spec.network.hidden_dim)
+        .with_n_hidden(spec.network.n_hidden)
+        .with_output_dim(5);
+    B::seed(&device, spec.network.model_init_seed);
+    let annulus_model = chart_cfg.init(&device);
+    B::seed(&device, spec.network.model_init_seed ^ 0xA77A_0001);
+    let outer_model = raw_cfg.init(&device);
+    let mut models = vec![annulus_model, outer_model];
+    let mut optims = (0..2).map(|_| DomainOptim {
+        weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim(),
+    }).collect::<Vec<_>>();
+    let base_weights = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+    let mut saw = SawBrdr::with_base(base_weights, 0.95);
+    let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+    let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+    let placeholder = spec.geometry.to_placeholder();
+    let n_annulus = (spec.training.n_interior / 2).max(256);
+    let n_outer = spec.training.n_interior.saturating_sub(n_annulus).max(256);
+    let mut last_total = f32::NAN;
+    for step in 0..spec.training.max_steps {
+        let annulus_data = resample_domain_step_data(
+            problem.domains()[0].id, problem.sampling_strategy(0), &placeholder, &spec.load,
+            n_annulus, 0, spec.geometry.half_w, spec.geometry.half_h,
+        );
+        let outer_data = resample_domain_step_data(
+            problem.domains()[1].id, problem.sampling_strategy(1), &placeholder, &spec.load,
+            n_outer, spec.training.n_boundary, spec.geometry.half_w, spec.geometry.half_h,
+        );
+        let ctx = plate_multi_domain_step_ctx(
+            &config, &problem, &fd, &annulus_data, &outer_data,
+            scales.u_ref, scales.ref_energy, scales.ref_stress2, spec.geometry.n_fourier(),
+            spec.geometry.coordinate_embedding(), diagnostic_steps.contains(&step), step,
+        );
+        let (new_models, out) = step_physics_multi(
+            models, &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+        models = new_models;
+        last_total = out.total_scalar;
+        if diagnostic_steps.contains(&step) {
+            use burn::module::AutodiffModule;
+            diagnostics.push(annular_l5_diagnostic(step, &out, &models[0].valid(), &spec, &fd, &device));
+        }
+        if on_step(step, out.total_scalar, out.lr, annulus_data.int_norm.len() + outer_data.int_norm.len()) {
+            break;
+        }
+    }
+    sync_device(&device);
+    let mut models = models.into_iter();
+    (models.next().expect("annulus model"), models.next().expect("outer model"), last_total)
+}
+
+/// Train #77's bonded annular/global model pair. Kept public so GUI production dispatch and
+/// L5 use identical optimizer, sampling, and loss wiring rather than maintaining two loops.
+pub fn run_annular_decomposition_training(
+    spec: ProblemSpec,
+    device: BDevice,
+    on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
+    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new())
+}
+
+/// Same production runner with opt-in, deterministic diagnostic checkpoints. No output file is
+/// created here; callers explicitly persist the returned records with
+/// [`write_annular_l5_diagnostics_json`].
+pub fn run_annular_decomposition_training_with_diagnostics(
+    spec: ProblemSpec,
+    device: BDevice,
+    diagnostic_steps: &[usize],
+    on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+) -> (
+    crate::network::ElasticityNet<B>,
+    crate::network::ElasticityNet<B>,
+    f32,
+    Vec<AnnularL5Diagnostic>,
+) {
+    let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
+    let (annulus, outer, loss) = run_annular_decomposition_training_inner(
+        spec, device, on_step, diagnostic_steps, &mut diagnostics,
+    );
+    (annulus, outer, loss, diagnostics)
+}
+
+/// Minimal deterministic single-model loop for benchmark companions. Production UI/headless
+/// retain their richer reporting loops; this avoids copying that training math into L5 tests.
+pub(crate) fn train_single_user_problem_for_benchmark(
+    spec: ProblemSpec,
+    device: &BDevice,
+) -> crate::network::ElasticityNet<crate::training_core::BInner> {
+    assert!(!AnnularDecompositionProblem::supports(&spec), "benchmark helper is single-model only");
+    let problem = UserDefinedProblem::new(spec.clone());
+    crate::problem::validate_loss_terms(&problem);
+    let mut config = SolverConfig::default_kirsch();
+    config.load = spec.load;
+    let net_cfg = ElasticityNetConfig::new().with_input_dim(spec.geometry.net_input_dim())
+        .with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden).with_output_dim(5);
+    B::seed(device, spec.network.model_init_seed);
+    let mut model = net_cfg.init(device);
+    let mut optim = DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() };
+    let mut saw = SawBrdr::with_base(problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect(), 0.95);
+    let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+    let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+    let placeholder = spec.geometry.to_placeholder();
+    for step in 0..spec.training.max_steps {
+        let data = resample_plate_step_data(
+            problem.sampling_strategy(0), &placeholder, &spec.load, spec.training.n_interior,
+            spec.training.n_boundary, spec.geometry.half_w, spec.geometry.half_h,
+        );
+        let ctx = plate_multi_step_ctx(
+            &config, &problem, &fd, &data, scales.u_ref, scales.ref_energy, scales.ref_stress2,
+            spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
+        );
+        let (new_model, _) = step_physics_multi(
+            vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, device, 0, 1.0, 1.0,
+        );
+        model = new_model.into_iter().next().expect("single model");
+    }
+    use burn::module::AutodiffModule;
+    model.valid()
+}
 
 /// Trains a [`UserDefinedProblem`] built from `spec` headlessly, printing progress. Returns
 /// `true` if the final step's loss is finite (the only generic "did this not blow up"
 /// signal available — there's no closed-form convergence target for an arbitrary
 /// user-defined geometry, unlike Kirsch's K_t).
 pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
+    if AnnularDecompositionProblem::supports(&spec) {
+        let device = BDevice::default();
+        let steps = spec.training.max_steps;
+        let (_annulus, _outer, total) = run_annular_decomposition_training(spec, device, |step, loss, lr, n| {
+            if step % (steps / 10).max(1) == 0 || step + 1 == steps {
+                println!("  [#77 annular] step {step:>6} total_loss={loss:.6e} lr={lr:.3e} points={n}");
+            }
+            false
+        });
+        println!("  [#77 annular] done final_total_loss={total:.6e}");
+        return total.is_finite();
+    }
     let device = BDevice::default();
     let half_w = spec.geometry.half_w;
     let half_h = spec.geometry.half_h;
@@ -125,6 +360,7 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         let ctx = plate_multi_step_ctx(
             &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
             spec.geometry.n_fourier(),
+            spec.geometry.coordinate_embedding(),
             // PH4-06: one final live gradient ledger is cheap enough for headless controlled
             // ladders and prevents a falling total loss from being mistaken for physical
             // convergence. Earlier steps keep the normal no-extra-backward-pass path.

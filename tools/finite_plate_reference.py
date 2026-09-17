@@ -124,6 +124,57 @@ def sparse_pcg(rows, columns, values, force, free, rtol=1e-10):
     raise RuntimeError("PCG failed to converge")
 
 
+def element_pcg(stiffness, dofs, force, free, rtol=1e-10):
+    """Matrix-free PCG for assembled finite elements.
+
+    Forming and sorting 36 global sparse entries per CST element peaks above
+    available memory at the required 2048x512 reference mesh.  The element
+    stiffness matrices already exist, so apply them directly and reduce the
+    six local contributions per element into global DOFs.  This is algebraically
+    the same assembled operator without global COO storage.
+    """
+    n = len(force)
+    local_diagonal = stiffness[:, np.arange(6), np.arange(6)]
+    diagonal = np.bincount(dofs.ravel(), weights=local_diagonal.ravel(), minlength=n)
+    if np.any(diagonal[free] <= 0):
+        raise ValueError("non-positive stiffness diagonal")
+
+    def matvec(vector):
+        local = np.einsum("eij,ej->ei", stiffness, vector[dofs])
+        return np.bincount(dofs.ravel(), weights=local.ravel(), minlength=n)
+
+    x, residual = np.zeros(n), force.copy()
+    residual[~free] = 0
+    rhs_norm = np.linalg.norm(residual)
+    if rhs_norm == 0:
+        raise ValueError("no nonzero load on free DOFs")
+    inverse_diagonal = np.zeros(n)
+    inverse_diagonal[free] = 1 / diagonal[free]
+    z = residual * inverse_diagonal
+    direction, rz = z.copy(), float(residual @ z)
+    for iteration in range(1, 20 * n + 1):
+        product = matvec(direction)
+        product[~free] = 0
+        curvature = float(direction @ product)
+        if curvature <= 0 or not math.isfinite(curvature):
+            raise RuntimeError("PCG encountered non-positive curvature")
+        alpha = rz / curvature
+        x += alpha * direction
+        residual -= alpha * product
+        relative = np.linalg.norm(residual) / rhs_norm
+        if relative < rtol:
+            actual = matvec(x) - force
+            actual_relative = np.linalg.norm(actual[free]) / rhs_norm
+            if actual_relative > 10 * rtol:
+                raise RuntimeError(f"PCG true relative residual too large: {actual_relative}")
+            return x, actual, iteration, actual_relative
+        z = residual * inverse_diagonal
+        next_rz = float(residual @ z)
+        direction = z + (next_rz / rz) * direction
+        rz = next_rz
+    raise RuntimeError("PCG failed to converge")
+
+
 @dataclass
 class Solution:
     nodes: np.ndarray
@@ -133,10 +184,33 @@ class Solution:
     constitutive: np.ndarray
     traction: float
     radius: float
+    angles: np.ndarray
+    n_radial: int
     iterations: int
     relative_residual: float
     relative_load_error: float
     relative_work_error: float
+
+    def _candidate_elements(self, point):
+        """Return nearby structured-mesh elements for one first-quadrant point.
+
+        The old sampler scanned every triangle for every probe point.  That turns
+        the required 2048x512 convergence check into billions of comparisons.
+        This mesh is polar-structured, so locate the radial/angular cell first and
+        test only its small neighbourhood with the exact barycentric predicate.
+        """
+        theta = math.atan2(point[1], point[0])
+        width = len(self.angles)
+        i = int(np.clip(np.searchsorted(self.angles, theta, side="right") - 1, 0, width - 2))
+        outer = ray_box_radius(theta, self.nodes[:, 0].max(), self.nodes[:, 1].max())
+        fraction = math.log(max(np.hypot(*point), self.radius) / self.radius) / math.log(outer / self.radius)
+        j = int(np.clip(math.floor(fraction * self.n_radial), 0, self.n_radial - 1))
+        candidates = []
+        for jj in range(max(0, j - 2), min(self.n_radial, j + 3)):
+            for ii in range(max(0, i - 2), min(width - 1, i + 3)):
+                base = 2 * (jj * (width - 1) + ii)
+                candidates.extend((base, base + 1))
+        return np.asarray(candidates, dtype=int)
 
     def sample(self, points):
         """Piecewise linear displacement and element stress at physical points.
@@ -144,19 +218,18 @@ class Solution:
         Reflection uses the quarter-plate symmetries. On an element interface,
         average incident stresses; displacement is continuous there.
         """
-        vertices = self.nodes[self.triangles]
-        minimum, maximum = vertices.min(axis=1), vertices.max(axis=1)
-        origin = vertices[:, 0]
-        edge1, edge2 = vertices[:, 1] - origin, vertices[:, 2] - origin
-        det = edge1[:, 0] * edge2[:, 1] - edge1[:, 1] * edge2[:, 0]
         displacements, stresses = [], []
         for point in np.asarray(points):
             sign = np.where(point < 0, -1, 1)
             p = np.abs(point)
-            candidates = np.flatnonzero(np.all((p >= minimum - 1e-14) & (p <= maximum + 1e-14), axis=1))
-            diff = p - origin[candidates]
-            w1 = (diff[:, 0] * edge2[candidates, 1] - diff[:, 1] * edge2[candidates, 0]) / det[candidates]
-            w2 = (edge1[candidates, 0] * diff[:, 1] - edge1[candidates, 1] * diff[:, 0]) / det[candidates]
+            candidates = self._candidate_elements(p)
+            vertices = self.nodes[self.triangles[candidates]]
+            origin = vertices[:, 0]
+            edge1, edge2 = vertices[:, 1] - origin, vertices[:, 2] - origin
+            det = edge1[:, 0] * edge2[:, 1] - edge1[:, 1] * edge2[:, 0]
+            diff = p - origin
+            w1 = (diff[:, 0] * edge2[:, 1] - diff[:, 1] * edge2[:, 0]) / det
+            w2 = (edge1[:, 0] * diff[:, 1] - edge1[:, 1] * diff[:, 0]) / det
             weights = np.stack((1 - w1 - w2, w1, w2), axis=-1)
             inside = np.all(weights >= -1e-10, axis=1)
             selected, weights = candidates[inside], weights[inside]
@@ -194,8 +267,6 @@ def solve(half_w, half_h, radius, young, nu, traction, n_theta, n_radial):
     nodes, triangles, angles = mesh(half_w, half_h, radius, n_theta, n_radial)
     B, D, areas, stiffness = cst_matrix(nodes[triangles], young, nu)
     dofs = np.stack((2 * triangles, 2 * triangles + 1), axis=-1).reshape(-1, 6)
-    rows = np.broadcast_to(dofs[:, :, None], stiffness.shape).ravel()
-    columns = np.broadcast_to(dofs[:, None, :], stiffness.shape).ravel()
     force = np.zeros(2 * len(nodes))
     width, load_length = len(angles), 0.0
     for i in range(width - 1):
@@ -212,7 +283,7 @@ def solve(half_w, half_h, radius, young, nu, traction, n_theta, n_radial):
     free = np.ones(len(force), dtype=bool)
     free[2 * np.flatnonzero(nodes[:, 0] == 0)] = False
     free[2 * np.flatnonzero(nodes[:, 1] == 0) + 1] = False
-    displacement, reaction, iterations, residual = sparse_pcg(rows, columns, stiffness.ravel(), force, free)
+    displacement, reaction, iterations, residual = element_pcg(stiffness, dofs, force, free)
     strains = np.einsum("eij,ej->ei", B, displacement[dofs])
     stress = strains @ D.T
     twice_energy = float(np.sum(areas * np.einsum("ei,ei->e", strains, stress)))
@@ -222,7 +293,7 @@ def solve(half_w, half_h, radius, young, nu, traction, n_theta, n_radial):
     if np.linalg.norm(balance) / (traction * half_h) > 1e-7 or work_error > 1e-7:
         raise RuntimeError("FEM reaction balance or strain-energy identity failed")
     return Solution(nodes, triangles, displacement.reshape(-1, 2), stress, D, traction,
-                    radius, iterations, residual, load_error, work_error)
+                    radius, angles, n_radial, iterations, residual, load_error, work_error)
 
 
 def main():

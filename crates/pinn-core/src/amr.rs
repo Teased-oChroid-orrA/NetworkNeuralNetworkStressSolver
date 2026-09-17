@@ -493,6 +493,33 @@ impl QuadNode {
             }
         }
     }
+
+    /// Collect every leaf with nonzero physical measure, including a cut cell whose center is
+    /// inside a hole.  This is intentionally separate from the legacy center-point traversal:
+    /// residual ownership there is one point per accepted center, while measure-aware
+    /// quadrature must represent every part of the physical domain exactly once.
+    fn collect_quadrature_leaves<G: AmrDomain>(&self, geom: &G, out: &mut Vec<QuadratureLeaf>) {
+        match &self.children {
+            Some(ch) => {
+                for child in ch.iter() {
+                    child.collect_quadrature_leaves(geom, out);
+                }
+            }
+            None => {
+                let bounds = (self.x0, self.x1, self.y0, self.y1);
+                let area = geom.area_in_rect(bounds);
+                if area.is_finite() && area > 0.0 {
+                    out.push(QuadratureLeaf { bounds, area });
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct QuadratureLeaf {
+    bounds: (f64, f64, f64, f64),
+    area: f64,
 }
 
 /// A sampled point paired with the physical area of the quadtree leaf it was drawn from -
@@ -689,18 +716,12 @@ impl<G: AmrDomain + Clone> AdaptiveGrid<G> {
 
     /// Fresh, fixed-budget quadrature from the current adaptive leaves.
     ///
-    /// Every active leaf is sampled the same number of times (plus one sample for a stable
-    /// prefix when `n` is not divisible by the leaf count). Each retained sample carries its
-    /// leaf area divided by that leaf's retained sample count. Consequently the returned
-    /// `DensitySample::leaf_area` values still sum to the represented domain area: increasing
-    /// the requested point budget improves quadrature resolution without duplicating any
-    /// physical area. This is deliberately different from appending a second overlapping point
-    /// set, which would make `compensation_weights` describe a different objective.
-    ///
-    /// The adaptive tree can contain more active leaves than a caller's requested budget. In
-    /// that unsupported case this returns one point per leaf rather than silently omitting a
-    /// region of the domain; callers that require an exact fixed budget must cap refinement at
-    /// or below that budget.
+    /// Every positive-area leaf contributes its physical area exactly once. When budget is
+    /// smaller than leaf count, adjacent DFS leaves are grouped and one leaf is selected by
+    /// area within each group; its point carries the entire group area. This preserves a
+    /// constant integral exactly and a nonconstant integral in expectation without dropping a
+    /// region or exceeding caller's fixed work budget. When budget is larger, each leaf gets
+    /// repeated fresh draws and divides its area across them.
     pub fn sample_points_jittered_with_density_budget(
         &mut self,
         n: usize,
@@ -709,36 +730,80 @@ impl<G: AmrDomain + Clone> AdaptiveGrid<G> {
         if n == 0 {
             return Vec::new();
         }
-        let first = self.sample_points_jittered_with_density(seed);
-        let leaves = first.len();
-        if leaves == 0 {
-            return first;
+        const CALL_SEED_MIX: u64 = 0x9E3779B97F4A7C15;
+        let call = self.sample_call_counter;
+        self.sample_call_counter = self.sample_call_counter.wrapping_add(1);
+        let mut rng = LcgRng::new(seed ^ call.wrapping_mul(CALL_SEED_MIX));
+        let mut leaves = Vec::new();
+        self.root.collect_quadrature_leaves(&self.geom, &mut leaves);
+        let leaves = leaves;
+        let leaf_count = leaves.len();
+        if leaf_count == 0 {
+            return Vec::new();
         }
-        if n <= leaves {
-            return first;
+        if n < leaf_count {
+            let mut out = Vec::with_capacity(n);
+            for group in 0..n {
+                let start = group * leaf_count / n;
+                let end = (group + 1) * leaf_count / n;
+                let group_area: f64 = leaves[start..end].iter().map(|leaf| leaf.area).sum();
+                let mut target = rng.next_f64() * group_area;
+                let mut selected = leaves[end - 1];
+                for leaf in &leaves[start..end] {
+                    if target <= leaf.area {
+                        selected = *leaf;
+                        break;
+                    }
+                    target -= leaf.area;
+                }
+                out.push(DensitySample {
+                    point: Self::jittered_point_in_leaf(&self.geom, selected, &mut rng),
+                    leaf_area: group_area,
+                });
+            }
+            return out;
         }
 
-        let whole_rounds = n / leaves;
-        let remainder = n % leaves;
-        let samples_per_leaf: Vec<usize> = (0..leaves)
+        let whole_rounds = n / leaf_count;
+        let remainder = n % leaf_count;
+        let samples_per_leaf: Vec<usize> = (0..leaf_count)
             .map(|i| whole_rounds + usize::from(i < remainder))
             .collect();
         let mut out = Vec::with_capacity(n);
-        let mut append_round = |round: Vec<DensitySample>, take: usize| {
-            for (i, mut sample) in round.into_iter().take(take).enumerate() {
-                sample.leaf_area /= samples_per_leaf[i] as f64;
-                out.push(sample);
+        for (i, leaf) in leaves.iter().enumerate() {
+            for _ in 0..samples_per_leaf[i] {
+                out.push(DensitySample {
+                    point: Self::jittered_point_in_leaf(&self.geom, *leaf, &mut rng),
+                    leaf_area: leaf.area / samples_per_leaf[i] as f64,
+                });
             }
-        };
-        append_round(first, leaves);
-        for _ in 1..whole_rounds {
-            append_round(self.sample_points_jittered_with_density(seed), leaves);
-        }
-        if remainder != 0 {
-            append_round(self.sample_points_jittered_with_density(seed), remainder);
         }
         debug_assert_eq!(out.len(), n);
         out
+    }
+
+    fn jittered_point_in_leaf(geom: &G, leaf: QuadratureLeaf, rng: &mut LcgRng) -> [f64; 2] {
+        const RANDOM_ATTEMPTS: usize = 256;
+        for _ in 0..RANDOM_ATTEMPTS {
+            let x = leaf.bounds.0 + (leaf.bounds.1 - leaf.bounds.0) * rng.next_f64();
+            let y = leaf.bounds.2 + (leaf.bounds.3 - leaf.bounds.2) * rng.next_f64();
+            if geom.contains(x, y) {
+                return [x, y];
+            }
+        }
+        // A center can be outside a cut cell.  Scan deterministic interior subcells before
+        // giving up, so the fallback never emits a point inside a hole.
+        const SIDE: usize = 64;
+        for iy in 0..SIDE {
+            for ix in 0..SIDE {
+                let x = leaf.bounds.0 + (ix as f64 + 0.5) * (leaf.bounds.1 - leaf.bounds.0) / SIDE as f64;
+                let y = leaf.bounds.2 + (iy as f64 + 0.5) * (leaf.bounds.3 - leaf.bounds.2) / SIDE as f64;
+                if geom.contains(x, y) {
+                    return [x, y];
+                }
+            }
+        }
+        panic!("positive-area AMR leaf had no valid collocation point");
     }
 
     /// Assign per-point residuals back to leaf cells.
@@ -2004,26 +2069,28 @@ mod tests {
         let geom = test_geom();
         let cfg = AmrtConfig::default();
         let reference_grid = AdaptiveGrid::new(&geom, cfg.clone());
-        let represented_area: f64 = reference_grid
-            .sample_points_with_density()
-            .iter()
-            .map(|s| s.leaf_area)
-            .sum();
-        let leaf_count = reference_grid.active_count();
+        let represented_area = geom.area_in_rect((
+            geom.x_range().0, geom.x_range().1, geom.y_range().0, geom.y_range().1,
+        ));
+        let mut quadrature_leaves = Vec::new();
+        reference_grid.root.collect_quadrature_leaves(&geom, &mut quadrature_leaves);
+        let leaf_count = quadrature_leaves.len();
 
         let mut grid = AdaptiveGrid::new(&geom, cfg);
-        let target = leaf_count * 3 + 5;
-        let samples = grid.sample_points_jittered_with_density_budget(target, 444);
-        assert_eq!(samples.len(), target, "fixed-budget sampler must not change training work");
-        let sample_area: f64 = samples.iter().map(|s| s.leaf_area).sum();
-        assert!(
-            (sample_area - represented_area).abs() < 1e-12,
-            "splitting a leaf across several fresh samples must preserve its measure: \
-             samples={sample_area}, leaves={represented_area}"
-        );
-        let weights = compensation_weights(&samples);
-        let mean_weight: f64 = weights.iter().sum::<f64>() / weights.len() as f64;
-        assert!((mean_weight - 1.0).abs() < 1e-12, "compensation weights must remain normalized");
+        for target in [leaf_count / 3, leaf_count * 3 + 5] {
+            let samples = grid.sample_points_jittered_with_density_budget(target, 444);
+            assert_eq!(samples.len(), target, "fixed-budget sampler must not change training work");
+            let sample_area: f64 = samples.iter().map(|s| s.leaf_area).sum();
+            assert!(
+                (sample_area - represented_area).abs() < 1e-12,
+                "quadrature must preserve the full physical measure: samples={sample_area}, domain={represented_area}"
+            );
+            assert!(samples.iter().all(|s| geom.contains(s.point[0], s.point[1])),
+                "cut-cell sampling must never emit a point inside a hole");
+            let weights = compensation_weights(&samples);
+            let mean_weight: f64 = weights.iter().sum::<f64>() / weights.len() as f64;
+            assert!((mean_weight - 1.0).abs() < 1e-12, "compensation weights must remain normalized");
+        }
     }
 
     #[test]

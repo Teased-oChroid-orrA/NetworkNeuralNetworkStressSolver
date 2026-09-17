@@ -40,6 +40,57 @@ pub struct HoleSpec {
     pub bc: HoleBc,
 }
 
+/// First #77 annular-decomposition interface: three hole radii from the center. This retains
+/// two radii of material beyond the free boundary while leaving a substantial outer domain for
+/// the L5 small-hole geometry. It is geometry-owned, not duplicated in sampler/runner code.
+pub const ANNULAR_INTERFACE_RADIUS_FACTOR: f64 = 3.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnnularPartition {
+    pub center: [f64; 2],
+    pub hole_radius: f64,
+    pub interface_radius: f64,
+}
+
+impl AnnularPartition {
+    pub fn contains_annulus(self, x: f64, y: f64) -> bool {
+        let dx = x - self.center[0];
+        let dy = y - self.center[1];
+        let r2 = dx * dx + dy * dy;
+        r2 >= self.hole_radius * self.hole_radius && r2 <= self.interface_radius * self.interface_radius
+    }
+
+    pub fn contains_outer(self, x: f64, y: f64) -> bool {
+        let dx = x - self.center[0];
+        let dy = y - self.center[1];
+        dx * dx + dy * dy >= self.interface_radius * self.interface_radius
+    }
+}
+
+/// Deterministic coordinate representation used by user-defined plate networks.
+///
+/// `SingleHoleChart` keeps raw normalized coordinates and appends dimensionless local-hole
+/// chart and bounded-envelope features. `inv_radius` converts independently normalized x/y coordinates
+/// back to radius units, preserving circular physical geometry on non-square plates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CoordinateEmbedding {
+    Raw,
+    SingleHoleChart {
+        center_norm: [f32; 2],
+        inv_radius: [f32; 2],
+        epsilon: f32,
+    },
+}
+
+impl CoordinateEmbedding {
+    pub const fn input_dim(self) -> usize {
+        match self {
+            Self::Raw => 3,
+            Self::SingleHoleChart { .. } => 10,
+        }
+    }
+}
+
 /// Issue #61 EPIC P2-06: identifies one boundary component of a [`UserGeometry`] - an outer
 /// rectangle edge, or a specific hole by index. See [`UserGeometry::nearest_boundary`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +133,16 @@ pub struct UserGeometry {
 }
 
 impl UserGeometry {
+    /// #77's first decomposition supports exactly one circular hole. Multi-hole partition
+    /// ownership is deliberately deferred rather than silently assigning overlap regions.
+    pub fn annular_partition(&self) -> Option<AnnularPartition> {
+        let [hole] = self.holes.as_slice() else { return None };
+        let interface_radius = ANNULAR_INTERFACE_RADIUS_FACTOR * hole.radius;
+        if interface_radius >= self.half_w.min(self.half_h) {
+            return None;
+        }
+        Some(AnnularPartition { center: hole.center, hole_radius: hole.radius, interface_radius })
+    }
     /// True if `(x, y)` is inside the plate's rectangular bound and outside every hole.
     pub fn contains(&self, x: f64, y: f64) -> bool {
         if x < -self.half_w || x > self.half_w || y < -self.half_h || y > self.half_h {
@@ -154,8 +215,27 @@ impl UserGeometry {
     /// no Fourier embedding, `4 * n_fourier` when there is. Mirrors `pinn_solver::engine::
     /// EngineParams::net_input_dim`'s identical formula.
     pub fn net_input_dim(&self) -> usize {
-        let nf = self.n_fourier();
-        if nf > 0 { 4 * nf } else { 3 }
+        self.coordinate_embedding().input_dim()
+    }
+
+    /// Geometry-owned input representation for #77. One hole gets a local radial/angular
+    /// chart with a bounded far-field envelope; no-hole and multi-hole problems remain raw-coordinate models.
+    /// Multi-hole enrichment is intentionally deferred until it has an unambiguous benchmark.
+    pub fn coordinate_embedding(&self) -> CoordinateEmbedding {
+        let [hole] = self.holes.as_slice() else {
+            return CoordinateEmbedding::Raw;
+        };
+        let radius = hole.radius as f32;
+        CoordinateEmbedding::SingleHoleChart {
+            center_norm: [
+                (hole.center[0] / self.half_w) as f32,
+                (hole.center[1] / self.half_h) as f32,
+            ],
+            inv_radius: [(self.half_w as f32) / radius, (self.half_h as f32) / radius],
+            // Only protection at r=0. Valid plate points are outside r=a, so this cannot
+            // alter physical features at collocation or FD-stencil points.
+            epsilon: 1e-4,
+        }
     }
 
     /// Issue #61 EPIC P2-07: true iff NO hole is [`HoleBc::Fixed`] - the plate's only essential/
@@ -343,6 +423,47 @@ mod tests {
         // two_hole_geometry's 2nd hole is HoleBc::Fixed by construction.
         let geom = two_hole_geometry();
         assert!(!geom.is_pure_neumann());
+    }
+
+    #[test]
+    fn coordinate_embedding_preserves_raw_no_hole_and_multi_hole_inputs() {
+        let no_holes = UserGeometry { half_w: 1.0, half_h: 1.0, thickness: 0.1, holes: vec![] };
+        assert_eq!(no_holes.coordinate_embedding(), CoordinateEmbedding::Raw);
+        assert_eq!(no_holes.net_input_dim(), 3);
+        let multi = two_hole_geometry();
+        assert_eq!(multi.coordinate_embedding(), CoordinateEmbedding::Raw);
+        assert_eq!(multi.net_input_dim(), 3);
+    }
+
+    #[test]
+    fn coordinate_embedding_normalizes_single_hole_in_physical_radius_units() {
+        let geometry = UserGeometry {
+            half_w: 2.0,
+            half_h: 1.0,
+            thickness: 0.1,
+            holes: vec![HoleSpec { center: [0.5, -0.25], radius: 0.1, bc: HoleBc::Free }],
+        };
+        assert_eq!(geometry.net_input_dim(), 10);
+        assert_eq!(geometry.coordinate_embedding(), CoordinateEmbedding::SingleHoleChart {
+            center_norm: [0.25, -0.25],
+            inv_radius: [20.0, 10.0],
+            epsilon: 1e-4,
+        });
+    }
+
+    #[test]
+    fn annular_partition_is_disjoint_and_covers_the_exterior_of_one_hole() {
+        let geometry = UserGeometry {
+            half_w: 1.0, half_h: 1.0, thickness: 0.1,
+            holes: vec![HoleSpec { center: [0.0, 0.0], radius: 0.1, bc: HoleBc::Free }],
+        };
+        let partition = geometry.annular_partition().expect("small single hole must partition");
+        assert!((partition.interface_radius - 0.3).abs() < 1e-12);
+        assert!(partition.contains_annulus(0.2, 0.0));
+        assert!(!partition.contains_outer(0.2, 0.0));
+        assert!(partition.contains_outer(0.5, 0.0));
+        assert!(!partition.contains_annulus(0.5, 0.0));
+        assert!(!partition.contains_annulus(0.0, 0.0));
     }
 
     #[test]

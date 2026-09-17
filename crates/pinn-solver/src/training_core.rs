@@ -40,7 +40,7 @@ use crate::{
     fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig},
     kirsch_problem::KIRSCH_DOMAIN,
     lr_schedule::LrSchedule,
-    network::{fwd, fwd_masked, ElasticityNet},
+    network::{fwd, fwd_embedded_masked, fwd_masked, ElasticityNet},
     optim::{BiasOptim, GateOptim, WeightOptim},
     problem::{BoundaryValueProblem, DomainForwardOutputs, LossTerm},
     saw_brdr::SawBrdr,
@@ -1397,7 +1397,7 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
     // comment on `MultiStepCtx`) is non-zero for the plate path specifically, when its
     // geometry has a hole (`UserGeometry::n_fourier`) - the pin-lug path stays at 0,
     // byte-identical to before this field existed.
-    let n_fourier = ctx.n_fourier;
+    let coordinate_embedding = ctx.coordinate_embedding;
 
     let mut needed: Vec<(DomainId, &'static str)> = Vec::new();
     // (domain, point_set) pairs at least one active term needs the Hessian for - see
@@ -1492,8 +1492,18 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
         // per-point (dx, dy) scale factors `DirichletAnsatz::eval` returns, then scale to
         // physical units exactly as `step_physics`'s `scale_out` does: displacement cols by
         // u_ref [m], and (mDEM only) stress cols 2..5 by Px [Pa].
-        let raw_net = fwd_masked::<Bk>(
-            model, stencil, n_fourier, device, forward_masks[model_idx],
+        // Domain decomposition may pair a raw-coordinate outer model (3 inputs) with a
+        // chart-enriched annular model (10 inputs). The model's saved architecture is the
+        // authoritative per-domain contract; the ctx embedding describes the chart variant.
+        let model_embedding = if model.input_dim() == 3 {
+            pinn_core::user_geometry::CoordinateEmbedding::Raw
+        } else if model.input_dim() == coordinate_embedding.input_dim() {
+            coordinate_embedding
+        } else {
+            panic!("unsupported domain input width {}; expected raw 3 or geometry-chart {}", model.input_dim(), coordinate_embedding.input_dim());
+        };
+        let raw_net = fwd_embedded_masked::<Bk>(
+            model, stencil, model_embedding, device, forward_masks[model_idx],
         );
         debug_assert_eq!(raw_net.dims()[0], m, "stencil row count must match 5*n_pts");
         let dx_t = Tensor::<Bk, 2>::from_data(TensorData::new(dx_v, vec![m, 1]), device);
@@ -1551,7 +1561,7 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
             let fd2 = crate::fd_stencil::hessian_fd_config(ctx.fd);
             let m9 = 9 * n_pts;
             let stencil2 = crate::fd_stencil::assemble_second_order_stencil::<Bk>(&pts_t, &fd2, device);
-            let raw_net2 = fwd_masked::<Bk>(model, stencil2, n_fourier, device, forward_masks[model_idx]);
+            let raw_net2 = fwd_embedded_masked::<Bk>(model, stencil2, model_embedding, device, forward_masks[model_idx]);
             debug_assert_eq!(raw_net2.dims()[0], m9, "second-order stencil row count must match 9*n_pts");
 
             let mut dx2_v = Vec::with_capacity(m9);
@@ -1656,17 +1666,12 @@ impl LossTerm for InteriorProbeTerm {
 /// ever reads `.into_data()`/scalars out), so building an autodiff graph for it was always
 /// unnecessary work, not just unnecessary risk.
 ///
-/// This is issue #74's fix: repeated forward passes through the SAME live autodiff-tracked
-/// model, purely to read residual magnitudes and never followed by `.backward()` on that probe
-/// graph, left orphaned graph nodes in burn-autodiff's internal registry across AMR's multiple
-/// sweep checks per run. Over enough sweeps (2200-step budget, ~2 sweeps at the default
-/// interval) this surfaced as `"Node should have a step registered"` inside the NEXT real
-/// training step's `.backward()` call — specific to the Variational formulation's term
-/// structure (`PhysicalPotentialEnergyTerm` spanning two point sets in one term) interacting
-/// with the probe's graph differently than Hybrid's separate single-point-set terms did, which
-/// is why Kirsch's Hybrid-formulation AMR path never observably hit it despite being the same
-/// general shape of bug class. Routing through `BInner` means the probe never enters the
-/// autodiff graph at all, so there is nothing left to orphan.
+/// This is a valid issue #74 hardening change, not the root-cause fix for its observed crash.
+/// Reading residuals through `BInner` avoids needless live autodiff nodes and their associated
+/// lifetime risk. The reproducible `"Node should have a step registered"` crash was instead
+/// traced to Burn 0.21's process-global concurrent-backward race (upstream #5573, fixed by
+/// unreleased #5647). Keep this probe detached because it needs no gradients; do not claim that
+/// detaching it cures that upstream race.
 pub(crate) fn probe_interior_energy_residuals(
     ctx: &crate::problem::MultiStepCtx,
     models: &[&ElasticityNet<B>],
@@ -1820,7 +1825,7 @@ pub fn step_physics_multi(
             // optimizer dynamics despite preserving the continuum stationary point only in the
             // constant-weight limit. Keep its live coefficient fixed at the canonical unit
             // scale; constraints remain independently adaptive.
-            "physical_potential" => 1.0,
+            "physical_potential" | "annulus_potential" => 1.0,
             // "hole_free" is `UserDefinedProblem`'s own name for exactly the same traction-
             // free hole condition "hole_traction"/"lug_free_edge_traction" already cap here -
             // a real, previously-missed gap (confirmed via direct code read, not assumed):
@@ -2033,19 +2038,19 @@ pub fn step_physics_multi(
     // out here so the block can fill it without restructuring its existing control flow.
     let mut term_grad_vectors: Option<std::collections::HashMap<&'static str, Vec<f32>>> = None;
     let term_grad_norms: Option<std::collections::HashMap<&'static str, f32>> = if ctx.probe_term_gradients {
+        use burn::module::AutodiffModule;
         use crate::problem::DomainForwardOutputs as DFO;
         use pinn_core::problem::DomainId;
 
-        let no_masks: Vec<Option<&[bool]>> = model_refs.iter().map(|_| None).collect();
         // Returns both the term's gradient L2 norm AND its flattened gradient vector, computed
         // from the SAME backward pass - Priority 4 (General-PINN §17, gradient conflict
         // diagnostics) needs the full vector to compute pairwise cosine similarity between
         // terms, not just each term's norm; reusing this backward pass avoids a second one.
-        let grad_norm_and_vec_for = |t: Tensor<B, 1>| -> (f32, Vec<f32>) {
+        let grad_norm_and_vec_for = |t: Tensor<B, 1>, diagnostic_models: &[ElasticityNet<B>]| -> (f32, Vec<f32>) {
             let mut g = t.backward();
             let mut sq = 0.0_f32;
             let mut flat: Vec<f32> = Vec::new();
-            for model in model_refs.iter().copied() {
+            for model in diagnostic_models {
                 let (weight_ids, bias_ids) = model.param_ids();
                 let gate_ids = model.gate_ids();
                 let wg = GradientsParams::from_params(&mut g, model, &weight_ids);
@@ -2063,8 +2068,10 @@ pub fn step_physics_multi(
             }
             (sq.max(0.0).sqrt(), flat)
         };
-        let fresh_term_loss = |term: &Box<dyn LossTerm>| -> Tensor<B, 1> {
-            let computed = compute_domain_forwards(ctx, &model_refs, std::slice::from_ref(term), device, &no_masks);
+        let fresh_term_loss = |term: &Box<dyn LossTerm>, diagnostic_models: &[ElasticityNet<B>]| -> Tensor<B, 1> {
+            let diagnostic_refs: Vec<&ElasticityNet<B>> = diagnostic_models.iter().collect();
+            let no_masks: Vec<Option<&[bool]>> = diagnostic_refs.iter().map(|_| None).collect();
+            let computed = compute_domain_forwards(ctx, &diagnostic_refs, std::slice::from_ref(term), device, &no_masks);
             let forwards: HashMap<(DomainId, &'static str), DFO<'_, B>> = computed.iter()
                 .map(|c| (c.key, DFO {
                     domain: c.key.0, raw_out: &c.raw_out,
@@ -2083,8 +2090,15 @@ pub fn step_physics_multi(
         let mut norms = std::collections::HashMap::new();
         let mut vectors = std::collections::HashMap::new();
         for term in &active_terms {
-            let loss = fresh_term_loss(term);
-            let (norm, vec) = grad_norm_and_vec_for(loss);
+            // A diagnostic backward must never share live autodiff leaves with the training
+            // total built above. `valid` detaches the current values and `from_inner` creates
+            // fresh leaves with the same ParamIds, preserving gradient lookup while isolating
+            // Burn's single-use graph ownership.
+            let diagnostic_models: Vec<ElasticityNet<B>> = models.iter()
+                .map(|model| ElasticityNet::<B>::from_inner(model.valid()))
+                .collect();
+            let loss = fresh_term_loss(term, &diagnostic_models);
+            let (norm, vec) = grad_norm_and_vec_for(loss, &diagnostic_models);
             norms.insert(term.name(), norm);
             vectors.insert(term.name(), vec);
         }
@@ -2094,6 +2108,9 @@ pub fn step_physics_multi(
         // simplification: anchors only exist for holed geometries, and the "interior" term
         // dominates the constitutive-consistency signal either way).
         if any_mdem {
+            let diagnostic_models: Vec<ElasticityNet<B>> = models.iter()
+                .map(|model| ElasticityNet::<B>::from_inner(model.valid()))
+                .collect();
             let mut combined: Option<Tensor<B, 1>> = None;
             for domain in ctx.problem.domains().iter().filter(|d| d.output_dim == 5) {
                 let term: Box<dyn LossTerm> = Box::new(crate::kirsch_problem::ConstitutiveConsistencyTerm {
@@ -2101,11 +2118,11 @@ pub fn step_physics_multi(
                     material: domain.material.clone(),
                     ref_stress2: ctx.domains.iter().find(|d| d.data.id == domain.id).map(|d| d.ref_stress2).unwrap_or(1.0),
                 });
-                let loss = fresh_term_loss(&term);
+                let loss = fresh_term_loss(&term, &diagnostic_models);
                 combined = Some(match combined { Some(acc) => acc + loss, None => loss });
             }
             if let Some(combined) = combined {
-                let (norm, vec) = grad_norm_and_vec_for(combined);
+                let (norm, vec) = grad_norm_and_vec_for(combined, &diagnostic_models);
                 norms.insert("constitutive_consistency", norm);
                 vectors.insert("constitutive_consistency", vec);
             }
@@ -6052,6 +6069,7 @@ mod tests {
                 dynamic_lam_non_tension_cap: 100.0,
                 constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
                 n_fourier: 0,
+                coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
                 probe_term_gradients: false,
                 phase2_active: false,
                 step,
@@ -6354,6 +6372,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -6431,6 +6450,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -6550,6 +6570,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -6691,6 +6712,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -6743,6 +6765,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -6882,6 +6905,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -6967,6 +6991,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -7101,6 +7126,7 @@ mod tests {
             dynamic_lam_non_tension_cap,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
             probe_term_gradients: false,
             phase2_active,
             step: 0,

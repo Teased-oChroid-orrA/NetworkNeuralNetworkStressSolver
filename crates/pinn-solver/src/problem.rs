@@ -12,6 +12,7 @@ use burn::tensor::{backend::Backend, Tensor};
 
 use pinn_core::messages::SolverConfig;
 use pinn_core::problem::{DirichletAnsatz, DomainId, DomainSamplingStrategy, DomainSpec};
+use pinn_core::user_geometry::CoordinateEmbedding;
 
 use crate::fd_stencil::FdConfig;
 use crate::network::ElasticityNet;
@@ -397,6 +398,40 @@ pub fn validate_loss_terms(problem: &dyn BoundaryValueProblem) {
     }
 }
 
+/// Issue #77 hardening: `validate_loss_terms` only checks that a term's *declared* domains
+/// exist — it never checked the other direction, whether a sampling strategy's own NAMED
+/// point sets (`DomainSamplingStrategy::named_point_sets`, e.g. a hole ring or an interface
+/// trace) are consumed by any registered term. That gap is exactly how issue #77's annular
+/// decomposition problem silently trained for weeks with an orphaned `"hole_0"` point set
+/// (emitted by its sampler, read by zero terms) — the hole boundary condition was simply
+/// absent from the objective, with nothing in the type system or an assertion catching it.
+///
+/// Deliberately a SEPARATE function from `validate_loss_terms`, not folded into it: this
+/// codebase has other `BoundaryValueProblem` implementations (Kirsch, pin-lug) not audited
+/// as part of this fix, and `validate_loss_terms` already runs broadly across their existing
+/// test suites — silently tightening it for every problem risks an unrelated regression this
+/// change never intended to touch. Call this explicitly wherever a problem's point-set
+/// wiring is being verified (see `user_problem.rs`'s decomposition tests for the first use).
+pub fn validate_point_sets_consumed(problem: &dyn BoundaryValueProblem) {
+    let terms = problem.loss_terms();
+    let consumed: std::collections::HashSet<(DomainId, &'static str)> = terms.iter()
+        .flat_map(|t| t.domains().into_iter().zip(t.point_sets().into_iter()))
+        .collect();
+    for (idx, spec) in problem.domains().iter().enumerate() {
+        for set in problem.sampling_strategy(idx).named_point_sets(&[]) {
+            if !consumed.contains(&(spec.id, set.name)) {
+                panic!(
+                    "validate_point_sets_consumed: domain {:?}'s sampling strategy emits named \
+                     point set '{}' but no registered LossTerm consumes it — either wire a term \
+                     to it or stop emitting it (see this function's own doc comment: issue #77's \
+                     orphaned \"hole_0\" set is exactly this bug, previously undetected).",
+                    spec.id, set.name,
+                );
+            }
+        }
+    }
+}
+
 // ─── Multi-domain step driver support (additive; `step_physics`/`StepCtx` unaffected) ────
 
 /// Per-named-point-set arrays a `LossTerm` reads from — normalized coordinates plus normal
@@ -496,6 +531,8 @@ pub struct MultiStepCtx<'a> {
     /// single-domain; every other caller keeps this `0`, byte-identical to before this field
     /// existed.
     pub n_fourier: usize,
+    /// User-geometry coordinate representation. Legacy callers use `Raw`.
+    pub coordinate_embedding: CoordinateEmbedding,
     /// Diagnostic-only, opt-in (default `false` everywhere except dedicated diagnostics): when
     /// true, `step_physics_multi` computes each active term's OWN gradient L2 norm (an extra
     /// `.backward()` pass per term) and populates `StepOutput.term_grad_norms`. Real cost (N
@@ -532,6 +569,7 @@ pub struct FrozenMultiStepCtx {
     pub dynamic_lam_non_tension_cap: f64,
     pub constitutive_consistency_weight: f64,
     pub n_fourier: usize,
+    pub coordinate_embedding: CoordinateEmbedding,
     pub phase2_active: bool,
 }
 
@@ -554,6 +592,7 @@ impl FrozenMultiStepCtx {
             dynamic_lam_non_tension_cap: ctx.dynamic_lam_non_tension_cap,
             constitutive_consistency_weight: ctx.constitutive_consistency_weight,
             n_fourier: ctx.n_fourier,
+            coordinate_embedding: ctx.coordinate_embedding,
             phase2_active: ctx.phase2_active,
         }
     }
@@ -581,6 +620,7 @@ impl FrozenMultiStepCtx {
             dynamic_lam_non_tension_cap: self.dynamic_lam_non_tension_cap,
             constitutive_consistency_weight: self.constitutive_consistency_weight,
             n_fourier: self.n_fourier,
+            coordinate_embedding: self.coordinate_embedding,
             // Not tracked by `FrozenMultiStepCtx` (same rationale as `step` above) - term-
             // gradient probing is a dedicated-diagnostic-only concern, never needed on the
             // L-BFGS/Converge path this reconstructs for.
@@ -730,6 +770,7 @@ mod tests {
             dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
+            coordinate_embedding: CoordinateEmbedding::Raw,
             probe_term_gradients: false,
             phase2_active: true,
             step: 0,

@@ -1,10 +1,17 @@
 """Mechanics and geometry checks independent of the PINN implementation."""
 import math
+import pathlib
+import sys
 import unittest
+
+# Keep this standalone reference tool runnable from repository root, where CI and
+# contributors normally invoke ``python -m unittest``.  ``tools`` is intentionally
+# not a Python package, so add this file's directory rather than relying on CWD.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import numpy as np
 
-from finite_plate_reference import cst_matrix, mesh, solve, validate
+from finite_plate_reference import cst_matrix, element_pcg, mesh, solve, sparse_pcg, validate
 
 
 class FinitePlateReferenceTests(unittest.TestCase):
@@ -42,6 +49,44 @@ class FinitePlateReferenceTests(unittest.TestCase):
         np.testing.assert_allclose(uv[2], uv[0] * [1, -1])
         np.testing.assert_allclose(stress[1], stress[0] * [1, 1, -1])
         self.assertGreater(first.profile(0.0054, fd_step=(0.0001, 0.0001))["kt_vm"], 2)
+
+    def test_structured_locator_matches_exhaustive_barycentric_lookup(self):
+        solution = solve(0.1, 0.1, 0.005, 71.7e9, 0.33, 69e6, 32, 12)
+        points = np.array([[0.007, 0.006], [0.03, 0.02], [0.08, 0.06]])
+        uv, stress = solution.sample(points)
+        expected_uv, expected_stress = [], []
+        for point in points:
+            vertices = solution.nodes[solution.triangles]
+            origin = vertices[:, 0]
+            edge1, edge2 = vertices[:, 1] - origin, vertices[:, 2] - origin
+            det = edge1[:, 0] * edge2[:, 1] - edge1[:, 1] * edge2[:, 0]
+            delta = point - origin
+            w1 = (delta[:, 0] * edge2[:, 1] - delta[:, 1] * edge2[:, 0]) / det
+            w2 = (edge1[:, 0] * delta[:, 1] - edge1[:, 1] * delta[:, 0]) / det
+            weights = np.stack((1 - w1 - w2, w1, w2), axis=-1)
+            inside = np.all(weights >= -1e-10, axis=1)
+            selected = np.flatnonzero(inside)
+            self.assertGreater(len(selected), 0)
+            expected_uv.append(np.einsum(
+                "ei,eij->ej", weights[selected], solution.displacement[solution.triangles[selected]]
+            ).mean(axis=0))
+            expected_stress.append(solution.stress[selected].mean(axis=0))
+        np.testing.assert_allclose(uv, expected_uv, rtol=1e-12, atol=1e-13)
+        np.testing.assert_allclose(stress, expected_stress, rtol=1e-12, atol=1e-3)
+
+    def test_matrix_free_pcg_matches_coalesced_sparse_operator(self):
+        stiffness = np.array([[
+            [4, 1, 0, 0, 0, 0], [1, 5, 1, 0, 0, 0], [0, 1, 6, 1, 0, 0],
+            [0, 0, 1, 7, 1, 0], [0, 0, 0, 1, 8, 1], [0, 0, 0, 0, 1, 9],
+        ]], dtype=float)
+        dofs = np.array([[0, 1, 2, 3, 4, 5]])
+        force = np.array([1, -2, 3, -4, 5, -6], dtype=float)
+        free = np.ones(6, dtype=bool)
+        rows = np.broadcast_to(dofs[:, :, None], stiffness.shape).ravel()
+        columns = np.broadcast_to(dofs[:, None, :], stiffness.shape).ravel()
+        sparse_x, _, _, _ = sparse_pcg(rows, columns, stiffness.ravel(), force, free)
+        element_x, _, _, _ = element_pcg(stiffness, dofs, force, free)
+        np.testing.assert_allclose(element_x, sparse_x, rtol=1e-12, atol=1e-13)
 
     def test_invalid_geometry_material_and_load_are_rejected(self):
         valid = [0.1, 0.1, 0.005, 71.7e9, 0.33, 69e6, 32, 8]

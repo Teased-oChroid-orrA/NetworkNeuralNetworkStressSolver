@@ -4,6 +4,7 @@ use burn::{
     nn::{Initializer, Linear, LinearConfig},
     tensor::{backend::Backend, ElementConversion, Tensor, TensorData},
 };
+use pinn_core::user_geometry::CoordinateEmbedding;
 
 /// Physics-informed displacement (+ optional stress) network.
 ///
@@ -38,6 +39,12 @@ pub(crate) struct LegacyElasticityNet<B: Backend> {
 }
 
 impl<B: Backend> ElasticityNet<B> {
+    /// Persisted checkpoint architecture width. This is read-only model metadata, not an
+    /// inference input contract supplied by callers.
+    pub fn input_dim(&self) -> usize {
+        self.layers[0].weight.val().dims()[0]
+    }
+
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
         self.forward_masked(x, None)
     }
@@ -890,6 +897,57 @@ pub fn fwd<Bk: Backend>(
     }
 }
 
+/// Geometry-aware forward for user-defined plates. Raw coordinates always remain the
+/// coordinate-skip input; only the MLP input receives local rational features.
+pub fn fwd_embedded<Bk: Backend>(
+    model: &ElasticityNet<Bk>,
+    input: Tensor<Bk, 2>,
+    embedding: CoordinateEmbedding,
+    device: &Bk::Device,
+) -> Tensor<Bk, 2> {
+    fwd_embedded_masked(model, input, embedding, device, None)
+}
+
+fn chart_embed<Bk: Backend>(
+    input: Tensor<Bk, 2>,
+    center_norm: [f32; 2],
+    inv_radius: [f32; 2],
+    epsilon: f32,
+) -> Tensor<Bk, 2> {
+    let n = input.dims()[0];
+    let x = input.clone().slice([0..n, 0..1]);
+    let y = input.clone().slice([0..n, 1..2]);
+    let qx = x.clone().sub_scalar(center_norm[0] as f64).mul_scalar(inv_radius[0] as f64);
+    let qy = y.clone().sub_scalar(center_norm[1] as f64).mul_scalar(inv_radius[1] as f64);
+    let r2 = qx.clone().powf_scalar(2.0) + qy.clone().powf_scalar(2.0);
+    let safe_r2 = r2.clamp_min((epsilon as f64).powi(2));
+    let r = safe_r2.clone().sqrt();
+    let log_r = r.clone().log();
+    let c2 = (qx.clone().powf_scalar(2.0) - qy.clone().powf_scalar(2.0)) / safe_r2.clone();
+    let s2 = qx.mul(qy).mul_scalar(2.0) / safe_r2;
+    // `r` already has only the zero-protection floor. 1/r is smooth through the physical
+    // interface r=1 and decays in the far field; no boundary clamp introduces an FD kink.
+    let psi = r.clone().recip();
+    Tensor::cat(vec![input, r, log_r, c2.clone(), s2.clone(), psi.clone(), psi.clone() * c2, psi * s2], 1)
+}
+
+pub fn fwd_embedded_masked<Bk: Backend>(
+    model: &ElasticityNet<Bk>,
+    input: Tensor<Bk, 2>,
+    embedding: CoordinateEmbedding,
+    _device: &Bk::Device,
+    mask: Option<&[bool]>,
+) -> Tensor<Bk, 2> {
+    let n = input.dims()[0];
+    let coords = input.clone().slice([0..n, 0..3]);
+    let embedded = match embedding {
+        CoordinateEmbedding::Raw => input,
+        CoordinateEmbedding::SingleHoleChart { center_norm, inv_radius, epsilon } =>
+            chart_embed(input, center_norm, inv_radius, epsilon),
+    };
+    model.forward_with_coordinates_masked(embedded, coords, mask)
+}
+
 /// `fwd`'s masked analogue — applies the same optional Fourier embedding, then calls
 /// `ElasticityNet::forward_masked` instead of `forward`. `None` is byte-identical to `fwd`.
 pub fn fwd_masked<Bk: Backend>(
@@ -917,6 +975,61 @@ mod tests {
 
     type TB = Autodiff<Wgpu>;
     type TBInner = Wgpu;
+
+    #[test]
+    fn chart_embed_preserves_raw_coordinates_and_encodes_known_boundary_point() {
+        use crate::training_core::{BDevice, BInner};
+        let device = BDevice::default();
+        // Hole center is (0.25, -0.25) in normalized coordinates. x=0.30 is one
+        // physical hole radius away when inv_radius.x=20.
+        let input = Tensor::<BInner, 2>::from_data(
+            TensorData::new(vec![0.30, -0.25, 0.0], vec![1, 3]), &device,
+        );
+        let values: Vec<f32> = chart_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4)
+            .into_data().to_vec().unwrap();
+        assert_eq!(&values[..3], &[0.30, -0.25, 0.0]);
+        assert!((values[3] - 1.0).abs() < 1e-5, "r={}", values[3]);
+        assert!(values[4].abs() < 1e-5, "log_r={}", values[4]);
+        assert!((values[5] - 1.0).abs() < 1e-5, "c2={}", values[5]);
+        assert!(values[6].abs() < 1e-5, "s2={}", values[6]);
+        assert!((values[7] - 1.0).abs() < 1e-5, "psi={}", values[7]);
+        assert!((values[8] - 1.0).abs() < 1e-5, "psi_c2={}", values[8]);
+        assert!(values[9].abs() < 1e-5, "psi_s2={}", values[9]);
+    }
+
+    #[test]
+    fn chart_embed_is_finite_at_hole_center_protection_limit() {
+        use crate::training_core::{BDevice, BInner};
+        let device = BDevice::default();
+        let input = Tensor::<BInner, 2>::from_data(
+            TensorData::new(vec![0.25, -0.25, 0.0], vec![1, 3]), &device,
+        );
+        let values: Vec<f32> = chart_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4)
+            .into_data().to_vec().unwrap();
+        assert!(values.iter().all(|value| value.is_finite()), "{values:?}");
+        assert_eq!(values[5], 0.0);
+        assert_eq!(values[6], 0.0);
+        assert_eq!(values[8], 0.0);
+        assert_eq!(values[9], 0.0);
+    }
+
+    #[test]
+    fn chart_embed_is_fd_continuous_across_hole_boundary() {
+        use crate::training_core::{BDevice, BInner};
+        let device = BDevice::default();
+        let h = 1e-4_f32;
+        // qx=r* because inv_radius.x=20 and center_norm.x=0.25.
+        let input = Tensor::<BInner, 2>::from_data(TensorData::new(
+            vec![0.30 - h / 20.0, -0.25, 0.0, 0.30, -0.25, 0.0, 0.30 + h / 20.0, -0.25, 0.0],
+            vec![3, 3],
+        ), &device);
+        let v: Vec<f32> = chart_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4)
+            .into_data().to_vec().unwrap();
+        let r = |row: usize| v[row * 10 + 3];
+        let psi = |row: usize| v[row * 10 + 7];
+        assert!(((r(2) - r(0)) / (2.0 * h) - 1.0).abs() < 2e-3);
+        assert!(((psi(2) - psi(0)) / (2.0 * h) + 1.0).abs() < 2e-3);
+    }
 
     /// Issue #62 PH3-11: real, verified evidence that `Backend::seed` immediately before
     /// `ElasticityNetConfig::init` makes weight initialization reproducible - this codebase's
@@ -1101,6 +1214,24 @@ mod tests {
         let new = model.forward_with_coordinates(coords.clone(), coords);
         let diff: f32 = (old - new).abs().sum().into_scalar();
         assert_eq!(diff, 0.0);
+    }
+
+    #[test]
+    fn raw_geometry_embedding_is_byte_identical_to_legacy_raw_forward() {
+        let device = WgpuDevice::default();
+        let model: ElasticityNet<TB> = ElasticityNetConfig::new()
+            .with_input_dim(3)
+            .with_hidden_dim(4)
+            .with_n_hidden(2)
+            .with_output_dim(5)
+            .init(&device);
+        let input = raw_coords(&device);
+        let legacy = fwd(&model, input.clone(), 0, &device);
+        let embedded = fwd_embedded(&model, input, CoordinateEmbedding::Raw, &device);
+        assert_eq!(
+            legacy.into_data().to_vec::<f32>().unwrap(),
+            embedded.into_data().to_vec::<f32>().unwrap(),
+        );
     }
 
     #[test]

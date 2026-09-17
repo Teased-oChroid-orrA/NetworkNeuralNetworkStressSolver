@@ -44,6 +44,10 @@ pub struct CheckpointMeta {
     /// its own (kept a pure function of its arguments, same as every other solver-side probe
     /// in this codebase).
     pub saved_at_unix: u64,
+    /// Input width actually saved with the weight record. Missing means a checkpoint written
+    /// before geometric enrichment metadata existed; those plate checkpoints used raw width 3.
+    #[serde(default)]
+    pub input_dim: Option<usize>,
     /// Issue #61 EPIC P2-13: reproducibility/provenance metadata - `#[serde(default)]` so
     /// existing `.meta.json` files saved before this field existed still deserialize (with
     /// `RunProvenance::default()`, whose `Option` fields are `None` and whose non-`Option`
@@ -84,10 +88,13 @@ pub fn save_checkpoint(
     meta: &CheckpointMeta,
     weights_path: &Path,
 ) -> Result<PathBuf, String> {
+    let input_dim = model.input_dim();
     model
         .save_file(weights_path, &recorder())
         .map_err(|e| format!("failed to write model weights: {e}"))?;
-    let json = serde_json::to_string_pretty(meta)
+    let mut meta = meta.clone();
+    meta.input_dim = Some(input_dim);
+    let json = serde_json::to_string_pretty(&meta)
         .map_err(|e| format!("failed to serialize checkpoint metadata: {e}"))?;
     std::fs::write(meta_path(weights_path), json)
         .map_err(|e| format!("failed to write checkpoint metadata: {e}"))?;
@@ -122,7 +129,7 @@ fn net_cfg_for_meta(meta: &CheckpointMeta) -> ElasticityNetConfig {
     // is plate-only, matching every other change in this pass.
     let (input_dim, hidden_dim, n_hidden, adaptive) = match &meta.spec {
         CheckpointSpec::Plate(spec) => (
-            spec.geometry.net_input_dim(),
+            meta.input_dim.unwrap_or(3),
             spec.network.hidden_dim,
             spec.network.n_hidden,
             spec.network.adaptive,
@@ -232,11 +239,8 @@ mod tests {
     fn save_then_load_round_trips_weights_and_metadata_exactly() {
         let device = BDevice::default();
         let spec = tiny_plate_spec();
-        // `tiny_plate_spec` has a hole, so `net_input_dim()` is the Fourier-embedded width
-        // (see `UserGeometry::n_fourier`'s doc comment) - must match `net_cfg_for_meta`'s own
-        // derivation exactly, or `load_file` below fails on a real shape mismatch (the actual
-        // bug this test would have caught had it existed before this fix).
-        let n_fourier = spec.geometry.n_fourier();
+        let embedding = spec.geometry.coordinate_embedding();
+        // Saved input width, not the current geometry default, is the checkpoint contract.
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(spec.geometry.net_input_dim())
             .with_hidden_dim(8)
@@ -255,7 +259,7 @@ mod tests {
         let probe_pts: Vec<[f32; 2]> = vec![[0.1, 0.2], [-0.3, 0.4], [0.5, -0.1]];
         let probe_tensor = crate::fd_stencil::norm_pts_to_tensor::<BInner>(&probe_pts, &device);
         let before =
-            crate::network::fwd::<BInner>(&model, probe_tensor.clone(), n_fourier, &device)
+            crate::network::fwd_embedded::<BInner>(&model, probe_tensor.clone(), embedding, &device)
                 .into_data()
                 .to_vec::<f32>()
                 .unwrap();
@@ -264,6 +268,7 @@ mod tests {
             steps_completed: 42,
             final_loss: 0.0123,
             saved_at_unix: 1_700_000_000,
+            input_dim: None,
             provenance: Default::default(),
             report: None,
         };
@@ -279,12 +284,13 @@ mod tests {
         assert_eq!(loaded_meta.steps_completed, 42);
         assert!((loaded_meta.final_loss - 0.0123).abs() < 1e-6);
         assert_eq!(loaded_meta.saved_at_unix, 1_700_000_000);
+        assert_eq!(loaded_meta.input_dim, Some(10));
         match &loaded_meta.spec {
             CheckpointSpec::Plate(s) => assert_eq!(s.network.hidden_dim, 8),
             CheckpointSpec::Parametric(_) => panic!("expected Plate spec"),
         }
 
-        let after = crate::network::fwd::<BInner>(&loaded, probe_tensor, n_fourier, &device)
+        let after = crate::network::fwd_embedded::<BInner>(&loaded, probe_tensor, embedding, &device)
             .into_data()
             .to_vec::<f32>()
             .unwrap();
@@ -338,6 +344,7 @@ mod tests {
             steps_completed: 6,
             final_loss: 1.0,
             saved_at_unix: 0,
+            input_dim: None,
             provenance: Default::default(),
             report: None,
         };
@@ -379,8 +386,16 @@ mod tests {
         let device = BDevice::default();
         let spec = tiny_plate_spec();
         let n_fourier = spec.geometry.n_fourier();
+        // A genuinely "legacy" (`meta.input_dim: None`) checkpoint predates chart embedding by
+        // definition - it was saved back when `net_input_dim()` was unconditionally 3 for every
+        // geometry, regardless of hole count. Using `spec.geometry.net_input_dim()` here (now
+        // 10 for `tiny_plate_spec()`'s single centered Free hole, post-#77) would build and save
+        // a model shape the `input_dim: None` fallback (`unwrap_or(3)`) can never actually
+        // reconstruct - exactly the matmul-dimension-mismatch this hardcoded `3` avoids, and the
+        // correct fixture for what this test is actually verifying (backward compatibility with
+        // a pre-chart-embedding record, not chart embedding itself).
         let net_cfg = ElasticityNetConfig::new()
-            .with_input_dim(spec.geometry.net_input_dim())
+            .with_input_dim(3)
             .with_hidden_dim(8)
             .with_n_hidden(2)
             .with_output_dim(5);
@@ -390,6 +405,7 @@ mod tests {
             steps_completed: 1,
             final_loss: 0.0,
             saved_at_unix: 0,
+            input_dim: None,
             provenance: Default::default(),
             report: None,
         };

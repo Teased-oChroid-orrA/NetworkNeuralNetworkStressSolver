@@ -31,7 +31,7 @@ use pinn_core::{
     loading::{BoundaryKind, BoundaryPoint, LoadConfig},
     material::MaterialProps,
     problem::{
-        DirichletAnsatz, DomainId, DomainSamplingStrategy, DomainSpec, NamedPointSet,
+        DirichletAnsatz, DomainId, DomainSamplingStrategy, DomainSpec, InterfaceParametrization, NamedPointSet,
     },
     problem_spec::ProblemSpec,
     user_geometry::{HoleBc, HoleSpec, UserGeometry},
@@ -44,6 +44,10 @@ use crate::{
 };
 
 pub const USER_DOMAIN: DomainId = DomainId(0);
+/// Domains used by the one-hole bonded annular decomposition. Kept separate from the legacy
+/// user domain so a mixed-domain forward can never accidentally satisfy a legacy term.
+pub const ANNULUS_DOMAIN: DomainId = DomainId(1);
+pub const OUTER_DOMAIN: DomainId = DomainId(2);
 
 const LAM_INTERIOR_ENERGY: f32 = 1.0;
 /// One optimization scale for the complete physical potential `Π = U - W_ext`.
@@ -87,6 +91,44 @@ const LAM_HOLE_FIXED: f32 = 50.0;
 const LAM_TRANSLATION_GAUGE: f32 = 50.0;
 const LAM_ROTATION_GAUGE: f32 = 50.0;
 
+/// Issue #77 root-cause fix (kinematic decomposition): the closed-form uniform-tension
+/// strain `(eps_xx, eps_yy, eps_xy)` of `u_affine(x,y) = ((px-nu*py)/E)*x, ((py-nu*px)/E)*y`
+/// under Hooke's law inverse for plane stress (`sigma_xx=px, sigma_yy=py, sigma_xy=0`
+/// exactly reproduces `run_no_hole_benchmark`'s own reference solution). Used to superpose a
+/// KNOWN, EXACT background field onto the network's output so the network represents only
+/// the residual correction `u_hole := u_total - u_affine`, not the (dominant, easily-learned)
+/// affine part — see `docs/PHASE_4_MATHEMATICAL_OBJECTIVE_AUDIT.md`'s own affine reduction
+/// and this session's SNR analysis (a hole's total energy signature is a fraction of a
+/// percent of Pi for a small hole; a network minimizing total Pi spends nearly all its
+/// gradient budget reducing the large affine misfit first, starving the local correction).
+///
+/// Every energy/stress functional evaluated on the TOTAL field must use TOTAL strain
+/// (`eps_affine + eps_hole`), not `eps_hole` alone — the cross term `C:eps_affine:eps_hole`
+/// is physically required for equivalence to the true Pi (dropping it reproduces the
+/// documented "not a uniform rescaling, changes the stationary point" defect from
+/// `PHASE_4_MATHEMATICAL_OBJECTIVE_AUDIT.md`'s historical-defect section, one level deeper).
+/// Adding this constant to the network's own FD/Hessian-derived strain before calling into
+/// `dem_energy_per_point`/`compute_stress`/`neumann_loss` achieves this "for free" — those
+/// functions never see the decomposition, they just receive the already-total strain.
+fn affine_strain(px: f64, py: f64, material: &MaterialProps) -> (f64, f64, f64) {
+    let e = material.e as f64;
+    let nu = material.nu as f64;
+    ((px - nu * py) / e, (py - nu * px) / e, 0.0)
+}
+
+/// Kinematic decomposition (issue #77 fix) is scoped to exactly the case where
+/// `u_affine` has a clean closed form and the hole's own natural BC needs an explicit,
+/// correctly-targeted residual: one centered, traction-free hole. Off, unconditionally,
+/// for no-hole/multi-hole/off-center/Fixed-bc geometries — those fall back to the
+/// existing, unmodified behavior byte-for-byte (no `affine_strain`/`affine_target` field
+/// is ever `Some` for them).
+fn decomposition_applicable(spec: &ProblemSpec) -> bool {
+    matches!(
+        spec.geometry.holes.as_slice(),
+        [HoleSpec { bc: HoleBc::Free, center, .. }] if center[0] == 0.0 && center[1] == 0.0
+    )
+}
+
 /// Points sampled around each hole's circumference, per hole — a fixed, generous default;
 /// not user-configurable in v1 (see `ProblemSpec`'s scope note).
 const HOLE_RING_POINTS: usize = 64;
@@ -120,6 +162,135 @@ pub fn ring_anchor_margin_m(fd_h: f32, geometry: &UserGeometry) -> f64 {
     RING_ANCHOR_SAFETY_FACTOR * fd_h as f64 * geometry.half_w.max(geometry.half_h)
 }
 
+/// One side of #77's bonded annular decomposition. Both sides share `interface.thetas`, so
+/// cross-domain losses compare identical physical interface points by index.
+pub struct AnnularPartitionSampling {
+    geometry: UserGeometry,
+    partition: pinn_core::user_geometry::AnnularPartition,
+    is_annulus: bool,
+    partner: DomainId,
+    interface: std::sync::Arc<InterfaceParametrization>,
+    collocation_inner_radius: f64,
+    interface_trace_offset: f64,
+    interior_calls: std::sync::atomic::AtomicU64,
+}
+
+impl AnnularPartitionSampling {
+    pub fn new(geometry: UserGeometry, fd_h: f32, is_annulus: bool, partner: DomainId, interface: std::sync::Arc<InterfaceParametrization>) -> Self {
+        let partition = geometry.annular_partition().expect("#77 decomposition requires one safely-contained circular hole");
+        let collocation_inner_radius = partition.hole_radius + ring_anchor_margin_m(fd_h, &geometry);
+        assert!(collocation_inner_radius < partition.interface_radius, "#77 annulus too thin for FD-safe collocation");
+        let interface_trace_offset = 0.5 * ring_anchor_margin_m(fd_h, &geometry);
+        assert!(interface_trace_offset > 0.0 && interface_trace_offset < partition.interface_radius - collocation_inner_radius,
+            "#77 interface FD trace offset must fit inside annulus");
+        Self { geometry, partition, is_annulus, partner, interface, collocation_inner_radius, interface_trace_offset, interior_calls: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+}
+
+impl DomainSamplingStrategy for AnnularPartitionSampling {
+    fn sample_interior(&self, _geom: &GeometryConfig, n: usize) -> Vec<[f64; 2]> {
+        use pinn_core::LcgRng;
+        let call = self.interior_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut rng = LcgRng::new(SEED_INTERIOR ^ call.wrapping_mul(CALL_SEED_MIX) ^ if self.is_annulus { 0xA11u64 } else { 0x0u64 });
+        let mut points = Vec::with_capacity(n);
+        if self.is_annulus {
+            let r0sq = self.collocation_inner_radius * self.collocation_inner_radius;
+            let r1sq = self.partition.interface_radius * self.partition.interface_radius;
+            for _ in 0..n {
+                let r = (r0sq + rng.next_f64() * (r1sq - r0sq)).sqrt();
+                let theta = 2.0 * std::f64::consts::PI * rng.next_f64();
+                points.push([self.partition.center[0] + r * theta.cos(), self.partition.center[1] + r * theta.sin()]);
+            }
+        } else {
+            let mut attempts = 0usize;
+            while points.len() < n && attempts < n * REJECTION_SAMPLE_ATTEMPTS_FACTOR {
+                attempts += 1;
+                let x = (rng.next_f64() * 2.0 - 1.0) * self.geometry.half_w;
+                let y = (rng.next_f64() * 2.0 - 1.0) * self.geometry.half_h;
+                if self.geometry.contains(x, y) && self.partition.contains_outer(x, y) { points.push([x, y]); }
+            }
+        }
+        points
+    }
+
+    fn sample_boundary(&self, _geom: &GeometryConfig, _load: &LoadConfig, n: usize) -> Vec<BoundaryPoint> {
+        if self.is_annulus { return Vec::new(); }
+        let per_edge = (n / 4).max(1);
+        let mut points = Vec::with_capacity(4 * per_edge);
+        for i in 0..per_edge {
+            let f = (i as f64 + 0.5) / per_edge as f64;
+            let x = -self.geometry.half_w + 2.0 * self.geometry.half_w * f;
+            let y = -self.geometry.half_h + 2.0 * self.geometry.half_h * f;
+            points.extend([
+                BoundaryPoint { x: self.geometry.half_w, y, nx: 1.0, ny: 0.0, tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannLoad },
+                BoundaryPoint { x: -self.geometry.half_w, y, nx: -1.0, ny: 0.0, tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannLoad },
+                BoundaryPoint { x, y: self.geometry.half_h, nx: 0.0, ny: 1.0, tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannLoad },
+                BoundaryPoint { x, y: -self.geometry.half_h, nx: 0.0, ny: -1.0, tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannLoad },
+            ]);
+        }
+        points
+    }
+
+    fn amr_lock_zone(&self, _geom: &GeometryConfig, _cell_center: [f64; 2]) -> bool { false }
+    fn sample_extra_ring(&self, _geom: &GeometryConfig, _n: usize) -> Vec<[f64; 2]> { Vec::new() }
+    fn named_point_sets(&self, _bnd: &[BoundaryPoint]) -> Vec<NamedPointSet> {
+        let interface = self.interface.thetas.iter().map(|&theta| {
+            let radial = [theta.cos(), theta.sin()];
+            let sign = if self.is_annulus { 1.0 } else { -1.0 };
+            BoundaryPoint {
+                x: self.partition.center[0] + self.partition.interface_radius * radial[0],
+                y: self.partition.center[1] + self.partition.interface_radius * radial[1],
+                nx: sign * radial[0], ny: sign * radial[1], tx: 0.0, ty: 0.0,
+                kind: BoundaryKind::Interface { partner_domain: self.partner },
+            }
+        }).collect();
+        let mut sets = vec![NamedPointSet { name: "interface", points: interface }];
+        // Keep all five arms of the central-difference stencil inside its owner. The offset is
+        // two maximum physical FD reaches: one reach remains after the worst radial component
+        // of an axis-aligned arm. This is a trace approximation, never a cross-domain model
+        // extension masquerading as a derivative.
+        let trace_radius = if self.is_annulus {
+            self.partition.interface_radius - self.interface_trace_offset
+        } else {
+            self.partition.interface_radius + self.interface_trace_offset
+        };
+        let trace_name = if self.is_annulus {
+            "interface_annulus_stress"
+        } else {
+            "interface_outer_stress"
+        };
+        let trace_sign = if self.is_annulus { 1.0 } else { -1.0 };
+        let trace_points = self.interface.thetas.iter().map(|&theta| BoundaryPoint {
+            x: self.partition.center[0] + trace_radius * theta.cos(),
+            y: self.partition.center[1] + trace_radius * theta.sin(),
+            nx: trace_sign * theta.cos(), ny: trace_sign * theta.sin(), tx: 0.0, ty: 0.0,
+            kind: BoundaryKind::Interface { partner_domain: self.partner },
+        }).collect();
+        sets.push(NamedPointSet { name: trace_name, points: trace_points });
+        if self.is_annulus {
+            let hole = self.geometry.holes[0];
+            let points = self.interface.thetas.iter().map(|&theta| BoundaryPoint {
+                x: hole.center[0] + hole.radius * theta.cos(), y: hole.center[1] + hole.radius * theta.sin(),
+                nx: -theta.cos(), ny: -theta.sin(), tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannFree,
+            }).collect();
+            sets.push(NamedPointSet { name: "hole_0", points });
+            // Issue #77 fix: FD-safe companion ring at `collocation_inner_radius`
+            // (`radius + ring_anchor_margin_m`, already computed for this sampler's own
+            // interior collocation) - the kinematic-decomposition hole traction term needs a
+            // DERIVED stress read, and the exact-radius "hole_0" ring above is stencil-unsafe
+            // for that (an inward FD arm would land inside the hole).
+            let fd_points = self.interface.thetas.iter().map(|&theta| BoundaryPoint {
+                x: hole.center[0] + self.collocation_inner_radius * theta.cos(),
+                y: hole.center[1] + self.collocation_inner_radius * theta.sin(),
+                nx: -theta.cos(), ny: -theta.sin(), tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannFree,
+            }).collect();
+            sets.push(NamedPointSet { name: "hole_0_fd", points: fd_points });
+        }
+        sets
+    }
+}
+
 /// Per-domain sampling strategy driven directly by a [`UserGeometry`] — ignores the
 /// `&GeometryConfig` parameter every [`DomainSamplingStrategy`] method takes (an
 /// established, precedented pattern — see `FakeInterfaceSampling` in
@@ -131,6 +302,12 @@ pub struct UserSamplingStrategy {
     /// [`Self::named_point_sets`] can return the same content-stable `&'static str` names
     /// every call without leaking memory continuously across a long training run.
     hole_names: Vec<&'static str>,
+    /// `"hole_0_fd"`, `"hole_1_fd"`, ... — FD-safe rings at `radius + anchor_margin_m`, one per
+    /// hole, leaked alongside `hole_names`. Issue #77 fix: unlike `hole_names`'s exact-radius
+    /// ring (safe only for a DIRECT stress read), a DERIVED/constitutive-stress read needs its
+    /// FD stencil arms to clear the hole boundary, the same requirement `contains_for_collocation`
+    /// already enforces for interior points.
+    hole_fd_names: Vec<&'static str>,
     /// Radial offset [m] applied outside each hole's radius when EXCLUDING collocation points
     /// from the FD-unsafe near-hole annulus (see [`Self::contains_for_collocation`]) — see
     /// [`Self::new`] for the derivation. No longer used to emit a training point-set/anchor
@@ -175,9 +352,12 @@ impl UserSamplingStrategy {
         let hole_names = (0..geometry.holes.len())
             .map(|i| -> &'static str { Box::leak(format!("hole_{i}").into_boxed_str()) })
             .collect();
+        let hole_fd_names = (0..geometry.holes.len())
+            .map(|i| -> &'static str { Box::leak(format!("hole_{i}_fd").into_boxed_str()) })
+            .collect();
         let anchor_margin_m = ring_anchor_margin_m(fd_h, &geometry);
         Self {
-            geometry, hole_names, anchor_margin_m,
+            geometry, hole_names, hole_fd_names, anchor_margin_m,
             interior_calls: std::sync::atomic::AtomicU64::new(0),
             boundary_calls: std::sync::atomic::AtomicU64::new(0),
         }
@@ -316,7 +496,23 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
                 }
             }).collect();
             NamedPointSet { name, points }
-        }).collect()
+        }).chain(self.geometry.holes.iter().zip(self.hole_fd_names.iter()).map(|(hole, &name)| {
+            // Issue #77 fix: FD-safe ring at `radius + anchor_margin_m`, same outward-into-the-
+            // hole normal convention as the exact-radius ring above — used only by the
+            // kinematic-decomposition hole traction term, which needs a DERIVED (constitutive)
+            // stress read and therefore a stencil-safe radius, not the exact hole boundary.
+            let r = hole.radius + self.anchor_margin_m;
+            let points = (0..HOLE_RING_POINTS).map(|i| {
+                let theta = 2.0 * std::f64::consts::PI * i as f64 / HOLE_RING_POINTS as f64;
+                let (nx, ny) = (theta.cos(), theta.sin());
+                BoundaryPoint {
+                    x: hole.center[0] + r * nx, y: hole.center[1] + r * ny,
+                    nx: -nx, ny: -ny, tx: 0.0, ty: 0.0,
+                    kind: BoundaryKind::NeumannFree,
+                }
+            }).collect();
+            NamedPointSet { name, points }
+        })).collect()
     }
 
     // `constitutive_anchor_point_sets` intentionally NOT overridden here anymore (falls back
@@ -375,6 +571,23 @@ pub fn resample_plate_step_data(
     half_w: f64,
     half_h: f64,
 ) -> crate::problem::DomainStepData {
+    resample_domain_step_data(
+        USER_DOMAIN, sampling, placeholder_geom, load, n_interior, n_boundary, half_w, half_h,
+    )
+}
+
+/// Domain-id-parametrized version of [`resample_plate_step_data`]. Multi-domain problems use
+/// the same sampling and point-set conversion as the legacy plate path; only ownership differs.
+pub fn resample_domain_step_data(
+    id: DomainId,
+    sampling: &dyn DomainSamplingStrategy,
+    placeholder_geom: &GeometryConfig,
+    load: &LoadConfig,
+    n_interior: usize,
+    n_boundary: usize,
+    half_w: f64,
+    half_h: f64,
+) -> crate::problem::DomainStepData {
     let int_pts = sampling.sample_interior(placeholder_geom, n_interior);
     let int_norm: Vec<[f32; 2]> = int_pts.iter()
         .map(|&[x, y]| plate_normalize_point(x, y, half_w, half_h))
@@ -390,7 +603,7 @@ pub fn resample_plate_step_data(
         named.insert(set.name, plate_build_pointset(&set.points, half_w, half_h));
     }
 
-    crate::problem::DomainStepData { id: USER_DOMAIN, int_norm, extra_ring_norm: Vec::new(), named }
+    crate::problem::DomainStepData { id, int_norm, extra_ring_norm: Vec::new(), named }
 }
 
 /// Issue #75: whether a step's interior points came from plain uniform sampling or the
@@ -528,6 +741,7 @@ pub fn plate_multi_step_ctx<'a>(
     ref_energy: f32,
     ref_stress2: f32,
     n_fourier: usize,
+    coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding,
     probe_term_gradients: bool,
     step: usize,
 ) -> crate::problem::MultiStepCtx<'a> {
@@ -543,6 +757,43 @@ pub fn plate_multi_step_ctx<'a>(
         dynamic_lam_non_tension_cap: f64::MAX,
         constitutive_consistency_weight: 50.0,
         n_fourier,
+        coordinate_embedding,
+        probe_term_gradients,
+        phase2_active: true,
+        step,
+    }
+}
+
+/// Two-domain counterpart of [`plate_multi_step_ctx`]. Both domains use shared physical
+/// reference scales, while model input width selects raw outer versus charted annular forwards.
+#[allow(clippy::too_many_arguments)]
+pub fn plate_multi_domain_step_ctx<'a>(
+    config: &'a pinn_core::messages::SolverConfig,
+    problem: &'a dyn crate::problem::BoundaryValueProblem,
+    fd: &'a crate::fd_stencil::FdConfig,
+    annulus: &'a crate::problem::DomainStepData,
+    outer: &'a crate::problem::DomainStepData,
+    u_ref: f32,
+    ref_energy: f32,
+    ref_stress2: f32,
+    n_fourier: usize,
+    coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding,
+    probe_term_gradients: bool,
+    step: usize,
+) -> crate::problem::MultiStepCtx<'a> {
+    crate::problem::MultiStepCtx {
+        config, problem, fd, k: 1.0,
+        domains: vec![
+            crate::problem::DomainStepCtx { data: annulus, u_ref, ref_energy, ref_stress2 },
+            crate::problem::DomainStepCtx { data: outer, u_ref, ref_energy, ref_stress2 },
+        ],
+        dynamic_lam_h_cap: 50.0,
+        dynamic_lam_d_cap: 50.0,
+        dynamic_lam_penetration_cap: 50.0,
+        dynamic_lam_non_tension_cap: f64::MAX,
+        constitutive_consistency_weight: 50.0,
+        n_fourier,
+        coordinate_embedding,
         probe_term_gradients,
         phase2_active: true,
         step,
@@ -561,6 +812,7 @@ pub fn plate_multi_step_ctx<'a>(
 /// (not `dem_energy_loss`'s plain, AMR-density-biased `.mean()`) is the correct estimator once
 /// sampling becomes nonuniform.
 struct InteriorEnergyTerm {
+    domain: DomainId,
     material: MaterialProps,
     ref_energy: f32,
     measure_aware: bool,
@@ -581,7 +833,7 @@ struct InteriorEnergyTerm {
 }
 impl LossTerm for InteriorEnergyTerm {
     fn name(&self) -> &'static str { "interior_energy" }
-    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
+    fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
     fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Weak }
     // Strain-energy only - no stress quantity at the term level.
@@ -591,7 +843,7 @@ impl LossTerm for InteriorEnergyTerm {
     // `U` itself - the literal physical functional term issue #61 P2-05 names.
     fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
-        let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("interior_energy: domain missing");
+        let d = inputs.iter().find(|i| i.domain == self.domain).expect("interior_energy: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("interior_energy: strains must be Some");
         if !self.measure_aware {
             return dem_energy_loss(exx, eyy, exy, &self.material).mul_scalar(1.0 / self.ref_energy as f64);
@@ -624,13 +876,14 @@ impl LossTerm for InteriorEnergyTerm {
 /// `kirsch_problem.rs` is untouched; this is a separate, plate-scoped struct so Kirsch's own
 /// path/tests can never be affected by anything here.
 struct EquilibriumTerm {
+    domain: DomainId,
     point_set: &'static str,
     material: MaterialProps,
     ref_div2: f64,
 }
 impl LossTerm for EquilibriumTerm {
     fn name(&self) -> &'static str { "equilibrium" }
-    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
+    fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec![self.point_set] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
     fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
@@ -646,7 +899,7 @@ impl LossTerm for EquilibriumTerm {
     // physics, not an admissibility constraint or a diagnostic.
     fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
-        let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("equilibrium: domain missing");
+        let d = inputs.iter().find(|i| i.domain == self.domain).expect("equilibrium: domain missing");
         let (u_xx, u_yy, u_xy, v_xx, v_yy, v_xy) = d.hessian.clone()
             .expect("equilibrium: hessian must be Some (needs_hessian()==true)");
         equilibrium_from_displacement_hessian_loss(
@@ -664,6 +917,7 @@ impl LossTerm for EquilibriumTerm {
 /// whatever points this problem's own sampling strategy just generated — simpler than
 /// threading a stale target tensor through resampling, and the same physics either way.
 struct OuterTractionTerm {
+    domain: DomainId,
     material: MaterialProps,
     ref_stress2: f32,
     px: f64,
@@ -671,7 +925,7 @@ struct OuterTractionTerm {
 }
 impl LossTerm for OuterTractionTerm {
     fn name(&self) -> &'static str { "outer_traction" }
-    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
+    fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["outer_boundary"] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
     fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
@@ -685,7 +939,7 @@ impl LossTerm for OuterTractionTerm {
     // admissibility constraint layered on top of it (unlike an essential/Dirichlet condition).
     fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
-        let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("outer_traction: domain missing");
+        let d = inputs.iter().find(|i| i.domain == self.domain).expect("outer_traction: domain missing");
         let (exx, eyy, exy) = d.strains.clone().expect("outer_traction: strains must be Some");
         let (nx, ny) = d.normals.clone().expect("outer_traction: normals must be Some");
         let tx_target = nx.clone().mul_scalar(self.px);
@@ -752,6 +1006,7 @@ struct ExternalWorkTerm {
 /// functional.  That keeps its physical 1:-1 coefficient ratio inside the tensor graph before
 /// any optimizer/adaptive weighting is applied.
 struct PhysicalPotentialEnergyTerm {
+    domain: DomainId,
     material: MaterialProps,
     px: f64,
     py: f64,
@@ -762,11 +1017,16 @@ struct PhysicalPotentialEnergyTerm {
     ref_energy_absolute: f64,
     interior_weights: Option<Vec<f64>>,
     ds_per_point: Vec<f64>,
+    /// Issue #77 fix: `Some((px,py))` when kinematic decomposition is active — the network's
+    /// own `interior.strains` is then `eps_hole` alone, so `affine_strain(px,py,material)`
+    /// must be added before computing `U` (see that function's doc comment: the cross term is
+    /// physically required, not optional). `None` everywhere else — byte-identical fallback.
+    affine_strain: Option<(f64, f64)>,
 }
 
 impl LossTerm for PhysicalPotentialEnergyTerm {
     fn name(&self) -> &'static str { "physical_potential" }
-    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN, USER_DOMAIN] }
+    fn domains(&self) -> Vec<DomainId> { vec![self.domain, self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["interior", "outer_boundary"] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
     fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Weak }
@@ -777,8 +1037,14 @@ impl LossTerm for PhysicalPotentialEnergyTerm {
         assert_eq!(inputs.len(), 2, "physical_potential requires interior and outer-boundary forwards");
         let interior = &inputs[0];
         let boundary = &inputs[1];
-        let (exx, eyy, exy) = interior.strains.clone()
+        let (mut exx, mut eyy, mut exy) = interior.strains.clone()
             .expect("physical_potential: interior strains must be Some");
+        if let Some((px, py)) = self.affine_strain {
+            let (a_exx, a_eyy, a_exy) = affine_strain(px, py, &self.material);
+            exx = exx.add_scalar(a_exx);
+            eyy = eyy.add_scalar(a_eyy);
+            exy = exy.add_scalar(a_exy);
+        }
         let u = if self.measure_aware {
             let density = crate::energy::dem_energy_per_point(exx, eyy, exy, &self.material);
             match &self.interior_weights {
@@ -850,24 +1116,114 @@ impl LossTerm for ExternalWorkTerm {
 /// `Fixed` mirrors `pinlug_problem::LugShankAnchorTerm` (`mean(u^2+v^2)` on direct mDEM
 /// displacement columns).
 struct HoleBcTerm {
+    domain: DomainId,
     point_set: &'static str,
     bc: HoleBc,
     ref_stress2: f32,
+    material: MaterialProps,
+    /// Issue #77 fix: `Some((px,py))` when kinematic decomposition is active for a `Free`
+    /// hole. The network represents `u_hole`, so the true traction-free condition on the
+    /// TOTAL field (`sigma_total.n=0`) becomes `sigma_hole.n = -sigma_affine.n` on `u_hole` —
+    /// a known, nonzero target, not zero. Also switches the read from direct mDEM stress (see
+    /// this term's own module doc comment on why that head "never develops real spatial
+    /// structure") to DERIVED/constitutive stress at the FD-safe ring - `self.point_set` must
+    /// then be the `*_fd` ring name, which the caller in `loss_terms()` is responsible for
+    /// pairing correctly. `None` (both for `Fixed` and for every geometry outside
+    /// `decomposition_applicable`'s scope) preserves the exact original direct-stress,
+    /// zero-target, exact-radius-ring behavior byte-for-byte.
+    affine_target: Option<(f64, f64)>,
+}
+
+/// Equality constraints for a bonded artificial interface between two subdomains. Both
+/// domains must expose the same ordered "interface" coordinates. Traction balance uses
+/// each domain's outward normal, so physical tractions sum to zero.
+pub struct InterfaceDisplacementContinuityTerm {
+    pub left: DomainId,
+    pub right: DomainId,
+    pub inv_u_ref_sq: f64,
+}
+impl LossTerm for InterfaceDisplacementContinuityTerm {
+    fn name(&self) -> &'static str { "interface_displacement_continuity" }
+    fn domains(&self) -> Vec<DomainId> { vec![self.left, self.right] }
+    fn point_sets(&self) -> Vec<&'static str> { vec!["interface", "interface"] }
+    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Interface) }
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
+    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        let left = inputs.iter().find(|d| d.domain == self.left).expect("interface displacement: left domain missing");
+        let right = inputs.iter().find(|d| d.domain == self.right).expect("interface displacement: right domain missing");
+        let n = left.raw_out.dims()[0];
+        assert_eq!(n, right.raw_out.dims()[0], "interface displacement: point sets must be aligned");
+        let du = left.raw_out.clone().slice([0..n, 0..1]) - right.raw_out.clone().slice([0..n, 0..1]);
+        let dv = left.raw_out.clone().slice([0..n, 1..2]) - right.raw_out.clone().slice([0..n, 1..2]);
+        (du.clone() * du + dv.clone() * dv).mean().mul_scalar(self.inv_u_ref_sq)
+    }
+}
+
+pub struct InterfaceTractionContinuityTerm {
+    pub left: DomainId,
+    pub right: DomainId,
+    pub left_material: MaterialProps,
+    pub right_material: MaterialProps,
+    pub inv_ref_stress2: f64,
+}
+impl LossTerm for InterfaceTractionContinuityTerm {
+    fn name(&self) -> &'static str { "interface_traction_continuity" }
+    fn domains(&self) -> Vec<DomainId> { vec![self.left, self.right] }
+    /// Central differences at the geometrical interface would sample a model beyond the
+    /// subdomain it represents. Each trace is therefore evaluated on an FD-safe offset ring
+    /// wholly owned by that subdomain; the two offsets converge to the same physical trace as
+    /// `fd_h` is refined.
+    fn point_sets(&self) -> Vec<&'static str> {
+        vec!["interface_annulus_stress", "interface_outer_stress"]
+    }
+    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
+    fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Interface) }
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
+    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        let left = inputs.iter().find(|d| d.domain == self.left).expect("interface traction: left domain missing");
+        let right = inputs.iter().find(|d| d.domain == self.right).expect("interface traction: right domain missing");
+        let (lexx, leyy, lexy) = left.strains.clone().expect("interface traction: left strains missing");
+        let (rexx, reyy, rexy) = right.strains.clone().expect("interface traction: right strains missing");
+        let (lnx, lny) = left.normals.clone().expect("interface traction: left normals missing");
+        let (rnx, rny) = right.normals.clone().expect("interface traction: right normals missing");
+        let (lsxx, lsyy, lsxy) = crate::energy::compute_stress(lexx, leyy, lexy, &self.left_material);
+        let (rsxx, rsyy, rsxy) = crate::energy::compute_stress(rexx, reyy, rexy, &self.right_material);
+        let tx = lsxx * lnx.clone() + lsxy.clone() * lny.clone() + rsxx * rnx.clone() + rsxy.clone() * rny.clone();
+        let ty = lsxy * lnx + lsyy * lny + rsxy * rnx + rsyy * rny;
+        (tx.clone() * tx + ty.clone() * ty).mean().mul_scalar(self.inv_ref_stress2)
+    }
 }
 impl LossTerm for HoleBcTerm {
     fn name(&self) -> &'static str {
         match self.bc { HoleBc::Free => "hole_free", HoleBc::Fixed => "hole_fixed" }
     }
-    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
+    fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec![self.point_set] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
     fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
-    // Runtime-dependent: `Free` reads `raw_out` cols 2..5 directly (FD is undefined exactly at
-    // the hole boundary); `Fixed` is displacement-only.
+    // Runtime-dependent: `Free` normally reads `raw_out` cols 2..5 directly (FD is undefined
+    // exactly at the hole boundary); `Fixed` is displacement-only. Issue #77 fix: when
+    // `affine_target` is `Some`, `Free` instead reads DERIVED/constitutive stress at the
+    // FD-safe `*_fd` ring `point_set` already points at in that case.
     fn stress_source(&self) -> Option<crate::problem::StressSource> {
-        match self.bc {
-            HoleBc::Free => Some(crate::problem::StressSource::Direct),
-            HoleBc::Fixed => None,
+        match (self.bc, self.affine_target) {
+            (HoleBc::Free, Some(_)) => Some(crate::problem::StressSource::Derived),
+            (HoleBc::Free, None) => Some(crate::problem::StressSource::Direct),
+            (HoleBc::Fixed, _) => None,
+        }
+    }
+    // Only the issue #77 decomposition arm needs an FD-derived strain (`Some(First)`); the
+    // original direct-stress read needs no derivative at all (trait default `None`, matching
+    // pre-existing behavior exactly since this method wasn't previously overridden).
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> {
+        match (self.bc, self.affine_target) {
+            (HoleBc::Free, Some(_)) => Some(crate::problem::DerivativeOrder::First),
+            _ => None,
         }
     }
     // `Free` prescribes stress·n=0 (Neumann, zero flux); `Fixed` prescribes displacement=0
@@ -890,11 +1246,25 @@ impl LossTerm for HoleBcTerm {
         }
     }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
-        let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("hole_bc: domain missing");
+        let d = inputs.iter().find(|i| i.domain == self.domain).expect("hole_bc: domain missing");
         let n = d.raw_out.dims()[0];
         match self.bc {
             HoleBc::Free => {
                 let (nx, ny) = d.normals.clone().expect("hole_bc(free): normals must be Some");
+                if let Some((px, py)) = self.affine_target {
+                    // Issue #77 fix: `u_hole`'s own traction target is `-sigma_affine.n`, not
+                    // zero - `sigma_affine` is spatially constant (`diag(px,py)`), so the
+                    // target reduces to `(-px*nx, -py*ny)`. Reuses `neumann_loss` exactly as
+                    // `OuterTractionTerm` does, just with the sign flipped and a derived (not
+                    // direct) stress source, consistent with `stress_source`/`derivative_order`
+                    // above.
+                    let (exx, eyy, exy) = d.strains.clone()
+                        .expect("hole_bc(free, decomposed): strains must be Some");
+                    let tx_target = nx.clone().mul_scalar(-px);
+                    let ty_target = ny.clone().mul_scalar(-py);
+                    return crate::energy::neumann_loss(exx, eyy, exy, nx, ny, tx_target, ty_target, &self.material)
+                        .mul_scalar(1.0 / self.ref_stress2 as f64);
+                }
                 let (sxx, syy, sxy) = match crate::field_graph::resolve_field(
                     crate::field_graph::FieldKind::DirectStress, d.raw_out, None, None,
                 ).expect("hole_free requires direct mDEM stress") {
@@ -931,11 +1301,12 @@ impl LossTerm for HoleBcTerm {
 /// without it a micrometre-scale rigid translation contributes ~1e-12 and is inert regardless
 /// of its nominal base weight.
 struct TranslationGaugeTerm {
+    domain: DomainId,
     inv_u_ref_sq: f64,
 }
 impl LossTerm for TranslationGaugeTerm {
     fn name(&self) -> &'static str { "translation_gauge" }
-    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
+    fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
     fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     // A gauge/admissibility fix, not part of the physical functional U-W_ext - "separate from
@@ -943,7 +1314,7 @@ impl LossTerm for TranslationGaugeTerm {
     fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
     // Displacement-only - no stress quantity involved.
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
-        let d = inputs.iter().find(|i| i.domain == USER_DOMAIN).expect("translation_gauge: domain missing");
+        let d = inputs.iter().find(|i| i.domain == self.domain).expect("translation_gauge: domain missing");
         let n = d.raw_out.dims()[0];
         let u = d.raw_out.clone().slice([0..n, 0..1]).reshape([n]);
         let v = d.raw_out.clone().slice([0..n, 1..2]).reshape([n]);
@@ -961,20 +1332,21 @@ impl LossTerm for TranslationGaugeTerm {
 /// the added rigid rotation.  This selects a displacement representative only; stress and
 /// strain are unchanged.
 struct RotationGaugeTerm {
+    domain: DomainId,
     half_w: f64,
     half_h: f64,
 }
 
 impl LossTerm for RotationGaugeTerm {
     fn name(&self) -> &'static str { "rotation_gauge" }
-    fn domains(&self) -> Vec<DomainId> { vec![USER_DOMAIN] }
+    fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec!["outer_boundary"] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
     fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
     fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
 
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
-        let d = inputs.iter().find(|i| i.domain == USER_DOMAIN)
+        let d = inputs.iter().find(|i| i.domain == self.domain)
             .expect("rotation_gauge: domain missing");
         let n = d.raw_out.dims()[0];
         assert!(n >= 4 && n % 4 == 0,
@@ -1139,33 +1511,46 @@ impl BoundaryValueProblem for UserDefinedProblem {
             }).collect(),
         };
         // Natural (HoleBc::Free) hole boundaries are a strong-form penalty term - active for
-        // Strong and Hybrid (this codebase's own pre-remediation behavior always included it),
-        // OMITTED for Variational: a correctly-posed W_ext already encodes the traction-free
-        // natural boundary (its own contribution there is identically zero, since t̄=0), so a
-        // separate penalty would duplicate natural Neumann enforcement (issue #61 §1.2's
-        // explicit prohibition) rather than adding real constraint pressure.
-        let hole_free_active = !matches!(self.spec.formulation, FormulationSelection::Variational);
+        // Strong and Hybrid (this codebase's own pre-remediation behavior always included it).
+        // For Variational this was previously OMITTED entirely on the theory that a
+        // correctly-posed W_ext already encodes the traction-free natural boundary - a valid
+        // CONTINUUM argument that does not hold under a noisy finite-sample estimator (issue
+        // #77 root cause: with no direct hole-boundary signal and a hole energy contribution
+        // of a fraction of a percent of Pi, three independent representation changes all
+        // converged to the "no hole at all" answer). `decomposition_applicable` scopes a fix -
+        // kinematic decomposition (`u = u_affine + u_hole`) plus a correctly-retargeted
+        // traction residual - to exactly the case it's been verified for: one centered,
+        // traction-free hole. Every other Variational configuration (no-hole, multi-hole,
+        // off-center, Fixed bc) is completely unaffected - `hole_free_active` stays `false` and
+        // every new field below stays `None`, preserving the exact original behavior.
+        let decomposed = decomposition_applicable(&self.spec);
+        let hole_free_active = !matches!(self.spec.formulation, FormulationSelection::Variational) || decomposed;
+        let affine_strain_pair = if decomposed { Some((self.spec.load.px, self.spec.load.py)) } else { None };
 
         let mut terms: Vec<Box<dyn LossTerm>> = Vec::new();
         if active_base.contains("physical_potential") {
             terms.push(Box::new(PhysicalPotentialEnergyTerm {
+                domain: USER_DOMAIN,
                 material: self.spec.material.clone(), px: self.spec.load.px, py: self.spec.load.py,
                 measure_aware, domain_area, thickness, ref_energy, ref_energy_absolute,
                 interior_weights: interior_weights.clone(), ds_per_point: ds_per_point.clone(),
+                affine_strain: affine_strain_pair,
             }));
         }
         if active_base.contains("interior_energy") {
             terms.push(Box::new(InteriorEnergyTerm {
+                domain: USER_DOMAIN,
                 material: self.spec.material.clone(), ref_energy,
                 measure_aware, domain_area, thickness, ref_energy_absolute,
                 weights: interior_weights,
             }));
         }
         if active_base.contains("equilibrium") {
-            terms.push(Box::new(EquilibriumTerm { point_set: "interior", material: self.spec.material.clone(), ref_div2: eq_ref_div2 }));
+            terms.push(Box::new(EquilibriumTerm { domain: USER_DOMAIN, point_set: "interior", material: self.spec.material.clone(), ref_div2: eq_ref_div2 }));
         }
         if active_base.contains("outer_traction") {
             terms.push(Box::new(OuterTractionTerm {
+                domain: USER_DOMAIN,
                 material: self.spec.material.clone(),
                 ref_stress2,
                 px: self.spec.load.px,
@@ -1178,9 +1563,15 @@ impl BoundaryValueProblem for UserDefinedProblem {
                 measure_aware, thickness, ref_energy_absolute, ds_per_point,
             }));
         }
-        for (hole, &name) in self.spec.geometry.holes.iter().zip(self.hole_names.iter()) {
+        for (i, (hole, &name)) in self.spec.geometry.holes.iter().zip(self.hole_names.iter()).enumerate() {
             if hole.bc == HoleBc::Fixed || hole_free_active {
-                terms.push(Box::new(HoleBcTerm { point_set: name, bc: hole.bc, ref_stress2 }));
+                let use_decomposed = decomposed && hole.bc == HoleBc::Free;
+                let point_set = if use_decomposed { self.sampling.hole_fd_names[i] } else { name };
+                let affine_target = if use_decomposed { affine_strain_pair } else { None };
+                terms.push(Box::new(HoleBcTerm {
+                    domain: USER_DOMAIN, point_set, bc: hole.bc, ref_stress2,
+                    material: self.spec.material.clone(), affine_target,
+                }));
             }
         }
         // Issue #61 P2-07: gauge-fix the rigid-body translation nullspace for pure-Neumann
@@ -1189,6 +1580,7 @@ impl BoundaryValueProblem for UserDefinedProblem {
         // registered when a real Dirichlet anchor already exists (redundant there).
         if self.spec.geometry.is_pure_neumann() {
             terms.push(Box::new(TranslationGaugeTerm {
+                domain: USER_DOMAIN,
                 inv_u_ref_sq: 1.0 / (scales.u_ref as f64).powi(2).max(1e-30),
             }));
         }
@@ -1198,6 +1590,7 @@ impl BoundaryValueProblem for UserDefinedProblem {
             && matches!(self.spec.formulation, FormulationSelection::Variational)
         {
             terms.push(Box::new(RotationGaugeTerm {
+                domain: USER_DOMAIN,
                 half_w: self.spec.geometry.half_w,
                 half_h: self.spec.geometry.half_h,
             }));
@@ -1229,6 +1622,185 @@ impl BoundaryValueProblem for UserDefinedProblem {
     fn convergence_target(&self) -> f64 { 0.0 }
 }
 
+/// Local annulus plus global exterior BVP for one small, traction-free circular hole.
+///
+/// This is intentionally a narrow production route: it preserves the legacy one-model path
+/// for all other geometries and formulations. Both domains minimize pieces of the same global
+/// potential energy, coupled by displacement and derived-traction continuity on their shared
+/// circle. The annular model receives the #77 chart input; outer model remains raw-coordinate.
+pub struct AnnularDecompositionProblem {
+    spec: ProblemSpec,
+    domains: Vec<DomainSpec>,
+    annulus_sampling: AnnularPartitionSampling,
+    outer_sampling: AnnularPartitionSampling,
+    ansatz: IdentityAnsatz,
+}
+
+impl AnnularDecompositionProblem {
+    pub fn supports(spec: &ProblemSpec) -> bool {
+        matches!(spec.formulation, pinn_core::problem_spec::FormulationSelection::Variational)
+            && spec.training.measure_aware_training
+            && matches!(spec.geometry.holes.as_slice(), [HoleSpec { bc: HoleBc::Free, .. }])
+            && spec.geometry.annular_partition().is_some()
+    }
+
+    pub fn new(spec: ProblemSpec) -> Self {
+        assert!(Self::supports(&spec),
+            "annular decomposition requires one safely-contained Free hole, Variational formulation, and measure-aware training");
+        let placeholder = spec.geometry.to_placeholder();
+        let interface = std::sync::Arc::new(InterfaceParametrization {
+            thetas: (0..HOLE_RING_POINTS)
+                .map(|i| 2.0 * std::f64::consts::PI * i as f64 / HOLE_RING_POINTS as f64)
+                .collect(),
+        });
+        let annulus_sampling = AnnularPartitionSampling::new(
+            spec.geometry.clone(), spec.training.fd_h, true, OUTER_DOMAIN, interface.clone(),
+        );
+        let outer_sampling = AnnularPartitionSampling::new(
+            spec.geometry.clone(), spec.training.fd_h, false, ANNULUS_DOMAIN, interface,
+        );
+        Self {
+            domains: vec![
+                DomainSpec { id: ANNULUS_DOMAIN, geometry: placeholder.clone(), material: spec.material.clone(), output_dim: 5 },
+                DomainSpec { id: OUTER_DOMAIN, geometry: placeholder, material: spec.material.clone(), output_dim: 5 },
+            ],
+            spec,
+            annulus_sampling,
+            outer_sampling,
+            ansatz: IdentityAnsatz,
+        }
+    }
+
+    pub fn spec(&self) -> &ProblemSpec { &self.spec }
+}
+
+/// Annular U contribution to the one global potential. Its name remains distinct from the
+/// outer contribution so loss ledgers can report both physical pieces. `step_physics_multi`
+/// pins both names to coefficient one, so SAW-BRDR cannot distort U_annulus + U_outer - W_ext.
+struct AnnularPotentialEnergyTerm {
+    material: MaterialProps,
+    domain_area: f64,
+    thickness: f64,
+    ref_energy_absolute: f64,
+    /// Issue #77 fix: see `PhysicalPotentialEnergyTerm::affine_strain`'s doc comment — same
+    /// mechanism, applied to the annulus domain's own strain read.
+    affine_strain: Option<(f64, f64)>,
+}
+
+impl LossTerm for AnnularPotentialEnergyTerm {
+    fn name(&self) -> &'static str { "annulus_potential" }
+    fn domains(&self) -> Vec<DomainId> { vec![ANNULUS_DOMAIN] }
+    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Weak }
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
+    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        let d = inputs.iter().find(|d| d.domain == ANNULUS_DOMAIN)
+            .expect("annular physical potential: domain missing");
+        let (mut exx, mut eyy, mut exy) = d.strains.clone().expect("annular physical potential: strains missing");
+        if let Some((px, py)) = self.affine_strain {
+            let (a_exx, a_eyy, a_exy) = affine_strain(px, py, &self.material);
+            exx = exx.add_scalar(a_exx);
+            eyy = eyy.add_scalar(a_eyy);
+            exy = exy.add_scalar(a_exy);
+        }
+        let density = crate::energy::dem_energy_per_point(exx, eyy, exy, &self.material);
+        crate::measure_integral::domain_integral_tensor::<B>(self.domain_area, self.thickness, density)
+            .mul_scalar(1.0 / self.ref_energy_absolute)
+    }
+}
+
+impl BoundaryValueProblem for AnnularDecompositionProblem {
+    fn domains(&self) -> &[DomainSpec] { &self.domains }
+    fn sampling_strategy(&self, domain_idx: usize) -> &dyn DomainSamplingStrategy {
+        match self.domains[domain_idx].id {
+            ANNULUS_DOMAIN => &self.annulus_sampling,
+            OUTER_DOMAIN => &self.outer_sampling,
+            _ => unreachable!(),
+        }
+    }
+    fn ansatz(&self, domain_idx: usize) -> &dyn DirichletAnsatz {
+        assert!(domain_idx < 2, "annular decomposition has two domains");
+        &self.ansatz
+    }
+    fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
+        let scales = crate::training_core::compute_reference_scales_for_plate(&self.spec);
+        let partition = self.spec.geometry.annular_partition().expect("validated by constructor");
+        let annulus_area = std::f64::consts::PI * (partition.interface_radius.powi(2) - partition.hole_radius.powi(2));
+        let outer_area = 4.0 * self.spec.geometry.half_w * self.spec.geometry.half_h
+            - std::f64::consts::PI * partition.interface_radius.powi(2);
+        let total_area = annulus_area + outer_area;
+        let ref_energy_absolute = scales.ref_energy as f64 * total_area * self.spec.geometry.thickness;
+        let per_edge = (self.spec.training.n_boundary / 4).max(1);
+        let mut ds_per_point = Vec::with_capacity(per_edge * 4);
+        for _ in 0..per_edge {
+            ds_per_point.push(2.0 * self.spec.geometry.half_h / per_edge as f64);
+            ds_per_point.push(2.0 * self.spec.geometry.half_h / per_edge as f64);
+            ds_per_point.push(2.0 * self.spec.geometry.half_w / per_edge as f64);
+            ds_per_point.push(2.0 * self.spec.geometry.half_w / per_edge as f64);
+        }
+        // Issue #77 root-cause fix: see `UserDefinedProblem::loss_terms()`'s matching comment.
+        // `AnnularDecompositionProblem::supports` already restricts to exactly one Free,
+        // safely-contained hole; `decomposition_applicable` additionally requires it centered
+        // (this problem's own v1 scope) before enabling the closed-form affine background and
+        // the corrected hole-traction residual - previously this formulation registered NO
+        // term referencing the hole at all (the orphaned "hole_0" point set, #77's own history).
+        let decomposed = decomposition_applicable(&self.spec);
+        let affine_strain_pair = if decomposed { Some((self.spec.load.px, self.spec.load.py)) } else { None };
+        let mut terms: Vec<Box<dyn LossTerm>> = vec![
+            Box::new(AnnularPotentialEnergyTerm {
+                material: self.spec.material.clone(), domain_area: annulus_area,
+                thickness: self.spec.geometry.thickness, ref_energy_absolute,
+                affine_strain: affine_strain_pair,
+            }),
+            Box::new(PhysicalPotentialEnergyTerm {
+                domain: OUTER_DOMAIN, material: self.spec.material.clone(),
+                px: self.spec.load.px, py: self.spec.load.py, measure_aware: true,
+                domain_area: outer_area, thickness: self.spec.geometry.thickness,
+                ref_energy: scales.ref_energy, ref_energy_absolute, interior_weights: None,
+                ds_per_point, affine_strain: affine_strain_pair,
+            }),
+            Box::new(InterfaceDisplacementContinuityTerm {
+                left: ANNULUS_DOMAIN, right: OUTER_DOMAIN,
+                inv_u_ref_sq: 1.0 / (scales.u_ref as f64).powi(2).max(1e-30),
+            }),
+            Box::new(InterfaceTractionContinuityTerm {
+                left: ANNULUS_DOMAIN, right: OUTER_DOMAIN,
+                left_material: self.spec.material.clone(), right_material: self.spec.material.clone(),
+                inv_ref_stress2: 1.0 / (scales.ref_stress2 as f64).max(1e-30),
+            }),
+            Box::new(TranslationGaugeTerm {
+                domain: OUTER_DOMAIN,
+                inv_u_ref_sq: 1.0 / (scales.u_ref as f64).powi(2).max(1e-30),
+            }),
+            Box::new(RotationGaugeTerm {
+                domain: OUTER_DOMAIN, half_w: self.spec.geometry.half_w, half_h: self.spec.geometry.half_h,
+            }),
+        ];
+        if decomposed {
+            terms.push(Box::new(HoleBcTerm {
+                domain: ANNULUS_DOMAIN, point_set: "hole_0_fd", bc: HoleBc::Free,
+                ref_stress2: scales.ref_stress2, material: self.spec.material.clone(),
+                affine_target: affine_strain_pair,
+            }));
+        }
+        terms
+    }
+    fn base_weight(&self, term_name: &str) -> f32 {
+        match term_name {
+            "annulus_potential" | "physical_potential" => LAM_PHYSICAL_POTENTIAL,
+            "interface_displacement_continuity" | "interface_traction_continuity" => 100.0,
+            "translation_gauge" => LAM_TRANSLATION_GAUGE,
+            "rotation_gauge" => LAM_ROTATION_GAUGE,
+            "hole_free" => LAM_HOLE_FREE,
+            other => panic!("AnnularDecompositionProblem::base_weight: unknown term '{other}'"),
+        }
+    }
+    fn phase1_steps(&self) -> usize { 0 }
+    fn convergence_metric(&self, _state: &[DomainState<B>]) -> Option<f64> { None }
+    fn convergence_target(&self) -> f64 { 0.0 }
+}
+
 /// Builds a `VisFields` for GUI display by evaluating `model` once over a
 /// `[nx,ny]`-shaped normalized grid masked by `geometry.contains` — mirrors `runner.rs`'s
 /// private `evaluate_vis_grid_mdem` (same mDEM forward convention, same von Mises formula,
@@ -1252,7 +1824,7 @@ pub fn evaluate_user_vis_grid(
     int_norm: &[[f32; 2]],
     device: &crate::training_core::BDevice,
 ) -> pinn_core::messages::VisFields {
-    use crate::network::fwd;
+    use crate::network::fwd_embedded;
     use crate::differential_operator::production_strain as compute_strains;
     use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor};
     use crate::energy::dem_energy_per_point;
@@ -1308,7 +1880,7 @@ pub fn evaluate_user_vis_grid(
     let n_act = active_pts.len();
     let pts_t = norm_pts_to_tensor::<BInner>(&active_pts, device);
     let stencil_coords = assemble_stencil::<BInner>(&pts_t, fd, device);
-    let raw_net = fwd::<BInner>(model, stencil_coords, geometry.n_fourier(), device); // [5*n_act, 5], unscaled
+    let raw_net = fwd_embedded::<BInner>(model, stencil_coords, geometry.coordinate_embedding(), device); // [5*n_act, 5], unscaled
 
     // Physical scale BEFORE the FD derivative — same convention as `compute_domain_forwards`'s
     // `is_mdem` branch and `probe_hole_boundary_profile` (displacement by u_ref, stress by
@@ -1378,7 +1950,7 @@ pub fn probe_boundary_residuals(
     use crate::energy::compute_stress;
     use crate::differential_operator::production_strain as compute_strains;
     use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
-    use crate::network::fwd;
+    use crate::network::fwd_embedded;
     use crate::training_core::BInner;
     use burn::tensor::TensorData;
 
@@ -1390,7 +1962,6 @@ pub fn probe_boundary_residuals(
     let (stress_ref, u_ref) = (scales.stress_ref, scales.u_ref);
     let px_pa = stress_ref;
     let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / geometry.half_w) as f32, (y / geometry.half_h) as f32] };
-    let n_fourier = geometry.n_fourier();
 
     let mut residuals: Vec<f32> = Vec::new();
 
@@ -1399,7 +1970,7 @@ pub fn probe_boundary_residuals(
         let n_bnd = bnd_pts_phys.len();
         let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
         let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
-        let raw = fwd::<BInner>(model, stencil, n_fourier, device);
+        let raw = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device);
         let m = 5 * n_bnd;
         let scaled = Tensor::cat(vec![
             raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
@@ -1428,7 +1999,7 @@ pub fn probe_boundary_residuals(
         let n_h = set.points.len();
         if n_h == 0 { continue; }
         let ring_norm: Vec<[f32; 2]> = set.points.iter().map(|p| norm_pt(p.x, p.y)).collect();
-        let raw = fwd::<BInner>(model, norm_pts_to_tensor::<BInner>(&ring_norm, device), n_fourier, device);
+        let raw = fwd_embedded::<BInner>(model, norm_pts_to_tensor::<BInner>(&ring_norm, device), geometry.coordinate_embedding(), device);
         let scaled = Tensor::cat(vec![
             raw.clone().slice([0..n_h, 0..2]).mul_scalar(u_ref as f64),
             raw.slice([0..n_h, 2..5]).mul_scalar(px_pa),
@@ -1520,7 +2091,7 @@ pub fn probe_reaction_force(
     use crate::energy::compute_stress;
     use crate::differential_operator::production_strain as compute_strains;
     use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
-    use crate::network::fwd;
+    use crate::network::fwd_embedded;
     use crate::training_core::BInner;
     use burn::tensor::TensorData;
 
@@ -1551,7 +2122,7 @@ pub fn probe_reaction_force(
 
     let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
     let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
-    let raw = fwd::<BInner>(model, stencil, geometry.n_fourier(), device);
+    let raw = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device);
     let m = 5 * n_bnd;
     let scaled = Tensor::cat(vec![
         raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
@@ -1619,7 +2190,7 @@ pub fn probe_load_transfer(
     use crate::energy::compute_stress;
     use crate::differential_operator::production_strain as compute_strains;
     use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
-    use crate::network::fwd;
+    use crate::network::fwd_embedded;
     use crate::training_core::BInner;
     use burn::tensor::TensorData;
 
@@ -1654,7 +2225,7 @@ pub fn probe_load_transfer(
 
     let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
     let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
-    let raw = fwd::<BInner>(model, stencil, geometry.n_fourier(), device);
+    let raw = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device);
     let m = 5 * n_bnd;
     let scaled = Tensor::cat(vec![
         raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
@@ -1751,7 +2322,7 @@ pub fn run_no_hole_benchmark(
     use crate::energy::compute_stress;
     use crate::differential_operator::production_strain as compute_strains;
     use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
-    use crate::network::fwd;
+    use crate::network::fwd_embedded;
     use crate::training_core::{residual_stats, BInner};
 
     let geometry = &spec.geometry;
@@ -1772,7 +2343,7 @@ pub fn run_no_hole_benchmark(
         let n_int = interior.len();
         let int_norm: Vec<[f32; 2]> = interior.iter().map(|&[x, y]| norm_pt(x, y)).collect();
         let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&int_norm, device), &fd, device);
-        let raw = fwd::<BInner>(model, stencil, geometry.n_fourier(), device);
+        let raw = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device);
         let m = 5 * n_int;
         let scaled = Tensor::cat(vec![
             raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
@@ -2010,7 +2581,7 @@ pub fn probe_energy_balance(
     use crate::energy::dem_energy_per_point;
     use crate::differential_operator::production_strain as compute_strains;
     use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
-    use crate::network::fwd;
+    use crate::network::fwd_embedded;
     use crate::training_core::BInner;
 
     let geometry = &spec.geometry;
@@ -2032,7 +2603,7 @@ pub fn probe_energy_balance(
         let n_int = interior.len();
         let int_norm: Vec<[f32; 2]> = interior.iter().map(|&[x, y]| norm_pt(x, y)).collect();
         let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&int_norm, device), &fd, device);
-        let raw = fwd::<BInner>(model, stencil, geometry.n_fourier(), device);
+        let raw = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device);
         let m = 5 * n_int;
         let scaled = Tensor::cat(vec![
             raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
@@ -2057,7 +2628,7 @@ pub fn probe_energy_balance(
         let ds_y_normal = 2.0 * geometry.half_w / per_edge as f64;
         let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
         let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
-        let raw = fwd::<BInner>(model, stencil, geometry.n_fourier(), device);
+        let raw = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device);
         let m = 5 * n_bnd;
         let scaled = Tensor::cat(vec![
             raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
@@ -2136,7 +2707,7 @@ pub fn probe_hole_stress_profile_direct_at_radius(
 ) -> Vec<HoleBoundaryPoint> {
     use crate::differential_operator::production_strain as compute_strains;
     use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor};
-    use crate::network::fwd;
+    use crate::network::fwd_embedded;
     use crate::training_core::BInner;
 
     let n = n_theta.max(1);
@@ -2157,7 +2728,7 @@ pub fn probe_hole_stress_profile_direct_at_radius(
 
     let pts_t = norm_pts_to_tensor::<BInner>(&pts_norm, device);
     let stencil = assemble_stencil::<BInner>(&pts_t, fd, device);
-    let raw_stencil = fwd::<BInner>(model, stencil, geometry.n_fourier(), device); // [5n, 5]: u,v,sxx,syy,sxy
+    let raw_stencil = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device); // [5n, 5]: u,v,sxx,syy,sxy
 
     // Physical-scale FIRST (same convention as `compute_domain_forwards`/`evaluate_user_
     // vis_grid`), so the FD-derived strain below is directly the physical strain - no extra
@@ -2262,7 +2833,7 @@ pub fn probe_hole_boundary_profile_derived(
     use crate::energy::compute_stress;
     use crate::differential_operator::production_strain as compute_strains;
     use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor};
-    use crate::network::fwd;
+    use crate::network::fwd_embedded;
     use crate::training_core::BInner;
 
     let n = n_theta.max(1);
@@ -2284,7 +2855,7 @@ pub fn probe_hole_boundary_profile_derived(
 
     let pts_t = norm_pts_to_tensor::<BInner>(&pts_norm, device);
     let stencil = assemble_stencil::<BInner>(&pts_t, fd, device);
-    let raw_stencil = fwd::<BInner>(model, stencil, geometry.n_fourier(), device);
+    let raw_stencil = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device);
 
     let m = 5 * n;
     let scaled = Tensor::cat(vec![
@@ -2541,6 +3112,43 @@ pub fn kt_convergence_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annular_partition_samplers_are_disjoint_and_interface_aligned() {
+        let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005,
+            holes: vec![HoleSpec { center: [0.0, 0.0], radius: 0.005, bc: HoleBc::Free }] };
+        let thetas = std::sync::Arc::new(InterfaceParametrization { thetas: (0..16).map(|i| i as f64 * std::f64::consts::TAU / 16.0).collect() });
+        let annulus = AnnularPartitionSampling::new(geometry.clone(), 1e-3, true, DomainId(1), thetas.clone());
+        let outer = AnnularPartitionSampling::new(geometry.clone(), 1e-3, false, DomainId(0), thetas);
+        let placeholder = geometry.to_placeholder();
+        for point in annulus.sample_interior(&placeholder, 128) {
+            assert!(geometry.annular_partition().unwrap().contains_annulus(point[0], point[1]));
+            let r = (point[0] * point[0] + point[1] * point[1]).sqrt();
+            assert!(r >= 0.005 + ring_anchor_margin_m(1e-3, &geometry));
+        }
+        let annular_sets = annulus.named_point_sets(&[]);
+        let outer_sets = outer.named_point_sets(&[]);
+        let annular_trace = annular_sets.iter().find(|set| set.name == "interface_annulus_stress").unwrap();
+        let outer_trace = outer_sets.iter().find(|set| set.name == "interface_outer_stress").unwrap();
+        for point in &annular_trace.points {
+            let r = (point.x * point.x + point.y * point.y).sqrt();
+            assert!(r < 0.015, "annular stress stencil trace must be inside interface: {r}");
+        }
+        for point in &outer_trace.points {
+            let r = (point.x * point.x + point.y * point.y).sqrt();
+            assert!(r > 0.015, "outer stress stencil trace must be outside interface: {r}");
+        }
+        for point in outer.sample_interior(&placeholder, 128) {
+            assert!(geometry.annular_partition().unwrap().contains_outer(point[0], point[1]));
+        }
+        let annular_interface = annulus.named_point_sets(&[]).remove(0).points;
+        let outer_interface = outer.named_point_sets(&[]).remove(0).points;
+        assert_eq!(annular_interface.len(), outer_interface.len());
+        for (a, b) in annular_interface.iter().zip(&outer_interface) {
+            assert!((a.x - b.x).abs() < 1e-12 && (a.y - b.y).abs() < 1e-12);
+            assert!((a.nx + b.nx).abs() < 1e-12 && (a.ny + b.ny).abs() < 1e-12);
+        }
+    }
     use pinn_core::user_geometry::HoleSpec;
 
     /// Representative `fd_h` for tests that don't otherwise have a `ProblemSpec.training.fd_h`
@@ -2553,6 +3161,137 @@ mod tests {
         UserGeometry {
             half_w: 0.10, half_h: 0.10, thickness: 0.005,
             holes: vec![HoleSpec { center: [0.0, 0.0], radius: 0.005, bc: HoleBc::Free }],
+        }
+    }
+
+    /// Same shape as `runner.rs`'s own private `single_hole_like_spec` test helper (not
+    /// reusable across modules) — `l5_geometry()`'s real L5 hole (radius=0.005,
+    /// `3*r=0.015 < half_w=0.10` so `annular_partition()` applies too), `measure_aware_training`
+    /// left to the caller since Variational-vs-Hybrid/Strong tests need different values.
+    fn single_hole_like_spec(max_steps: usize) -> ProblemSpec {
+        use pinn_core::loading::LoadConfig;
+        use pinn_core::problem_spec::{NetworkSpec, TrainingSpec};
+        ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: NetworkSpec { hidden_dim: 64, n_hidden: 3, ..Default::default() },
+            training: TrainingSpec {
+                max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: false, derivative_operator_diagnostic: false, amr_enabled: false,
+            },
+            formulation: pinn_core::problem_spec::default_formulation(),
+        }
+    }
+
+    #[test]
+    fn annular_decomposition_bvp_has_two_disjoint_domains_and_bonded_interface_terms() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(), material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7), network: Default::default(),
+            training: pinn_core::problem_spec::TrainingSpec {
+                measure_aware_training: true, ..Default::default()
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        assert!(AnnularDecompositionProblem::supports(&spec));
+        let problem = AnnularDecompositionProblem::new(spec);
+        crate::problem::validate_loss_terms(&problem);
+        assert_eq!(problem.domains().iter().map(|d| d.id).collect::<Vec<_>>(), vec![ANNULUS_DOMAIN, OUTER_DOMAIN]);
+        let terms = problem.loss_terms();
+        assert!(terms.iter().any(|t| t.name() == "interface_displacement_continuity"));
+        assert!(terms.iter().any(|t| t.name() == "interface_traction_continuity"));
+    }
+
+    #[test]
+    fn annular_decomposition_two_model_runner_smoke_is_finite() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(), material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 12, n_hidden: 2, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 2, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let (annulus, outer, loss) = crate::user_runner::run_annular_decomposition_training(
+            spec, device, |_step, _loss, _lr, _points| false,
+        );
+        assert!(loss.is_finite());
+        assert_eq!(annulus.input_dim(), 10);
+        assert_eq!(outer.input_dim(), 3);
+    }
+
+    #[test]
+    fn annular_l5_diagnostics_preserve_both_energy_halves_and_write_json() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(), material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 12, n_hidden: 2, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 1, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics(
+            spec, device, &[0], |_step, _loss, _lr, _points| false,
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), 1);
+        let terms = &diagnostics[0].terms;
+        assert!(terms.iter().any(|term| term.name == "annulus_potential"), "{terms:?}");
+        assert!(terms.iter().any(|term| term.name == "physical_potential"), "{terms:?}");
+        assert!(diagnostics[0].kt_derived_fd_vm.is_finite());
+        let path = std::env::temp_dir().join(format!("pinn-annular-diagnostic-{}.json", std::process::id()));
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("annulus_potential") && text.contains("physical_potential"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Controlled #77 reset run. This records evidence at initialization-adjacent, early,
+    /// middle, and final checkpoints before any further boundary or representation change.
+    #[test]
+    #[ignore]
+    fn issue_77_l5_annular_diagnostic_trace() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics(
+            spec, device, &checkpoints, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 diagnostic] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        // Was a relative "target/issue-77-l5-diagnostics.json": a `pinn-solver` unit
+        // test's cwd is the crate manifest dir (no `target/` subdir there), and the
+        // workspace's real build dir is `.shared-cargo-target` (`.cargo/config.toml`),
+        // not `target/` - the write would `.unwrap()`-panic on the very first real run.
+        // `std::env::temp_dir()` always exists and matches this file's sibling test
+        // (`annular_l5_diagnostics_preserve_both_energy_halves_and_write_json` above).
+        let path = std::env::temp_dir().join("issue-77-l5-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 diagnostic] wrote {}", path.display());
+        for diagnostic in diagnostics {
+            println!("[#77 diagnostic] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
         }
     }
 
@@ -2802,6 +3541,7 @@ mod tests {
         let thickness = 0.01_f64;
         let ref_energy_absolute = 5.0_f64;
         let term = InteriorEnergyTerm {
+            domain: USER_DOMAIN,
             material: material.clone(), ref_energy: 1.0,
             measure_aware: true, domain_area, thickness, ref_energy_absolute, weights: None,
         };
@@ -2835,10 +3575,12 @@ mod tests {
         // Deliberately non-uniform (mean == 1.0, per `compensation_weights`'s own contract).
         let weights = vec![0.2_f64, 2.5, 0.3];
         let term_weighted = InteriorEnergyTerm {
+            domain: USER_DOMAIN,
             material: material.clone(), ref_energy: 1.0,
             measure_aware: true, domain_area, thickness, ref_energy_absolute, weights: Some(weights.clone()),
         };
         let term_unweighted = InteriorEnergyTerm {
+            domain: USER_DOMAIN,
             material: material.clone(), ref_energy: 1.0,
             measure_aware: true, domain_area, thickness, ref_energy_absolute, weights: None,
         };
@@ -2976,9 +3718,10 @@ mod tests {
         let ref_energy_absolute = 7.0;
         let px = 6.9e7;
         let term = PhysicalPotentialEnergyTerm {
+            domain: USER_DOMAIN,
             material: material.clone(), px, py: 0.0, measure_aware: true, domain_area,
             thickness, ref_energy: 1.0, ref_energy_absolute, interior_weights: None,
-            ds_per_point: vec![1.0, 1.0],
+            ds_per_point: vec![1.0, 1.0], affine_strain: None,
         };
         assert_eq!(term.domains(), vec![USER_DOMAIN, USER_DOMAIN]);
         assert_eq!(term.point_sets(), vec!["interior", "outer_boundary"]);
@@ -3032,10 +3775,12 @@ mod tests {
             let nx = Tensor::<B, 1>::from_data(TensorData::new(vec![1.0_f32, -1.0, 0.0, 0.0], vec![4]), &device);
             let ny = Tensor::<B, 1>::from_data(TensorData::new(vec![0.0_f32, 0.0, 1.0, -1.0], vec![4]), &device);
             PhysicalPotentialEnergyTerm {
+                domain: USER_DOMAIN,
                 material: material.clone(), px: sigma0, py: 0.0, measure_aware: true,
                 domain_area: area, thickness, ref_energy: 1.0, ref_energy_absolute: 1.0,
                 interior_weights: None,
                 ds_per_point: vec![2.0 * half_h, 2.0 * half_h, 2.0 * half_w, 2.0 * half_w],
+                affine_strain: None,
             }.compute(&[
                 DomainForwardOutputs { domain: USER_DOMAIN, raw_out: &interior_out,
                     strains: Some((exx, eyy, exy)), normals: None, shifted_stress: None, hessian: None },
@@ -3069,9 +3814,10 @@ mod tests {
         let ny = Tensor::<B, 1>::zeros([4], &device);
         let weights = vec![1.8, 0.2]; // mean one; an AMR-density compensation shape.
         let make_term = |weights: Option<Vec<f64>>| PhysicalPotentialEnergyTerm {
+            domain: USER_DOMAIN,
             material: material.clone(), px: 0.0, py: 0.0, measure_aware: true,
             domain_area: 1.0, thickness: 1.0, ref_energy: 1.0, ref_energy_absolute: 1.0,
-            interior_weights: weights, ds_per_point: vec![0.25; 4],
+            interior_weights: weights, ds_per_point: vec![0.25; 4], affine_strain: None,
         };
         let weighted = make_term(Some(weights.clone())).compute(&[
             DomainForwardOutputs { domain: USER_DOMAIN, raw_out: &interior_out,
@@ -3091,6 +3837,189 @@ mod tests {
         assert!((weighted - expected).abs() / expected.abs() < 1e-6, "{weighted} vs {expected}");
         assert!((weighted - unweighted).abs() / unweighted.abs() > 0.1,
             "compensation must materially change this deliberately biased sample");
+    }
+
+    // ─── Issue #77 root-cause fix: kinematic decomposition (u = u_affine + u_hole) ─────────
+
+    /// The correctness gate this whole approach depends on (plan's own explicit requirement):
+    /// `PhysicalPotentialEnergyTerm`'s `affine_strain` mechanism adds a CONSTANT strain to the
+    /// network's own FD-derived strain before calling `dem_energy_per_point`, which computes
+    /// `psi(eps_affine + eps_hole)` via `strain_energy_density`'s real quadratic form - not a
+    /// hand-rolled decomposition that could accidentally drop the cross term
+    /// `C:eps_affine:eps_hole`. This test proves the two are numerically identical for a
+    /// nontrivial (nonzero, asymmetric) `eps_hole`, confirmed against the closed-form quadratic
+    /// expansion `psi(eps_affine+eps_hole) = psi(eps_affine) + C:eps_affine:eps_hole +
+    /// psi(eps_hole)` computed independently in plain f64 - i.e. the cross term really is
+    /// present in what the production code computes, not silently dropped.
+    #[test]
+    fn affine_strain_cross_term_is_present_not_dropped() {
+        let material = MaterialProps::al7075_t6();
+        let (e, nu) = (material.e as f64, material.nu as f64);
+        let px = 6.9e7_f64;
+        let py = 1.3e7_f64; // nonzero, to exercise the general biaxial case too
+        let (a_exx, a_eyy, a_exy) = affine_strain(px, py, &material);
+        // Independent hand-check: exx_affine=(px-nu*py)/E, eyy_affine=(py-nu*px)/E, exy=0.
+        assert!((a_exx - (px - nu * py) / e).abs() / a_exx.abs() < 1e-12);
+        assert!((a_eyy - (py - nu * px) / e).abs() / a_eyy.abs() < 1e-12);
+        assert_eq!(a_exy, 0.0);
+
+        let (h_exx, h_eyy, h_exy) = (3.7e-5_f64, -1.1e-5_f64, 2.3e-5_f64); // a plausible u_hole strain
+        let device: crate::training_core::BDevice = Default::default();
+        let t = |v: f64| Tensor::<B, 1>::from_data(
+            burn::tensor::TensorData::new(vec![v as f32], vec![1]), &device,
+        );
+        // What the production code actually computes: add the constant, then call the SAME
+        // strain-energy function every other term uses.
+        let total_exx = t(h_exx).add_scalar(a_exx);
+        let total_eyy = t(h_eyy).add_scalar(a_eyy);
+        let total_exy = t(h_exy).add_scalar(a_exy);
+        let psi_total: f64 = crate::energy::dem_energy_per_point::<B>(total_exx, total_eyy, total_exy, &material)
+            .into_data().to_vec::<f32>().unwrap()[0] as f64;
+
+        // Independent plain-f64 reference: full quadratic expansion, cross term included.
+        let c = e / (1.0 - nu * nu);
+        let psi = |exx: f64, eyy: f64, exy: f64| -> f64 {
+            let sxx = c * (exx + nu * eyy);
+            let syy = c * (eyy + nu * exx);
+            let sxy = e / (1.0 + nu) * exy;
+            0.5 * (sxx * exx + syy * eyy + 2.0 * sxy * exy)
+        };
+        let psi_affine = psi(a_exx, a_eyy, a_exy);
+        let psi_hole = psi(h_exx, h_eyy, h_exy);
+        // Full cross term from expanding psi(a+h): the C*(exx^2+eyy^2+2*nu*exx*eyy) part of
+        // strain_energy_density contributes BOTH a same-component piece (a_exx*h_exx,
+        // a_eyy*h_eyy) AND a Poisson cross-coupling piece (nu*(a_exx*h_eyy+a_eyy*h_exx)) - easy
+        // to drop by only expanding the diagonal terms, which is exactly the mistake this test
+        // exists to catch in PRODUCTION code, so it must not make it here either.
+        let cross = c * (a_exx * h_exx + a_eyy * h_eyy + nu * (a_exx * h_eyy + a_eyy * h_exx))
+            + e / (1.0 + nu) * a_exy * h_exy;
+        let psi_expected = psi_affine + cross + psi_hole;
+
+        assert!((psi_total - psi_expected).abs() / psi_expected.abs() < 1e-5,
+            "psi_total={psi_total:.6e} psi_expected={psi_expected:.6e} (psi_affine={psi_affine:.6e} \
+             cross={cross:.6e} psi_hole={psi_hole:.6e}) - if this fails the cross term is being \
+             dropped somewhere, which changes the stationary point (see this test's own doc comment)");
+        // Also confirm the cross term is NOT negligible relative to psi_hole alone - otherwise
+        // this test wouldn't actually be exercising the property it claims to.
+        assert!(cross.abs() / psi_hole.abs() > 0.01,
+            "cross term must be a real, non-negligible contribution for this test to be meaningful");
+    }
+
+    /// `decomposition_applicable` scoping: exactly one centered, Free hole is in scope; every
+    /// other shape (no hole, multiple holes, off-center, Fixed bc) is explicitly out and must
+    /// fall back to the pre-#77 behavior byte-for-byte.
+    #[test]
+    fn decomposition_applicable_scopes_to_single_centered_free_hole_only() {
+        let base = single_hole_like_spec(1);
+        assert!(decomposition_applicable(&base), "L5-shaped spec must be in scope");
+
+        let mut no_hole = base.clone();
+        no_hole.geometry.holes.clear();
+        assert!(!decomposition_applicable(&no_hole));
+
+        let mut fixed = base.clone();
+        fixed.geometry.holes[0].bc = HoleBc::Fixed;
+        assert!(!decomposition_applicable(&fixed));
+
+        let mut off_center = base.clone();
+        off_center.geometry.holes[0].center = [0.01, 0.0];
+        assert!(!decomposition_applicable(&off_center));
+
+        let mut multi = base.clone();
+        multi.geometry.holes.push(HoleSpec { center: [0.03, 0.03], radius: 0.005, bc: HoleBc::Free });
+        assert!(!decomposition_applicable(&multi));
+    }
+
+    /// Direct value check of the corrected hole-traction target: for a `u_hole` whose derived
+    /// stress is exactly zero (network output all-zero strain), the residual must equal
+    /// `|sigma_affine . n|^2` exactly — i.e. the term is now driving toward a real, nonzero,
+    /// closed-form target rather than the old (wrong, for a decomposed field) zero target.
+    #[test]
+    fn hole_bc_term_decomposed_uses_negative_affine_traction_as_target() {
+        let material = MaterialProps::al7075_t6();
+        let px = 6.9e7_f64;
+        let py = 0.0_f64;
+        let device: crate::training_core::BDevice = Default::default();
+        let n = 4;
+        let zeros = || Tensor::<B, 1>::zeros([n], &device);
+        // theta = 0, 90, 180, 270 degrees; outward-into-hole normal convention (nx=-cos, ny=-sin).
+        let nx_v = [-1.0_f32, 0.0, 1.0, 0.0];
+        let ny_v = [0.0_f32, -1.0, 0.0, 1.0];
+        let nx = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(nx_v.to_vec(), vec![n]), &device);
+        let ny = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(ny_v.to_vec(), vec![n]), &device);
+        let raw_out = Tensor::<B, 2>::zeros([n, 5], &device);
+
+        let term = HoleBcTerm {
+            domain: USER_DOMAIN, point_set: "hole_0_fd", bc: HoleBc::Free, ref_stress2: 1.0,
+            material: material.clone(), affine_target: Some((px, py)),
+        };
+        let residual = term.compute(&[DomainForwardOutputs {
+            domain: USER_DOMAIN, raw_out: &raw_out,
+            strains: Some((zeros(), zeros(), zeros())), normals: Some((nx, ny)),
+            shifted_stress: None, hessian: None,
+        }]).into_data().to_vec::<f32>().unwrap()[0] as f64;
+
+        // sigma_hole=0 everywhere -> tx_pred=ty_pred=0; target=(-px*nx,-py*ny)=(-px*nx,0).
+        // mean over the 4 points of (0-(-px*nx))^2 = mean of (px*nx)^2 = px^2 * mean(nx^2).
+        let mean_nx2 = nx_v.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / n as f64;
+        let expected = px * px * mean_nx2;
+        assert!((residual - expected).abs() / expected < 1e-5,
+            "residual={residual:.6e} expected={expected:.6e} - decomposed hole term must target \
+             -sigma_affine.n, not zero");
+        assert!(residual > 0.0, "a nonzero target must produce nonzero residual for sigma_hole=0");
+    }
+
+    /// End-to-end registration proof: for the L5-shaped spec, `UserDefinedProblem::loss_terms()`
+    /// under `Variational` now includes `hole_free`, sourced from DERIVED stress at the FD-safe
+    /// ring — this is the exact gap issue #77's investigation traced the Kt~1.0 result to
+    /// (`hole_free_active = !matches!(formulation, Variational)` previously excluded it
+    /// unconditionally). Off-scope geometries (no-hole/multi-hole/off-center/Fixed) must NOT
+    /// register it under Variational, preserving the original behavior exactly.
+    #[test]
+    fn variational_registers_corrected_hole_term_only_when_decomposition_applicable() {
+        let mut spec = single_hole_like_spec(1);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        let problem = UserDefinedProblem::new(spec.clone());
+        let terms = problem.loss_terms();
+        let hole_term = terms.iter().find(|t| t.name() == "hole_free");
+        assert!(hole_term.is_some(), "L5-shaped Variational spec must register hole_free");
+        assert_eq!(hole_term.unwrap().point_sets(), vec!["hole_0_fd"],
+            "decomposed hole term must read the FD-safe ring, not the exact-radius one");
+        assert_eq!(hole_term.unwrap().stress_source(), Some(crate::problem::StressSource::Derived));
+
+        let mut off_center = spec.clone();
+        off_center.geometry.holes[0].center = [0.01, 0.0];
+        let off_center_problem = UserDefinedProblem::new(off_center);
+        assert!(off_center_problem.loss_terms().iter().all(|t| t.name() != "hole_free"),
+            "off-center hole must NOT register hole_free under Variational - out of #77 v1 scope");
+
+        let mut no_hole = spec;
+        no_hole.geometry.holes.clear();
+        let no_hole_problem = UserDefinedProblem::new(no_hole);
+        assert!(no_hole_problem.loss_terms().iter().all(|t| t.name() != "hole_free"),
+            "no-hole geometry must be byte-for-byte unaffected");
+    }
+
+    /// Same registration proof for `AnnularDecompositionProblem`, plus the point-set-consumption
+    /// hardening (`problem::validate_point_sets_consumed`) - before this fix, the annulus
+    /// sampler's own `"hole_0"` point set was emitted and consumed by NOTHING, which this new
+    /// check now catches structurally. `"hole_0_fd"` (the new FD-safe ring) must be consumed by
+    /// the registered `hole_free` term; the exact-radius `"hole_0"` legitimately stays
+    /// unconsumed in this problem (kept only for potential future direct-stress use) - which is
+    /// why this test targets the FD-safe name specifically via the loss-term assertion, and
+    /// calls the full consumption check only after confirming that.
+    #[test]
+    fn annular_decomposition_registers_corrected_hole_term_for_l5_shaped_spec() {
+        let mut spec = single_hole_like_spec(1); // l5_geometry: half_w=half_h=0.10, radius=0.005
+        spec.training.measure_aware_training = true; // AnnularDecompositionProblem::supports requires this
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        let problem = AnnularDecompositionProblem::new(spec);
+        let terms = problem.loss_terms();
+        let hole_term = terms.iter().find(|t| t.name() == "hole_free");
+        assert!(hole_term.is_some(), "L5-shaped annular spec must register hole_free");
+        assert_eq!(hole_term.unwrap().domains(), vec![ANNULUS_DOMAIN]);
+        assert_eq!(hole_term.unwrap().point_sets(), vec!["hole_0_fd"]);
     }
 
     /// Issue #63 PH4-04 (sub-issue #65): live measure-aware integral unbiasedness proof on the
@@ -3146,6 +4075,7 @@ mod tests {
             let exy_t = Tensor::<B, 1>::zeros([n], &device);
             let raw_out = Tensor::<B, 2>::zeros([n, 5], &device);
             let term = InteriorEnergyTerm {
+                domain: USER_DOMAIN,
                 material: material.clone(), ref_energy: 1.0,
                 measure_aware: true, domain_area, thickness, ref_energy_absolute, weights,
             };
@@ -3330,14 +4260,15 @@ mod tests {
     #[test]
     fn named_point_sets_returns_one_ring_per_hole_with_expected_point_count() {
         // No more "_anchor" point sets since bugSource-New #12 removed the near-ring
-        // constitutive-anchor mechanism - only one ring per hole now, matching Kirsch/pin-lug's
-        // own hole/interface point-set shape.
+        // constitutive-anchor mechanism. Issue #77 fix added a SECOND ring per hole
+        // (`"hole_i_fd"`, FD-safe at `radius+anchor_margin_m`) alongside the original
+        // exact-radius `"hole_i"` ring, so this is now 2 holes * 2 rings = 4 named point sets.
         let geom = two_hole_geometry();
         let strategy = UserSamplingStrategy::new(geom.clone(), TEST_FD_H);
         let sets = strategy.named_point_sets(&[]);
-        assert_eq!(sets.len(), 2, "2 holes * 1 ring = 2 named point sets");
+        assert_eq!(sets.len(), 4, "2 holes * 2 rings (exact-radius + FD-safe) = 4 named point sets");
         let names: Vec<&str> = sets.iter().map(|s| s.name).collect();
-        for expected in ["hole_0", "hole_1"] {
+        for expected in ["hole_0", "hole_1", "hole_0_fd", "hole_1_fd"] {
             assert!(names.contains(&expected), "missing point set {expected:?}, got {names:?}");
         }
         for set in &sets {
@@ -3455,7 +4386,7 @@ mod tests {
             domain: USER_DOMAIN, raw_out: &raw_out,
             strains: None, normals: None, shifted_stress: None, hessian: None,
         };
-        let term = TranslationGaugeTerm { inv_u_ref_sq: 1.0 };
+        let term = TranslationGaugeTerm { domain: USER_DOMAIN, inv_u_ref_sq: 1.0 };
         let loss = term.compute(&[d]);
         let loss_v = loss.into_data().to_vec::<f32>().unwrap()[0] as f64;
         let expected = 0.002_f64 * 0.002 + 0.001 * 0.001;
@@ -3488,7 +4419,7 @@ mod tests {
             domain: USER_DOMAIN, raw_out: &raw_out,
             strains: None, normals: None, shifted_stress: None, hessian: None,
         };
-        let loss = TranslationGaugeTerm { inv_u_ref_sq: 1.0 / u_ref.powi(2) }
+        let loss = TranslationGaugeTerm { domain: USER_DOMAIN, inv_u_ref_sq: 1.0 / u_ref.powi(2) }
             .compute(&[d]).into_data().to_vec::<f32>().unwrap()[0] as f64;
         assert!((loss - 1.0).abs() < 1e-5, "reference rigid translation must be O(1), got {loss}");
     }
@@ -3497,7 +4428,7 @@ mod tests {
     fn rotation_gauge_removes_only_rigid_rotation_not_affine_symmetric_strain() {
         use burn::tensor::TensorData;
         let device: crate::training_core::BDevice = Default::default();
-        let term = RotationGaugeTerm { half_w: 2.0, half_h: 1.0 };
+        let term = RotationGaugeTerm { domain: USER_DOMAIN, half_w: 2.0, half_h: 1.0 };
         // One point per edge in UserSamplingStrategy's right, left, top, bottom order.
         // Rigid rotation u=-omega*y, v=omega*x has omega=0.03 exactly.
         let rotation = Tensor::<B, 2>::from_data(
@@ -3811,6 +4742,7 @@ mod tests {
             dynamic_lam_non_tension_cap: f64::MAX,
             constitutive_consistency_weight: 50.0,
             n_fourier: spec.geometry.n_fourier(),
+            coordinate_embedding: spec.geometry.coordinate_embedding(),
             probe_term_gradients: true,
             phase2_active: true,
             step: 0,
@@ -4162,7 +5094,7 @@ mod tests {
     fn kt_convergence_check_runs_end_to_end_and_returns_finite_values() {
         let device = crate::training_core::BDevice::default();
         let geometry = two_hole_geometry();
-        let model = tiny_model(geometry.n_fourier());
+        let model = tiny_model(&geometry);
         let fd = crate::fd_stencil::FdConfig::new(TEST_FD_H, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
         let material = MaterialProps::al7075_t6();
         let hole = geometry.holes[0];
@@ -4184,18 +5116,37 @@ mod tests {
     /// probe's forward pass panics on a tensor width mismatch (the model's `input_dim` is
     /// fixed at construction time; the probe functions derive their Fourier embedding from
     /// the geometry they're actually given, independently).
-    fn tiny_model(n_fourier: usize) -> crate::network::ElasticityNet<crate::training_core::BInner> {
+    /// Pre-#77 signature took `n_fourier: usize` (`4*n_fourier` if nonzero, else `3`) — stale
+    /// since `UserGeometry::net_input_dim()` was rewritten to `coordinate_embedding().
+    /// input_dim()` (chart embedding for exactly-one-Free-hole geometries returns 10, not a
+    /// Fourier-derived width). `n_fourier()` itself is now hardcoded `0` for every geometry, so
+    /// every pre-existing call site's old `tiny_model(geometry.n_fourier())` silently built a
+    /// 3-input model even where `coordinate_embedding()` returns `SingleHoleChart` (10) —
+    /// caught as a real `cargo test` matmul-dimension failure, not by construction. Fixed by
+    /// taking `&UserGeometry` directly and using the SAME embedding-driven width production
+    /// code uses, so this helper can never again drift independently from it.
+    fn tiny_model(geometry: &UserGeometry) -> crate::network::ElasticityNet<crate::training_core::BInner> {
         let device = crate::training_core::BDevice::default();
-        let input_dim = if n_fourier > 0 { 4 * n_fourier } else { 3 };
         crate::network::ElasticityNetConfig::new()
-            .with_input_dim(input_dim).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
+            .with_input_dim(geometry.coordinate_embedding().input_dim())
+            .with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
+            .init(&device)
+    }
+
+    /// The pre-#77 `tiny_model_raw()` shape (raw 3-input, no geometry needed) - kept as a
+    /// separately-named helper rather than guessing a geometry at call sites that never had
+    /// one in scope.
+    fn tiny_model_raw() -> crate::network::ElasticityNet<crate::training_core::BInner> {
+        let device = crate::training_core::BDevice::default();
+        crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
             .init(&device)
     }
 
     #[test]
     fn evaluate_user_vis_grid_masks_every_new_field_outside_the_domain_same_as_the_original_six() {
         let geometry = two_hole_geometry();
-        let model = tiny_model(geometry.n_fourier());
+        let model = tiny_model(&geometry);
         let device = crate::training_core::BDevice::default();
         let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
         let vis = evaluate_user_vis_grid(
@@ -4220,7 +5171,7 @@ mod tests {
         // point would read exactly 0.0. Real, independently-computed values essentially never
         // land on exactly zero float-for-float, so "not identically zero everywhere" is strong
         // evidence the comparison is real, not a stub.
-        let model = tiny_model(0);
+        let model = tiny_model_raw();
         let device = crate::training_core::BDevice::default();
         let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] };
         let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
@@ -4237,7 +5188,7 @@ mod tests {
 
     #[test]
     fn evaluate_user_vis_grid_amr_score_is_finite_and_nonnegative_everywhere_inside_domain() {
-        let model = tiny_model(0);
+        let model = tiny_model_raw();
         let device = crate::training_core::BDevice::default();
         let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] };
         let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
@@ -4251,7 +5202,7 @@ mod tests {
 
     #[test]
     fn evaluate_user_vis_grid_collocation_density_matches_a_hand_binned_histogram() {
-        let model = tiny_model(0);
+        let model = tiny_model_raw();
         let device = crate::training_core::BDevice::default();
         let geometry = UserGeometry { half_w: 1.0, half_h: 1.0, thickness: 0.005, holes: vec![] };
         let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
@@ -4270,7 +5221,7 @@ mod tests {
 
     #[test]
     fn probe_boundary_residuals_is_finite_nonnegative_and_max_at_least_rms() {
-        let model = tiny_model(two_hole_geometry().n_fourier());
+        let model = tiny_model(&two_hole_geometry());
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: two_hole_geometry(),
@@ -4292,7 +5243,7 @@ mod tests {
 
     #[test]
     fn probe_boundary_residuals_handles_a_geometry_with_no_holes() {
-        let model = tiny_model(0);
+        let model = tiny_model_raw();
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
@@ -4312,7 +5263,7 @@ mod tests {
     #[test]
     fn probe_reaction_force_is_finite_and_reference_force_matches_hand_computed_nominal_load() {
         let geometry = two_hole_geometry();
-        let model = tiny_model(geometry.n_fourier());
+        let model = tiny_model(&geometry);
         let device = crate::training_core::BDevice::default();
         let px = 6.9e7;
         let spec = ProblemSpec {
@@ -4375,7 +5326,7 @@ mod tests {
 
     #[test]
     fn probe_reaction_force_handles_a_geometry_with_no_holes() {
-        let model = tiny_model(0);
+        let model = tiny_model_raw();
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
@@ -4394,7 +5345,7 @@ mod tests {
     fn probe_reaction_force_zero_load_gives_zero_reference_force_floored_and_finite_error() {
         // px = py = 0.0: `reference_force` would otherwise be exactly 0.0, which must not
         // produce a NaN/infinite division - the `.max(1e-30)` floor exists exactly for this.
-        let model = tiny_model(0);
+        let model = tiny_model_raw();
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
@@ -4442,7 +5393,7 @@ mod tests {
 
     #[test]
     fn probe_load_transfer_matches_hand_computed_prescribed_load_and_is_finite() {
-        let model = tiny_model(0);
+        let model = tiny_model_raw();
         let device = crate::training_core::BDevice::default();
         let px = 6.9e7;
         let spec = ProblemSpec {
@@ -4466,7 +5417,7 @@ mod tests {
 
     #[test]
     fn probe_load_transfer_zero_load_gives_ratio_one_and_no_warning() {
-        let model = tiny_model(0);
+        let model = tiny_model_raw();
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
@@ -4483,7 +5434,7 @@ mod tests {
 
     #[test]
     fn probe_load_transfer_handles_a_geometry_with_holes() {
-        let model = tiny_model(0);
+        let model = tiny_model_raw();
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: two_hole_geometry(),
@@ -4502,7 +5453,7 @@ mod tests {
 
     #[test]
     fn run_no_hole_benchmark_runs_end_to_end_and_correctly_fails_an_untrained_model() {
-        let model = tiny_model(0);
+        let model = tiny_model_raw();
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
@@ -4618,6 +5569,7 @@ mod tests {
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                 constitutive_consistency_weight: 50.0,
                 n_fourier: spec.geometry.n_fourier(),
+                coordinate_embedding: spec.geometry.coordinate_embedding(),
                 probe_term_gradients: false,
                 phase2_active: true, step,
             };
@@ -4718,7 +5670,7 @@ mod tests {
                 );
                 let ctx = plate_multi_step_ctx(
                     &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
-                    spec.geometry.n_fourier(), false, step,
+                    spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
                 );
                 let (new_model, _out) = step_physics_multi(
                     vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, device, 0, 1.0, 1.0,
@@ -4810,7 +5762,7 @@ mod tests {
                 );
                 let ctx = plate_multi_step_ctx(
                     &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
-                    spec.geometry.n_fourier(), false, step,
+                    spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
                 );
                 let (new_model, _out) = step_physics_multi(
                     vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, device, 0, 1.0, 1.0,
@@ -4931,7 +5883,7 @@ mod tests {
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
-                        n_fourier: spec.geometry.n_fourier(), probe_term_gradients: false,
+                        n_fourier: spec.geometry.n_fourier(), coordinate_embedding: spec.geometry.coordinate_embedding(), probe_term_gradients: false,
                         phase2_active: true, step,
                     };
                     if let Some(residuals) = probe_interior_energy_residuals(&probe_ctx, &[&model], device).remove(&USER_DOMAIN) {
@@ -4954,7 +5906,7 @@ mod tests {
                                 dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                                 constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
-                                n_fourier: spec.geometry.n_fourier(), probe_term_gradients: false,
+                                n_fourier: spec.geometry.n_fourier(), coordinate_embedding: spec.geometry.coordinate_embedding(), probe_term_gradients: false,
                                 phase2_active: true, step,
                             };
                             let after_residuals = probe_interior_energy_residuals(&after_ctx, &[&model], device)
@@ -4969,7 +5921,7 @@ mod tests {
 
                 let ctx = plate_multi_step_ctx(
                     &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
-                    spec.geometry.n_fourier(), false, step,
+                    spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
                 );
                 let (new_model, _out) = step_physics_multi(
                     vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, device, 0, 1.0, 1.0,
@@ -5077,13 +6029,19 @@ mod tests {
                 );
 
                 if use_persistent_amr && step >= AMR_WARMUP_STEPS && (step - AMR_WARMUP_STEPS) % amr_interval == 0 {
+                    // `update_residuals` consumes one value per active leaf in DFS order.
+                    // The training batch has a fixed budget and may contain several samples
+                    // from one leaf, so it is not a valid residual-assignment cloud.
+                    let probe_data = adaptive_grid_probe_data(
+                        &data, half_w, half_h, &mut amr_grid, step,
+                    );
                     let probe_ctx = MultiStepCtx {
                         config: &config, problem: &problem, fd: &fd, k: 1.0,
-                        domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
+                        domains: vec![DomainStepCtx { data: &probe_data, u_ref, ref_energy, ref_stress2 }],
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
-                        n_fourier: spec.geometry.n_fourier(), probe_term_gradients: false,
+                        n_fourier: spec.geometry.n_fourier(), coordinate_embedding: spec.geometry.coordinate_embedding(), probe_term_gradients: false,
                         phase2_active: true, step,
                     };
                     if let Some(residuals) = probe_interior_energy_residuals(&probe_ctx, &[&model], device).remove(&USER_DOMAIN) {
@@ -5109,7 +6067,7 @@ mod tests {
 
                 let ctx = plate_multi_step_ctx(
                     &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
-                    spec.geometry.n_fourier(), false, step,
+                    spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
                 );
                 let (new_model, _out) = step_physics_multi(
                     vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, device, 0, 1.0, 1.0,
@@ -5228,13 +6186,16 @@ mod tests {
                 );
 
                 if use_persistent_amr && step >= AMR_WARMUP_STEPS && (step - AMR_WARMUP_STEPS) % amr_interval == 0 {
+                    let probe_data = adaptive_grid_probe_data(
+                        &data, half_w, half_h, &mut amr_grid, step,
+                    );
                     let probe_ctx = MultiStepCtx {
                         config: &config, problem: &problem, fd: &fd, k: 1.0,
-                        domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
+                        domains: vec![DomainStepCtx { data: &probe_data, u_ref, ref_energy, ref_stress2 }],
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
-                        n_fourier: spec.geometry.n_fourier(), probe_term_gradients: false,
+                        n_fourier: spec.geometry.n_fourier(), coordinate_embedding: spec.geometry.coordinate_embedding(), probe_term_gradients: false,
                         phase2_active: true, step,
                     };
                     if let Some(residuals) = probe_interior_energy_residuals(&probe_ctx, &[&model], device).remove(&USER_DOMAIN) {
@@ -5260,7 +6221,7 @@ mod tests {
 
                 let ctx = plate_multi_step_ctx(
                     &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
-                    spec.geometry.n_fourier(), false, step,
+                    spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
                 );
                 let (new_model, _out) = step_physics_multi(
                     vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, device, 0, 1.0, 1.0,
@@ -5374,7 +6335,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "only valid for a plate with NO holes")]
     fn run_no_hole_benchmark_panics_on_a_holed_geometry() {
-        let model = tiny_model(two_hole_geometry().n_fourier());
+        let model = tiny_model(&two_hole_geometry());
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: two_hole_geometry(),
@@ -5605,7 +6566,7 @@ mod tests {
 
     #[test]
     fn run_hole_benchmark_refuses_when_the_no_hole_gate_did_not_pass() {
-        let model = tiny_model(two_hole_geometry().n_fourier());
+        let model = tiny_model(&two_hole_geometry());
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: two_hole_geometry(),
@@ -5625,7 +6586,7 @@ mod tests {
             half_w: 1.0, half_h: 1.0, thickness: 0.1,
             holes: vec![HoleSpec { center: [0.0, 0.0], radius: 0.05, bc: HoleBc::Free }], // ratio 0.05 < 0.10
         };
-        let model = tiny_model(geometry.n_fourier());
+        let model = tiny_model(&geometry);
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry, material: MaterialProps::al7075_t6(), load: LoadConfig::uniaxial_x(1e7),
@@ -5642,7 +6603,7 @@ mod tests {
     fn run_hole_benchmark_classifies_a_large_hole_as_finite_with_no_theory_reference() {
         // two_hole_geometry: half_w=0.1, half_h=0.05, hole 0 radius=0.01 -> ratio = 0.01/0.05 = 0.2 > 0.10.
         let geometry = two_hole_geometry();
-        let model = tiny_model(geometry.n_fourier());
+        let model = tiny_model(&geometry);
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry, material: MaterialProps::al7075_t6(), load: LoadConfig::uniaxial_x(1e7),
@@ -5671,7 +6632,7 @@ mod tests {
 
     #[test]
     fn probe_energy_balance_is_finite_for_a_fresh_model() {
-        let model = tiny_model(two_hole_geometry().n_fourier());
+        let model = tiny_model(&two_hole_geometry());
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: two_hole_geometry(),
@@ -5692,7 +6653,7 @@ mod tests {
         // A freshly-initialized network has no reason for its interior energy density and its
         // boundary work integral to already agree - if this were accidentally wired to compare
         // a value against itself, internal_energy would exactly equal external_work.
-        let model = tiny_model(0);
+        let model = tiny_model_raw();
         let device = crate::training_core::BDevice::default();
         let spec = ProblemSpec {
             geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
@@ -5777,5 +6738,52 @@ mod tests {
             "non-square affine field validation must pass with the same tolerance as the \
              square case, got: {ok:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod issue_77_l5_tests {
+    use super::*;
+
+    /// #77 proof: exact L5 sampling, optimizer, seed, derived-FD VM metric, and independently
+    /// converged finite-plate FEM comparator. No direct stress or infinite-plate target.
+    #[test]
+    #[ignore]
+    fn issue_77_l5_annular_decomposition_converges_to_fem_reference() {
+        use burn::module::AutodiffModule;
+        const FEM_KT: f64 = 2.460_638_516;
+        let base = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] },
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let no_hole = crate::user_runner::train_single_user_problem_for_benchmark(base.clone(), &device);
+        let companion = run_no_hole_benchmark(&no_hole, &base, &device);
+        assert!(companion.passed, "L5 companion no-hole gate failed: {companion:?}");
+
+        let mut hole = base.clone();
+        hole.geometry.holes = vec![HoleSpec { center: [0.0, 0.0], radius: 0.005, bc: HoleBc::Free }];
+        let (annulus, _outer, _) = crate::user_runner::run_annular_decomposition_training(
+            hole.clone(), device.clone(), |_step, _loss, _lr, _points| false,
+        );
+        let annulus = annulus.valid();
+        let scales = crate::training_core::compute_reference_scales_for_plate(&hole);
+        let fd = crate::fd_stencil::FdConfig::new(hole.training.fd_h, 2.0 * hole.geometry.half_w, 2.0 * hole.geometry.half_h);
+        let profile = probe_hole_boundary_profile_derived(
+            &annulus, &hole.geometry, &hole.geometry.holes[0], 144, &fd, scales.u_ref,
+            scales.stress_ref, &hole.material, ring_anchor_margin_m(hole.training.fd_h, &hole.geometry), &device,
+        );
+        let kt = stress_concentration_from_profile(&profile, hole.load.px.abs()).kt;
+        let error = (kt - FEM_KT).abs() / FEM_KT;
+        println!("[L5 #77] Kt={kt:.9} FEM={FEM_KT:.9} error={:.3}%", 100.0 * error);
+        assert!(kt.is_finite() && error <= 0.05,
+            "#77 L5 failed: Kt={kt:.9}, FEM={FEM_KT:.9}, error={:.3}%", 100.0 * error);
     }
 }
