@@ -1203,3 +1203,70 @@ A burn `Module`/`Tensor` `.clone()` is a **cheap, identity-sharing clone**, not 
 mints a fresh autodiff leaf. Any future test (or production code) that wants two genuinely
 independent training runs/graphs from "the same starting weights" must construct them via two
 separate `.init()` calls under the same seed, never via `.clone()`/move of one shared instance.
+
+## PH4-24 — Issue #77's real root cause: no hole-BC signal + a Monte-Carlo SNR floor, not a
+## representation limit
+
+Every #77 attempt through the annular/outer decomposition (rational features Kt=1.046,
+chart-envelope Kt=1.135, plain two-domain decomposition Kt=1.065 - all near the "no hole at all"
+Kt=1.000) changed *representation* while holding two things constant that turned out to be the
+actual gate: (a) neither `Variational`'s `loss_terms()` nor `AnnularDecompositionProblem`'s ever
+registered a term referencing the hole boundary at all (`hole_free_active =
+!matches!(formulation, Variational)`; the annular sampler emitted an orphaned `"hole_0"` point
+set consumed by zero terms - `validate_loss_terms` only checked declared domains exist, never
+that a declared point set is read by anything), and (b) the hole's own contribution to the
+domain-integrated strain energy Pi, restricted to the region collocation points can actually
+reach, is only **0.38% of Pi** at L5's hole size (`a=0.005`) - below the **~0.134%** Monte-Carlo
+standard error of the SAME n=4096 energy estimator (SNR~2.8, computed analytically from the
+closed-form Kirsch field). A pure uniform affine field (`sigma_xx=px, sigma_yy=sigma_xy=0` -
+genuinely no hole effect) scores **exactly** Kt=1.000 under the reported metric, so the observed
+1.02-1.13 band across three representations is "affine plus noise," not "concentration
+under-resolved" - exactly why changing representation alone never moved the number.
+
+**Fix (three-step plan, sequential, each gated on a real run before the next)**:
+
+1. **Kinematic decomposition + corrected hole term** (this entry): `u_total = u_affine + u_hole`
+   for the single-centered-Free-hole case, `u_affine` the exact closed-form uniaxial-tension
+   field (`run_no_hole_benchmark`'s own reference solution). The network represents only the
+   residual correction instead of competing for gradient budget against the dominant,
+   trivially-learned affine part. Every energy functional adds the constant affine strain
+   before calling into the EXISTING `dem_energy_per_point`/`compute_stress` machinery, so the
+   cross term `C:eps_affine:eps_hole` (mathematically required for argmin-equivalence to the
+   true Pi - dropping it would reproduce this file's own PH4-03 "not a uniform rescaling,
+   changes the stationary point" defect one level deeper) is present by construction, verified
+   by a dedicated correctness-gate test (`affine_strain_cross_term_is_present_not_dropped`)
+   against an independently hand-derived quadratic expansion. `HoleBcTerm`'s traction-free
+   residual is retargeted to `-sigma_affine.n` (not zero - the network no longer represents the
+   whole field) and switched from the direct mDEM stress head (documented elsewhere in this
+   file as never developing real spatial structure) to a derived/constitutive read on a new
+   FD-safe ring. A rejected alternative considered first - scaling the strain-energy integrand
+   inside `r/a<=2` to artificially inflate the hole's share of the objective - was NOT used: it
+   is the weak form of elasticity with a spatially varying modulus, manufacturing a spurious
+   stress discontinuity at the weight boundary and changing which BVP is actually being solved,
+   the same defect class as this file's own historical `lambda_U`/`lambda_W` bug in spatial
+   form. `problem::validate_point_sets_consumed` added as general hardening - would have caught
+   the orphaned `"hole_0"` point set structurally.
+
+   **Real result** (`issue_77_l5_annular_decomposition_converges_to_fem_reference`, release,
+   3000 steps, `n_interior=4096`, FEM reference `2.460638516`): **Kt=1.213417**, error 50.687%
+   - fails the test's own 5% acceptance gate, but moved in the predicted direction from the
+   pre-fix annular decomposition's Kt=1.065 (+0.148, real, not noise-floor-sized). Expected and
+   predeclared as a *partial* result before this fix landed: collocation points still cannot
+   reach the boundary layer at all (`ring_anchor_margin_m` scales with plate size, not hole
+   size - at L5 the exclusion radius is `1.08*radius`), which is what Step 2 (hole-relative
+   collocation margin) and Step 3 (energy-estimator variance reduction, reusing #76's cut-cell
+   quadrature) address next. Reported honestly per this file's own no-benchmark-hacking
+   discipline - not a pass, a real, predicted, directionally-correct partial improvement.
+
+Full workspace regression: `cargo test -p pinn-core -p pinn-solver --lib --features
+ndarray-backend -- --test-threads=1` -> 484 passed, 0 failed, 36 ignored (pinn-core: 137 passed).
+Exposed and fixed two pre-existing test-fixture bugs unrelated to this fix while getting there
+(both in the chart-embedding rewrite that landed alongside this piece, not introduced by it):
+`tiny_model(n_fourier)` used a stale Fourier-width formula instead of the current
+`coordinate_embedding().input_dim()`, and `legacy_record_loads_with_zero_coordinate_skip` built
+its "legacy" fixture at the new chart-embedded width instead of the literal pre-embedding width
+its own `input_dim: None` fallback assumes - both produced a real
+`burn-ndarray::ops::matmul::Dimensions are incompatible` panic, not a regression from this fix.
+
+Does not close issue #77 (or #74/#76) - Steps 2 and 3 remain, reported with evidence as each
+completes.
