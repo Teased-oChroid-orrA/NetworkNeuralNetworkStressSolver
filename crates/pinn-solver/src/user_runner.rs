@@ -31,7 +31,19 @@ use crate::{
 pub struct AnnularL5Diagnostic {
     pub step: usize,
     pub total_loss: f32,
+    /// Issue #77 Step 4: kept for backward compatibility with earlier diagnostic JSON files -
+    /// this is `out.lr`, the now-decorative SHARED `LrSchedule`'s own result. It does NOT
+    /// drive either domain's optimizer once `annulus_lr`/`outer_lr` below are populated (see
+    /// `PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-27). Prefer those two fields.
     pub learning_rate: f64,
+    /// The annulus domain's REAL, effective learning rate this step (from its own
+    /// `LrSchedule`, actually applied by `step_physics_multi` via `MultiStepCtx::
+    /// per_domain_lr`) - added specifically to let a future run distinguish "the annulus
+    /// domain's own schedule is still decaying prematurely" from other hypotheses, per
+    /// PH4-27's own open-question list.
+    pub annulus_lr: f64,
+    /// Same as `annulus_lr`, for the outer domain.
+    pub outer_lr: f64,
     pub kt_derived_fd_vm: f64,
     pub direct_stress_rms: f64,
     pub derived_stress_rms: f64,
@@ -52,6 +64,8 @@ pub struct AnnularTermDiagnostic {
 fn annular_l5_diagnostic(
     step: usize,
     out: &StepOutput,
+    annulus_lr: f64,
+    outer_lr: f64,
     model: &crate::network::ElasticityNet<crate::training_core::BInner>,
     spec: &ProblemSpec,
     fd: &FdConfig,
@@ -83,7 +97,7 @@ fn annular_l5_diagnostic(
         gradient_share: shares.and_then(|s| s.shares.get(name)).copied(),
     }).collect();
     AnnularL5Diagnostic {
-        step, total_loss: out.total_scalar, learning_rate: out.lr, kt_derived_fd_vm: kt,
+        step, total_loss: out.total_scalar, learning_rate: out.lr, annulus_lr, outer_lr, kt_derived_fd_vm: kt,
         direct_stress_rms: stress.direct_stress_rms, derived_stress_rms: stress.derived_stress_rms,
         direct_derived_mismatch_rms: stress.stress_mismatch_rms,
         derived_traction_rms: stress.derived_traction_rms, terms,
@@ -190,7 +204,7 @@ fn run_annular_decomposition_training_inner(
         last_total = out.total_scalar;
         if diagnostic_steps.contains(&step) {
             use burn::module::AutodiffModule;
-            diagnostics.push(annular_l5_diagnostic(step, &out, &models[0].valid(), &spec, &fd, &device));
+            diagnostics.push(annular_l5_diagnostic(step, &out, lr_annulus, lr_outer, &models[0].valid(), &spec, &fd, &device));
         }
         // Reports the annulus domain's own LR (the one whose starvation this fix addresses) -
         // a logging/callback choice only, does not affect either domain's optimizer step.

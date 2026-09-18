@@ -1453,3 +1453,43 @@ dynamics. (a) is cheap to check (a diagnostic-visibility fix, no new training ru
 implement, though confirming it still needs one); (b) would need a real weight-sensitivity run.
 
 Does not close issue #77 (or #74/#76).
+
+## PH4-28 — Candidate (a) ruled out with real evidence: the annulus domain's own LR never
+## decays; LR is no longer the bottleneck at all
+
+Added `annulus_lr`/`outer_lr` fields to `AnnularL5Diagnostic` (the pre-existing `learning_rate`
+field now only reports the decorative shared schedule's result, kept for backward JSON
+compatibility) and threaded the real per-domain values from `run_annular_decomposition_
+training_inner` through to the diagnostic writer - a visibility-only change, zero training
+logic touched.
+
+**Real result** (`issue_77_l5_annular_diagnostic_trace`, 3000 steps, release, Step 4's
+per-domain-LR fix active):
+
+| step | Kt | annulus_lr | outer_lr |
+|---|---|---|---|
+| 0 | 0.255 | 1.00e-5 | 1.00e-5 |
+| 300 | 0.348 | 9.90e-4 | 9.90e-4 |
+| 1500 | 1.220 | **9.90e-4** | 4.85e-4 |
+| 2999 | 1.231 | **9.90e-4** | 1.66e-4 |
+
+The annulus domain's own `LrSchedule` reaches its post-warmup peak (9.90e-4) by step 300 and
+**never decays for the rest of the run** - its own loss aggregate (`annulus_potential` +
+`hole_free` + the interface terms) never plateaus long enough to trigger `ReduceLROnPlateau`.
+The outer domain's LR correctly decays (9.90e-4 -> 4.85e-4 -> 1.66e-4) as its own,
+genuinely-plateaued loss triggers its own schedule - exactly the intended, per-domain-decoupled
+behavior Step 4 was built to produce.
+
+**Candidate (a) is ruled out.** The annulus domain has full, undecayed learning rate for the
+entire run and Kt still plateaus around 1.2-1.3, not approaching the FEM reference (2.4606).
+Training dynamics/LR are conclusively NOT the remaining bottleneck - four different axes
+(representation, collocation margin, sampling variance, and now training dynamics/LR) have
+each been raised, tested with real evidence, and ruled out or fixed without closing the Kt gap.
+
+**Next: candidate (b)**, the interface-continuity terms (`interface_displacement_continuity`/
+`interface_traction_continuity`, base weight 100.0 each) may be over-constraining the annulus
+field toward compatibility with the (affine-dominated) outer field's smoothness at `r=3a`,
+independent of any LR dynamics - the one remaining candidate from PH4-27's own list, and the
+only one not yet given a real, evidenced test.
+
+Does not close issue #77 (or #74/#76).
