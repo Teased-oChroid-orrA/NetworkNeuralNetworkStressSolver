@@ -1707,6 +1707,14 @@ pub struct AnnularDecompositionProblem {
     annulus_sampling: AnnularPartitionSampling,
     outer_sampling: AnnularPartitionSampling,
     ansatz: IdentityAnsatz,
+    /// Issue #77 candidate (b): base weight for BOTH `interface_displacement_continuity` and
+    /// `interface_traction_continuity` (previously a hardcoded `100.0` literal in
+    /// `base_weight()`). Defaults to `100.0` via `new()` - byte-identical to every pre-#77-
+    /// candidate-(b) caller. `new_with_interface_weight` exists solely to run a real,
+    /// controlled A/B comparison testing whether this weight over-constrains the annulus
+    /// field toward the outer field's smoothness at the interface - see
+    /// `PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-28 open-question list.
+    interface_weight: f32,
 }
 
 impl AnnularDecompositionProblem {
@@ -1718,6 +1726,11 @@ impl AnnularDecompositionProblem {
     }
 
     pub fn new(spec: ProblemSpec) -> Self {
+        Self::new_with_interface_weight(spec, 100.0)
+    }
+
+    /// See `interface_weight`'s own doc comment.
+    pub fn new_with_interface_weight(spec: ProblemSpec, interface_weight: f32) -> Self {
         assert!(Self::supports(&spec),
             "annular decomposition requires one safely-contained Free hole, Variational formulation, and measure-aware training");
         let placeholder = spec.geometry.to_placeholder();
@@ -1741,6 +1754,7 @@ impl AnnularDecompositionProblem {
             annulus_sampling,
             outer_sampling,
             ansatz: IdentityAnsatz,
+            interface_weight,
         }
     }
 
@@ -1862,7 +1876,7 @@ impl BoundaryValueProblem for AnnularDecompositionProblem {
     fn base_weight(&self, term_name: &str) -> f32 {
         match term_name {
             "annulus_potential" | "physical_potential" => LAM_PHYSICAL_POTENTIAL,
-            "interface_displacement_continuity" | "interface_traction_continuity" => 100.0,
+            "interface_displacement_continuity" | "interface_traction_continuity" => self.interface_weight,
             "translation_gauge" => LAM_TRANSLATION_GAUGE,
             "rotation_gauge" => LAM_ROTATION_GAUGE,
             "hole_free" => LAM_HOLE_FREE,
@@ -3276,6 +3290,33 @@ mod tests {
         assert!(terms.iter().any(|t| t.name() == "interface_traction_continuity"));
     }
 
+    /// Issue #77 candidate (b): `new_with_interface_weight`'s default arm (`new()`) must be
+    /// byte-identical to the pre-#77-candidate-(b) hardcoded `100.0` - a real override must
+    /// actually change what `base_weight` returns for both interface terms, and nothing else.
+    #[test]
+    fn interface_weight_override_changes_only_the_two_interface_terms_base_weight() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(), material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7), network: Default::default(),
+            training: pinn_core::problem_spec::TrainingSpec {
+                measure_aware_training: true, ..Default::default()
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let default_problem = AnnularDecompositionProblem::new(spec.clone());
+        assert_eq!(default_problem.base_weight("interface_displacement_continuity"), 100.0);
+        assert_eq!(default_problem.base_weight("interface_traction_continuity"), 100.0);
+
+        let overridden = AnnularDecompositionProblem::new_with_interface_weight(spec, 10.0);
+        assert_eq!(overridden.base_weight("interface_displacement_continuity"), 10.0);
+        assert_eq!(overridden.base_weight("interface_traction_continuity"), 10.0);
+        // Every other term's base weight must be completely unaffected by the override.
+        assert_eq!(overridden.base_weight("annulus_potential"), default_problem.base_weight("annulus_potential"));
+        assert_eq!(overridden.base_weight("physical_potential"), default_problem.base_weight("physical_potential"));
+        assert_eq!(overridden.base_weight("translation_gauge"), default_problem.base_weight("translation_gauge"));
+        assert_eq!(overridden.base_weight("rotation_gauge"), default_problem.base_weight("rotation_gauge"));
+    }
+
     #[test]
     fn annular_decomposition_two_model_runner_smoke_is_finite() {
         let spec = ProblemSpec {
@@ -3363,6 +3404,48 @@ mod tests {
         println!("[#77 diagnostic] wrote {}", path.display());
         for diagnostic in diagnostics {
             println!("[#77 diagnostic] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+    }
+
+    /// Issue #77 candidate (b): controlled A/B against `issue_77_l5_annular_diagnostic_trace`'s
+    /// own real run (identical geometry/material/load/network/training config, identical
+    /// checkpoints, identical seed - ONLY `interface_weight` differs: `10.0` here vs the
+    /// default `100.0`). Tests whether `interface_displacement_continuity`/
+    /// `interface_traction_continuity` over-constrain the annulus field toward the outer
+    /// field's smoothness at `r=3a` - the one remaining candidate after LR/training-dynamics
+    /// was ruled out with real evidence (`PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-28).
+    #[test]
+    #[ignore]
+    fn issue_77_interface_weight_reduced_l5_trace() {
+        const REDUCED_INTERFACE_WEIGHT: f32 = 10.0;
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_interface_weight(
+            spec, device, &checkpoints, REDUCED_INTERFACE_WEIGHT, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 interface-weight] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-interface-weight-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 interface-weight] wrote {}", path.display());
+        for diagnostic in diagnostics {
+            println!("[#77 interface-weight] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
                 diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
                 diagnostic.direct_derived_mismatch_rms);
         }

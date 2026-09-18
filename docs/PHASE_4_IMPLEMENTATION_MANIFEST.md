@@ -1493,3 +1493,54 @@ independent of any LR dynamics - the one remaining candidate from PH4-27's own l
 only one not yet given a real, evidenced test.
 
 Does not close issue #77 (or #74/#76).
+
+## PH4-29 — Candidate (b) also ruled out: interface-continuity weight is not the bottleneck
+## either. Every tested axis has now been addressed or ruled out with real evidence
+
+Added `AnnularDecompositionProblem::interface_weight` (default `100.0` via `new()`, byte-
+identical to every existing caller; `new_with_interface_weight(spec, weight)` for a real
+controlled comparison) and a matching experimental entry point,
+`run_annular_decomposition_training_with_diagnostics_and_interface_weight` - zero blast radius
+on the 8 existing production/test callers of the two pre-existing public runners. 1 new cheap
+correctness test (override changes only the two interface terms' `base_weight`, nothing else);
+full suite 495 passed, 0 failed, 39 ignored.
+
+**Real result** (`issue_77_interface_weight_reduced_l5_trace`, identical config/seed/
+checkpoints to the PH4-28 baseline run, `interface_weight=10.0` vs the default `100.0`):
+
+| step | baseline Kt (weight=100) | reduced Kt (weight=10) |
+|---|---|---|
+| 0 | 0.255 | 0.255 |
+| 300 | 0.348 | 0.353 |
+| 1500 | 1.220 | 1.168 |
+| 2999 | 1.231 | 1.251 |
+
+A 10x reduction in the interface-continuity weight produces changes well within run-to-run
+noise (step 1500 is actually slightly LOWER with the reduced weight; the final Kt is only
++0.02 higher) - no consistent, meaningful movement in either direction. **Candidate (b) is
+ruled out.**
+
+**Every axis raised in this investigation has now been tested with real evidence and either
+fixed (kinematic decomposition + corrected hole term, Step 1; per-domain LR, Step 4) or ruled
+out (representation - #77's original three attempts; collocation margin - Step 2; sampling
+variance - Step 3's zero-cost SNR check; annulus-own LR decay - PH4-28; interface-continuity
+weight - this entry).** Kt still settles near 1.0-1.3 versus the FEM reference of 2.4606,
+under a formulation, sampling scheme, and training schedule that are all now individually
+confirmed to be behaving as intended.
+
+**Working hypothesis for the next step** (not yet tested): this may be a more fundamental
+limitation of PURE VARIATIONAL/DEM training for a sharp, localized stress concentration at
+this hole-to-plate size ratio, rather than a bug in any one mechanism. This codebase's own
+existing `EquilibriumTerm` doc comment (for the single-domain `UserDefinedProblem` path)
+already documents a version of this: pure energy-integral minimization can under-resolve
+sharp local features, and that problem's `Strong`/`Hybrid` formulations exist specifically to
+add an explicit PDE-residual (equilibrium) term as an independent, LOCAL source of gradient
+pressure near the feature - unlike the domain-integrated energy term, whose gradient at any
+one point is diluted by the whole domain's integral. `AnnularDecompositionProblem` has NO
+such option today - it offers only the variational energy term on each domain, no strong-form/
+equilibrium residual anywhere. Adding an equivalent capability (a Hessian-derived-stress
+equilibrium residual on the annulus domain specifically, mirroring `EquilibriumTerm`'s own
+existing, working implementation) is a real, scoped feature addition - not a config tweak -
+and the next candidate to test.
+
+Does not close issue #77 (or #74/#76).

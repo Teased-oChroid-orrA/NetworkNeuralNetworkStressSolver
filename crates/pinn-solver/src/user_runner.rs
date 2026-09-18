@@ -123,8 +123,9 @@ fn run_annular_decomposition_training_inner(
     mut on_step: impl FnMut(usize, f32, f64, usize) -> bool,
     diagnostic_steps: &[usize],
     diagnostics: &mut Vec<AnnularL5Diagnostic>,
+    interface_weight: f32,
 ) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
-    let problem = AnnularDecompositionProblem::new(spec.clone());
+    let problem = AnnularDecompositionProblem::new_with_interface_weight(spec.clone(), interface_weight);
     crate::problem::validate_loss_terms(&problem);
     let mut config = SolverConfig::default_kirsch();
     config.load = spec.load;
@@ -225,7 +226,7 @@ pub fn run_annular_decomposition_training(
     device: BDevice,
     on_step: impl FnMut(usize, f32, f64, usize) -> bool,
 ) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
-    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new())
+    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new(), 100.0)
 }
 
 /// Same production runner with opt-in, deterministic diagnostic checkpoints. No output file is
@@ -244,7 +245,31 @@ pub fn run_annular_decomposition_training_with_diagnostics(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0,
+    );
+    (annulus, outer, loss, diagnostics)
+}
+
+/// Issue #77 candidate (b): same as [`run_annular_decomposition_training_with_diagnostics`],
+/// but with `interface_weight` exposed for a real, controlled A/B comparison against the
+/// default `100.0` — see `AnnularDecompositionProblem::interface_weight`'s own doc comment
+/// and `PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-28 open-question list for why this exists.
+/// Not used by any production entry point; experimental-comparison callers only.
+pub fn run_annular_decomposition_training_with_diagnostics_and_interface_weight(
+    spec: ProblemSpec,
+    device: BDevice,
+    diagnostic_steps: &[usize],
+    interface_weight: f32,
+    on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+) -> (
+    crate::network::ElasticityNet<B>,
+    crate::network::ElasticityNet<B>,
+    f32,
+    Vec<AnnularL5Diagnostic>,
+) {
+    let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
+    let (annulus, outer, loss) = run_annular_decomposition_training_inner(
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, interface_weight,
     );
     (annulus, outer, loss, diagnostics)
 }
