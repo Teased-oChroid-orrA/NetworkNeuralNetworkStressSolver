@@ -124,8 +124,9 @@ fn run_annular_decomposition_training_inner(
     diagnostic_steps: &[usize],
     diagnostics: &mut Vec<AnnularL5Diagnostic>,
     interface_weight: f32,
+    include_annulus_equilibrium: bool,
 ) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
-    let problem = AnnularDecompositionProblem::new_with_interface_weight(spec.clone(), interface_weight);
+    let problem = AnnularDecompositionProblem::new_experimental(spec.clone(), interface_weight, include_annulus_equilibrium);
     crate::problem::validate_loss_terms(&problem);
     let mut config = SolverConfig::default_kirsch();
     config.load = spec.load;
@@ -226,7 +227,7 @@ pub fn run_annular_decomposition_training(
     device: BDevice,
     on_step: impl FnMut(usize, f32, f64, usize) -> bool,
 ) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
-    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new(), 100.0)
+    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new(), 100.0, false)
 }
 
 /// Same production runner with opt-in, deterministic diagnostic checkpoints. No output file is
@@ -245,7 +246,7 @@ pub fn run_annular_decomposition_training_with_diagnostics(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -269,7 +270,33 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_interface_weight(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, interface_weight,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, interface_weight, false,
+    );
+    (annulus, outer, loss, diagnostics)
+}
+
+/// Issue #77 next candidate (PH4-29): same as
+/// [`run_annular_decomposition_training_with_diagnostics`], but with
+/// `include_annulus_equilibrium` exposed to test whether a strong-form residual on the
+/// annulus domain closes (or narrows) the Kt gap that pure variational energy minimization,
+/// collocation margin, sampling variance, training-dynamics/LR, and interface-continuity
+/// weight have all failed to close. See `AnnularDecompositionProblem::
+/// include_annulus_equilibrium`'s own doc comment. Not used by any production entry point.
+pub fn run_annular_decomposition_training_with_diagnostics_and_annulus_equilibrium(
+    spec: ProblemSpec,
+    device: BDevice,
+    diagnostic_steps: &[usize],
+    include_annulus_equilibrium: bool,
+    on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+) -> (
+    crate::network::ElasticityNet<B>,
+    crate::network::ElasticityNet<B>,
+    f32,
+    Vec<AnnularL5Diagnostic>,
+) {
+    let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
+    let (annulus, outer, loss) = run_annular_decomposition_training_inner(
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, include_annulus_equilibrium,
     );
     (annulus, outer, loss, diagnostics)
 }

@@ -1715,6 +1715,18 @@ pub struct AnnularDecompositionProblem {
     /// field toward the outer field's smoothness at the interface - see
     /// `PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-28 open-question list.
     interface_weight: f32,
+    /// Issue #77 next candidate: when `true`, adds a strong-form `EquilibriumTerm` (the SAME
+    /// struct/loss the single-domain `UserDefinedProblem`'s `Strong`/`Hybrid` formulations
+    /// already use, reused verbatim here - not a new implementation) on the ANNULUS domain's
+    /// own "interior" point set. Every axis raised so far (representation, collocation
+    /// margin, sampling variance, training-dynamics/LR, interface-continuity weight) has been
+    /// tested with real evidence and ruled out or fixed without closing the Kt gap - this
+    /// tests the working hypothesis that pure variational/DEM energy minimization
+    /// under-resolves a concentration this sharp because a domain-INTEGRATED energy term's
+    /// gradient at any one point is diluted by the whole domain's integral, while a strong-
+    /// form residual supplies gradient pressure LOCALLY (`PHASE_4_IMPLEMENTATION_MANIFEST.md`'s
+    /// PH4-29). Defaults to `false` via `new()` - byte-identical to every existing caller.
+    include_annulus_equilibrium: bool,
 }
 
 impl AnnularDecompositionProblem {
@@ -1726,11 +1738,20 @@ impl AnnularDecompositionProblem {
     }
 
     pub fn new(spec: ProblemSpec) -> Self {
-        Self::new_with_interface_weight(spec, 100.0)
+        Self::new_experimental(spec, 100.0, false)
     }
 
     /// See `interface_weight`'s own doc comment.
     pub fn new_with_interface_weight(spec: ProblemSpec, interface_weight: f32) -> Self {
+        Self::new_experimental(spec, interface_weight, false)
+    }
+
+    /// See `include_annulus_equilibrium`'s own doc comment.
+    pub fn new_with_annulus_equilibrium(spec: ProblemSpec, include_annulus_equilibrium: bool) -> Self {
+        Self::new_experimental(spec, 100.0, include_annulus_equilibrium)
+    }
+
+    pub(crate) fn new_experimental(spec: ProblemSpec, interface_weight: f32, include_annulus_equilibrium: bool) -> Self {
         assert!(Self::supports(&spec),
             "annular decomposition requires one safely-contained Free hole, Variational formulation, and measure-aware training");
         let placeholder = spec.geometry.to_placeholder();
@@ -1755,6 +1776,7 @@ impl AnnularDecompositionProblem {
             outer_sampling,
             ansatz: IdentityAnsatz,
             interface_weight,
+            include_annulus_equilibrium,
         }
     }
 
@@ -1871,6 +1893,19 @@ impl BoundaryValueProblem for AnnularDecompositionProblem {
                 affine_target: affine_strain_pair,
             }));
         }
+        if self.include_annulus_equilibrium {
+            // See `include_annulus_equilibrium`'s own doc comment (PH4-29's working
+            // hypothesis) - the SAME `EquilibriumTerm` struct the single-domain
+            // `UserDefinedProblem`'s Strong/Hybrid formulations already use, reused verbatim
+            // (it's already generic over `domain`/`point_set`, no new struct needed), scoped
+            // to the annulus domain's own "interior" point set. `ref_div2` reuses
+            // `stress_per_length2`, the SAME normalization `UserDefinedProblem::loss_terms()`
+            // derives for its own `EquilibriumTerm` - not a new formula.
+            terms.push(Box::new(EquilibriumTerm {
+                domain: ANNULUS_DOMAIN, point_set: "interior",
+                material: self.spec.material.clone(), ref_div2: scales.stress_per_length2,
+            }));
+        }
         terms
     }
     fn base_weight(&self, term_name: &str) -> f32 {
@@ -1880,6 +1915,7 @@ impl BoundaryValueProblem for AnnularDecompositionProblem {
             "translation_gauge" => LAM_TRANSLATION_GAUGE,
             "rotation_gauge" => LAM_ROTATION_GAUGE,
             "hole_free" => LAM_HOLE_FREE,
+            "equilibrium" => LAM_EQUILIBRIUM_PLATE,
             other => panic!("AnnularDecompositionProblem::base_weight: unknown term '{other}'"),
         }
     }
@@ -3317,6 +3353,44 @@ mod tests {
         assert_eq!(overridden.base_weight("rotation_gauge"), default_problem.base_weight("rotation_gauge"));
     }
 
+    /// PH4-29's next candidate: `include_annulus_equilibrium=false` (the `new()` default)
+    /// must never register `"equilibrium"`; `true` must register it on `ANNULUS_DOMAIN`'s
+    /// own "interior" point set with `needs_hessian()==true` (proving it will actually get a
+    /// real Hessian forward pass, not silently read `None`) - and every other registered term
+    /// must be completely unaffected either way.
+    #[test]
+    fn annulus_equilibrium_registers_only_when_explicitly_enabled() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(), material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7), network: Default::default(),
+            training: pinn_core::problem_spec::TrainingSpec {
+                measure_aware_training: true, ..Default::default()
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let default_problem = AnnularDecompositionProblem::new(spec.clone());
+        let default_terms = default_problem.loss_terms();
+        assert!(default_terms.iter().all(|t| t.name() != "equilibrium"),
+            "equilibrium must NOT register by default: {:?}", default_terms.iter().map(|t| t.name()).collect::<Vec<_>>());
+
+        let enabled_problem = AnnularDecompositionProblem::new_with_annulus_equilibrium(spec, true);
+        let enabled_terms = enabled_problem.loss_terms();
+        let eq = enabled_terms.iter().find(|t| t.name() == "equilibrium")
+            .expect("equilibrium must register when include_annulus_equilibrium=true");
+        assert_eq!(eq.domains(), vec![ANNULUS_DOMAIN]);
+        assert_eq!(eq.point_sets(), vec!["interior"]);
+        assert!(eq.needs_hessian(), "equilibrium term must request a real Hessian forward pass");
+        assert_eq!(enabled_problem.base_weight("equilibrium"), LAM_EQUILIBRIUM_PLATE);
+        // Every other term is present, unchanged, in both configurations.
+        for name in ["annulus_potential", "physical_potential", "interface_displacement_continuity",
+                     "interface_traction_continuity", "translation_gauge", "rotation_gauge"] {
+            assert!(default_terms.iter().any(|t| t.name() == name), "missing in default: {name}");
+            assert!(enabled_terms.iter().any(|t| t.name() == name), "missing when enabled: {name}");
+        }
+        assert_eq!(default_terms.len() + 1, enabled_terms.len(),
+            "enabling must add EXACTLY one term (equilibrium), nothing else");
+    }
+
     #[test]
     fn annular_decomposition_two_model_runner_smoke_is_finite() {
         let spec = ProblemSpec {
@@ -3446,6 +3520,47 @@ mod tests {
         println!("[#77 interface-weight] wrote {}", path.display());
         for diagnostic in diagnostics {
             println!("[#77 interface-weight] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+    }
+
+    /// Issue #77 PH4-29 working hypothesis: controlled A/B against the same baseline config
+    /// (identical geometry/material/load/network/training/checkpoints/seed) - ONLY
+    /// `include_annulus_equilibrium=true` differs. Tests whether a strong-form residual
+    /// (the SAME `EquilibriumTerm` the single-domain path already uses, reused verbatim) on
+    /// the annulus domain's own "interior" points closes or narrows the Kt gap that every
+    /// prior axis (representation, margin, sampling variance, LR/training-dynamics,
+    /// interface-continuity weight) failed to move.
+    #[test]
+    #[ignore]
+    fn issue_77_annulus_equilibrium_l5_trace() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_annulus_equilibrium(
+            spec, device, &checkpoints, true, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 equilibrium] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-equilibrium-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 equilibrium] wrote {}", path.display());
+        for diagnostic in diagnostics {
+            println!("[#77 equilibrium] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
                 diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
                 diagnostic.direct_derived_mismatch_rms);
         }

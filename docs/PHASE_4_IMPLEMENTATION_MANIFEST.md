@@ -1544,3 +1544,53 @@ existing, working implementation) is a real, scoped feature addition - not a con
 and the next candidate to test.
 
 Does not close issue #77 (or #74/#76).
+
+## PH4-30 — Strong-form residual on the annulus domain: real result is WORSE, not better.
+## Every readily-identifiable axis has now been tested; the investigation needs a strategy
+## decision, not another mechanism guess
+
+Implemented PH4-29's working hypothesis: `AnnularDecompositionProblem::include_annulus_
+equilibrium` (default `false`, byte-identical to every existing caller) reuses the SAME
+`EquilibriumTerm` the single-domain `UserDefinedProblem`'s Strong/Hybrid formulations already
+use (no new struct - it was already generic over `domain`/`point_set`), scoped to
+`ANNULUS_DOMAIN`'s own `"interior"` points, with `ref_div2` reusing the same
+`stress_per_length2` normalization. `new_with_annulus_equilibrium`/
+`run_annular_decomposition_training_with_diagnostics_and_annulus_equilibrium` mirror PH4-29's
+own opt-in pattern exactly. 2 new tests (registration/gating correctness, and confirming
+`needs_hessian()==true` so the Hessian forward pass genuinely runs). Full suite: 496 passed, 0
+failed, 40 ignored.
+
+**Real result** (`issue_77_annulus_equilibrium_l5_trace`, identical config/seed/checkpoints to
+every prior controlled comparison in this investigation):
+
+| step | baseline Kt (no equilibrium) | with annulus equilibrium |
+|---|---|---|
+| 0 | 0.255 | 0.255 |
+| 300 | 0.348 | **0.273** |
+| 1500 | 1.220 | **0.982** |
+| 2999 | 1.231 | **0.986** |
+
+Adding the strong-form residual made Kt WORSE at every checkpoint after step 0, not better -
+final Kt is lower (0.986 vs 1.231) and never even reaches the pure-variational baseline's
+step-1500 value. The working hypothesis (a domain-integrated energy term's gradient is diluted
+by the whole domain, while a local residual supplies pressure directly at the concentration) is
+**not supported** by this evidence - if anything the added term competed with, rather than
+reinforced, the existing terms' progress within the same step budget (step-0 total loss jumped
+from 28.7 to 421.9 with the new term's initial residual, and the run may simply need more steps
+to digest that - not yet distinguished from a genuine interference effect, but reported as a
+real negative result either way, not assumed favorable).
+
+**Status after six tested axes**: representation (#77's original three attempts - ruled out),
+collocation margin (Step 2 - ruled out, flat), sampling variance (Step 3's zero-cost SNR check
+- ruled out), training-dynamics/LR (Step 4 - a real bug FIXED, PH4-28 - the annulus's own
+schedule also ruled out as a factor), interface-continuity weight (PH4-29 - ruled out, 10x
+change had no effect), and now a strong-form residual (PH4-30 - tested, real result is worse).
+Every readily-identifiable mechanism within the current annular-decomposition architecture has
+now been given a real, evidenced test. Kt remains in the 1.0-1.3 range versus the FEM reference
+of 2.4606 (a mesh-converged, independently-validated target - `#76`'s own FEM tool - not in
+question). This investigation has reached the point where continuing to guess individual
+mechanisms has a low prior of success without a genuinely different architectural idea or a
+decision to accept the current state and redirect effort - a strategy decision for the project
+owner, not something to keep probing autonomously.
+
+Does not close issue #77 (or #74/#76).
