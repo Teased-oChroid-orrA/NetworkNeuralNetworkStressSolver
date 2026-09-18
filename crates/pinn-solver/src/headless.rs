@@ -1270,7 +1270,7 @@ pub(crate) fn run_headless_pinlug_inner(
         let ctx = MultiStepCtx {
             config: &config,
             problem: &problem,
-            fd: &fd,
+            fd: &fd, hole_fd: &fd,
             k: 1.0,
             domains: vec![
                 DomainStepCtx {

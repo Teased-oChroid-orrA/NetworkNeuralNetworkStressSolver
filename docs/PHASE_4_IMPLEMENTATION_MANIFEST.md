@@ -1270,3 +1270,40 @@ its own `input_dim: None` fallback assumes - both produced a real
 
 Does not close issue #77 (or #74/#76) - Steps 2 and 3 remain, reported with evidence as each
 completes.
+
+## PH4-25 — Step 2 (hole-relative ring margin): implemented, real result flat vs Step 1
+
+`ring_anchor_margin_m` (PH4-24) is plate-scaled (`fd_h * max(half_w,half_h)`), not hole-scaled -
+for L5's `radius=0.005` this makes the decomposed hole-traction term's own FD-safe ring sit at
+`r=1.08*radius`, a margin/radius ratio that gets proportionally worse as the hole shrinks (the
+same ratio for `single_hole_plate.toml`'s larger `radius=0.02` is already `1.02*radius` "for
+free" under the same plate-scaled formula).
+
+**Fix**: `hole_ring_margin_m(radius) = 0.02*radius` (hole-relative, uniform ratio regardless of
+plate size) plus `hole_ring_fd_config` - a genuinely SMALLER `FdConfig` sized specifically for
+this tighter margin, since the margin is bounded below by whatever FD step the ring's own
+stencil uses. Required threading a new `MultiStepCtx::hole_fd`/`FrozenMultiStepCtx::hole_fd`
+field through `compute_domain_forwards` (selected only for point sets whose name ends `"_fd"` -
+every other point set's own `fd`/FD accuracy is completely unaffected) rather than just editing
+a margin formula, once it became clear `ctx.fd` is one single global step shared by every point
+set today - confirmed by reading every `assemble_stencil`/`compute_strains` call site in
+`compute_domain_forwards` before implementing, not assumed. Explicitly scoped to NOT touch
+`ring_anchor_margin_m` itself, the interior-collocation exclusion, or the Kt-measurement probe's
+own margin/radius convention (`probe_hole_boundary_profile_derived`) - changing the measurement
+convention would invalidate `FEM_KT=2.460638516`'s comparability without a fresh FEM re-run,
+explicitly out of scope for this step.
+
+**Real result** (same test, same release/3000-step/`n_interior=4096` configuration as PH4-24):
+**Kt=1.206957**, error 50.949% - essentially FLAT versus PH4-24's `1.213417` (a ~0.5% move,
+inside run-to-run noise, not a real improvement). Reported honestly: Step 2 alone did not move
+Kt further. Working interpretation (not yet independently verified): the hole-traction term's
+own probe-ring RADIUS was not the binding constraint - the interior energy estimator's Monte-
+Carlo variance (the OTHER half of this session's SNR finding, still governed by the untouched,
+plate-scaled interior-collocation margin) is the more likely remaining bottleneck, which is
+exactly what Step 3 (stratified/variance-reduced sampling, reusing #76's cut-cell quadrature)
+targets next. This interpretation is a hypothesis for Step 3 to test, not a re-litigated claim.
+
+Full workspace regression: 487 passed, 0 failed, 36 ignored (3 new focused tests added for the
+hole-relative margin/FD-config machinery, all passing; zero regressions).
+
+Does not close issue #77 (or #74/#76).

@@ -136,6 +136,7 @@ fn run_annular_decomposition_training_inner(
     let mut saw = SawBrdr::with_base(base_weights, 0.95);
     let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+    let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
     let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
     let placeholder = spec.geometry.to_placeholder();
     let n_annulus = (spec.training.n_interior / 2).max(256);
@@ -151,7 +152,8 @@ fn run_annular_decomposition_training_inner(
             n_outer, spec.training.n_boundary, spec.geometry.half_w, spec.geometry.half_h,
         );
         let ctx = plate_multi_domain_step_ctx(
-            &config, &problem, &fd, &annulus_data, &outer_data,
+            &config, &problem, &fd, &hole_fd,
+            &annulus_data, &outer_data,
             scales.u_ref, scales.ref_energy, scales.ref_stress2, spec.geometry.n_fourier(),
             spec.geometry.coordinate_embedding(), diagnostic_steps.contains(&step), step,
         );
@@ -223,6 +225,7 @@ pub(crate) fn train_single_user_problem_for_benchmark(
     let mut saw = SawBrdr::with_base(problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect(), 0.95);
     let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+    let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
     let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
     let placeholder = spec.geometry.to_placeholder();
     for step in 0..spec.training.max_steps {
@@ -231,7 +234,7 @@ pub(crate) fn train_single_user_problem_for_benchmark(
             spec.training.n_boundary, spec.geometry.half_w, spec.geometry.half_h,
         );
         let ctx = plate_multi_step_ctx(
-            &config, &problem, &fd, &data, scales.u_ref, scales.ref_energy, scales.ref_stress2,
+            &config, &problem, &fd, &hole_fd, &data, scales.u_ref, scales.ref_energy, scales.ref_stress2,
             spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
         );
         let (new_model, _) = step_physics_multi(
@@ -324,6 +327,7 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
     let mut saw = SawBrdr::with_base(base_weights, 0.95);
     let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+    let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
 
     let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
     let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
@@ -358,7 +362,7 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
             spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
         );
         let ctx = plate_multi_step_ctx(
-            &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
+            &config, &problem, &fd, &hole_fd, &data, u_ref, ref_energy, ref_stress2,
             spec.geometry.n_fourier(),
             spec.geometry.coordinate_embedding(),
             // PH4-06: one final live gradient ledger is cheap enough for headless controlled

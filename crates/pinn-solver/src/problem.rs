@@ -502,6 +502,19 @@ pub struct MultiStepCtx<'a> {
     pub config: &'a SolverConfig,
     pub problem: &'a dyn BoundaryValueProblem,
     pub fd: &'a FdConfig,
+    /// Issue #77 Step 2: a SEPARATE, normally-smaller `FdConfig` used ONLY for point sets
+    /// whose name ends in `"_fd"` (the hole-boundary rings `HoleBcTerm`'s decomposed traction
+    /// residual reads — see `user_problem.rs`'s `hole_i_fd`/`hole_0_fd` rings). `fd` above
+    /// remains the single global step used for every other point set (interior, outer
+    /// boundary, interface) — completely unaffected. Exists because `ring_anchor_margin_m`'s
+    /// exclusion radius is bounded below by the physical reach of whichever FD step the ring's
+    /// OWN stencil uses; shrinking that step for the hole ring specifically (independent of the
+    /// bulk `fd`, which every interior/boundary point's own stencil still needs unchanged) is
+    /// what lets the ring sit meaningfully closer to the true hole boundary. Legacy/other
+    /// callers set this equal to `fd` (byte-identical: the ring then just doesn't shrink,
+    /// exactly the pre-#77-Step-2 behavior) — only the plate/annular problem's own per-step ctx
+    /// builder passes something genuinely smaller.
+    pub hole_fd: &'a FdConfig,
     pub k: f32,
     pub domains: Vec<DomainStepCtx<'a>>,
     pub dynamic_lam_h_cap: f64,
@@ -561,6 +574,8 @@ pub struct FrozenDomainStepCtx {
 pub struct FrozenMultiStepCtx {
     pub config: SolverConfig,
     pub fd: FdConfig,
+    /// See `MultiStepCtx::hole_fd`'s doc comment.
+    pub hole_fd: FdConfig,
     pub k: f32,
     pub domains: Vec<FrozenDomainStepCtx>,
     pub dynamic_lam_h_cap: f64,
@@ -579,6 +594,7 @@ impl FrozenMultiStepCtx {
         Self {
             config: ctx.config.clone(),
             fd: *ctx.fd,
+            hole_fd: *ctx.hole_fd,
             k: ctx.k,
             domains: ctx.domains.iter().map(|d| FrozenDomainStepCtx {
                 data: d.data.clone(),
@@ -607,6 +623,7 @@ impl FrozenMultiStepCtx {
             config: &self.config,
             problem,
             fd: &self.fd,
+            hole_fd: &self.hole_fd,
             k: self.k,
             domains: self.domains.iter().map(|d| DomainStepCtx {
                 data: &d.data,
@@ -761,7 +778,7 @@ mod tests {
         let ctx = MultiStepCtx {
             config: &config,
             problem: &problem,
-            fd: &fd,
+            fd: &fd, hole_fd: &fd,
             k: 1.0,
             domains: vec![DomainStepCtx { data: &data, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 }],
             dynamic_lam_h_cap: 50.0,

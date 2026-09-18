@@ -913,7 +913,7 @@ pub fn run_training_pinlug(
             let probe_ctx = MultiStepCtx {
                 config: &config,
                 problem: &problem,
-                fd: &fd,
+                fd: &fd, hole_fd: &fd,
                 k: 1.0,
                 domains: vec![
                     DomainStepCtx { data: &pin_data, u_ref, ref_energy, ref_stress2 },
@@ -951,7 +951,7 @@ pub fn run_training_pinlug(
                     let points_after = pin_data.int_norm.len();
 
                     let after_ctx = MultiStepCtx {
-                        config: &config, problem: &problem, fd: &fd, k: 1.0,
+                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
                         domains: vec![
                             DomainStepCtx { data: &pin_data, u_ref, ref_energy, ref_stress2 },
                             DomainStepCtx { data: &lug_data, u_ref, ref_energy, ref_stress2 },
@@ -996,7 +996,7 @@ pub fn run_training_pinlug(
                     let points_after = lug_data.int_norm.len();
 
                     let after_ctx = MultiStepCtx {
-                        config: &config, problem: &problem, fd: &fd, k: 1.0,
+                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
                         domains: vec![
                             DomainStepCtx { data: &pin_data, u_ref, ref_energy, ref_stress2 },
                             DomainStepCtx { data: &lug_data, u_ref, ref_energy, ref_stress2 },
@@ -1032,7 +1032,7 @@ pub fn run_training_pinlug(
         let ctx = MultiStepCtx {
             config: &config,
             problem: &problem,
-            fd: &fd,
+            fd: &fd, hole_fd: &fd,
             k: 1.0,
             domains: vec![
                 DomainStepCtx { data: &pin_data, u_ref, ref_energy, ref_stress2 },
@@ -1468,6 +1468,7 @@ fn run_user_problem_training_from(
     let mut saw = SawBrdr::with_base(base_weights, 0.95);
     let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+    let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
 
     let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
     let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
@@ -1581,7 +1582,7 @@ fn run_user_problem_training_from(
             let probe_ctx = MultiStepCtx {
                 config: &config,
                 problem: &problem,
-                fd: &fd,
+                fd: &fd, hole_fd: &fd,
                 k: 1.0,
                 domains: vec![DomainStepCtx { data: probe_data, u_ref, ref_energy, ref_stress2 }],
                 dynamic_lam_h_cap: f64::MAX,
@@ -1655,7 +1656,7 @@ fn run_user_problem_training_from(
                     // "After" DOES need a fresh probe - the point set (and therefore the
                     // residual signal at it) genuinely changed.
                     let after_ctx = MultiStepCtx {
-                        config: &config, problem: &problem, fd: &fd, k: 1.0,
+                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
                         domains: vec![DomainStepCtx { data: after_probe_data, u_ref, ref_energy, ref_stress2 }],
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -1747,7 +1748,8 @@ fn run_user_problem_training_from(
         // comments this replaced, for the full rationale behind each value - unchanged, only
         // no longer independently maintained in two places).
         let ctx = crate::user_problem::plate_multi_step_ctx(
-            &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
+            &config, &problem, &fd, &hole_fd, &data,
+            u_ref, ref_energy, ref_stress2,
             spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), send_vis, step,
         );
 
@@ -2949,7 +2951,7 @@ mod tests {
 
         for step in 0..steps {
             let ctx = MultiStepCtx {
-                config: &config, problem: &problem, fd: &fd, k: 1.0,
+                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
                 domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                 dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -3033,7 +3035,7 @@ mod tests {
         for step in 0..200 {
             let probe_now = print_steps.contains(&step);
             let ctx = MultiStepCtx {
-                config: &config, problem: &problem, fd: &fd, k: 1.0,
+                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
                 domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                 dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -3152,7 +3154,7 @@ mod tests {
         for step in 0..200 {
             let probe_now = print_steps.contains(&step);
             let ctx = MultiStepCtx {
-                config: &config, problem: &problem, fd: &fd, k: 1.0,
+                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
                 domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                 dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -3879,8 +3881,10 @@ mod tests {
         let data = resample_plate_step_data(
             sampling, &placeholder, &spec.load, spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
         );
+        let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
         let ctx = plate_multi_step_ctx(
-            &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2, spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, 0,
+            &config, &problem, &fd, &hole_fd, &data,
+            u_ref, ref_energy, ref_stress2, spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, 0,
         );
         let (_new_model, reference_out) = step_physics_multi(
             vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,

@@ -162,6 +162,60 @@ pub fn ring_anchor_margin_m(fd_h: f32, geometry: &UserGeometry) -> f64 {
     RING_ANCHOR_SAFETY_FACTOR * fd_h as f64 * geometry.half_w.max(geometry.half_h)
 }
 
+/// Issue #77 Step 2 fix: `ring_anchor_margin_m` above is PLATE-scaled (`fd_h *
+/// max(half_w,half_h)`), not hole-scaled — for a small hole this makes the exclusion
+/// margin/radius ratio proportionally WORSE as the hole shrinks (confirmed real: at L5's
+/// `radius=0.005`, the default margin is `4e-4 m = 0.08*radius`, i.e. the ring already sits
+/// at `1.08*radius` — not "far" in absolute plate terms, but the wrong scale to reason about
+/// for a hole whose own stress concentration lives entirely within a few hole-radii). This
+/// constant instead defines the margin as a FIXED FRACTION of the hole's own radius,
+/// independent of plate size — the ring sits at `(1+HOLE_MARGIN_FRACTION)*radius` for every
+/// hole size, not just the ones that happen to be large relative to the plate.
+///
+/// Deliberately conservative (not pushed to the theoretical FD-safety minimum): `0.02` keeps
+/// the ring's `r/a` ratio at `1.02`, matching what `single_hole_plate.toml`'s larger
+/// `radius=0.02` case already got "for free" under the old plate-scaled formula (`4e-4/0.02 =
+/// 0.02`) — this is a real, working ratio already exercised elsewhere in this codebase, not a
+/// speculative new value.
+const HOLE_MARGIN_FRACTION: f64 = 0.02;
+
+/// The margin (physical, meters) used ONLY for the decomposition hole term's own FD-safe ring
+/// (`"hole_i_fd"`/`"hole_0_fd"`, added in issue #77 Step 1) — see [`HOLE_MARGIN_FRACTION`]'s
+/// doc comment. Deliberately a SEPARATE function from [`ring_anchor_margin_m`]: the interior
+/// collocation exclusion (`UserSamplingStrategy::contains_for_collocation`,
+/// `AnnularPartitionSampling`'s own inner sampling radius) is tied to the GLOBAL `fd_h` every
+/// interior/boundary point's own stencil uses and must stay unchanged by this fix — only the
+/// hole ring's OWN, separately-configurable FD step ([`hole_ring_fd_config`]) shrinks.
+pub fn hole_ring_margin_m(radius: f64) -> f64 {
+    (HOLE_MARGIN_FRACTION * radius).max(1e-9)
+}
+
+/// The (normalized-step) `FdConfig` the hole ring's OWN stencil must use so its physical reach
+/// stays within [`hole_ring_margin_m`]'s tighter margin — inverts
+/// [`ring_anchor_margin_m`]'s derivation (`margin = RING_ANCHOR_SAFETY_FACTOR * fd_h *
+/// max(half_w,half_h)`) to solve for the `fd_h` a margin this small requires, rather than
+/// reusing the training config's own (larger, plate-scaled) `fd_h`. Same `domain_width`/
+/// `domain_height` (the real plate dimensions) as every other point set's `FdConfig` — only
+/// the step size `h` differs, so `FdConfig::sx`/`sy` (used to convert the resulting FD
+/// derivative back to physical units) stay correct.
+pub fn hole_ring_fd_config(radius: f64, geometry: &UserGeometry) -> crate::fd_stencil::FdConfig {
+    let margin = hole_ring_margin_m(radius);
+    let h = (margin / (RING_ANCHOR_SAFETY_FACTOR * geometry.half_w.max(geometry.half_h))) as f32;
+    crate::fd_stencil::FdConfig::new(h, 2.0 * geometry.half_w, 2.0 * geometry.half_h)
+}
+
+/// Convenience for `plate_multi_step_ctx`/`plate_multi_domain_step_ctx`'s callers: the tighter
+/// [`hole_ring_fd_config`] only means anything for exactly the single-hole geometries
+/// [`decomposition_applicable`]-style logic targets — every other case (no-hole, multi-hole)
+/// has no `"_i_fd"` point set for it to ever apply to, so falling back to the caller's own
+/// (unchanged) `fd` there is exactly as inert as it needs to be, not a special case to track.
+pub fn hole_fd_config_for_geometry(fd: &crate::fd_stencil::FdConfig, geometry: &UserGeometry) -> crate::fd_stencil::FdConfig {
+    match geometry.holes.as_slice() {
+        [hole] => hole_ring_fd_config(hole.radius, geometry),
+        _ => *fd,
+    }
+}
+
 /// One side of #77's bonded annular decomposition. Both sides share `interface.thetas`, so
 /// cross-domain losses compare identical physical interface points by index.
 pub struct AnnularPartitionSampling {
@@ -275,14 +329,18 @@ impl DomainSamplingStrategy for AnnularPartitionSampling {
                 nx: -theta.cos(), ny: -theta.sin(), tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannFree,
             }).collect();
             sets.push(NamedPointSet { name: "hole_0", points });
-            // Issue #77 fix: FD-safe companion ring at `collocation_inner_radius`
-            // (`radius + ring_anchor_margin_m`, already computed for this sampler's own
-            // interior collocation) - the kinematic-decomposition hole traction term needs a
-            // DERIVED stress read, and the exact-radius "hole_0" ring above is stencil-unsafe
-            // for that (an inward FD arm would land inside the hole).
+            // Issue #77 Step 1: FD-safe companion ring - the kinematic-decomposition hole
+            // traction term needs a DERIVED stress read, and the exact-radius "hole_0" ring
+            // above is stencil-unsafe for that (an inward FD arm would land inside the hole).
+            // Issue #77 Step 2: radius uses `hole_ring_margin_m` (hole-relative, `0.02*radius`)
+            // rather than `self.collocation_inner_radius` (plate-scaled, this sampler's own
+            // interior-collocation inner bound) - a deliberately SEPARATE, tighter margin, paired
+            // with `hole_ring_fd_config`'s own smaller FD step at the call site that reads this
+            // point set's strains (see `MultiStepCtx::hole_fd`'s doc comment).
+            let fd_radius = hole.radius + hole_ring_margin_m(hole.radius);
             let fd_points = self.interface.thetas.iter().map(|&theta| BoundaryPoint {
-                x: hole.center[0] + self.collocation_inner_radius * theta.cos(),
-                y: hole.center[1] + self.collocation_inner_radius * theta.sin(),
+                x: hole.center[0] + fd_radius * theta.cos(),
+                y: hole.center[1] + fd_radius * theta.sin(),
                 nx: -theta.cos(), ny: -theta.sin(), tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannFree,
             }).collect();
             sets.push(NamedPointSet { name: "hole_0_fd", points: fd_points });
@@ -497,11 +555,15 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
             }).collect();
             NamedPointSet { name, points }
         }).chain(self.geometry.holes.iter().zip(self.hole_fd_names.iter()).map(|(hole, &name)| {
-            // Issue #77 fix: FD-safe ring at `radius + anchor_margin_m`, same outward-into-the-
-            // hole normal convention as the exact-radius ring above — used only by the
-            // kinematic-decomposition hole traction term, which needs a DERIVED (constitutive)
-            // stress read and therefore a stencil-safe radius, not the exact hole boundary.
-            let r = hole.radius + self.anchor_margin_m;
+            // Issue #77 Step 1: FD-safe ring, same outward-into-the-hole normal convention as
+            // the exact-radius ring above — used only by the kinematic-decomposition hole
+            // traction term, which needs a DERIVED (constitutive) stress read and therefore a
+            // stencil-safe radius, not the exact hole boundary.
+            // Issue #77 Step 2: radius uses `hole_ring_margin_m` (hole-relative, `0.02*radius`)
+            // rather than `self.anchor_margin_m` (plate-scaled, this sampler's own interior-
+            // collocation exclusion) - deliberately separate, tighter, paired with
+            // `hole_ring_fd_config`'s own smaller FD step at the call site.
+            let r = hole.radius + hole_ring_margin_m(hole.radius);
             let points = (0..HOLE_RING_POINTS).map(|i| {
                 let theta = 2.0 * std::f64::consts::PI * i as f64 / HOLE_RING_POINTS as f64;
                 let (nx, ny) = (theta.cos(), theta.sin());
@@ -736,6 +798,7 @@ pub fn plate_multi_step_ctx<'a>(
     config: &'a pinn_core::messages::SolverConfig,
     problem: &'a dyn crate::problem::BoundaryValueProblem,
     fd: &'a crate::fd_stencil::FdConfig,
+    hole_fd: &'a crate::fd_stencil::FdConfig,
     data: &'a crate::problem::DomainStepData,
     u_ref: f32,
     ref_energy: f32,
@@ -749,6 +812,7 @@ pub fn plate_multi_step_ctx<'a>(
         config,
         problem,
         fd,
+        hole_fd,
         k: 1.0, // IdentityAnsatz ignores k entirely — value is inert
         domains: vec![crate::problem::DomainStepCtx { data, u_ref, ref_energy, ref_stress2 }],
         dynamic_lam_h_cap: 50.0,
@@ -771,6 +835,7 @@ pub fn plate_multi_domain_step_ctx<'a>(
     config: &'a pinn_core::messages::SolverConfig,
     problem: &'a dyn crate::problem::BoundaryValueProblem,
     fd: &'a crate::fd_stencil::FdConfig,
+    hole_fd: &'a crate::fd_stencil::FdConfig,
     annulus: &'a crate::problem::DomainStepData,
     outer: &'a crate::problem::DomainStepData,
     u_ref: f32,
@@ -782,7 +847,7 @@ pub fn plate_multi_domain_step_ctx<'a>(
     step: usize,
 ) -> crate::problem::MultiStepCtx<'a> {
     crate::problem::MultiStepCtx {
-        config, problem, fd, k: 1.0,
+        config, problem, fd, hole_fd, k: 1.0,
         domains: vec![
             crate::problem::DomainStepCtx { data: annulus, u_ref, ref_energy, ref_stress2 },
             crate::problem::DomainStepCtx { data: outer, u_ref, ref_energy, ref_stress2 },
@@ -4201,6 +4266,85 @@ mod tests {
         }
     }
 
+    // ─── Issue #77 Step 2: hole-relative (not plate-relative) ring margin ───────────────────
+
+    /// `hole_ring_margin_m` must scale with the HOLE's own radius, not the plate size — the
+    /// direct falsification of the pre-Step-2 defect (`ring_anchor_margin_m` gives a
+    /// margin/radius ratio that gets proportionally worse as the hole shrinks). Same plate,
+    /// three different hole sizes: the ratio `margin/radius` must be IDENTICAL (hole-relative),
+    /// unlike `ring_anchor_margin_m`'s ratio, which must DIFFER across the same three holes
+    /// (plate-relative) - both properties checked together so this test cannot pass by
+    /// accident.
+    #[test]
+    fn hole_ring_margin_scales_with_hole_radius_not_plate_size() {
+        let make = |radius: f64| UserGeometry {
+            half_w: 0.10, half_h: 0.10, thickness: 0.005,
+            holes: vec![HoleSpec { center: [0.0, 0.0], radius, bc: HoleBc::Free }],
+        };
+        let radii = [0.005, 0.01, 0.02];
+        let hole_ratios: Vec<f64> = radii.iter().map(|&r| hole_ring_margin_m(r) / r).collect();
+        for &ratio in &hole_ratios {
+            assert!((ratio - HOLE_MARGIN_FRACTION).abs() / HOLE_MARGIN_FRACTION < 1e-9,
+                "hole_ring_margin_m/radius must be the fixed fraction {HOLE_MARGIN_FRACTION} \
+                 for every hole size, got {ratio}");
+        }
+        let plate_ratios: Vec<f64> = radii.iter()
+            .map(|&r| ring_anchor_margin_m(TEST_FD_H, &make(r)) / r)
+            .collect();
+        assert!(plate_ratios[0] > plate_ratios[1] * 1.9 && plate_ratios[1] > plate_ratios[2] * 1.9,
+            "sanity check on the OLD plate-scaled margin: its margin/radius ratio must roughly \
+             halve each time radius doubles (it's independent of radius), got {plate_ratios:?} - \
+             if this assertion itself fails, `ring_anchor_margin_m` changed and this test's own \
+             premise needs revisiting");
+    }
+
+    /// The FD-safety property Step 2 must preserve at the NEW, tighter margin: every stencil
+    /// arm reachable by `hole_ring_fd_config`'s own (smaller) step, evaluated from a point on
+    /// the "hole_i_fd" ring, must stay outside the hole. Direct geometric check (not a training
+    /// run) - the same style as `sample_interior_points_stay_outside_the_fd_safe_margin_...`
+    /// above, adapted to the ring's own margin/FD-step pairing instead of the interior
+    /// sampler's plate-scaled one.
+    #[test]
+    fn hole_ring_fd_config_keeps_every_stencil_arm_outside_the_hole() {
+        for radius in [0.002, 0.005, 0.02, 0.05] {
+            let geom = UserGeometry {
+                half_w: 0.10, half_h: 0.10, thickness: 0.005,
+                holes: vec![HoleSpec { center: [0.0, 0.0], radius, bc: HoleBc::Free }],
+            };
+            let fd = hole_ring_fd_config(radius, &geom);
+            let ring_r = radius + hole_ring_margin_m(radius);
+            // Physical reach of the ring's own (smaller) FD step, worst case (arm pointing
+            // straight at the hole center): `fd.hx * half_w` / `fd.hy * half_h`.
+            let reach_x = fd.hx as f64 * geom.half_w;
+            let reach_y = fd.hy as f64 * geom.half_h;
+            let worst_case_r = ring_r - reach_x.max(reach_y);
+            assert!(worst_case_r > radius,
+                "radius={radius}: ring at r={ring_r} with FD reach {reach_x}/{reach_y} leaves \
+                 worst-case stencil arm at r={worst_case_r}, inside or on the hole (radius={radius})");
+        }
+    }
+
+    /// `hole_fd_config_for_geometry` must fall back to the caller's own `fd` (byte-identical,
+    /// no shrinking) for every geometry outside single-centered-hole scope — no-hole and
+    /// multi-hole must be completely unaffected by Step 2, matching Step 1's own scope
+    /// discipline.
+    #[test]
+    fn hole_fd_config_for_geometry_falls_back_to_fd_outside_single_hole_scope() {
+        let fd = crate::fd_stencil::FdConfig::new(1e-3, 0.2, 0.2);
+        let no_hole = UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] };
+        assert_eq!(hole_fd_config_for_geometry(&fd, &no_hole).hx, fd.hx);
+
+        let multi = two_hole_geometry();
+        assert_eq!(hole_fd_config_for_geometry(&fd, &multi).hx, fd.hx);
+
+        let single = UserGeometry {
+            half_w: 0.10, half_h: 0.10, thickness: 0.005,
+            holes: vec![HoleSpec { center: [0.0, 0.0], radius: 0.005, bc: HoleBc::Free }],
+        };
+        assert_ne!(hole_fd_config_for_geometry(&fd, &single).hx, fd.hx,
+            "single-hole geometry must get a genuinely different (smaller) hole_fd");
+    }
+
     #[test]
     fn sample_boundary_produces_points_on_all_four_outer_edges() {
         let geom = two_hole_geometry();
@@ -4733,7 +4877,7 @@ mod tests {
         let ctx = MultiStepCtx {
             config: &pinn_core::messages::SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd,
+            fd: &fd, hole_fd: &fd,
             k: 1.0,
             domains: vec![DomainStepCtx { data: &data, u_ref: scales.u_ref, ref_energy: scales.ref_energy, ref_stress2: scales.ref_stress2 }],
             dynamic_lam_h_cap: 50.0,
@@ -5563,7 +5707,7 @@ mod tests {
                 extra_ring_norm: Vec::new(), named,
             };
             let ctx = MultiStepCtx {
-                config: &config, problem: &problem, fd: &fd, k: 1.0,
+                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
                 domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                 dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -5668,8 +5812,9 @@ mod tests {
                 let data = resample_plate_step_data(
                     sampling, &placeholder, &spec.load, spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
                 );
+                let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
                 let ctx = plate_multi_step_ctx(
-                    &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
+                    &config, &problem, &fd, &hole_fd, &data, u_ref, ref_energy, ref_stress2,
                     spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
                 );
                 let (new_model, _out) = step_physics_multi(
@@ -5760,8 +5905,9 @@ mod tests {
                 let data = resample_plate_step_data(
                     sampling, &placeholder, &spec.load, spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
                 );
+                let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
                 let ctx = plate_multi_step_ctx(
-                    &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
+                    &config, &problem, &fd, &hole_fd, &data, u_ref, ref_energy, ref_stress2,
                     spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
                 );
                 let (new_model, _out) = step_physics_multi(
@@ -5878,7 +6024,7 @@ mod tests {
 
                 if spec.training.amr_enabled && step >= AMR_WARMUP_STEPS && (step - AMR_WARMUP_STEPS) % amr_interval == 0 {
                     let probe_ctx = MultiStepCtx {
-                        config: &config, problem: &problem, fd: &fd, k: 1.0,
+                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
                         domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -5901,7 +6047,7 @@ mod tests {
                             }
                             let points_after = data.int_norm.len();
                             let after_ctx = MultiStepCtx {
-                                config: &config, problem: &problem, fd: &fd, k: 1.0,
+                                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
                                 domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                                 dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -5919,8 +6065,9 @@ mod tests {
                     }
                 }
 
+                let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
                 let ctx = plate_multi_step_ctx(
-                    &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
+                    &config, &problem, &fd, &hole_fd, &data, u_ref, ref_energy, ref_stress2,
                     spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
                 );
                 let (new_model, _out) = step_physics_multi(
@@ -6036,7 +6183,7 @@ mod tests {
                         &data, half_w, half_h, &mut amr_grid, step,
                     );
                     let probe_ctx = MultiStepCtx {
-                        config: &config, problem: &problem, fd: &fd, k: 1.0,
+                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
                         domains: vec![DomainStepCtx { data: &probe_data, u_ref, ref_energy, ref_stress2 }],
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -6065,8 +6212,9 @@ mod tests {
                     problem.set_interior_weights(None);
                 }
 
+                let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
                 let ctx = plate_multi_step_ctx(
-                    &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
+                    &config, &problem, &fd, &hole_fd, &data, u_ref, ref_energy, ref_stress2,
                     spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
                 );
                 let (new_model, _out) = step_physics_multi(
@@ -6190,7 +6338,7 @@ mod tests {
                         &data, half_w, half_h, &mut amr_grid, step,
                     );
                     let probe_ctx = MultiStepCtx {
-                        config: &config, problem: &problem, fd: &fd, k: 1.0,
+                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
                         domains: vec![DomainStepCtx { data: &probe_data, u_ref, ref_energy, ref_stress2 }],
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -6219,8 +6367,9 @@ mod tests {
                     problem.set_interior_weights(None);
                 }
 
+                let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
                 let ctx = plate_multi_step_ctx(
-                    &config, &problem, &fd, &data, u_ref, ref_energy, ref_stress2,
+                    &config, &problem, &fd, &hole_fd, &data, u_ref, ref_energy, ref_stress2,
                     spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
                 );
                 let (new_model, _out) = step_physics_multi(

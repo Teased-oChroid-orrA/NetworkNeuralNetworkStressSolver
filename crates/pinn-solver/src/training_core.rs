@@ -1466,6 +1466,14 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
 
         let n_pts = norm_pts.len();
 
+        // Issue #77 Step 2: point sets whose name ends "_fd" (the hole-boundary rings the
+        // kinematic-decomposition traction term reads - see `MultiStepCtx::hole_fd`'s doc
+        // comment) use a SEPARATE, normally-smaller `FdConfig` than every other point set in
+        // this step. Every other name (interior/outer_boundary/interface/...) is completely
+        // unaffected - `point_fd` is just `ctx.fd` for them, byte-identical to before this
+        // existed.
+        let point_fd: &FdConfig = if ps_name.ends_with("_fd") { ctx.hole_fd } else { ctx.fd };
+
         // Compute the per-stencil-row (dx, dy) Dirichlet-ansatz scale factors directly from
         // `norm_pts` (already CPU-resident) + the 4 known FD shift offsets, in exactly the
         // row order `assemble_stencil` lays the [5*n_pts, 3] stencil batch out in (centre,
@@ -1475,7 +1483,7 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
         let m = 5 * n_pts;
         let mut dx_v = Vec::with_capacity(m);
         let mut dy_v = Vec::with_capacity(m);
-        for &(sx, sy) in &[(0.0f32, 0.0f32), (ctx.fd.hx, 0.0), (-ctx.fd.hx, 0.0), (0.0, ctx.fd.hy), (0.0, -ctx.fd.hy)] {
+        for &(sx, sy) in &[(0.0f32, 0.0f32), (point_fd.hx, 0.0), (-point_fd.hx, 0.0), (0.0, point_fd.hy), (0.0, -point_fd.hy)] {
             for p in norm_pts {
                 let xn = p[0] + sx;
                 let yn = p[1] + sy;
@@ -1486,7 +1494,7 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
         }
 
         let pts_t = norm_pts_to_tensor::<Bk>(norm_pts, device);
-        let stencil = assemble_stencil::<Bk>(&pts_t, ctx.fd, device);
+        let stencil = assemble_stencil::<Bk>(&pts_t, point_fd, device);
 
         // Apply this domain's Dirichlet ansatz pointwise (columns 0,1 = u,v) via the
         // per-point (dx, dy) scale factors `DirichletAnsatz::eval` returns, then scale to
@@ -1555,10 +1563,10 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
         // actually needs it for this (domain, point_set) pair (zero cost otherwise, matching
         // `shifted_stress`'s and every other conditional field's precedent).
         let hessian: Option<crate::problem::HessianData<Bk>> = if needs_hessian.contains(&(domain_id, ps_name)) {
-            // Wider FD step than `ctx.fd` - see `hessian_fd_config`'s doc comment for why the
-            // second-order stencil needs this (real, measured f32 cancellation noise at
-            // `ctx.fd`'s step, not a hypothetical concern).
-            let fd2 = crate::fd_stencil::hessian_fd_config(ctx.fd);
+            // Wider FD step than `point_fd` - see `hessian_fd_config`'s doc comment for why
+            // the second-order stencil needs this (real, measured f32 cancellation noise at
+            // the base step, not a hypothetical concern).
+            let fd2 = crate::fd_stencil::hessian_fd_config(point_fd);
             let m9 = 9 * n_pts;
             let stencil2 = crate::fd_stencil::assemble_second_order_stencil::<Bk>(&pts_t, &fd2, device);
             let raw_net2 = fwd_embedded_masked::<Bk>(model, stencil2, model_embedding, device, forward_masks[model_idx]);
@@ -1587,7 +1595,7 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
             None
         };
 
-        let (eps_xx, eps_yy, eps_xy) = compute_strains::<Bk>(raw, n_pts, ctx.fd);
+        let (eps_xx, eps_yy, eps_xy) = compute_strains::<Bk>(raw, n_pts, point_fd);
 
         computed.push(Computed {
             key: (domain_id, ps_name),
@@ -6058,7 +6066,7 @@ mod tests {
             let ctx_multi = MultiStepCtx {
                 config: &config,
                 problem: &problem,
-                fd: &fd,
+                fd: &fd, hole_fd: &fd,
                 k: engine.ansatz_k,
                 domains: vec![DomainStepCtx {
                     data: &domain_data, u_ref, ref_energy, ref_stress2,
@@ -6360,7 +6368,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd,
+            fd: &fd, hole_fd: &fd,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -6438,7 +6446,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd,
+            fd: &fd, hole_fd: &fd,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -6558,7 +6566,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd,
+            fd: &fd, hole_fd: &fd,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -6700,7 +6708,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd,
+            fd: &fd, hole_fd: &fd,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -6753,7 +6761,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd,
+            fd: &fd, hole_fd: &fd,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -6893,7 +6901,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd,
+            fd: &fd, hole_fd: &fd,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -6979,7 +6987,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd,
+            fd: &fd, hole_fd: &fd,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -7115,6 +7123,7 @@ mod tests {
             config,
             problem,
             fd,
+            hole_fd: fd, // pin-lug has no hole concept - same value as `fd`, inert
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: pin_data, u_ref, ref_energy, ref_stress2 },
