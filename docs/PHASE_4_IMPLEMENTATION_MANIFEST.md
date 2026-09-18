@@ -1307,3 +1307,81 @@ Full workspace regression: 487 passed, 0 failed, 36 ignored (3 new focused tests
 hole-relative margin/FD-config machinery, all passing; zero regressions).
 
 Does not close issue #77 (or #74/#76).
+
+## PH4-26 — Step 2 flat result explained: Kt peaks around step 3000, then DECLINES with
+## more training — a shared, loss-driven LR schedule starves the annulus domain, not undertraining
+
+PH4-25's flat Step 2 result prompted a zero-cost check (this session): the annulus domain's own
+energy estimator, restricted to just the annulus region (`r` in `[1.02*radius, 3*radius]`,
+`n_annulus=2048`), has SNR~12.2 against the same closed-form Kirsch field - well above detection
+threshold. Sampling variance was never the annulus estimator's bottleneck post-decomposition;
+Step 3 (stratified sampling) as originally planned would not have helped and was not implemented
+as originally scoped.
+
+The per-checkpoint term-gradient ledger (`issue_77_l5_annular_diagnostic_trace`, real run, Steps
+1+2 active) showed every term has live, nonzero gradient (no term is dead/starved to zero), but
+`physical_potential` (outer) sat flat in a `0.98-1.10` band from step 0 - it converges almost
+immediately post-decomposition, since it now represents only the small residual correction to
+the exact affine background field. Total loss - dominated by `physical_potential`'s magnitude -
+was correspondingly still decreasing only slowly by step 2700, while Kt was still rising at the
+final (step 2999) checkpoint. This looked like undertraining.
+
+**It was not.** A real 12000-step extended run (`issue_77_l5_extended_convergence_trend_trace`,
+release, 9705.57s, checkpoints `[0, 1500, 3000, 6000, 9000, 11999]`) gives the real trajectory:
+
+| step | Kt |
+|---|---|
+| 0 | 0.255174 |
+| 1500 | 1.166180 |
+| **3000** | **1.287459 (peak)** |
+| 6000 | 1.169102 |
+| 9000 | 1.010714 |
+| 11999 | 0.976746 |
+
+Kt rises to a real peak around step 3000, then **declines steadily for the remaining 9000
+steps**, ending below its step-1500 value. More training actively hurt, not helped - the
+opposite of this entry's own working hypothesis after PH4-25.
+
+**Root cause, confirmed by reading the code (not the gradient-starvation mechanism a plausible-
+sounding first guess suggested)**: `run_annular_decomposition_training_inner`
+(`user_runner.rs:137`) uses **one shared `LrSchedule`** (`ReduceLROnPlateau`, `patience=500`,
+`factor=0.7`, then cosine annealing) for BOTH domains, driven by TOTAL loss. Since total loss is
+dominated by `physical_potential` (flat from step 0), the schedule detects a "plateau" almost
+immediately and begins decaying LR - by design, cascading toward `MIN_LR`/cosine-annealed-floor
+within a few thousand steps of the plateau starting. This collapses the LEARNING RATE available
+to BOTH domains, including the annulus domain, right around when Kt peaks - not because its own
+gradient is diluted (`.backward()` splits gradients back to each domain's own `ParamId`s, a
+separately-tested invariant unaffected by another term's magnitude), but because the OPTIMIZER
+STEP SIZE available to make further use of that gradient collapses, governed by a scheduler
+reading the same blunt, `physical_potential`-dominated signal this investigation already flagged
+as misleading for MONITORING purposes (PH4-24/25's own ledger) - here it turns out to also
+corrupt the OPTIMIZATION dynamics themselves, a materially different and more serious mechanism
+than "just a bad dashboard metric."
+
+**Prep work landed, not yet wired into production training**: `pinn_solver::controllers::
+DualMetricStopAdvisor` (`controllers.rs`) - a small, purpose-built plateau detector for STOP
+decisions only (loss AND Kt tracked independently via a new sibling `PlateauMonitor`, NOT a
+reuse of `ConvergenceTracker::check_plateau`, whose one-shot restart-budget semantics don't fit
+a repeatable stop query). Explicitly does NOT touch the training objective/gradient - 4 new
+focused tests, including one that directly reproduces this investigation's own real finding
+(loss-plateaued-but-Kt-still-improving must not signal stop). A user-proposed companion idea -
+per-term "initial-value loss normalization" (`term / term(0)`) to rebalance
+`annulus_potential`/`physical_potential` in the shared loss sum - was evaluated and explicitly
+REJECTED: it assigns each term a different constant (here, a ~62x relative reweighting at step
+0), which is the same "not a uniform rescaling of Pi, changes the stationary point" defect this
+file's own PH4-03 fixed once already and this investigation's own sub-domain-energy-mask
+rejection (see `#77`'s planning history) fixed a second time in spatial form - `annulus_potential`
+and `physical_potential` are two additive pieces of ONE energy functional (`Pi = U_annulus +
+U_outer - W_ext`), not independent multi-task losses free to be reweighted per-term.
+
+**Next concrete lever (not yet implemented)**: give the annulus domain its own `LrSchedule`,
+decoupled from the outer domain's early-plateauing total loss - a genuinely new mechanism this
+step_physics_multi/two-domain path doesn't have today (one shared schedule for N domains).
+`DualMetricStopAdvisor` remains useful independently as an early-stop trigger near the real Kt
+peak (would have signaled a stop around step 3000-4500 in this run), but is a mitigation for the
+symptom (train past the peak), not the root cause (why the peak is followed by decline at all).
+
+Full workspace regression after this session's additions: pending (running as this entry is
+written; will be confirmed before any commit).
+
+Does not close issue #77 (or #74/#76).

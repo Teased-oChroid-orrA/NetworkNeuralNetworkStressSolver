@@ -344,9 +344,147 @@ impl ConvergenceTracker {
     }
 }
 
+/// Issue #77 training-time research (`docs/L5_TRAINING_PERFORMANCE_RESEARCH.md`, candidate 4):
+/// a small, purpose-built plateau detector for STOP decisions only — no restart/cap-cascade
+/// side effects. `ConvergenceTracker::check_plateau` was deliberately NOT reused here: it's
+/// designed for a one-shot restart BUDGET (`MAX_PLATEAU_RESTARTS`, after which it permanently
+/// returns `None` regardless of the metric's real trend) and mutates `lam_h_cap`/
+/// `plateau_restarts` as a side effect — neither behavior fits a repeatable "should training
+/// stop now" query polled every checkpoint. Forcing that reuse would have been the wrong kind
+/// of code reuse (bending a class built for a different job), so this is a small sibling
+/// instead, not a wrapper around it.
+struct PlateauMonitor {
+    window: usize,
+    rel_eps: f64,
+    history: std::collections::VecDeque<f64>,
+}
+
+impl PlateauMonitor {
+    fn new(window: usize, rel_eps: f64) -> Self {
+        Self { window, rel_eps, history: std::collections::VecDeque::with_capacity(window * 2) }
+    }
+
+    fn push(&mut self, value: f64) {
+        self.history.push_back(value);
+        while self.history.len() > self.window * 2 { self.history.pop_front(); }
+    }
+
+    /// True once the metric's best-in-recent-window hasn't improved on the best-in-previous-
+    /// window by more than `rel_eps` (a fraction of the older window's best) — repeatable,
+    /// no state mutation beyond the rolling history `push` already maintains. "Best" is always
+    /// the LARGER value (both this monitor's real uses — total loss trending down is tracked
+    /// via its own negation by the caller, `DualMetricStopAdvisor::push`; for Kt, larger
+    /// genuinely is better). Divides by `max_older.abs()`, not `max_older` directly, and guards
+    /// on `.abs() > epsilon` rather than `> 0.0` — the negated-loss convention means `max_older`
+    /// is legitimately NEGATIVE for that metric, and a bare `> 0.0` guard (the natural-looking
+    /// choice for an always-positive metric like Kt) would silently and permanently report
+    /// "never plateaued" for it.
+    fn has_plateaued(&self) -> bool {
+        if self.history.len() < self.window * 2 { return false; }
+        let recent: Vec<f64> = self.history.iter().rev().take(self.window).cloned().collect();
+        let older: Vec<f64> = self.history.iter().rev().skip(self.window).take(self.window).cloned().collect();
+        let max_recent = recent.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let max_older = older.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        max_older.abs() > 1e-30 && (max_recent - max_older) / max_older.abs() < self.rel_eps
+    }
+}
+
+/// Two independent `PlateauMonitor`s, one per tracked metric, combined so a caller can stop
+/// only when BOTH have plateaued. Exists because of a real, measured finding in this
+/// investigation (`PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-24/25 diagnostic ledger): in the
+/// annular-decomposition architecture, total training loss is dominated by `physical_potential`
+/// (the outer domain, which converges almost immediately post-decomposition) while `Kt` tracks
+/// the much smaller `annulus_potential`/`hole_free` terms that barely move total loss — a loss
+/// plateau does NOT imply Kt has plateaued. Stopping on loss alone would be a blunt, misleading
+/// signal for this specific architecture; this type exists so a caller never has that option.
+///
+/// Deliberately NOT wired into any production training loop yet — prep work only, per this
+/// investigation's own decision gate: whether early stopping is even the right lever depends on
+/// the extended convergence-trend run's real result (still pending when this was written).
+pub struct DualMetricStopAdvisor {
+    loss: PlateauMonitor,
+    kt: PlateauMonitor,
+}
+
+impl DualMetricStopAdvisor {
+    /// `window`: readings per comparison window (same convention as `ConvergenceTracker`'s
+    /// `PLATEAU_WINDOW`, but caller-supplied here since this problem's own checkpoint cadence
+    /// isn't Kirsch's). `loss_rel_eps`/`kt_rel_eps`: minimum relative improvement (fraction of
+    /// the older window's best) required to NOT count as plateaued, one per metric since loss
+    /// and Kt live on very different scales/noise characteristics.
+    pub fn new(window: usize, loss_rel_eps: f64, kt_rel_eps: f64) -> Self {
+        Self {
+            loss: PlateauMonitor::new(window, loss_rel_eps),
+            kt: PlateauMonitor::new(window, kt_rel_eps),
+        }
+    }
+
+    /// `neg_loss`: pass `-loss` (loss is smaller-is-better; `PlateauMonitor` always tracks
+    /// "best = larger", so negating makes "improving" and "larger" agree for this metric too).
+    pub fn push(&mut self, neg_loss: f64, kt: f64) {
+        self.loss.push(neg_loss);
+        self.kt.push(kt);
+    }
+
+    pub fn should_stop(&self) -> bool {
+        self.loss.has_plateaued() && self.kt.has_plateaued()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Issue #77 training-time research: DualMetricStopAdvisor ────────────────────────
+
+    /// The whole point of this type: a plateaued loss combined with a still-improving Kt
+    /// must NOT signal stop. Directly reproduces this investigation's own real diagnostic
+    /// finding (PH4-24/25: `physical_potential` flat from step 0, `Kt` still climbing at the
+    /// final 3000-step checkpoint).
+    #[test]
+    fn does_not_stop_when_loss_plateaus_but_kt_still_improves() {
+        let mut advisor = DualMetricStopAdvisor::new(5, 1e-3, 1e-3);
+        // Loss constant (plateaued); Kt climbing throughout - mirrors the real trend.
+        for i in 0..20 {
+            let kt = 0.2 + 0.05 * i as f64; // steadily increasing, never plateaus
+            advisor.push(-1.0, kt);
+        }
+        assert!(!advisor.should_stop(),
+            "loss-only plateau must not trigger stop while Kt keeps improving");
+    }
+
+    /// The mirror case: both metrics genuinely flat must signal stop.
+    #[test]
+    fn stops_when_both_loss_and_kt_plateau() {
+        let mut advisor = DualMetricStopAdvisor::new(5, 1e-3, 1e-3);
+        for _ in 0..20 {
+            advisor.push(-1.0, 2.0); // both constant
+        }
+        assert!(advisor.should_stop(), "both metrics flat must signal stop");
+    }
+
+    /// A Kt-only plateau (loss still moving) must also not stop - `should_stop` requires
+    /// BOTH, not either.
+    #[test]
+    fn does_not_stop_when_kt_plateaus_but_loss_still_improves() {
+        let mut advisor = DualMetricStopAdvisor::new(5, 1e-3, 1e-3);
+        for i in 0..20 {
+            let neg_loss = -1.0 / (i as f64 + 1.0); // loss shrinking -> neg_loss improving (rising)
+            advisor.push(neg_loss, 2.0); // Kt constant
+        }
+        assert!(!advisor.should_stop(), "Kt-only plateau must not trigger stop while loss keeps improving");
+    }
+
+    /// Below the window requirement, neither monitor has enough history to judge a plateau -
+    /// must never claim "stop" from insufficient data.
+    #[test]
+    fn never_stops_before_enough_history_accumulates() {
+        let mut advisor = DualMetricStopAdvisor::new(5, 1e-3, 1e-3);
+        for _ in 0..9 { // window=5 needs 2*5=10 readings
+            advisor.push(-1.0, 2.0);
+        }
+        assert!(!advisor.should_stop(), "must not signal stop before the comparison window fills");
+    }
 
     /// Push a constant K_t reading enough times to satisfy `check_plateau`'s window
     /// requirement without ever satisfying `check_kt_crash` (no peak > CRASH_MIN_PEAK_KT

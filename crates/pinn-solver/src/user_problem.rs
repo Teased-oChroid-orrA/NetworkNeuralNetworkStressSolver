@@ -3360,6 +3360,98 @@ mod tests {
         }
     }
 
+    /// Issue #77 investigation follow-up: `issue_77_l5_annular_diagnostic_trace`'s real run
+    /// (3000 steps) showed loss AND Kt both still moving at the final checkpoint (Kt
+    /// 0.255->0.344->1.141->1.338 at steps 0/300/1500/2999, decelerating but not plateaued) -
+    /// i.e. every L5 Kt number measured so far in this investigation (1.065, 1.213, 1.207) may
+    /// be an UNDERTRAINED snapshot, not a converged-but-wrong one. This test extends training
+    /// 4x (12000 steps) with checkpoints spread across the full range to get real evidence on
+    /// whether Kt keeps climbing meaningfully toward the FEM reference or plateaus well short
+    /// of it. Separate test, NOT modifying the canonical 3000-step
+    /// `issue_77_l5_annular_diagnostic_trace` - that test's own checkpoint convention stays
+    /// exactly as-is for future comparability.
+    #[test]
+    #[ignore]
+    fn issue_77_l5_extended_convergence_trend_trace() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 12000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 1500, 3000, 6000, 9000, 11999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics(
+            spec, device, &checkpoints, |step, loss, _lr, _points| {
+                if step % 500 == 0 { println!("[#77 extended] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-extended-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 extended] wrote {}", path.display());
+        for diagnostic in diagnostics {
+            println!("[#77 extended] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+    }
+
+    /// Issue #77 training-time research (`docs/L5_TRAINING_PERFORMANCE_RESEARCH.md`,
+    /// candidate 2): backend-agnostic steady-state per-step timing on the real L5 annular
+    /// config. `BDevice`/`B` are compile-time-selected by the `ndarray-backend` feature
+    /// (`training_core`'s own doc comment) - this same test measures whichever backend the
+    /// crate was built with, so the comparison is `cargo test ... issue_77_backend_comparison_
+    /// timing -- --ignored --nocapture` run twice: once with the default Wgpu build, once with
+    /// `--features ndarray-backend`. 300 steps: the first 50 are discarded as warmup (Phase 2's
+    /// own real measurement found Wgpu's one-time kernel-compile cost concentrated in the first
+    /// handful of steps - step 0 forward=264ms vs step 4 forward=35ms), the remaining 250 give
+    /// the steady-state per-step number that's actually comparable across backends.
+    #[test]
+    #[ignore]
+    fn issue_77_backend_comparison_timing() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 300, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        const WARMUP_STEPS: usize = 50;
+        let mut warmup_start: Option<std::time::Instant> = None;
+        let mut steady_start: Option<std::time::Instant> = None;
+        let mut steady_end: Option<std::time::Instant> = None;
+        let (_annulus, _outer, loss, _diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics(
+            spec, device, &[], |step, _loss, _lr, _points| {
+                let now = std::time::Instant::now();
+                if step == 0 { warmup_start = Some(now); }
+                if step == WARMUP_STEPS { steady_start = Some(now); }
+                steady_end = Some(now);
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        let warmup_s = steady_start.unwrap().duration_since(warmup_start.unwrap()).as_secs_f64();
+        let steady_s = steady_end.unwrap().duration_since(steady_start.unwrap()).as_secs_f64();
+        let steady_steps = 300 - WARMUP_STEPS;
+        println!("[#77 backend-timing] backend={} warmup({WARMUP_STEPS} steps)={warmup_s:.3}s \
+            steady_state({steady_steps} steps)={steady_s:.3}s ({:.4} s/step)",
+            if cfg!(feature = "ndarray-backend") { "ndarray" } else { "wgpu" },
+            steady_s / steady_steps as f64);
+    }
+
     fn uniform_int_norm(n: usize) -> Vec<[f32; 2]> {
         // Deterministic placeholder "uniform" point set for tests that only need SOME baseline
         // data.int_norm to exist before the function under test may overwrite it.
