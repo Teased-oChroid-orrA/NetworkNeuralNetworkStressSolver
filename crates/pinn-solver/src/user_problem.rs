@@ -813,6 +813,7 @@ pub fn plate_multi_step_ctx<'a>(
         problem,
         fd,
         hole_fd,
+        per_domain_lr: None,
         k: 1.0, // IdentityAnsatz ignores k entirely — value is inert
         domains: vec![crate::problem::DomainStepCtx { data, u_ref, ref_energy, ref_stress2 }],
         dynamic_lam_h_cap: 50.0,
@@ -847,7 +848,14 @@ pub fn plate_multi_domain_step_ctx<'a>(
     step: usize,
 ) -> crate::problem::MultiStepCtx<'a> {
     crate::problem::MultiStepCtx {
-        config, problem, fd, hole_fd, k: 1.0,
+        config, problem, fd, hole_fd,
+        // Issue #77 Step 4: defaults to `None` here (every domain shares `lr_sched`'s single
+        // LR, this function's own pre-Step-4 behavior). `run_annular_decomposition_training_
+        // inner`, the one real caller that needs per-domain LR, sets `ctx.per_domain_lr`
+        // AFTER calling this builder (a simple post-construction field mutation) rather than
+        // this function growing yet another parameter only one caller would ever use non-None.
+        per_domain_lr: None,
+        k: 1.0,
         domains: vec![
             crate::problem::DomainStepCtx { data: annulus, u_ref, ref_energy, ref_stress2 },
             crate::problem::DomainStepCtx { data: outer, u_ref, ref_energy, ref_stress2 },
@@ -4969,7 +4977,7 @@ mod tests {
         let ctx = MultiStepCtx {
             config: &pinn_core::messages::SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd, hole_fd: &fd,
+            fd: &fd, hole_fd: &fd, per_domain_lr: None,
             k: 1.0,
             domains: vec![DomainStepCtx { data: &data, u_ref: scales.u_ref, ref_energy: scales.ref_energy, ref_stress2: scales.ref_stress2 }],
             dynamic_lam_h_cap: 50.0,
@@ -5799,7 +5807,7 @@ mod tests {
                 extra_ring_norm: Vec::new(), named,
             };
             let ctx = MultiStepCtx {
-                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
+                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, per_domain_lr: None, k: 1.0,
                 domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                 dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -6116,7 +6124,7 @@ mod tests {
 
                 if spec.training.amr_enabled && step >= AMR_WARMUP_STEPS && (step - AMR_WARMUP_STEPS) % amr_interval == 0 {
                     let probe_ctx = MultiStepCtx {
-                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
+                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, per_domain_lr: None, k: 1.0,
                         domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -6139,7 +6147,7 @@ mod tests {
                             }
                             let points_after = data.int_norm.len();
                             let after_ctx = MultiStepCtx {
-                                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
+                                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, per_domain_lr: None, k: 1.0,
                                 domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                                 dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -6275,7 +6283,7 @@ mod tests {
                         &data, half_w, half_h, &mut amr_grid, step,
                     );
                     let probe_ctx = MultiStepCtx {
-                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
+                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, per_domain_lr: None, k: 1.0,
                         domains: vec![DomainStepCtx { data: &probe_data, u_ref, ref_energy, ref_stress2 }],
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -6430,7 +6438,7 @@ mod tests {
                         &data, half_w, half_h, &mut amr_grid, step,
                     );
                     let probe_ctx = MultiStepCtx {
-                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
+                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, per_domain_lr: None, k: 1.0,
                         domains: vec![DomainStepCtx { data: &probe_data, u_ref, ref_energy, ref_stress2 }],
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,

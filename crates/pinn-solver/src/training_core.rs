@@ -2174,10 +2174,14 @@ pub fn step_physics_multi(
         let bn: f32 = flatten_grads(&model, &bias_grads).powf_scalar(2.0_f64).sum().into_scalar();
         let gn: f32 = flatten_grads(&model, &gate_grads).powf_scalar(2.0_f64).sum().into_scalar();
         grad_norm_sq += wn + bn + gn;
+        // Issue #77 Step 4: per-domain LR override (`MultiStepCtx::per_domain_lr`'s own doc
+        // comment has the full rationale) - falls back to the single shared `lr` above when
+        // `None` or when this domain has no entry, byte-identical to every pre-Step-4 caller.
+        let domain_lr = ctx.per_domain_lr.as_ref().and_then(|v| v.get(i).copied()).unwrap_or(lr);
         let optim = &mut optims[i];
-        let model = optim.weight.step(lr, model, weight_grads);
-        let model = optim.bias.step(lr, model, bias_grads);
-        let model = optim.gate.step(lr * alpha_lr_mult, model, gate_grads);
+        let model = optim.weight.step(domain_lr, model, weight_grads);
+        let model = optim.bias.step(domain_lr, model, bias_grads);
+        let model = optim.gate.step(domain_lr * alpha_lr_mult, model, gate_grads);
         let _ = dctx;
         new_models.push(model);
     }
@@ -2219,6 +2223,38 @@ pub fn step_physics_multi(
         gradient_conflict_report: term_grad_vectors.as_ref()
             .map(|v| build_gradient_conflict_report(pairwise_gradient_cosine_similarities(v))),
     })
+}
+
+/// Issue #77 Step 4: per-domain weighted-loss aggregate, for feeding a caller-owned per-domain
+/// `LrSchedule` (see `MultiStepCtx::per_domain_lr`'s doc comment for why this exists — one
+/// shared schedule reading TOTAL loss can be dominated by one domain's own early-plateauing
+/// term, starving another domain's optimizer of learning rate). Sums `raw*lambda` over every
+/// ACTIVE term (`problem.loss_terms()`, matching `step_physics_multi`'s own filtering
+/// convention: drops `constitutive_consistency`, respects `phase2_active`) whose `domains()`
+/// includes `domain_id`. A cross-domain term (e.g. an interface term touching two domains)
+/// contributes to BOTH domains' aggregates — correct for a scheduling/monitoring signal (a
+/// genuinely shared term should count toward both schedules), even though it's real double-
+/// counting if read as a literal sum; this is not part of the optimization objective itself,
+/// only an input to a plateau-detecting `LrSchedule`, so that tradeoff is accepted, not a bug.
+pub fn domain_weighted_loss(
+    problem: &dyn crate::problem::BoundaryValueProblem,
+    domain_id: pinn_core::problem::DomainId,
+    phase2_active: bool,
+    out: &StepOutput,
+) -> f64 {
+    let (Some(raw), Some(lam)) = (out.raw_scalar_by_name.as_ref(), out.lam_by_name.as_ref()) else {
+        return 0.0;
+    };
+    problem.loss_terms().iter()
+        .filter(|t| t.name() != "constitutive_consistency")
+        .filter(|t| phase2_active || !t.phase2_only())
+        .filter(|t| t.domains().contains(&domain_id))
+        .map(|t| {
+            let r = *raw.get(t.name()).unwrap_or(&0.0) as f64;
+            let l = *lam.get(t.name()).unwrap_or(&0.0);
+            r * l
+        })
+        .sum()
 }
 
 /// K_t probe shared between runner and headless modes.
@@ -6066,7 +6102,7 @@ mod tests {
             let ctx_multi = MultiStepCtx {
                 config: &config,
                 problem: &problem,
-                fd: &fd, hole_fd: &fd,
+                fd: &fd, hole_fd: &fd, per_domain_lr: None,
                 k: engine.ansatz_k,
                 domains: vec![DomainStepCtx {
                     data: &domain_data, u_ref, ref_energy, ref_stress2,
@@ -6368,7 +6404,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd, hole_fd: &fd,
+            fd: &fd, hole_fd: &fd, per_domain_lr: None,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -6410,6 +6446,215 @@ mod tests {
         assert_eq!(b_after, b_before, "domain B's params must be EXACTLY unchanged — loss did not depend on B's output");
     }
 
+    // ─── Issue #77 Step 4: per-domain LR override ────────────────────────────────────────
+
+    /// The whole point of `MultiStepCtx::per_domain_lr`: two domains with IDENTICAL initial
+    /// weights and IDENTICAL gradients (same seed, same symmetric loss term, same literal
+    /// input points) must receive MEASURABLY DIFFERENT parameter updates when given different
+    /// per-domain LR overrides — isolating LR as the only variable, since gradient magnitude
+    /// is held equal by construction.
+    #[test]
+    fn per_domain_lr_override_produces_different_updates_for_identical_gradients() {
+        let device = BDevice::default();
+        const SEED: u64 = 424242;
+        B::seed(&device, SEED);
+        let model_a = tiny_net(&device);
+        B::seed(&device, SEED);
+        let model_b = tiny_net(&device);
+
+        let domain_a = pinn_core::problem::DomainId(300);
+        let domain_b = pinn_core::problem::DomainId(301);
+        let geom = toy_geom_2d();
+        let material = pinn_core::material::MaterialProps::al7075_t6();
+        let problem = TwoDomainToyProblem {
+            domains: vec![
+                pinn_core::problem::DomainSpec { id: domain_a, geometry: geom.clone(), material: material.clone(), output_dim: 2 },
+                pinn_core::problem::DomainSpec { id: domain_b, geometry: geom, material, output_dim: 2 },
+            ],
+            sampling: crate::kirsch_problem::KirschSamplingStrategy,
+            ansatz: crate::kirsch_problem::QuarterSymmAnsatz,
+            only_a: false, // TwoDomainSumLossTerm: symmetric, both domains contribute equally
+        };
+        let data_a = toy_domain_data(domain_a);
+        let data_b = toy_domain_data(domain_b);
+        let fd = FdConfig::new(1e-3, 2.0, 2.0);
+        let ctx = crate::problem::MultiStepCtx {
+            config: &SolverConfig::default_kirsch(),
+            problem: &problem,
+            fd: &fd, hole_fd: &fd,
+            per_domain_lr: Some(vec![1e-2, 1e-6]), // domain A: large LR, domain B: near-zero
+            k: 1.0,
+            domains: vec![
+                crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+                crate::problem::DomainStepCtx { data: &data_b, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+            ],
+            dynamic_lam_h_cap: 50.0,
+            dynamic_lam_d_cap: 50.0,
+            dynamic_lam_penetration_cap: 500.0,
+            dynamic_lam_non_tension_cap: 100.0,
+            constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
+            n_fourier: 0,
+            coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            probe_term_gradients: false,
+            phase2_active: false,
+            step: 0,
+        };
+
+        let a_before = param_l2_sq(&model_a);
+        let b_before = param_l2_sq(&model_b);
+        let mut optims = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+        let mut saw = SawBrdr::with_base(vec![1.0], 0.95);
+        let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
+
+        let (new_models, _out) = step_physics_multi(
+            vec![model_a, model_b], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+        let mut iter = new_models.into_iter();
+        let a_after = param_l2_sq(&iter.next().unwrap());
+        let b_after = param_l2_sq(&iter.next().unwrap());
+
+        let a_delta = (a_after - a_before).abs();
+        let b_delta = (b_after - b_before).abs();
+        assert!(a_delta > 1e-9, "domain A (large LR override) must move measurably: delta={a_delta:.3e}");
+        assert!(a_delta > b_delta * 100.0,
+            "domain A's per_domain_lr=1e-2 must move it far more than domain B's per_domain_lr=1e-6 \
+             (identical gradients by construction - LR is the only variable): a_delta={a_delta:.3e} b_delta={b_delta:.3e}");
+    }
+
+    /// Regression proof: `per_domain_lr: None` must behave EXACTLY as it did before this
+    /// field existed - every domain uses the single shared `lr_sched`-derived `lr`. Compares
+    /// against an explicit `Some(vec![lr, lr])` (same value repeated) built from the SAME
+    /// schedule state, which must produce byte-identical models.
+    #[test]
+    fn per_domain_lr_none_is_byte_identical_to_explicit_shared_value() {
+        let device = BDevice::default();
+        const SEED: u64 = 909090;
+        let domain_a = pinn_core::problem::DomainId(302);
+        let domain_b = pinn_core::problem::DomainId(303);
+        let geom = toy_geom_2d();
+        let material = pinn_core::material::MaterialProps::al7075_t6();
+        let make_problem = || TwoDomainToyProblem {
+            domains: vec![
+                pinn_core::problem::DomainSpec { id: domain_a, geometry: geom.clone(), material: material.clone(), output_dim: 2 },
+                pinn_core::problem::DomainSpec { id: domain_b, geometry: geom.clone(), material: material.clone(), output_dim: 2 },
+            ],
+            sampling: crate::kirsch_problem::KirschSamplingStrategy,
+            ansatz: crate::kirsch_problem::QuarterSymmAnsatz,
+            only_a: false,
+        };
+        let data_a = toy_domain_data(domain_a);
+        let data_b = toy_domain_data(domain_b);
+        let fd = FdConfig::new(1e-3, 2.0, 2.0);
+        let config = SolverConfig::default_kirsch();
+
+        let run = |per_domain_lr: Option<Vec<f64>>| -> (f64, f64) {
+            B::seed(&device, SEED);
+            let model_a = tiny_net(&device);
+            B::seed(&device, SEED ^ 0xABCD);
+            let model_b = tiny_net(&device);
+            let problem = make_problem();
+            let ctx = crate::problem::MultiStepCtx {
+                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, per_domain_lr,
+                k: 1.0,
+                domains: vec![
+                    crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+                    crate::problem::DomainStepCtx { data: &data_b, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+                ],
+                dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+                dynamic_lam_penetration_cap: 500.0, dynamic_lam_non_tension_cap: 100.0,
+                constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
+                n_fourier: 0, coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+                probe_term_gradients: false, phase2_active: false, step: 0,
+            };
+            let mut optims = vec![
+                crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+                crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            ];
+            let mut saw = SawBrdr::with_base(vec![1.0], 0.95);
+            let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
+            let (new_models, _out) = step_physics_multi(
+                vec![model_a, model_b], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+            );
+            let mut iter = new_models.into_iter();
+            (param_l2_sq(&iter.next().unwrap()), param_l2_sq(&iter.next().unwrap()))
+        };
+
+        // `LrSchedule::new(1e-3, ...)` warmup step 0 -> `1e-3 * WARMUP_START_FRACTION`;
+        // replicate that exact value rather than guessing, so the `Some` arm matches `None`'s
+        // real internal computation, not a hand-picked stand-in.
+        let mut probe_sched = LrSchedule::new(1e-3, 200, 1000);
+        let shared_lr = probe_sched.step(f64::MAX);
+
+        let (a_none, b_none) = run(None);
+        let (a_some, b_some) = run(Some(vec![shared_lr, shared_lr]));
+        assert_eq!(a_none, a_some, "per_domain_lr=None must match explicit Some([shared,shared])");
+        assert_eq!(b_none, b_some, "per_domain_lr=None must match explicit Some([shared,shared])");
+    }
+
+    /// `domain_weighted_loss`: for a term touching only domain A (`only_a: true`,
+    /// `OneDomainLossTerm`), domain B's aggregate must be exactly 0.0 (nothing to sum), while
+    /// domain A's must equal that term's own `raw*lambda` (both read straight out of the real
+    /// `StepOutput` a real `step_physics_multi` call produces — not a hand-built fixture, so
+    /// this also proves `raw_scalar_by_name`/`lam_by_name` are populated in the shape the
+    /// helper expects).
+    #[test]
+    fn domain_weighted_loss_sums_only_terms_touching_that_domain() {
+        let device = BDevice::default();
+        let domain_a = pinn_core::problem::DomainId(304);
+        let domain_b = pinn_core::problem::DomainId(305);
+        let geom = toy_geom_2d();
+        let material = pinn_core::material::MaterialProps::al7075_t6();
+        let problem = TwoDomainToyProblem {
+            domains: vec![
+                pinn_core::problem::DomainSpec { id: domain_a, geometry: geom.clone(), material: material.clone(), output_dim: 2 },
+                pinn_core::problem::DomainSpec { id: domain_b, geometry: geom, material, output_dim: 2 },
+            ],
+            sampling: crate::kirsch_problem::KirschSamplingStrategy,
+            ansatz: crate::kirsch_problem::QuarterSymmAnsatz,
+            only_a: true, // OneDomainLossTerm ("solo_term"): touches domain A only
+        };
+        let data_a = toy_domain_data(domain_a);
+        let data_b = toy_domain_data(domain_b);
+        let fd = FdConfig::new(1e-3, 2.0, 2.0);
+        let ctx = crate::problem::MultiStepCtx {
+            config: &SolverConfig::default_kirsch(),
+            problem: &problem,
+            fd: &fd, hole_fd: &fd, per_domain_lr: None,
+            k: 1.0,
+            domains: vec![
+                crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+                crate::problem::DomainStepCtx { data: &data_b, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
+            ],
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            dynamic_lam_penetration_cap: 500.0, dynamic_lam_non_tension_cap: 100.0,
+            constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
+            n_fourier: 0, coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            probe_term_gradients: false, phase2_active: false, step: 0,
+        };
+        let mut optims = vec![
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+        ];
+        let mut saw = SawBrdr::with_base(vec![1.0], 0.95);
+        let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
+        let (_new_models, out) = step_physics_multi(
+            vec![tiny_net(&device), tiny_net(&device)], &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+
+        let raw = *out.raw_scalar_by_name.as_ref().unwrap().get("solo_term").unwrap() as f64;
+        let lam = *out.lam_by_name.as_ref().unwrap().get("solo_term").unwrap();
+        let expected_a = raw * lam;
+
+        let a_loss = domain_weighted_loss(&problem, domain_a, false, &out);
+        let b_loss = domain_weighted_loss(&problem, domain_b, false, &out);
+        assert!((a_loss - expected_a).abs() / expected_a.abs().max(1e-30) < 1e-9,
+            "domain A's aggregate must equal solo_term's own raw*lambda: {a_loss} vs {expected_a}");
+        assert_eq!(b_loss, 0.0, "domain B's aggregate must be exactly 0.0 - solo_term never touches it");
+    }
+
     /// RED test #3: a combined loss depending on BOTH domains' outputs must leave BOTH
     /// domains' weights changed after one step.
     #[test]
@@ -6446,7 +6691,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd, hole_fd: &fd,
+            fd: &fd, hole_fd: &fd, per_domain_lr: None,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -6566,7 +6811,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd, hole_fd: &fd,
+            fd: &fd, hole_fd: &fd, per_domain_lr: None,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -6708,7 +6953,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd, hole_fd: &fd,
+            fd: &fd, hole_fd: &fd, per_domain_lr: None,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -6761,7 +7006,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd, hole_fd: &fd,
+            fd: &fd, hole_fd: &fd, per_domain_lr: None,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -6901,7 +7146,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd, hole_fd: &fd,
+            fd: &fd, hole_fd: &fd, per_domain_lr: None,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -6987,7 +7232,7 @@ mod tests {
         let ctx = crate::problem::MultiStepCtx {
             config: &SolverConfig::default_kirsch(),
             problem: &problem,
-            fd: &fd, hole_fd: &fd,
+            fd: &fd, hole_fd: &fd, per_domain_lr: None,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: &data_a, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 },
@@ -7124,6 +7369,7 @@ mod tests {
             problem,
             fd,
             hole_fd: fd, // pin-lug has no hole concept - same value as `fd`, inert
+            per_domain_lr: None,
             k: 1.0,
             domains: vec![
                 crate::problem::DomainStepCtx { data: pin_data, u_ref, ref_energy, ref_stress2 },

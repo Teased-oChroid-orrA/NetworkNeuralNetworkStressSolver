@@ -134,7 +134,19 @@ fn run_annular_decomposition_training_inner(
     }).collect::<Vec<_>>();
     let base_weights = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
     let mut saw = SawBrdr::with_base(base_weights, 0.95);
-    let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+    // Issue #77 Step 4 (`PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-26): a single shared
+    // `LrSchedule` reading TOTAL loss was found to collapse LR for BOTH domains once
+    // `physical_potential` (outer) plateaus almost immediately post-decomposition — starving
+    // the annulus domain right around a real, measured Kt peak (a 12000-step run showed Kt
+    // rise to 1.287 at step 3000, then DECLINE to 0.977 by step 11999). Each domain now gets
+    // its OWN schedule, fed its OWN weighted-loss aggregate (`domain_weighted_loss`) instead
+    // of the shared total. `lr_sched_shared` is kept only so `step_physics_multi`'s own
+    // (unconditionally-called) `lr_sched.step(total_scalar)` bookkeeping still runs and
+    // populates `StepOutput.lr` consistently — its result no longer drives either domain's
+    // optimizer once `ctx.per_domain_lr` is set below.
+    let mut lr_sched_annulus = LrSchedule::new(spec.training.lr, 100, 500);
+    let mut lr_sched_outer = LrSchedule::new(spec.training.lr, 100, 500);
+    let mut lr_sched_shared = LrSchedule::new(spec.training.lr, 100, 500);
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
     let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
     let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
@@ -142,6 +154,7 @@ fn run_annular_decomposition_training_inner(
     let n_annulus = (spec.training.n_interior / 2).max(256);
     let n_outer = spec.training.n_interior.saturating_sub(n_annulus).max(256);
     let mut last_total = f32::NAN;
+    let mut prev_out: Option<crate::training_core::StepOutput> = None;
     for step in 0..spec.training.max_steps {
         let annulus_data = resample_domain_step_data(
             problem.domains()[0].id, problem.sampling_strategy(0), &placeholder, &spec.load,
@@ -151,14 +164,27 @@ fn run_annular_decomposition_training_inner(
             problem.domains()[1].id, problem.sampling_strategy(1), &placeholder, &spec.load,
             n_outer, spec.training.n_boundary, spec.geometry.half_w, spec.geometry.half_h,
         );
-        let ctx = plate_multi_domain_step_ctx(
+        let mut ctx = plate_multi_domain_step_ctx(
             &config, &problem, &fd, &hole_fd,
             &annulus_data, &outer_data,
             scales.u_ref, scales.ref_energy, scales.ref_stress2, spec.geometry.n_fourier(),
             spec.geometry.coordinate_embedding(), diagnostic_steps.contains(&step), step,
         );
+        // One-step lag: this step's own per-term losses aren't known until `step_physics_multi`
+        // runs below, so (like every LR schedule) this reacts to the LAST observed reading.
+        // Step 0 has no previous reading — `f64::MAX` matches `LrSchedule::best_loss`'s own
+        // "nothing observed yet" sentinel, so it never spuriously triggers a plateau decay.
+        let annulus_loss = prev_out.as_ref()
+            .map(|o| crate::training_core::domain_weighted_loss(&problem, problem.domains()[0].id, true, o))
+            .unwrap_or(f64::MAX);
+        let outer_loss = prev_out.as_ref()
+            .map(|o| crate::training_core::domain_weighted_loss(&problem, problem.domains()[1].id, true, o))
+            .unwrap_or(f64::MAX);
+        let lr_annulus = lr_sched_annulus.step(annulus_loss);
+        let lr_outer = lr_sched_outer.step(outer_loss);
+        ctx.per_domain_lr = Some(vec![lr_annulus, lr_outer]);
         let (new_models, out) = step_physics_multi(
-            models, &mut optims, &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+            models, &mut optims, &ctx, &mut saw, &mut lr_sched_shared, &device, 0, 1.0, 1.0,
         );
         models = new_models;
         last_total = out.total_scalar;
@@ -166,9 +192,12 @@ fn run_annular_decomposition_training_inner(
             use burn::module::AutodiffModule;
             diagnostics.push(annular_l5_diagnostic(step, &out, &models[0].valid(), &spec, &fd, &device));
         }
-        if on_step(step, out.total_scalar, out.lr, annulus_data.int_norm.len() + outer_data.int_norm.len()) {
+        // Reports the annulus domain's own LR (the one whose starvation this fix addresses) -
+        // a logging/callback choice only, does not affect either domain's optimizer step.
+        if on_step(step, out.total_scalar, lr_annulus, annulus_data.int_norm.len() + outer_data.int_norm.len()) {
             break;
         }
+        prev_out = Some(out);
     }
     sync_device(&device);
     let mut models = models.into_iter();

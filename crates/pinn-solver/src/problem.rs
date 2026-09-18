@@ -515,6 +515,19 @@ pub struct MultiStepCtx<'a> {
     /// exactly the pre-#77-Step-2 behavior) — only the plate/annular problem's own per-step ctx
     /// builder passes something genuinely smaller.
     pub hole_fd: &'a FdConfig,
+    /// Issue #77 Step 4: per-domain learning-rate override, one entry per `domains` (same
+    /// order), `None` = every domain uses the single shared `lr_sched.step(total_scalar)`
+    /// result (the pre-#77-Step-4 behavior, byte-identical for every existing caller). Exists
+    /// because `run_annular_decomposition_training_inner`'s one shared `LrSchedule` reads
+    /// TOTAL loss, which is dominated by `physical_potential` (the outer domain, converges
+    /// almost immediately post-Step-1-decomposition) — this made the schedule declare a
+    /// plateau and collapse LR for BOTH domains right around when Kt peaked in a real 12000-
+    /// step run (`PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-26), starving the annulus domain
+    /// of the learning rate it still needed. `step_physics_multi` still calls `lr_sched.step`
+    /// unconditionally even when this is `Some` (cheap, keeps any external reader of the
+    /// shared schedule's own state consistent) — it just doesn't use that result for a
+    /// domain whose own override is present.
+    pub per_domain_lr: Option<Vec<f64>>,
     pub k: f32,
     pub domains: Vec<DomainStepCtx<'a>>,
     pub dynamic_lam_h_cap: f64,
@@ -624,6 +637,9 @@ impl FrozenMultiStepCtx {
             problem,
             fd: &self.fd,
             hole_fd: &self.hole_fd,
+            // Not tracked by `FrozenMultiStepCtx` - the L-BFGS/Converge path this reconstructs
+            // for uses its own line-search step size, not `lr_sched`/this override at all.
+            per_domain_lr: None,
             k: self.k,
             domains: self.domains.iter().map(|d| DomainStepCtx {
                 data: &d.data,
@@ -778,7 +794,7 @@ mod tests {
         let ctx = MultiStepCtx {
             config: &config,
             problem: &problem,
-            fd: &fd, hole_fd: &fd,
+            fd: &fd, hole_fd: &fd, per_domain_lr: None,
             k: 1.0,
             domains: vec![DomainStepCtx { data: &data, u_ref: 1.0, ref_energy: 1.0, ref_stress2: 1.0 }],
             dynamic_lam_h_cap: 50.0,

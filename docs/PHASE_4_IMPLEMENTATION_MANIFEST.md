@@ -1381,7 +1381,75 @@ step_physics_multi/two-domain path doesn't have today (one shared schedule for N
 peak (would have signaled a stop around step 3000-4500 in this run), but is a mitigation for the
 symptom (train past the peak), not the root cause (why the peak is followed by decline at all).
 
-Full workspace regression after this session's additions: pending (running as this entry is
-written; will be confirmed before any commit).
+Full workspace regression after this session's additions: 491 passed, 0 failed, 38 ignored -
+zero regressions.
+
+Does not close issue #77 (or #74/#76).
+
+## PH4-27 — Step 4 implemented: per-domain LrSchedule fixes the decline, does NOT close the
+## Kt gap - real, honest, mixed result
+
+Implemented PH4-26's own next-lever recommendation: `MultiStepCtx` gained `per_domain_lr:
+Option<Vec<f64>>` (one entry per domain, `None` = every existing caller's exact pre-Step-4
+behavior — the single shared `lr_sched.step(total_scalar)` result applied to every domain,
+byte-for-byte unchanged). `step_physics_multi`'s per-domain optimizer loop now reads
+`ctx.per_domain_lr.get(i)` before falling back to the shared `lr`. `run_annular_decomposition_
+training_inner` now runs two independent `LrSchedule` instances (one per domain), each fed its
+own domain's weighted-loss aggregate via a new `training_core::domain_weighted_loss` helper
+(sums `raw*lambda` over every active term whose `domains()` includes that domain — a
+cross-domain term counts toward both, which is correct for a monitoring/scheduling signal, not
+part of the optimization objective itself) computed from the PREVIOUS step's `StepOutput` (a
+one-step lag, the natural convention for any LR schedule reacting to "the last observed
+reading"). The single shared schedule (`lr_sched_shared`) is kept only so `step_physics_multi`'s
+own unconditional `lr_sched.step(...)` bookkeeping still runs — its result no longer drives
+either domain's optimizer once the override is set.
+
+7 new focused tests (2 in `controllers.rs` already landed with PH4-26's prep work, 3 new in
+`training_core.rs`: a real two-domain fixture with identical gradients and different LR
+overrides proving domain-specific step sizes actually differ, a byte-identical-fallback
+regression proof for `per_domain_lr: None`, and a `domain_weighted_loss` correctness proof
+including the "term touches only one domain" zero-aggregate case). Full suite: 494 passed, 0
+failed, 38 ignored.
+
+**Real result** (`issue_77_l5_extended_convergence_trend_trace`, same 12000-step config,
+identical seed/checkpoints as PH4-26's run, only the per-domain-LR fix changed):
+
+| step | pre-fix Kt (PH4-26) | post-fix Kt | delta |
+|---|---|---|---|
+| 0 | 0.255174 | 0.255174 | 0 |
+| 1500 | 1.166180 | 1.168147 | +0.002 |
+| 3000 | **1.287459 (peak)** | 1.064374 | **-0.223** |
+| 6000 | 1.169102 | 1.009547 | -0.160 |
+| 9000 | 1.010714 | 1.012618 | +0.002 |
+| 11999 | 0.976746 (declined below step-1500 value) | **1.020403** | **+0.044** |
+
+**The specific pathology PH4-26 identified is fixed**: the post-fix trajectory stabilizes
+around 1.00-1.02 from step 6000 onward (1.010 -> 1.013 -> 1.020, essentially flat/slightly
+rising) instead of continuing to decline past its peak (1.169 -> 1.011 -> 0.977 pre-fix). This
+confirms the LR-starvation mechanism was real: decoupling the annulus domain's learning rate
+from the outer domain's early-plateauing loss removes the degradation, exactly as PH4-26
+predicted.
+
+**It does NOT close the Kt gap.** The real, transient peak the pre-fix run reached at step 3000
+(1.287) is also gone post-fix (1.064 at the same step) — the new schedule changes the early
+dynamics too, trading the old run's higher-but-decaying peak for a lower, stable plateau. Kt
+still settles near 1.0-1.02, far from the FEM reference (2.460638516). **Training dynamics (the
+LR-schedule bug) were a real, now-fixed defect, but not the (or not the only) root cause of why
+Kt doesn't approach the FEM reference at all.** Reported honestly, per this project's own
+no-benchmark-hacking discipline — a real bug fix with a real, mixed, non-breakthrough result.
+
+**Open question for the next step**: with representation (#77's first three attempts),
+collocation margin (PH4-25/Step 2), sampling variance (PH4-26/Step 3's zero-cost SNR check),
+and this training-dynamics bug (PH4-27/Step 4) all now addressed or ruled out, what's left to
+explain Kt settling near the affine floor regardless of which of these axes is changed? Two
+untested candidates going into the next step: (a) the ANNULUS domain's own new `LrSchedule`
+might itself still be decaying prematurely on its own small-magnitude loss signal (self-inflicted
+rather than outer-domain-inflicted this time) — not yet checked, since the diagnostic ledger's
+`learning_rate` field currently still reports the now-decorative SHARED schedule's value, not
+either real per-domain one; (b) the interface-continuity terms (weight 100, enforcing
+displacement/traction continuity at `r=3a`) may be over-constraining the annulus field toward
+smoothness/compatibility with the (affine-dominated) outer field, independent of any LR
+dynamics. (a) is cheap to check (a diagnostic-visibility fix, no new training run needed to
+implement, though confirming it still needs one); (b) would need a real weight-sensitivity run.
 
 Does not close issue #77 (or #74/#76).

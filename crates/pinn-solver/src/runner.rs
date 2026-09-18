@@ -913,7 +913,7 @@ pub fn run_training_pinlug(
             let probe_ctx = MultiStepCtx {
                 config: &config,
                 problem: &problem,
-                fd: &fd, hole_fd: &fd,
+                fd: &fd, hole_fd: &fd, per_domain_lr: None,
                 k: 1.0,
                 domains: vec![
                     DomainStepCtx { data: &pin_data, u_ref, ref_energy, ref_stress2 },
@@ -951,7 +951,7 @@ pub fn run_training_pinlug(
                     let points_after = pin_data.int_norm.len();
 
                     let after_ctx = MultiStepCtx {
-                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
+                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, per_domain_lr: None, k: 1.0,
                         domains: vec![
                             DomainStepCtx { data: &pin_data, u_ref, ref_energy, ref_stress2 },
                             DomainStepCtx { data: &lug_data, u_ref, ref_energy, ref_stress2 },
@@ -996,7 +996,7 @@ pub fn run_training_pinlug(
                     let points_after = lug_data.int_norm.len();
 
                     let after_ctx = MultiStepCtx {
-                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
+                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, per_domain_lr: None, k: 1.0,
                         domains: vec![
                             DomainStepCtx { data: &pin_data, u_ref, ref_energy, ref_stress2 },
                             DomainStepCtx { data: &lug_data, u_ref, ref_energy, ref_stress2 },
@@ -1032,7 +1032,7 @@ pub fn run_training_pinlug(
         let ctx = MultiStepCtx {
             config: &config,
             problem: &problem,
-            fd: &fd, hole_fd: &fd,
+            fd: &fd, hole_fd: &fd, per_domain_lr: None,
             k: 1.0,
             domains: vec![
                 DomainStepCtx { data: &pin_data, u_ref, ref_energy, ref_stress2 },
@@ -1582,7 +1582,7 @@ fn run_user_problem_training_from(
             let probe_ctx = MultiStepCtx {
                 config: &config,
                 problem: &problem,
-                fd: &fd, hole_fd: &fd,
+                fd: &fd, hole_fd: &fd, per_domain_lr: None,
                 k: 1.0,
                 domains: vec![DomainStepCtx { data: probe_data, u_ref, ref_energy, ref_stress2 }],
                 dynamic_lam_h_cap: f64::MAX,
@@ -1656,7 +1656,7 @@ fn run_user_problem_training_from(
                     // "After" DOES need a fresh probe - the point set (and therefore the
                     // residual signal at it) genuinely changed.
                     let after_ctx = MultiStepCtx {
-                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
+                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, per_domain_lr: None, k: 1.0,
                         domains: vec![DomainStepCtx { data: after_probe_data, u_ref, ref_energy, ref_stress2 }],
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -2951,7 +2951,7 @@ mod tests {
 
         for step in 0..steps {
             let ctx = MultiStepCtx {
-                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
+                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, per_domain_lr: None, k: 1.0,
                 domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                 dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -3035,7 +3035,7 @@ mod tests {
         for step in 0..200 {
             let probe_now = print_steps.contains(&step);
             let ctx = MultiStepCtx {
-                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
+                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, per_domain_lr: None, k: 1.0,
                 domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                 dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
@@ -3154,7 +3154,7 @@ mod tests {
         for step in 0..200 {
             let probe_now = print_steps.contains(&step);
             let ctx = MultiStepCtx {
-                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, k: 1.0,
+                config: &config, problem: &problem, fd: &fd, hole_fd: &fd, per_domain_lr: None, k: 1.0,
                 domains: vec![DomainStepCtx { data: &data, u_ref, ref_energy, ref_stress2 }],
                 dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
