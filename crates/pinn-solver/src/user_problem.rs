@@ -3784,6 +3784,88 @@ mod tests {
         }
     }
 
+    /// Issue #77, user-requested isolation test: a quasi-infinite-plate geometry variant of
+    /// `l5_geometry()` — hole radius 0.125in (0.003175m), plate 10in x 10in
+    /// (half_w=half_h=0.127m), thickness 0.125in (0.003175m). L5's hole/half-width ratio is
+    /// 0.05 (0.005/0.10); this geometry's ratio is 0.025 (0.003175/0.127) — half of L5's,
+    /// closer to the idealized-infinite-plate regime the Kt=3.0 Kirsch solution assumes.
+    /// `3*radius=0.009525 < half_w=0.127`, so `annular_partition()`/`decomposition_applicable`
+    /// still validate — same centered single Free hole, same kinematic-decomposition/
+    /// hole-correction machinery `l5_geometry()` uses, per the user's own "maintain spatial
+    /// compatibility" instruction. Material/load unchanged from L5 (E=71.7e9 Pa, nu=0.33,
+    /// far-field uniaxial traction 6.9e7 Pa) — the far-field BC is already applied at the
+    /// plate edges, and enlarging the plate relative to the hole is itself what pushes that
+    /// edge further (in ratio terms) from the hole, without needing a load change.
+    fn quasi_infinite_geometry() -> UserGeometry {
+        UserGeometry {
+            half_w: 0.127, half_h: 0.127, thickness: 0.003175,
+            holes: vec![HoleSpec { center: [0.0, 0.0], radius: 0.003175, bc: HoleBc::Free }],
+        }
+    }
+
+    #[test]
+    fn quasi_infinite_geometry_still_supports_annular_decomposition() {
+        let geometry = quasi_infinite_geometry();
+        let partition = geometry.annular_partition().expect("3*radius must be < half_w/half_h");
+        assert!((partition.interface_radius - 3.0 * 0.003175).abs() < 1e-12);
+        let spec = ProblemSpec {
+            geometry, material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7), network: Default::default(),
+            training: pinn_core::problem_spec::TrainingSpec {
+                measure_aware_training: true, ..Default::default()
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        assert!(AnnularDecompositionProblem::supports(&spec));
+    }
+
+    /// Issue #77, user-requested isolation test: is the ~1.0-1.3 Kt plateau (against FEM
+    /// 2.4606 for L5's own geometry) partly a finite-domain/finite-width artifact, rather than
+    /// purely a training/representation problem? Same baseline architecture as
+    /// `issue_77_l5_annular_diagnostic_trace` (kinematic decomposition, corrected hole term,
+    /// annular decomposition, per-domain LR — no Fourier features, no interface-weight
+    /// override, no equilibrium term: those axes are independently tested elsewhere in this
+    /// investigation and are not the variable under test here), identical network/training
+    /// hyperparameters and checkpoints for direct comparability — ONLY the geometry changes to
+    /// `quasi_infinite_geometry()`. The correct comparison target is a FRESH FEM reference
+    /// computed for THIS geometry (`tools/finite_plate_reference.py`), not L5's 2.4606 — a
+    /// smaller hole/half-width ratio has its own, closer-to-3.0, mesh-converged finite-plate
+    /// Kt, and comparing the network's result to the wrong target would misattribute a real
+    /// geometry difference as more or less error than the network actually has.
+    #[test]
+    #[ignore]
+    fn issue_77_quasi_infinite_plate_l5_trace() {
+        let spec = ProblemSpec {
+            geometry: quasi_infinite_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics(
+            spec, device, &checkpoints, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 quasi-infinite] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-quasi-infinite-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 quasi-infinite] wrote {}", path.display());
+        for diagnostic in diagnostics {
+            println!("[#77 quasi-infinite] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+    }
+
     /// Issue #77 training-time research (`docs/L5_TRAINING_PERFORMANCE_RESEARCH.md`,
     /// candidate 2): backend-agnostic steady-state per-step timing on the real L5 annular
     /// config. `BDevice`/`B` are compile-time-selected by the `ndarray-backend` feature

@@ -1723,3 +1723,83 @@ Full workspace regression: unaffected (no production code changed in this step -
 production code as PH4-31, only a new `#[ignore]`d comparison test with a different constant).
 
 Does not close issue #77 (or #74/#76).
+
+## PH4-33 — User-requested isolation test: quasi-infinite-plate geometry rules out finite-
+## domain/finite-width effects as the dominant remaining cause of the Kt gap
+
+User-proposed test: does L5's Kt gap (network ~1.0-1.3 vs FEM 2.4606) partly reflect a
+finite-plate/finite-width sampling or boundary-proximity artifact, rather than a purely
+training/representation problem? Requested geometry, converted to SI: hole radius 0.125in
+(0.003175m), plate 10in x 10in (half_w=half_h=0.127m), thickness 0.125in (0.003175m) - a
+hole/half-width ratio of 0.025, half of L5's own 0.05, pushing toward the idealized-infinite-
+plate regime the Kirsch Kt=3.0 solution assumes. Zero production code changes needed - a new
+`quasi_infinite_geometry()`/`ProblemSpec` reusing every existing mechanism (kinematic
+decomposition, corrected hole term, annular decomposition, per-domain LR - `3*radius=0.009525
+< half_w=0.127`, comfortably satisfying `annular_partition()`), verified by a cheap gate test
+(`quasi_infinite_geometry_still_supports_annular_decomposition`) before any real run.
+
+**A correct comparison needed a FRESH FEM reference for this geometry, not L5's 2.4606** - a
+smaller hole/plate ratio has its own, different, mesh-converged finite-plate Kt; comparing
+against the wrong number would misattribute a real geometry difference as training error.
+Computed via the same independent `tools/finite_plate_reference.py` CST tool issue #76 already
+validated (`--half-width 0.127 --half-height 0.127 --radius 0.003175 --young 71.7e9 --poisson
+0.33 --traction 6.9e7 --fd-h 1e-3`), converged to two consecutive under-2%-change mesh
+refinements at `512x128 -> 1024x256 -> 2048x512` (max relative change 0.0019 on the final
+refinement): **`probe_fd_kt_vm = 2.0738642734198516`**.
+
+**Confirmed before trusting this comparison**: the FEM tool's probe-ring placement
+(`probe_radius = radius + 4*fd_h*max(half_w,half_h)`, `tools/finite_plate_reference.py`) and the
+PINN diagnostic's own ring placement (`ring_anchor_margin_m`, `user_problem.rs`, used by
+`annular_l5_diagnostic` for every `kt_derived_fd_vm` reading in this whole investigation) are
+the SAME plate-scaled formula with the same `RING_ANCHOR_SAFETY_FACTOR=4.0` - re-deriving L5's
+own `FEM_KT=2.460638516` from the tool at L5's default geometry reproduces it exactly
+(`probe_fd_kt_vm=2.46063851616289`), confirming this is the correct field to read for a
+like-for-like comparison, not a different convention that would need reconciling.
+
+**Real result** (`issue_77_quasi_infinite_plate_l5_trace`, identical network/training
+hyperparameters and checkpoints to every PH4-28..32 comparison - only geometry changed):
+
+| step | Kt |
+|---|---|
+| 0 | 0.462* |
+| 300 | 0.357 |
+| 1500 | 1.160 |
+| 2999 | **1.116** |
+
+*step 0 is untrained-network init noise, not physically meaningful (same caveat as every prior
+comparison in this investigation).
+
+Relative error against the CORRECT geometry-specific FEM target: `(2.0739-1.116)/2.0739 =
+46.18%`, versus L5's own baseline relative error `(2.4606-1.231)/2.4606 = 49.97%`. A ~3.8
+percentage point reduction - real, but small, and well within the noise band this investigation
+has already characterized on every other axis (PH4-29's interface-weight A/B moved by a similar
+margin with an explicitly "no effect" verdict).
+
+**Interesting secondary finding, worth noting but not the main conclusion**: the quasi-infinite
+geometry's own correct FEM target (2.074) is LOWER than L5's own FEM target (2.461), despite
+having a smaller (more idealized) hole/plate ratio that would naively suggest a Kt closer to
+3.0. This is explained by the plate-scaled probe-ring formula above: a bigger plate at the same
+`fd_h` pushes the probe ring proportionally further (in units of hole radii) from the hole
+boundary for a smaller hole, and Kirsch's hoop stress decays with distance from the hole - so
+part of what "quasi-infinite" bought in finite-width relief, this fixed relative-margin
+convention partially gave back by reading the stress field further from the true concentration.
+This is a real, disclosed property of the comparison methodology, not a bug - both the FEM tool
+and the PINN diagnostic apply it identically (confirmed above), so it doesn't invalidate the
+comparison, but it does mean "closer to the ideal infinite-plate regime" and "closer to the
+naive Kt=3.0 number" are not the same statement once this probe convention is held fixed.
+
+**Conclusion: finite-domain/finite-width effects are NOT the dominant remaining cause of the Kt
+gap.** Halving the hole/plate ratio (a real, physically meaningful step toward the idealized
+regime the proposed diagnosis targeted) produced only a ~4-point relative-error improvement,
+not the large closure a genuine finite-width-artifact explanation would predict. Combined with
+every other ruled-out axis in this investigation (collocation margin, sampling variance,
+LR/training dynamics, interface-continuity weight, strong-form residual, spectral-bias/Fourier
+features at two frequency counts, and now finite-domain scale), the remaining ~46-50% gap keeps
+resisting every mechanism this session has tested with real evidence - narrowing the search
+further rather than being explained away. Per the standing instruction, this does not close
+issue #77 (or #74/#76).
+
+Full workspace regression: 0 changed production files in this step (new geometry + two new
+tests only) - full suite run alongside this test, 0 failures.
+
+Does not close issue #77 (or #74/#76).
