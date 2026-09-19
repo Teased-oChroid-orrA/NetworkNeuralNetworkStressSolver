@@ -2110,4 +2110,40 @@ better Kt, or whether 2.121 was a favorable draw from a wide, backend-driven var
 that can also land at 0.73, is now genuinely open and must not be presented as settled in
 either direction until a repeat lands. Launching that repeat now.
 
+## PH4-35 reproducibility: the repeat run confirms high variance - 2.121 was likely a
+## favorable outlier, not the typical outcome
+
+Repeated `issue_77_annulus_hard_constraint_l5_trace` exactly (same test, same config, same
+seed - a genuinely independent process invocation, not a code change). Result: `Kt = 1.032`
+at step 2999 (trajectory `0.255 -> 0.352 -> 1.786 -> 1.032`).
+
+Three real, independent samples now exist at (or immediately adjacent to) step ~3000 under
+this identical nominal config:
+
+| sample | Kt at ~step 3000 | relative error vs FEM (2.460638516) |
+|---|---|---|
+| original run (PH4-35's headline result) | 2.121 | 13.80% |
+| repeat 1 (this entry) | 1.032 | 58.06% |
+| extended run's own step-3000 checkpoint | 1.065 | 56.72% |
+| *(baseline, soft `hole_free`, for reference)* | *1.231* | *49.97%* |
+
+Mean of the three: `Kt=1.406`, mean error `~42.9%` - nominally better than the soft-`hole_free`
+baseline's 49.97% on average, but **two of the three samples are individually WORSE than
+baseline**, and the spread (13.8% to 58.1% relative error) is enormous for a supposedly
+identical configuration. This is not the profile of a reliable improvement with normal
+run-to-run noise - it is the profile of a HIGH-VARIANCE outcome where the original headline
+result was very likely a favorable draw, not the representative behavior.
+
+**Revised honest assessment**: the hard-constraint mechanism itself remains real and correctly
+implemented (verified independently of any training run - the sympy-derived closed form, the
+FD-based traction-free confirmation, and the gradient-share redirection are all mathematical/
+structural facts, not run-dependent). What is NOT established is that this mechanism reliably
+improves Kt over the soft-`hole_free` baseline - the real evidence so far is equivocal-to-
+negative on that specific question, dominated by variance whose root cause (suspected Wgpu
+backend non-determinism, not yet independently confirmed) is itself unresolved. PH4-35's
+original framing ("real breakthrough") is retracted as a characterization of the typical
+outcome; it was accurate only for describing that one specific, favorable sample. Running
+further repeats to build a firmer sample before drawing a final conclusion - do not treat n=3
+as sufficient either.
+
 Does not close issue #77 (or #74/#76).
