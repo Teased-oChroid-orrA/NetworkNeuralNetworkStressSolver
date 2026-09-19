@@ -1895,8 +1895,44 @@ defaulted to `100.0` at every existing call site) and a new
 `run_annular_decomposition_training_with_diagnostics_and_hole_free_weight` entry point. 1 new
 gate test proves the override changes ONLY `hole_free`'s own base weight.
 
-**Real result pending** - `issue_77_hole_free_weight_reduced_l5_trace` (10x reduction, `100.0
--> 10.0`) launched as a real, controlled A/B against the same baseline config/checkpoints;
-result to be appended here once the run completes.
+**Real result** (`issue_77_hole_free_weight_reduced_l5_trace`, 10x reduction `100.0 -> 10.0`,
+identical config/seed/checkpoints to every prior comparison):
+
+| step | baseline Kt (weight=100) | reduced-weight Kt (weight=10) |
+|---|---|---|
+| 0 | 0.255 | 0.255 (identical seed, pre-training) |
+| 300 | 0.348 | 0.284 |
+| 1500 | 1.220 | 1.187 |
+| 2999 | 1.231 | **0.975** |
+
+**Worse than baseline, and the gradient-share mechanism did NOT work as hypothesized.** At
+step 2999, `hole_free`'s `effective_weight` was `9.60` - confirming SAW-BRDR did NOT
+compensate the reduced base weight back up (no "SAW cancels the intervention" escape hatch) -
+yet its `gradient_share` was **82.4%**, actually HIGHER than the `100.0`-weight baseline's
+78.4% at the same checkpoint. This means gradient share is driven by an INTRINSIC gradient-
+magnitude disparity between `hole_free` (a boundary-only term over 64 points, evaluated
+pointwise) and the domain-integrated energy terms (`physical_potential`/`annulus_potential`,
+averaged over thousands of interior points) that a 10x weight change does not meaningfully
+close - `hole_free`'s raw per-point gradient must simply be far larger in magnitude than the
+energy terms' own, so even a much smaller weight still produces a comparably large or larger
+weighted gradient once SAW-BRDR's own per-term normalization is applied.
+
+**Conclusion: the `hole_free_weight` reduction is REJECTED** - it did not free meaningful
+gradient budget for the physics terms (gradient share moved the WRONG direction), and the
+trained-endpoint Kt got worse, not better. This is still a genuinely informative negative
+result, distinct from every prior "no effect" finding in this investigation (PH4-29's
+interface-weight test, for comparison, showed no significant movement either direction): here
+the intervention measurably moved something (gradient share went UP, not down) while the
+outcome (Kt) got worse - evidence that naively rebalancing a nominal loss weight cannot fix a
+gradient-magnitude imbalance that is structural to how the boundary term and the domain-
+integrated terms are formulated (pointwise MSE over a fixed point count vs. a mean over a
+resampled interior point cloud), not a simple SAW-BRDR tuning problem. A real fix for this
+specific imbalance, if one exists, would need to change how `hole_free`'s gradient magnitude
+itself is normalized relative to the domain-integrated terms (e.g., an explicit gradient-norm
+rescale rather than a scalar loss weight) - not attempted here; flagged as a possible, more
+invasive follow-up rather than assumed to work.
+
+Full workspace regression: 506 passed, 0 failed, 44 ignored - zero regressions (suite run
+alongside PH4-34a, confirmed before this commit).
 
 Does not close issue #77 (or #74/#76).
