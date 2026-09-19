@@ -1672,3 +1672,54 @@ mechanism, a real sweep (e.g. `n_fourier=8` or higher) is the next honest step, 
 Full workspace regression: 502 passed, 0 failed, 41 ignored - zero regressions.
 
 Does not close issue #77 (or #74/#76).
+
+## PH4-32 — Fourier sweep at n_fourier=8: real result is WORSE, not flat. Spectral-bias-via-
+## input-features hypothesis is now rejected, not just unsupported.
+
+PH4-31 left one honest gap open: `n_fourier=4` was flat, but a modest frequency count could
+mean under-powered features rather than a wrong hypothesis. Ran the same controlled comparison
+(`issue_77_annulus_fourier_n8_l5_trace`, `n_fourier=8`, max dyadic frequency `128*pi` vs `8*pi`
+at n=4, identical geometry/material/load/network/seed/checkpoints to every prior PH4-28..31
+comparison) to settle it.
+
+**Real result**:
+
+| step | baseline Kt (no Fourier) | n_fourier=4 | n_fourier=8 |
+|---|---|---|---|
+| 0 | 0.255 | 1.276* | 4.781* |
+| 300 | 0.348 | 1.063 | 0.720 |
+| 1500 | 1.220 | 1.311 | 0.679 |
+| 2999 | 1.231 | 1.238 | **0.587** |
+
+*Step 0 is init noise, not physically meaningful (PH4-31's own caveat, more pronounced here -
+more frequencies means more high-frequency content in an untrained network's random output).
+
+Step-0 loss confirms the same pattern from the other side: `2207` at n=8 vs `79.8` at n=4 vs
+`28.7` baseline - adding frequency content made the initial residual landscape dramatically
+worse, not just noisier. Training loss at n=8 is also visibly non-monotonic step-to-step
+(1.51 -> 1.60 -> 1.09 -> 1.07 -> 1.15 -> 1.03, `l5_fourier_n8_run.log`) where n=4 and baseline
+both settle smoothly - consistent with a harder, not easier, optimization landscape.
+
+**This is a real trend, not noise**: Kt at the trained endpoint moves monotonically WORSE as
+`n_fourier` increases (1.231 -> 1.238 -> 0.587 for 0/4/8). If spectral bias via under-powered
+input frequencies were the real bottleneck, more frequency content should move Kt toward the
+FEM target (2.4606), not away from the pure-affine floor (1.0) and below it. Instead, doubling
+the frequency range roughly halved the final Kt. The most likely mechanism: the added
+high-frequency basis functions expand the annulus network's effective input dimensionality
+(10 -> 26 -> 42) and raster a much rougher loss surface, which a fixed-budget 3000-step AdamW
+run does not have time to optimize through - an optimization-difficulty cost, not a
+representation win.
+
+**Conclusion**: the multi-scale Fourier feature approach (as implemented - hole-relative dyadic
+frequencies, opt-in to the annulus domain only) is now REJECTED as a fix for issue #77's Kt
+gap, based on two real controlled data points showing a monotonic worsening trend, not just an
+absence of improvement. This closes out the spectral-bias-via-input-encoding hypothesis
+specifically; it does not rule out spectral bias as a phenomenon in this network (a
+SIREN-style sinusoidal-activation rewrite is a structurally different, network-wide change from
+adding input features, and remains an untested, higher-risk Tier-2 idea per PH4-31's own
+scope note - not run here).
+
+Full workspace regression: unaffected (no production code changed in this step - same
+production code as PH4-31, only a new `#[ignore]`d comparison test with a different constant).
+
+Does not close issue #77 (or #74/#76).

@@ -3698,6 +3698,48 @@ mod tests {
         }
     }
 
+    /// Issue #77 PH4-31 follow-up: `n_fourier=4`'s real result was flat (Kt=1.238 vs
+    /// baseline 1.231 - statistically indistinguishable), but PH4-31's own writeup flagged
+    /// this as inconclusive on spectral bias generally, since `n_fourier=4` (max frequency
+    /// `8*pi`) is a modest range - an under-powered frequency range would look identical to a
+    /// genuinely absent effect. This doubles the range to `n_fourier=8` (max frequency
+    /// `128*pi`) as the real sweep point needed before ruling spectral bias out, identical
+    /// config/seed/checkpoints to every prior comparison in this investigation.
+    #[test]
+    #[ignore]
+    fn issue_77_annulus_fourier_n8_l5_trace() {
+        const N_FOURIER: usize = 8;
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_annulus_fourier(
+            spec, device, &checkpoints, N_FOURIER, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 fourier-n8] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-fourier-n8-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 fourier-n8] wrote {}", path.display());
+        for diagnostic in diagnostics {
+            println!("[#77 fourier-n8] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+    }
+
     /// Issue #77 investigation follow-up: `issue_77_l5_annular_diagnostic_trace`'s real run
     /// (3000 steps) showed loss AND Kt both still moving at the final checkpoint (Kt
     /// 0.255->0.344->1.141->1.338 at steps 0/300/1500/2999, decelerating but not plateaued) -
