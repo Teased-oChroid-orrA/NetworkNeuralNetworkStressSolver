@@ -908,11 +908,22 @@ pub fn fwd_embedded<Bk: Backend>(
     fwd_embedded_masked(model, input, embedding, device, None)
 }
 
+/// Issue #77 spectral-bias fix: when `n_fourier > 0`, appends `4*n_fourier` multi-scale
+/// Fourier feature columns — `sin(qx*2^l*pi), cos(qx*2^l*pi), sin(qy*2^l*pi), cos(qy*2^l*pi)`
+/// for each frequency band `l in 0..n_fourier` — to the existing 10-column chart embedding,
+/// applied to the HOLE-RELATIVE `(qx,qy)` (not raw x,y): encoding frequency content tuned to
+/// the hole's own radius (`qx,qy ~ O(1)` near the boundary, by the same `inv_radius` scaling
+/// the rest of this function already uses) avoids needing very high absolute frequencies to
+/// resolve a small hole inside a large plate. Same dyadic-scale convention `fourier_embed`
+/// already uses elsewhere in this file, just applied to a hole-relative coordinate instead of
+/// a plate-relative one. `n_fourier=0` is byte-identical to the pre-#77-spectral-bias-fix
+/// 10-column embedding — this is purely additive.
 fn chart_embed<Bk: Backend>(
     input: Tensor<Bk, 2>,
     center_norm: [f32; 2],
     inv_radius: [f32; 2],
     epsilon: f32,
+    n_fourier: usize,
 ) -> Tensor<Bk, 2> {
     let n = input.dims()[0];
     let x = input.clone().slice([0..n, 0..1]);
@@ -924,11 +935,21 @@ fn chart_embed<Bk: Backend>(
     let r = safe_r2.clone().sqrt();
     let log_r = r.clone().log();
     let c2 = (qx.clone().powf_scalar(2.0) - qy.clone().powf_scalar(2.0)) / safe_r2.clone();
-    let s2 = qx.mul(qy).mul_scalar(2.0) / safe_r2;
+    let s2 = qx.clone().mul(qy.clone()).mul_scalar(2.0) / safe_r2;
     // `r` already has only the zero-protection floor. 1/r is smooth through the physical
     // interface r=1 and decays in the far field; no boundary clamp introduces an FD kink.
     let psi = r.clone().recip();
-    Tensor::cat(vec![input, r, log_r, c2.clone(), s2.clone(), psi.clone(), psi.clone() * c2, psi * s2], 1)
+    let mut cols = vec![input, r, log_r, c2.clone(), s2.clone(), psi.clone(), psi.clone() * c2, psi * s2];
+    for l in 0..n_fourier {
+        let scale = 2.0_f64.powi(l as i32) * std::f64::consts::PI;
+        let qxs = qx.clone().mul_scalar(scale);
+        let qys = qy.clone().mul_scalar(scale);
+        cols.push(qxs.clone().sin());
+        cols.push(qxs.cos());
+        cols.push(qys.clone().sin());
+        cols.push(qys.cos());
+    }
+    Tensor::cat(cols, 1)
 }
 
 pub fn fwd_embedded_masked<Bk: Backend>(
@@ -942,8 +963,8 @@ pub fn fwd_embedded_masked<Bk: Backend>(
     let coords = input.clone().slice([0..n, 0..3]);
     let embedded = match embedding {
         CoordinateEmbedding::Raw => input,
-        CoordinateEmbedding::SingleHoleChart { center_norm, inv_radius, epsilon } =>
-            chart_embed(input, center_norm, inv_radius, epsilon),
+        CoordinateEmbedding::SingleHoleChart { center_norm, inv_radius, epsilon, n_fourier } =>
+            chart_embed(input, center_norm, inv_radius, epsilon, n_fourier),
     };
     model.forward_with_coordinates_masked(embedded, coords, mask)
 }
@@ -985,7 +1006,7 @@ mod tests {
         let input = Tensor::<BInner, 2>::from_data(
             TensorData::new(vec![0.30, -0.25, 0.0], vec![1, 3]), &device,
         );
-        let values: Vec<f32> = chart_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4)
+        let values: Vec<f32> = chart_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4, 0)
             .into_data().to_vec().unwrap();
         assert_eq!(&values[..3], &[0.30, -0.25, 0.0]);
         assert!((values[3] - 1.0).abs() < 1e-5, "r={}", values[3]);
@@ -1004,7 +1025,7 @@ mod tests {
         let input = Tensor::<BInner, 2>::from_data(
             TensorData::new(vec![0.25, -0.25, 0.0], vec![1, 3]), &device,
         );
-        let values: Vec<f32> = chart_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4)
+        let values: Vec<f32> = chart_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4, 0)
             .into_data().to_vec().unwrap();
         assert!(values.iter().all(|value| value.is_finite()), "{values:?}");
         assert_eq!(values[5], 0.0);
@@ -1023,12 +1044,97 @@ mod tests {
             vec![0.30 - h / 20.0, -0.25, 0.0, 0.30, -0.25, 0.0, 0.30 + h / 20.0, -0.25, 0.0],
             vec![3, 3],
         ), &device);
-        let v: Vec<f32> = chart_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4)
+        let v: Vec<f32> = chart_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4, 0)
             .into_data().to_vec().unwrap();
         let r = |row: usize| v[row * 10 + 3];
         let psi = |row: usize| v[row * 10 + 7];
         assert!(((r(2) - r(0)) / (2.0 * h) - 1.0).abs() < 2e-3);
         assert!(((psi(2) - psi(0)) / (2.0 * h) + 1.0).abs() < 2e-3);
+    }
+
+    // ─── Issue #77 spectral-bias fix: multi-scale Fourier feature columns ────────────────
+
+    /// `n_fourier=0` must be byte-identical to the pre-#77-spectral-bias-fix 10-column
+    /// embedding - the exact same assertions as `chart_embed_preserves_raw_coordinates_and_
+    /// encodes_known_boundary_point`, just proving the NEW parameter's default doesn't change
+    /// anything (the existing test above already covers this implicitly by passing 0; this
+    /// test makes the "must add exactly zero columns" property explicit and named for it).
+    #[test]
+    fn chart_embed_n_fourier_zero_adds_no_columns() {
+        use crate::training_core::{BDevice, BInner};
+        let device = BDevice::default();
+        let input = Tensor::<BInner, 2>::from_data(
+            TensorData::new(vec![0.30, -0.25, 0.0], vec![1, 3]), &device,
+        );
+        let dims = chart_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4, 0).dims();
+        assert_eq!(dims, [1, 10], "n_fourier=0 must produce exactly the original 10 columns");
+    }
+
+    /// Dimension count for a real, nonzero frequency-band count: `10 + 4*n_fourier`, matching
+    /// `CoordinateEmbedding::input_dim()`'s own formula exactly (the two must agree, or model
+    /// construction and the real embedding width silently diverge at the forward pass).
+    #[test]
+    fn chart_embed_dimension_matches_coordinate_embedding_input_dim_formula() {
+        use crate::training_core::{BDevice, BInner};
+        let device = BDevice::default();
+        for n_fourier in [1usize, 4, 8] {
+            let input = Tensor::<BInner, 2>::from_data(
+                TensorData::new(vec![0.30, -0.25, 0.0], vec![1, 3]), &device,
+            );
+            let dims = chart_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4, n_fourier).dims();
+            let expected = pinn_core::user_geometry::CoordinateEmbedding::SingleHoleChart {
+                center_norm: [0.25, -0.25], inv_radius: [20.0, 10.0], epsilon: 1e-4, n_fourier,
+            }.input_dim();
+            assert_eq!(dims, [1, expected], "n_fourier={n_fourier}");
+        }
+    }
+
+    /// Known-value check at the same boundary point the base-embedding test already uses
+    /// (`qx=1.0, qy=0.0` there): at frequency band `l=0` (`scale=pi`), `sin(qx*pi)=sin(pi)≈0`,
+    /// `cos(qx*pi)=cos(pi)=-1`, `sin(qy*pi)=sin(0)=0`, `cos(qy*pi)=cos(0)=1` - a real,
+    /// hand-computed value, not just a shape check.
+    #[test]
+    fn chart_embed_fourier_columns_match_hand_computed_value_at_known_point() {
+        use crate::training_core::{BDevice, BInner};
+        let device = BDevice::default();
+        let input = Tensor::<BInner, 2>::from_data(
+            TensorData::new(vec![0.30, -0.25, 0.0], vec![1, 3]), &device,
+        );
+        let values: Vec<f32> = chart_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4, 1)
+            .into_data().to_vec().unwrap();
+        assert_eq!(values.len(), 14, "10 base + 4 for one frequency band");
+        assert!(values[10].abs() < 1e-5, "sin(qx*pi)={}", values[10]);
+        assert!((values[11] - (-1.0)).abs() < 1e-5, "cos(qx*pi)={}", values[11]);
+        assert!(values[12].abs() < 1e-5, "sin(qy*pi)={}", values[12]);
+        assert!((values[13] - 1.0).abs() < 1e-5, "cos(qy*pi)={}", values[13]);
+    }
+
+    /// FD-continuity for the new Fourier columns, same style/tolerance as the existing
+    /// `chart_embed_is_fd_continuous_across_hole_boundary` test - sin/cos of a smooth
+    /// (hole-relative-coordinate-linear) argument are themselves smooth everywhere, so this
+    /// should hold with the same margin the base embedding's own r/psi columns already meet.
+    #[test]
+    fn chart_embed_fourier_columns_are_fd_continuous_across_hole_boundary() {
+        use crate::training_core::{BDevice, BInner};
+        let device = BDevice::default();
+        let h = 1e-4_f32;
+        let input = Tensor::<BInner, 2>::from_data(TensorData::new(
+            vec![0.30 - h / 20.0, -0.25, 0.0, 0.30, -0.25, 0.0, 0.30 + h / 20.0, -0.25, 0.0],
+            vec![3, 3],
+        ), &device);
+        let v: Vec<f32> = chart_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4, 1)
+            .into_data().to_vec().unwrap();
+        // Matches the existing base-embedding FD test's own convention exactly: the input rows
+        // differ by `h/20.0` in x, which is a step of exactly `h` in qx (since qx=(x-0.25)*20)
+        // - so this FD estimates d/d(qx), not d/dx. At qx=1 (this boundary point), d/dqx
+        // [sin(qx*pi)] = pi*cos(qx*pi) = pi*cos(pi) = -pi - a real, nonzero, hand-computed
+        // value (column 11, cos(qx*pi), has a stationary point here instead - d/dqx
+        // [cos(qx*pi)] = -pi*sin(pi) = 0 - so column 10 is the one worth checking).
+        let sin_qx_pi = |row: usize| v[row * 14 + 10];
+        let fd_deriv = (sin_qx_pi(2) - sin_qx_pi(0)) / (2.0 * h);
+        let expected = -std::f32::consts::PI;
+        assert!((fd_deriv - expected).abs() / expected.abs() < 2e-3,
+            "fd_deriv={fd_deriv} expected={expected}");
     }
 
     /// Issue #62 PH3-11: real, verified evidence that `Backend::seed` immediately before

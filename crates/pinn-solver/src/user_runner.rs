@@ -125,13 +125,20 @@ fn run_annular_decomposition_training_inner(
     diagnostics: &mut Vec<AnnularL5Diagnostic>,
     interface_weight: f32,
     include_annulus_equilibrium: bool,
+    annulus_n_fourier: usize,
 ) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
     let problem = AnnularDecompositionProblem::new_experimental(spec.clone(), interface_weight, include_annulus_equilibrium);
     crate::problem::validate_loss_terms(&problem);
+    // Issue #77 spectral-bias fix (PH4-31): `annulus_n_fourier=0` (every existing caller)
+    // gives the exact pre-existing `spec.geometry.coordinate_embedding()` value - this is
+    // purely additive. Computed once and reused for both the annulus model's own input width
+    // AND the per-step ctx's embedding (they must always agree, or the forward pass panics on
+    // a width mismatch inside `compute_domain_forwards`).
+    let annulus_embedding = spec.geometry.coordinate_embedding_with_fourier(annulus_n_fourier);
     let mut config = SolverConfig::default_kirsch();
     config.load = spec.load;
     let chart_cfg = ElasticityNetConfig::new()
-        .with_input_dim(spec.geometry.coordinate_embedding().input_dim())
+        .with_input_dim(annulus_embedding.input_dim())
         .with_hidden_dim(spec.network.hidden_dim)
         .with_n_hidden(spec.network.n_hidden)
         .with_output_dim(5);
@@ -184,7 +191,7 @@ fn run_annular_decomposition_training_inner(
             &config, &problem, &fd, &hole_fd,
             &annulus_data, &outer_data,
             scales.u_ref, scales.ref_energy, scales.ref_stress2, spec.geometry.n_fourier(),
-            spec.geometry.coordinate_embedding(), diagnostic_steps.contains(&step), step,
+            annulus_embedding, diagnostic_steps.contains(&step), step,
         );
         // One-step lag: this step's own per-term losses aren't known until `step_physics_multi`
         // runs below, so (like every LR schedule) this reacts to the LAST observed reading.
@@ -227,7 +234,7 @@ pub fn run_annular_decomposition_training(
     device: BDevice,
     on_step: impl FnMut(usize, f32, f64, usize) -> bool,
 ) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
-    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new(), 100.0, false)
+    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new(), 100.0, false, 0)
 }
 
 /// Same production runner with opt-in, deterministic diagnostic checkpoints. No output file is
@@ -246,7 +253,7 @@ pub fn run_annular_decomposition_training_with_diagnostics(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -270,7 +277,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_interface_weight(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, interface_weight, false,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, interface_weight, false, 0,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -296,7 +303,34 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_annulus_equilibri
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, include_annulus_equilibrium,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, include_annulus_equilibrium, 0,
+    );
+    (annulus, outer, loss, diagnostics)
+}
+
+/// Issue #77 spectral-bias fix (PH4-31): same as
+/// [`run_annular_decomposition_training_with_diagnostics`], but with `annulus_n_fourier`
+/// exposed to test whether multi-scale Fourier features on the annulus domain's hole-relative
+/// coordinates close (or narrow) the Kt gap - the working hypothesis after six other tested
+/// mechanisms (representation, collocation margin, sampling variance, training-dynamics/LR,
+/// interface-continuity weight, a strong-form residual) were each fixed or ruled out without
+/// closing it. See `CoordinateEmbedding::SingleHoleChart::n_fourier`'s own doc comment. Not
+/// used by any production entry point.
+pub fn run_annular_decomposition_training_with_diagnostics_and_annulus_fourier(
+    spec: ProblemSpec,
+    device: BDevice,
+    diagnostic_steps: &[usize],
+    annulus_n_fourier: usize,
+    on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+) -> (
+    crate::network::ElasticityNet<B>,
+    crate::network::ElasticityNet<B>,
+    f32,
+    Vec<AnnularL5Diagnostic>,
+) {
+    let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
+    let (annulus, outer, loss) = run_annular_decomposition_training_inner(
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, annulus_n_fourier,
     );
     (annulus, outer, loss, diagnostics)
 }

@@ -2815,6 +2815,38 @@ pub fn probe_hole_boundary_profile(
     )
 }
 
+/// Issue #77 PH4-31 fix: derives the `CoordinateEmbedding` that actually matches `model`'s
+/// own saved input width, rather than assuming `geometry.coordinate_embedding()` (which is
+/// always the plain, `n_fourier=0` embedding). Mirrors `training_core::compute_domain_
+/// forwards`'s identical "the model's saved architecture is authoritative" dispatch, needed
+/// here because the model this is called on (the annulus model, at diagnostic checkpoints)
+/// may have been built with a Fourier-augmented embedding the caller doesn't otherwise pass
+/// in. A real bug this fixed: `issue_77_annulus_fourier_l5_trace`'s first run panicked with
+/// `IncompatibleShapes { left: [720, 10], right: [26, 64] }` - the probe was embedding at the
+/// plain 10-column width while the model's first layer expected 26 (`10 + 4*4` for
+/// `n_fourier=4`).
+fn embedding_for_model(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    geometry: &UserGeometry,
+) -> pinn_core::user_geometry::CoordinateEmbedding {
+    use pinn_core::user_geometry::CoordinateEmbedding;
+    let dim = model.input_dim();
+    if dim == 3 {
+        return CoordinateEmbedding::Raw;
+    }
+    let plain = geometry.coordinate_embedding();
+    if dim == plain.input_dim() {
+        return plain;
+    }
+    if dim > 10 && (dim - 10) % 4 == 0 {
+        let with_fourier = geometry.coordinate_embedding_with_fourier((dim - 10) / 4);
+        if dim == with_fourier.input_dim() {
+            return with_fourier;
+        }
+    }
+    panic!("embedding_for_model: model input_dim {dim} matches no known embedding for this geometry");
+}
+
 /// Direct mDEM stress at an FD-safe radial offset. Kept separate from the exact-boundary
 /// probe so diagnostics can compare direct and derived stress at identical coordinates.
 pub fn probe_hole_stress_profile_direct_at_radius(
@@ -2851,7 +2883,7 @@ pub fn probe_hole_stress_profile_direct_at_radius(
 
     let pts_t = norm_pts_to_tensor::<BInner>(&pts_norm, device);
     let stencil = assemble_stencil::<BInner>(&pts_t, fd, device);
-    let raw_stencil = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device); // [5n, 5]: u,v,sxx,syy,sxy
+    let raw_stencil = fwd_embedded::<BInner>(model, stencil, embedding_for_model(model, geometry), device); // [5n, 5]: u,v,sxx,syy,sxy
 
     // Physical-scale FIRST (same convention as `compute_domain_forwards`/`evaluate_user_
     // vis_grid`), so the FD-derived strain below is directly the physical strain - no extra
@@ -2978,7 +3010,7 @@ pub fn probe_hole_boundary_profile_derived(
 
     let pts_t = norm_pts_to_tensor::<BInner>(&pts_norm, device);
     let stencil = assemble_stencil::<BInner>(&pts_t, fd, device);
-    let raw_stencil = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device);
+    let raw_stencil = fwd_embedded::<BInner>(model, stencil, embedding_for_model(model, geometry), device);
 
     let m = 5 * n;
     let scaled = Tensor::cat(vec![
@@ -3412,6 +3444,63 @@ mod tests {
         assert_eq!(outer.input_dim(), 3);
     }
 
+    /// Issue #77 spectral-bias fix (PH4-31): the annulus model's real, constructed
+    /// `input_dim()` must reflect `annulus_n_fourier` (`10 + 4*n_fourier`), and the outer
+    /// model must be COMPLETELY unaffected (stays raw 3-input) - a real, tiny end-to-end
+    /// smoke run, not just a static dimension-formula check, so it also proves the forward
+    /// pass doesn't panic on a width mismatch between the constructed model and
+    /// `MultiStepCtx.coordinate_embedding` (see `run_annular_decomposition_training_inner`'s
+    /// own comment on why those two must always agree).
+    #[test]
+    fn annulus_fourier_embedding_changes_only_the_annulus_models_input_dim() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(), material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 12, n_hidden: 2, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 2, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        // `diagnostic_steps=&[0]` (NOT `&[]`) is load-bearing: it's the diagnostic ledger path
+        // (`annular_l5_diagnostic` -> `probe_hole_boundary_profile_derived`/`probe_hole_stress_
+        // diagnostic`) that actually exercises the annulus model's Fourier-augmented forward
+        // pass outside the main training step - the real bug this test caught
+        // (`IncompatibleShapes { left: [720, 10], right: [26, 64] }`) only fired on a
+        // diagnostic checkpoint step, so a smoke test with no checkpoints at all would have
+        // passed right past it.
+        let (annulus, outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_annulus_fourier(
+            spec, device, &[0], 4, |_step, _loss, _lr, _points| false,
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), 1, "diagnostic checkpoint must actually fire and succeed");
+        assert!(diagnostics[0].kt_derived_fd_vm.is_finite());
+        assert_eq!(annulus.input_dim(), 10 + 4 * 4, "annulus model must use the Fourier-augmented width");
+        assert_eq!(outer.input_dim(), 3, "outer model must be completely unaffected");
+    }
+
+    /// `embedding_for_model` unit test (issue #77 PH4-31's own bugfix): must correctly derive
+    /// Raw / plain-chart / Fourier-augmented-chart from a model's saved `input_dim()` alone,
+    /// for every width this codebase actually produces.
+    #[test]
+    fn embedding_for_model_derives_correct_embedding_from_saved_input_width() {
+        let no_hole_geom = UserGeometry { half_w: 0.10, half_h: 0.10, thickness: 0.005, holes: vec![] };
+        let raw_model = tiny_model(&no_hole_geom);
+        assert_eq!(embedding_for_model(&raw_model, &no_hole_geom), pinn_core::user_geometry::CoordinateEmbedding::Raw);
+
+        let hole_geom = l5_geometry();
+        let plain_chart_model = tiny_model(&hole_geom);
+        assert_eq!(embedding_for_model(&plain_chart_model, &hole_geom), hole_geom.coordinate_embedding());
+
+        let fourier_cfg = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(hole_geom.coordinate_embedding_with_fourier(4).input_dim())
+            .with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
+        let fourier_model = fourier_cfg.init(&crate::training_core::BDevice::default());
+        assert_eq!(embedding_for_model(&fourier_model, &hole_geom), hole_geom.coordinate_embedding_with_fourier(4));
+    }
+
     #[test]
     fn annular_l5_diagnostics_preserve_both_energy_halves_and_write_json() {
         let spec = ProblemSpec {
@@ -3561,6 +3650,49 @@ mod tests {
         println!("[#77 equilibrium] wrote {}", path.display());
         for diagnostic in diagnostics {
             println!("[#77 equilibrium] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+    }
+
+    /// Issue #77 PH4-31 spectral-bias hypothesis: controlled A/B against the same baseline
+    /// config (identical geometry/material/load/network/training/checkpoints/seed as every
+    /// PH4-28/29/30 comparison) - ONLY `annulus_n_fourier=4` differs (16 extra hole-relative
+    /// Fourier features on the annulus domain's own embedding). Tests whether the network's
+    /// spectral bias (a well-established property of standard MLPs: fast at learning smooth,
+    /// low-frequency structure, slow/unable to represent sharp local features even with
+    /// correct, present gradient signal - exactly what six other ruled-out/fixed mechanisms
+    /// this session pointed at) is the actual remaining bottleneck.
+    #[test]
+    #[ignore]
+    fn issue_77_annulus_fourier_l5_trace() {
+        const N_FOURIER: usize = 4;
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_annulus_fourier(
+            spec, device, &checkpoints, N_FOURIER, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 fourier] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-fourier-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 fourier] wrote {}", path.display());
+        for diagnostic in diagnostics {
+            println!("[#77 fourier] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
                 diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
                 diagnostic.direct_derived_mismatch_rms);
         }

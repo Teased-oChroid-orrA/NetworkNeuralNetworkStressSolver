@@ -1594,3 +1594,81 @@ decision to accept the current state and redirect effort - a strategy decision f
 owner, not something to keep probing autonomously.
 
 Does not close issue #77 (or #74/#76).
+
+## PH4-31 — Spectral-bias hypothesis tested via multi-scale Fourier features: real result is
+## flat, not a breakthrough. A user-proposed conformal-mapping rewrite was evaluated and
+## rejected before this was implemented (its diagnosis was contradicted by PH4-29's own evidence)
+
+A conformal-mapping / single-domain boundary-fitted-coordinate rewrite was proposed, diagnosing
+"annular decomposition's artificial interfaces dilute the gradient near the hole." Evaluated
+and rejected before any implementation: (1) its physical premise ("stress spikes exponentially
+near the hole") is factually wrong - the Kirsch hoop stress decays smoothly and algebraically
+(3.0 -> 2.53 -> 1.52 -> 1.07 from r/a=1 to r/a=3, verified this session); (2) its root cause is
+directly contradicted by PH4-29's own real A/B test (cutting the interface weight 10x, the
+literal test of "are interfaces damping the signal," produced no effect); (3) its one reusable
+idea (richer hole-local coordinate features) is a more elaborate version of something this
+codebase already tried (`SingleHoleChart` rational features, #77's original attempts) with a
+documented negative result. The pattern actually in the data - Kt resisting every push on
+sampling, weighting, schedule, and even an added local residual term, while sitting just above
+the pure-affine floor - matches **spectral bias**, a well-established property of MLPs
+(Rahaman et al. 2019; Tancik et al. 2020 for coordinate networks; Wang/Teng/Perdikaris for
+PINNs): fast at learning smooth structure, slow/unable to represent sharp local features even
+with correct, healthy gradient signal. This was tested directly via a **multi-scale Fourier
+feature embedding** - additive, low-risk, reusing this codebase's own dormant `fourier_embed`
+machinery - rather than the proposed rewrite, which would have discarded five already-validated
+pieces (kinematic decomposition, the corrected hole term, annular decomposition, per-domain LR,
+the FEM reference itself) to chase an evidence-contradicted diagnosis.
+
+**Implementation**: `CoordinateEmbedding::SingleHoleChart` gained `n_fourier: usize` (default
+`0`, byte-identical to every existing caller - verified by a dedicated test before anything
+else). `network::chart_embed` appends `4*n_fourier` columns - `sin`/`cos` of the HOLE-RELATIVE
+`(qx,qy)` (not raw x,y - encoding frequency content at the hole's own scale, standard guidance
+in the Fourier-features literature) at dyadic frequencies `2^l*pi`, same convention
+`fourier_embed` already used elsewhere in this file. Wired opt-in to the annulus domain only
+(`AnnularDecompositionProblem`/`run_annular_decomposition_training_with_diagnostics_and_
+annulus_fourier`), mirroring the exact `interface_weight`/`include_annulus_equilibrium`
+precedent - zero blast radius on every existing caller. 8 new tests (dimension formula,
+known-value, FD-continuity, byte-identical-at-zero, end-to-end wiring smoke test).
+
+**A real bug surfaced and was fixed during this step, not just the hypothesis test**: the
+first real run panicked with `IncompatibleShapes { left: [720, 10], right: [26, 64] }` -
+`probe_hole_boundary_profile_derived`/`probe_hole_stress_profile_direct_at_radius` (used only
+by `annular_l5_diagnostic`'s checkpoint-triggered diagnostic path, never the main training
+step) hardcoded `geometry.coordinate_embedding()` (always the plain, `n_fourier=0` embedding)
+instead of deriving the embedding actually matching the model's own saved width. Fixed via a
+new `embedding_for_model` helper that inverts `model.input_dim()` back to the correct
+`CoordinateEmbedding` - mirroring `training_core::compute_domain_forwards`'s own "the model's
+saved architecture is authoritative" dispatch pattern exactly, not a new invention. The smoke
+test that should have caught this originally passed anyway because it ran zero diagnostic
+checkpoints (`&[]`) - fixed to use `&[0]` specifically so this bug class can't hide behind an
+undertested code path again.
+
+**Real result** (`issue_77_annulus_fourier_l5_trace`, `n_fourier=4`, identical config/seed/
+checkpoints to every prior PH4-28/29/30 comparison):
+
+| step | baseline Kt (no Fourier) | with n_fourier=4 |
+|---|---|---|
+| 0 | 0.255 | 1.276* |
+| 300 | 0.348 | 1.063 |
+| 1500 | 1.220 | 1.311 |
+| 2999 | 1.231 | **1.238** |
+
+*Step 0 is not a fair comparison point - Fourier features add real high-frequency content to
+an UNTRAINED network's random-weight output, so the elevated step-0 Kt reflects init noise, not
+a physically meaningful reading (the same reason the step-0 loss was also higher, 79.8 vs
+28.7). The meaningful comparison is the trained endpoint.
+
+**Final Kt (1.238) is statistically indistinguishable from baseline (1.231)** - a difference
+of 0.007, well within the noise band every other controlled comparison in this investigation
+has shown (PH4-29's interface-weight test moved by a similar 0.02 with no real effect). The
+spectral-bias hypothesis, at least as implemented here (`n_fourier=4`, hole-relative dyadic
+Fourier features), is **not supported** by this result either.
+
+**Not yet conclusive on spectral bias generally** - `n_fourier=4` (max frequency `8*pi`, per
+the dyadic `2^l*pi` schedule) is a modest choice; a genuinely under-powered frequency range
+would look exactly like this flat result. Before fully ruling out spectral bias as the
+mechanism, a real sweep (e.g. `n_fourier=8` or higher) is the next honest step, not yet run.
+
+Full workspace regression: 502 passed, 0 failed, 41 ignored - zero regressions.
+
+Does not close issue #77 (or #74/#76).

@@ -79,6 +79,18 @@ pub enum CoordinateEmbedding {
         center_norm: [f32; 2],
         inv_radius: [f32; 2],
         epsilon: f32,
+        /// Issue #77 spectral-bias fix: multi-scale Fourier feature band count, applied to
+        /// the hole-relative `(qx,qy)` coordinates already computed for the chart embedding
+        /// (NOT raw x,y - encoding frequency content tuned to the hole's own radius avoids
+        /// needing very high absolute frequencies to resolve a small hole in a large plate).
+        /// `0` (every pre-existing call site of `UserGeometry::coordinate_embedding()`) is
+        /// byte-identical to the pre-#77-spectral-bias-fix embedding - only
+        /// `coordinate_embedding_with_fourier` ever sets this nonzero. See
+        /// `network::chart_embed`'s doc comment for the exact feature formula and
+        /// `PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-31 for why this exists (six other
+        /// candidate mechanisms tested and ruled out or fixed without closing the Kt gap;
+        /// this tests the spectral-bias hypothesis directly).
+        n_fourier: usize,
     },
 }
 
@@ -86,7 +98,9 @@ impl CoordinateEmbedding {
     pub const fn input_dim(self) -> usize {
         match self {
             Self::Raw => 3,
-            Self::SingleHoleChart { .. } => 10,
+            // 10 base chart columns + 4 columns (sin/cos of qx, sin/cos of qy) per frequency
+            // band - same `4*n_fourier` convention `network::fourier_embed` already uses.
+            Self::SingleHoleChart { n_fourier, .. } => 10 + 4 * n_fourier,
         }
     }
 }
@@ -222,6 +236,15 @@ impl UserGeometry {
     /// chart with a bounded far-field envelope; no-hole and multi-hole problems remain raw-coordinate models.
     /// Multi-hole enrichment is intentionally deferred until it has an unambiguous benchmark.
     pub fn coordinate_embedding(&self) -> CoordinateEmbedding {
+        self.coordinate_embedding_with_fourier(0)
+    }
+
+    /// Issue #77 spectral-bias fix: same as [`Self::coordinate_embedding`], but with
+    /// `n_fourier` set on the resulting `SingleHoleChart` (a no-op — byte-identical to
+    /// `coordinate_embedding()` — for a no-hole/multi-hole geometry, which always returns
+    /// `Raw` regardless of this argument). See `CoordinateEmbedding::SingleHoleChart::
+    /// n_fourier`'s own doc comment.
+    pub fn coordinate_embedding_with_fourier(&self, n_fourier: usize) -> CoordinateEmbedding {
         let [hole] = self.holes.as_slice() else {
             return CoordinateEmbedding::Raw;
         };
@@ -235,6 +258,7 @@ impl UserGeometry {
             // Only protection at r=0. Valid plate points are outside r=a, so this cannot
             // alter physical features at collocation or FD-stencil points.
             epsilon: 1e-4,
+            n_fourier,
         }
     }
 
@@ -448,6 +472,7 @@ mod tests {
             center_norm: [0.25, -0.25],
             inv_radius: [20.0, 10.0],
             epsilon: 1e-4,
+            n_fourier: 0,
         });
     }
 
