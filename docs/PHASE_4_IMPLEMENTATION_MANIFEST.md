@@ -2146,4 +2146,57 @@ outcome; it was accurate only for describing that one specific, favorable sample
 further repeats to build a firmer sample before drawing a final conclusion - do not treat n=3
 as sufficient either.
 
+## PH4-35 final verdict — a 4th hard-constraint sample plus a 2nd baseline sample settle it:
+## mean Kt is statistically indistinguishable from baseline; the ansatz's real, measured
+## effect is a ~13x increase in run-to-run variance, not an accuracy improvement
+
+Ran a 4th hard-constraint sample AND, critically, a 2nd sample of the BASELINE (soft
+`hole_free`) itself - the missing half of a fair comparison, since every prior PH4-35 entry
+compared hard-constraint's spread against a single baseline data point without knowing that
+baseline's OWN run-to-run variance.
+
+| | Kt samples | mean | stdev | coefficient of variation | mean relative error vs FEM |
+|---|---|---|---|---|---|
+| hard-constraint (4 samples) | 2.121, 1.032, 1.065, 0.912 | **1.2825** | 0.5629 | **43.9%** | 47.88% |
+| baseline / soft `hole_free` (2 samples) | 1.231, 1.290 | **1.2605** | 0.0417 | **3.3%** | 48.77% |
+
+**The means are statistically indistinguishable** (1.2825 vs 1.2605 - a 1.7% difference,
+nowhere near the size of either distribution's own spread) and so are the mean relative
+errors (47.88% vs 48.77%). The original headline result (2.121, 13.8% error) was the
+high-variance TAIL of a distribution whose CENTER is no better than the baseline it was
+built to replace - not a representative outcome.
+
+**What IS real and measured**: the hard-constraint ansatz's coefficient of variation is
+**~13x the baseline's** (43.9% vs 3.3%). Baseline is tightly reproducible run to run (1.231
+vs 1.290, a 5% spread) using the exact same Wgpu backend, same training loop, same
+architecture - which weakens the "generic Wgpu backend non-determinism" hypothesis from the
+earlier entries in this section as a SUFFICIENT explanation: if backend-level float
+non-determinism alone explained the hard-constraint spread, the baseline should show
+comparable relative variance too, and it does not. The more likely explanation, not yet
+independently isolated: the hard-constraint ansatz's own construction - the sharp,
+`exp(-((r-a)/a)^2)`-shaped envelope and/or the closed-form correction's `1/r^3` singularity
+structure just outside the hole - makes the local optimization landscape genuinely more
+sensitive to whatever small numerical differences exist between runs (initial GPU kernel
+scheduling, floating-point reduction order, etc.), amplifying them into a much wider outcome
+spread than the smoother baseline loss landscape does.
+
+**Final verdict**: PH4-35's hard-constraint hole ansatz, as implemented, is **not recommended
+as a practical Kt-accuracy fix** - its mean outcome does not improve on the baseline it
+replaces, and it measurably degrades training stability/reproducibility by an order of
+magnitude. The underlying mechanism remains mathematically real and independently verified
+(exact closed-form Kirsch correction, confirmed traction-free at `r=a` to FD precision;
+`annulus_potential`'s gradient share genuinely redirected from 3.2% to 18.2% by removing
+`hole_free`) - this is not a wasted or broken implementation, and the code/tests are kept
+(opt-in, byte-identical default, zero risk to any other path) as a documented, real negative
+result and a possible foundation for future work (e.g. a gentler envelope shape, or isolating
+whether the instability is intrinsic to the exact-constraint idea or specific to this
+particular envelope/correction combination) - but it should not be presented, used, or
+built upon as a solved improvement over the soft-penalty baseline.
+
+Eleven independently-evidenced mechanisms have now been tested with real evidence across this
+investigation (representation, collocation margin, sampling variance, LR/training-dynamics,
+interface-continuity weight, strong-form residual, spectral bias x2, finite-domain scale,
+SIREN, gradient-share rebalancing via weight reduction, and now the exact hard-constraint
+ansatz) - none reliably closes the ~48-50% mean relative-error gap. The gap remains open.
+
 Does not close issue #77 (or #74/#76).
