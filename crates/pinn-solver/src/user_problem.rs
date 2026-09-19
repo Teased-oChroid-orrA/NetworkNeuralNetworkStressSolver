@@ -1706,7 +1706,12 @@ pub struct AnnularDecompositionProblem {
     domains: Vec<DomainSpec>,
     annulus_sampling: AnnularPartitionSampling,
     outer_sampling: AnnularPartitionSampling,
-    ansatz: IdentityAnsatz,
+    /// The outer domain's own ansatz — always `IdentityAnsatz`, unaffected by anything below.
+    outer_ansatz: IdentityAnsatz,
+    /// The annulus domain's own ansatz — `Identity` (byte-identical to every pre-PH4-35
+    /// caller) unless `new_with_hard_constraint_ansatz` selected the hard-constraint mode.
+    /// See `kirsch_hole_correction::AnnulusAnsatz`'s own doc comment.
+    annulus_ansatz: crate::kirsch_hole_correction::AnnulusAnsatz,
     /// Issue #77 candidate (b): base weight for BOTH `interface_displacement_continuity` and
     /// `interface_traction_continuity` (previously a hardcoded `100.0` literal in
     /// `base_weight()`). Defaults to `100.0` via `new()` - byte-identical to every pre-#77-
@@ -1750,26 +1755,36 @@ impl AnnularDecompositionProblem {
     }
 
     pub fn new(spec: ProblemSpec) -> Self {
-        Self::new_experimental(spec, 100.0, false, LAM_HOLE_FREE)
+        Self::new_experimental(spec, 100.0, false, LAM_HOLE_FREE, false)
     }
 
     /// See `interface_weight`'s own doc comment.
     pub fn new_with_interface_weight(spec: ProblemSpec, interface_weight: f32) -> Self {
-        Self::new_experimental(spec, interface_weight, false, LAM_HOLE_FREE)
+        Self::new_experimental(spec, interface_weight, false, LAM_HOLE_FREE, false)
     }
 
     /// See `include_annulus_equilibrium`'s own doc comment.
     pub fn new_with_annulus_equilibrium(spec: ProblemSpec, include_annulus_equilibrium: bool) -> Self {
-        Self::new_experimental(spec, 100.0, include_annulus_equilibrium, LAM_HOLE_FREE)
+        Self::new_experimental(spec, 100.0, include_annulus_equilibrium, LAM_HOLE_FREE, false)
     }
 
     /// See `hole_free_weight`'s own doc comment (PH4-34).
     pub fn new_with_hole_free_weight(spec: ProblemSpec, hole_free_weight: f32) -> Self {
-        Self::new_experimental(spec, 100.0, false, hole_free_weight)
+        Self::new_experimental(spec, 100.0, false, hole_free_weight, false)
+    }
+
+    /// Issue #77 PH4-35: the exact, closed-form hard-constraint hole ansatz — see
+    /// `kirsch_hole_correction`'s own module doc comment for the full design and rationale.
+    /// When `true`, the annulus domain's `"hole_free"` soft-penalty term is not registered at
+    /// all (see `loss_terms()`'s own comment) — it would be redundant with an already-exact
+    /// constraint, and penalizing an already-exact residual serves no purpose.
+    pub fn new_with_hard_constraint_ansatz(spec: ProblemSpec, use_hard_constraint: bool) -> Self {
+        Self::new_experimental(spec, 100.0, false, LAM_HOLE_FREE, use_hard_constraint)
     }
 
     pub(crate) fn new_experimental(
         spec: ProblemSpec, interface_weight: f32, include_annulus_equilibrium: bool, hole_free_weight: f32,
+        use_hard_constraint: bool,
     ) -> Self {
         assert!(Self::supports(&spec),
             "annular decomposition requires one safely-contained Free hole, Variational formulation, and measure-aware training");
@@ -1785,6 +1800,25 @@ impl AnnularDecompositionProblem {
         let outer_sampling = AnnularPartitionSampling::new(
             spec.geometry.clone(), spec.training.fd_h, false, ANNULUS_DOMAIN, interface,
         );
+        let hole = &spec.geometry.holes[0];
+        let annulus_ansatz = if use_hard_constraint {
+            let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+            crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(
+                crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+                    hole_center: hole.center,
+                    hole_radius: hole.radius,
+                    half_w: spec.geometry.half_w,
+                    half_h: spec.geometry.half_h,
+                    px: spec.load.px,
+                    py: spec.load.py,
+                    e: spec.material.e as f64,
+                    nu: spec.material.nu as f64,
+                    u_ref: scales.u_ref as f64,
+                },
+            )
+        } else {
+            crate::kirsch_hole_correction::AnnulusAnsatz::Identity
+        };
         Self {
             domains: vec![
                 DomainSpec { id: ANNULUS_DOMAIN, geometry: placeholder.clone(), material: spec.material.clone(), output_dim: 5 },
@@ -1793,7 +1827,8 @@ impl AnnularDecompositionProblem {
             spec,
             annulus_sampling,
             outer_sampling,
-            ansatz: IdentityAnsatz,
+            outer_ansatz: IdentityAnsatz,
+            annulus_ansatz,
             interface_weight,
             include_annulus_equilibrium,
             hole_free_weight,
@@ -1801,6 +1836,13 @@ impl AnnularDecompositionProblem {
     }
 
     pub fn spec(&self) -> &ProblemSpec { &self.spec }
+
+    /// `true` iff `annulus_ansatz` is `AnnulusAnsatz::HardConstraint` — the single source of
+    /// truth for "should the soft `hole_free` penalty be skipped" (`loss_terms()`) rather than
+    /// a second, independently-set boolean that could drift out of sync with the ansatz.
+    fn hard_constraint_active(&self) -> bool {
+        matches!(self.annulus_ansatz, crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(_))
+    }
 }
 
 /// Annular U contribution to the one global potential. Its name remains distinct from the
@@ -1849,8 +1891,11 @@ impl BoundaryValueProblem for AnnularDecompositionProblem {
         }
     }
     fn ansatz(&self, domain_idx: usize) -> &dyn DirichletAnsatz {
-        assert!(domain_idx < 2, "annular decomposition has two domains");
-        &self.ansatz
+        match self.domains[domain_idx].id {
+            ANNULUS_DOMAIN => &self.annulus_ansatz,
+            OUTER_DOMAIN => &self.outer_ansatz,
+            _ => unreachable!(),
+        }
     }
     fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
         let scales = crate::training_core::compute_reference_scales_for_plate(&self.spec);
@@ -1906,7 +1951,12 @@ impl BoundaryValueProblem for AnnularDecompositionProblem {
                 domain: OUTER_DOMAIN, half_w: self.spec.geometry.half_w, half_h: self.spec.geometry.half_h,
             }),
         ];
-        if decomposed {
+        // PH4-35: under the hard-constraint ansatz, the traction-free condition is already
+        // exact by construction (see `kirsch_hole_correction`'s module doc comment) -
+        // registering the soft `hole_free` penalty on top would be redundant at best (its
+        // target is already satisfied to FD-truncation precision) and would reintroduce
+        // exactly the gradient-competition problem this ansatz exists to eliminate.
+        if decomposed && !self.hard_constraint_active() {
             terms.push(Box::new(HoleBcTerm {
                 domain: ANNULUS_DOMAIN, point_set: "hole_0_fd", bc: HoleBc::Free,
                 ref_stress2: scales.ref_stress2, material: self.spec.material.clone(),
@@ -3434,6 +3484,53 @@ mod tests {
         );
     }
 
+    /// PH4-35 gate test: `new()`'s default (`use_hard_constraint=false`) must register
+    /// `"hole_free"` exactly as before (byte-identical), and `ansatz(ANNULUS_DOMAIN)` must be
+    /// the `Identity` variant. `new_with_hard_constraint_ansatz(true)` must do the opposite:
+    /// no `"hole_free"` term at all, and `ansatz(ANNULUS_DOMAIN)` must be the `HardConstraint`
+    /// variant with a NONZERO `additive()` (proving the closed-form correction is actually
+    /// wired in, not silently falling back to `(0,0)`) and an `eval()` in `[0,1]` (the
+    /// envelope, not left at the pre-existing constant `1.0`). The outer domain's own ansatz
+    /// must be `Identity` in BOTH modes - this feature is annulus-only by design.
+    #[test]
+    fn hard_constraint_ansatz_default_false_is_byte_identical_and_true_wires_in_the_exact_correction() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(), material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7), network: Default::default(),
+            training: pinn_core::problem_spec::TrainingSpec {
+                measure_aware_training: true, ..Default::default()
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let default_problem = AnnularDecompositionProblem::new(spec.clone());
+        assert!(default_problem.loss_terms().iter().any(|t| t.name() == "hole_free"),
+            "default (hard-constraint disabled) must still register the soft hole_free term");
+        let default_annulus_ansatz = default_problem.ansatz(0);
+        // domains()[0] is ANNULUS_DOMAIN - confirmed by
+        // annular_decomposition_bvp_has_two_disjoint_domains_and_bonded_interface_terms above.
+        let (dx, dy) = default_annulus_ansatz.eval(0.06, 0.02, 1.0);
+        assert_eq!((dx, dy), (1.0, 1.0), "default annulus ansatz must be the pre-existing Identity");
+        assert_eq!(default_annulus_ansatz.additive(0.06, 0.02), (0.0, 0.0));
+
+        let hard_problem = AnnularDecompositionProblem::new_with_hard_constraint_ansatz(spec, true);
+        assert!(hard_problem.loss_terms().iter().all(|t| t.name() != "hole_free"),
+            "hard-constraint mode must NOT register the now-redundant soft hole_free term");
+        let hard_annulus_ansatz = hard_problem.ansatz(0);
+        // A point just inside the annulus (not exactly on r=a, so the envelope is meaningfully
+        // between 0 and 1, not degenerately equal to the boundary value).
+        let (dx2, dy2) = hard_annulus_ansatz.eval(0.06, 0.02, 1.0);
+        assert!((0.0..=1.0).contains(&dx2) && dx2 < 1.0, "envelope must suppress below 1.0 near the hole, got {dx2}");
+        assert_eq!(dx2, dy2, "envelope is a single scalar applied to both u,v");
+        let (ax, ay) = hard_annulus_ansatz.additive(0.06, 0.02);
+        assert!(ax != 0.0 || ay != 0.0, "hard-constraint additive correction must be nonzero away from the hole center");
+
+        // Outer domain's ansatz must stay Identity in BOTH modes - annulus-only feature.
+        let outer_default = default_problem.ansatz(1).eval(0.5, 0.5, 1.0);
+        let outer_hard = hard_problem.ansatz(1).eval(0.5, 0.5, 1.0);
+        assert_eq!(outer_default, (1.0, 1.0));
+        assert_eq!(outer_hard, (1.0, 1.0));
+    }
+
     /// PH4-29's next candidate: `include_annulus_equilibrium=false` (the `new()` default)
     /// must never register `"equilibrium"`; `true` must register it on `ANNULUS_DOMAIN`'s
     /// own "interior" point set with `needs_hessian()==true` (proving it will actually get a
@@ -3953,6 +4050,50 @@ mod tests {
         println!("[#77 siren] wrote {}", path.display());
         for diagnostic in diagnostics {
             println!("[#77 siren] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+    }
+
+    /// Issue #77 PH4-35: controlled A/B against the same baseline config (identical geometry/
+    /// material/load/network/training/checkpoints/seed as every PH4-28..34 comparison) - ONLY
+    /// the ansatz differs: the exact, closed-form hard-constraint hole ansatz
+    /// (`kirsch_hole_correction`) instead of the soft `hole_free` penalty. Ten independent
+    /// prior candidates (representation, sampling, LR, interface weight, strong-form residual,
+    /// spectral bias x2, finite-domain scale, SIREN, gradient-share rebalancing) all failed or
+    /// made things worse - every one of them left the SOFT penalty/energy gradient competition
+    /// intact and tried to rebalance it. This removes the competition entirely: traction-free
+    /// is exact by construction, so 100% of the annulus domain's gradient budget goes to
+    /// `annulus_potential`/interface continuity, with nothing left to "compete" against.
+    #[test]
+    #[ignore]
+    fn issue_77_annulus_hard_constraint_l5_trace() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_hard_constraint(
+            spec, device, &checkpoints, true, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 hard-constraint] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-hard-constraint-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 hard-constraint] wrote {}", path.display());
+        for diagnostic in diagnostics {
+            println!("[#77 hard-constraint] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
                 diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
                 diagnostic.direct_derived_mismatch_rms);
         }

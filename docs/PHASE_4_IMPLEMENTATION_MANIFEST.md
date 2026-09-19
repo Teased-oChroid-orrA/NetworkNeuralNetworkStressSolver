@@ -1936,3 +1936,119 @@ Full workspace regression: 506 passed, 0 failed, 44 ignored - zero regressions (
 alongside PH4-34a, confirmed before this commit).
 
 Does not close issue #77 (or #74/#76).
+
+## PH4-35 — Exact, closed-form hard-constraint hole ansatz: real result is a genuine
+## breakthrough, not another rejection
+
+Ten independently-evidenced candidates (PH4-24 through PH4-34b) all shared one property:
+they rebalanced or added to the SOFT `hole_free` penalty enforcing traction-free-at-the-hole,
+without removing the underlying mechanism - `hole_free`'s own gradient competing against the
+domain's actual energy terms for optimizer budget, even after its own raw loss was already
+satisfied to a ~1e-4 residual by step ~1500 in every prior run. This candidate removes that
+competition entirely: the traction-free condition is made EXACT, by construction, for any
+network weights - not a target to hit, a structural guarantee.
+
+**The construction** (`crates/pinn-solver/src/kirsch_hole_correction.rs`, a new, self-contained
+module):
+
+`u_hole(x,y) = kirsch_hole_displacement(x,y; px,py,a,E,nu)  +  traction_free_envelope(x,y;a) *
+NN(x,y)`
+
+- `kirsch_hole_displacement` is the EXACT closed-form classical Kirsch hole-correction
+  displacement (Timoshenko & Goodier's stress solution), independently re-derived via sympy -
+  not recalled from a remembered displacement formula, which is easy to get subtly wrong.
+  Derivation discipline: (1) start from the standard, independently-checkable STRESS solution;
+  (2) integrate strain-displacement relations to get displacement; (3) verify strain
+  COMPATIBILITY exactly (a real, independent check - an invalid stress field fails it); (4)
+  re-differentiate the result and confirm it reproduces the ORIGINAL stress formula exactly;
+  (5) confirm zero traction at `r=a` via the re-derived stress. General-biaxial (`px,py`) was
+  obtained by superposing two orthogonal single-axis solutions, checked against the known
+  equal-biaxial special case (caught and fixed a real error in the FIRST sanity-check attempt -
+  `u_r_total`, the full field, was mistakenly compared against a "correction-only" expectation;
+  the actual issue was in the test, not the derivation - resolved by explicitly subtracting
+  `u_affine` before comparing, confirmed to decay to exactly `0` at infinity for arbitrary
+  `px,py`). Combined with `u_affine` (already superposed elsewhere in this codebase, see
+  `user_problem::affine_strain`'s doc comment), the TOTAL field is traction-free at `r=a`
+  EXACTLY, for this problem's specific `px,py` - by construction, not by training.
+- `traction_free_envelope(r) = 1 - exp(-((r-a)/a)^2)`: multiplies the network's OWN free
+  output before it's added to the closed-form correction. `phi(a)=0` AND `phi'(a)=0` (the
+  `(r-a)` factor in the derivative vanishes at `r=a` too) - so the network's contribution to
+  STRAIN (a first derivative) at the hole boundary is exactly zero regardless of what it
+  predicts, by the product rule. Saturates to `~0.98` by `r=3a` (the annulus/outer interface),
+  so the network is essentially unconstrained there - it is NOT prevented from learning
+  whatever correction interface continuity or this finite plate's deviation from the idealized
+  infinite-plate Kirsch solution requires.
+
+**This is not "hand the network the answer"**: `kirsch_hole_displacement` is the exact
+solution for an INFINITE plate; this plate is FINITE (PH4-33's own real FEM result, 2.4606,
+already differs from the idealized infinite-plate Kirsch value, 3.0). The gap between
+"idealized infinite-plate correction" and "the true finite-plate solution," plus whatever
+interface continuity with the outer domain needs at `r=3a`, is exactly what `NN` still has to
+learn. The hard constraint removes ONLY the traction-free condition from gradient competition.
+
+**Wiring, minimal blast radius**: `DirichletAnsatz` (`pinn-core::problem`) gained a new
+`additive()` method with a `(0.0, 0.0)` default - every pre-existing ansatz (including
+`IdentityAnsatz`) is unaffected, since adding zero changes nothing. `compute_domain_forwards`
+(`training_core.rs`) now also evaluates `ansatz.additive(xn,yn)` at each of the 5 FD-stencil
+points (same loop that already computes the multiplicative `dx,dy` scale factors) and adds it
+into `u_col`/`v_col` before the existing `u_ref` rescale - so FD differencing of the SUM
+correctly picks up the closed-form correction's own spatial variation (its contribution to
+strain), not just its value at stencil centers. `AnnularDecompositionProblem` gained an
+`annulus_ansatz: AnnulusAnsatz` field (enum: `Identity` | `HardConstraint(...)`, replacing the
+single shared `IdentityAnsatz` field - the outer domain keeps its own separate, always-Identity
+`outer_ansatz`), a `new_with_hard_constraint_ansatz` constructor, and `loss_terms()` now skips
+registering `"hole_free"` entirely when the hard constraint is active (redundant at best,
+gradient-competition-reintroducing at worst, to penalize an already-exact residual).
+
+**Verification, before any real run**: 5 tests in `kirsch_hole_correction.rs` - numeric
+cross-check against independently-computed sympy reference values (catches a Rust
+transcription bug, which would otherwise silently fake the whole hard constraint with zero
+visible symptom); an INDEPENDENT in-Rust central-difference re-derivation of stress from
+`kirsch_hole_displacement + u_affine`, confirming traction magnitude at `r=a` is `<0.1%` of
+`px` at 8 angles around the hole (not just trusting the Python derivation); envelope
+zero-value/zero-derivative/saturation/bounded checks. Plus a wiring-level gate test
+(`hard_constraint_ansatz_default_false_is_byte_identical_and_true_wires_in_the_exact_
+correction`) proving the default mode is untouched and the hard-constraint mode is genuinely
+selected (nonzero `additive`, envelope `<1` near the hole, `hole_free` absent from
+`loss_terms()`, outer domain's ansatz unaffected either way). Full workspace regression run
+alongside the real training run below: 513 passed, 0 failed, 46 ignored - zero regressions.
+
+**Real result** (`issue_77_annulus_hard_constraint_l5_trace`, identical geometry/material/
+load/network/training/checkpoints/seed to every PH4-28..34b comparison - only the ansatz
+differs):
+
+| step | baseline Kt (soft `hole_free`) | hard-constraint Kt |
+|---|---|---|
+| 0 | 0.255 | 0.255 |
+| 300 | 0.348 | 0.311 |
+| 1500 | 1.220 | 1.196 |
+| 2999 | 1.231 | **2.121** |
+
+Relative error against the FEM target (2.460638516): baseline `(2.4606-1.231)/2.4606 =
+49.97%`; hard-constraint `(2.4606-2.121)/2.4606 = 13.81%`. **This is by far the largest
+improvement of any candidate in this entire investigation** - the gap closed from ~50% to
+~14%, a real, qualitative change, not a noise-level movement like every prior "no effect"
+result (PH4-29's interface-weight test, for comparison, moved Kt by 0.02).
+
+**Gradient-share evidence confirms the mechanism worked as hypothesized, not just the outcome**
+(`AnnularTermDiagnostic`, step 2999): `hole_free` is genuinely absent from every checkpoint's
+term list (confirmed programmatically, not just by inspection). `annulus_potential`'s gradient
+share is **18.2%**, up from the baseline's 3.2% - almost 6x more of the optimizer's attention
+now goes to the actual local energy functional that shapes the stress field, exactly the
+"freed gradient budget" PH4-34's own diagnostic-data-driven hypothesis predicted (that
+candidate tried to free this budget by REDUCING `hole_free`'s weight and failed, PH4-34b,
+because the dominance was a gradient-magnitude property, not a nominal-weight one - removing
+the term ENTIRELY, rather than shrinking its weight, is what actually worked).
+`interface_traction_continuity` is now the dominant term (62.8% gradient share) - a legitimate
+physical requirement (matching traction across the annulus/outer boundary), not a redundant
+already-satisfied one, so this is not a repeat of the same pathology in a new place.
+
+**Kt was still rising, not plateaued, at step 2999** (1.196 -> 2.121 between steps 1500 and
+2999, the largest single-interval jump of the whole trajectory) - unlike every prior candidate,
+which plateaued or declined by the final checkpoint. This strongly suggests the true converged
+value is closer to (or beyond) the FEM target than this snapshot shows. An extended run is the
+obvious next step to find out, not yet run as of this entry - see the manifest's next entry.
+
+Does not close issue #77 (or #74/#76) - the standing instruction remains in force even for a
+real, evidenced improvement of this size; the extended-run result and any adversarial review
+should land before any closing discussion.

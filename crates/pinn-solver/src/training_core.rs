@@ -1483,6 +1483,13 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
         let m = 5 * n_pts;
         let mut dx_v = Vec::with_capacity(m);
         let mut dy_v = Vec::with_capacity(m);
+        // Issue #77 hard-constraint hole ansatz (PH4-35): additive per-point correction,
+        // `(0.0, 0.0)` for every ansatz that doesn't override `DirichletAnsatz::additive` —
+        // computed at every stencil-shifted point, same as `dx_v`/`dy_v`, so FD differencing
+        // of `raw_net*dx + additive` correctly picks up the closed-form correction's OWN
+        // spatial variation (its contribution to strain), not just its value at the centre.
+        let mut add_x_v = Vec::with_capacity(m);
+        let mut add_y_v = Vec::with_capacity(m);
         for &(sx, sy) in &[(0.0f32, 0.0f32), (point_fd.hx, 0.0), (-point_fd.hx, 0.0), (0.0, point_fd.hy), (0.0, -point_fd.hy)] {
             for p in norm_pts {
                 let xn = p[0] + sx;
@@ -1490,6 +1497,9 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
                 let (dx, dy) = ansatz.eval(xn, yn, ctx.k);
                 dx_v.push(dx);
                 dy_v.push(dy);
+                let (ax, ay) = ansatz.additive(xn, yn);
+                add_x_v.push(ax);
+                add_y_v.push(ay);
             }
         }
 
@@ -1516,8 +1526,10 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
         debug_assert_eq!(raw_net.dims()[0], m, "stencil row count must match 5*n_pts");
         let dx_t = Tensor::<Bk, 2>::from_data(TensorData::new(dx_v, vec![m, 1]), device);
         let dy_t = Tensor::<Bk, 2>::from_data(TensorData::new(dy_v, vec![m, 1]), device);
-        let u_col = raw_net.clone().slice([0..m, 0..1]) * dx_t;
-        let v_col = raw_net.clone().slice([0..m, 1..2]) * dy_t;
+        let add_x_t = Tensor::<Bk, 2>::from_data(TensorData::new(add_x_v, vec![m, 1]), device);
+        let add_y_t = Tensor::<Bk, 2>::from_data(TensorData::new(add_y_v, vec![m, 1]), device);
+        let u_col = raw_net.clone().slice([0..m, 0..1]) * dx_t + add_x_t;
+        let v_col = raw_net.clone().slice([0..m, 1..2]) * dy_t + add_y_t;
         let ansatz_out = if is_mdem {
             let s_xx = raw_net.clone().slice([0..m, 2..3]);
             let s_yy = raw_net.clone().slice([0..m, 3..4]);

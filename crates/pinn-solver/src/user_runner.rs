@@ -128,8 +128,11 @@ fn run_annular_decomposition_training_inner(
     annulus_n_fourier: usize,
     annulus_use_siren: bool,
     hole_free_weight: f32,
+    annulus_use_hard_constraint: bool,
 ) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
-    let problem = AnnularDecompositionProblem::new_experimental(spec.clone(), interface_weight, include_annulus_equilibrium, hole_free_weight);
+    let problem = AnnularDecompositionProblem::new_experimental(
+        spec.clone(), interface_weight, include_annulus_equilibrium, hole_free_weight, annulus_use_hard_constraint,
+    );
     crate::problem::validate_loss_terms(&problem);
     // Issue #77 spectral-bias fix (PH4-31): `annulus_n_fourier=0` (every existing caller)
     // gives the exact pre-existing `spec.geometry.coordinate_embedding()` value - this is
@@ -240,7 +243,7 @@ pub fn run_annular_decomposition_training(
     device: BDevice,
     on_step: impl FnMut(usize, f32, f64, usize) -> bool,
 ) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
-    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new(), 100.0, false, 0, false, 100.0)
+    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new(), 100.0, false, 0, false, 100.0, false)
 }
 
 /// Same production runner with opt-in, deterministic diagnostic checkpoints. No output file is
@@ -259,7 +262,7 @@ pub fn run_annular_decomposition_training_with_diagnostics(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -283,7 +286,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_interface_weight(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, interface_weight, false, 0, false, 100.0,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, interface_weight, false, 0, false, 100.0, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -309,7 +312,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_annulus_equilibri
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, include_annulus_equilibrium, 0, false, 100.0,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, include_annulus_equilibrium, 0, false, 100.0, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -336,7 +339,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_annulus_fourier(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, annulus_n_fourier, false, 100.0,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, annulus_n_fourier, false, 100.0, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -364,7 +367,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_siren(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, use_siren, 100.0,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, use_siren, 100.0, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -393,7 +396,31 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_hole_free_weight(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, hole_free_weight,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, hole_free_weight, false,
+    );
+    (annulus, outer, loss, diagnostics)
+}
+
+/// Issue #77 PH4-35: same as [`run_annular_decomposition_training_with_diagnostics`], but with
+/// the exact, closed-form hard-constraint hole ansatz active on the annulus domain
+/// (`use_hard_constraint=true`) instead of the soft `hole_free` penalty. See
+/// `AnnularDecompositionProblem::new_with_hard_constraint_ansatz`'s and
+/// `kirsch_hole_correction`'s own doc comments. Not used by any production entry point.
+pub fn run_annular_decomposition_training_with_diagnostics_and_hard_constraint(
+    spec: ProblemSpec,
+    device: BDevice,
+    diagnostic_steps: &[usize],
+    use_hard_constraint: bool,
+    on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+) -> (
+    crate::network::ElasticityNet<B>,
+    crate::network::ElasticityNet<B>,
+    f32,
+    Vec<AnnularL5Diagnostic>,
+) {
+    let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
+    let (annulus, outer, loss) = run_annular_decomposition_training_inner(
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, use_hard_constraint,
     );
     (annulus, outer, loss, diagnostics)
 }

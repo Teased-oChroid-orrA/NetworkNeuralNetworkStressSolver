@@ -95,6 +95,20 @@ pub trait DomainSamplingStrategy: Send + Sync {
 /// Returns the `(u, v)` scale factors the raw network output should be multiplied by.
 pub trait DirichletAnsatz: Send + Sync {
     fn eval(&self, xn: f32, yn: f32, k: f32) -> (f32, f32);
+
+    /// Additive per-point displacement correction (same units as `eval`'s multiplicative
+    /// scale is applied in — i.e. whatever this returns is added to `eval(..)*raw_network_
+    /// output` BEFORE any later physical-unit rescaling), added AFTER the multiplicative
+    /// scale. Default `(0.0, 0.0)` — every existing ansatz (every implementor before this
+    /// method existed) is completely unaffected, since adding zero changes nothing.
+    ///
+    /// Issue #77's hard-constraint hole ansatz (`pinn_solver::kirsch_hole_correction`) is the
+    /// first real user: it returns the exact closed-form Kirsch hole-correction displacement
+    /// here (making the traction-free condition exact by construction) while `eval` returns
+    /// an envelope that suppresses the network's OWN free contribution to zero, with zero
+    /// derivative, at the hole boundary specifically — the two methods work together, not
+    /// independently, for that one ansatz.
+    fn additive(&self, _xn: f32, _yn: f32) -> (f32, f32) { (0.0, 0.0) }
 }
 
 #[cfg(test)]
