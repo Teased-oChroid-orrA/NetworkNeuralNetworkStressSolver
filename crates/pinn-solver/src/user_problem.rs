@@ -1727,6 +1727,18 @@ pub struct AnnularDecompositionProblem {
     /// form residual supplies gradient pressure LOCALLY (`PHASE_4_IMPLEMENTATION_MANIFEST.md`'s
     /// PH4-29). Defaults to `false` via `new()` - byte-identical to every existing caller.
     include_annulus_equilibrium: bool,
+    /// Issue #77 gradient-share hypothesis (PH4-34): real diagnostic evidence collected across
+    /// every prior comparison run in this investigation shows `hole_free`'s RAW loss converges
+    /// to a tiny residual (~1e-4, effectively satisfied) by step ~1500, yet its GRADIENT SHARE
+    /// climbs back up to 70-90% of the entire optimization's gradient budget by step 2999 —
+    /// while `physical_potential` (raw ~1.0, far from converged) gets only ~15% and
+    /// `annulus_potential` ~3%. The optimizer spends most of its late-training gradient budget
+    /// re-polishing an already-satisfied boundary condition instead of the actual energy
+    /// functional that shapes the stress field. Defaults to `LAM_HOLE_FREE` (100.0) via `new()`
+    /// - byte-identical to every pre-PH4-34 caller. `new_with_hole_free_weight` exists to test
+    /// whether reducing this weight frees gradient budget for the energy terms without
+    /// un-satisfying the (already nearly-exact) traction-free condition.
+    hole_free_weight: f32,
 }
 
 impl AnnularDecompositionProblem {
@@ -1738,20 +1750,27 @@ impl AnnularDecompositionProblem {
     }
 
     pub fn new(spec: ProblemSpec) -> Self {
-        Self::new_experimental(spec, 100.0, false)
+        Self::new_experimental(spec, 100.0, false, LAM_HOLE_FREE)
     }
 
     /// See `interface_weight`'s own doc comment.
     pub fn new_with_interface_weight(spec: ProblemSpec, interface_weight: f32) -> Self {
-        Self::new_experimental(spec, interface_weight, false)
+        Self::new_experimental(spec, interface_weight, false, LAM_HOLE_FREE)
     }
 
     /// See `include_annulus_equilibrium`'s own doc comment.
     pub fn new_with_annulus_equilibrium(spec: ProblemSpec, include_annulus_equilibrium: bool) -> Self {
-        Self::new_experimental(spec, 100.0, include_annulus_equilibrium)
+        Self::new_experimental(spec, 100.0, include_annulus_equilibrium, LAM_HOLE_FREE)
     }
 
-    pub(crate) fn new_experimental(spec: ProblemSpec, interface_weight: f32, include_annulus_equilibrium: bool) -> Self {
+    /// See `hole_free_weight`'s own doc comment (PH4-34).
+    pub fn new_with_hole_free_weight(spec: ProblemSpec, hole_free_weight: f32) -> Self {
+        Self::new_experimental(spec, 100.0, false, hole_free_weight)
+    }
+
+    pub(crate) fn new_experimental(
+        spec: ProblemSpec, interface_weight: f32, include_annulus_equilibrium: bool, hole_free_weight: f32,
+    ) -> Self {
         assert!(Self::supports(&spec),
             "annular decomposition requires one safely-contained Free hole, Variational formulation, and measure-aware training");
         let placeholder = spec.geometry.to_placeholder();
@@ -1777,6 +1796,7 @@ impl AnnularDecompositionProblem {
             ansatz: IdentityAnsatz,
             interface_weight,
             include_annulus_equilibrium,
+            hole_free_weight,
         }
     }
 
@@ -1914,7 +1934,7 @@ impl BoundaryValueProblem for AnnularDecompositionProblem {
             "interface_displacement_continuity" | "interface_traction_continuity" => self.interface_weight,
             "translation_gauge" => LAM_TRANSLATION_GAUGE,
             "rotation_gauge" => LAM_ROTATION_GAUGE,
-            "hole_free" => LAM_HOLE_FREE,
+            "hole_free" => self.hole_free_weight,
             "equilibrium" => LAM_EQUILIBRIUM_PLATE,
             other => panic!("AnnularDecompositionProblem::base_weight: unknown term '{other}'"),
         }
@@ -3385,6 +3405,35 @@ mod tests {
         assert_eq!(overridden.base_weight("rotation_gauge"), default_problem.base_weight("rotation_gauge"));
     }
 
+    /// PH4-34 gate test: `new()`'s default `hole_free_weight` must equal the pre-PH4-34
+    /// hardcoded `LAM_HOLE_FREE` constant exactly, and a real override must change ONLY
+    /// `hole_free`'s own base weight, nothing else.
+    #[test]
+    fn hole_free_weight_override_changes_only_the_hole_free_term_base_weight() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(), material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7), network: Default::default(),
+            training: pinn_core::problem_spec::TrainingSpec {
+                measure_aware_training: true, ..Default::default()
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let default_problem = AnnularDecompositionProblem::new(spec.clone());
+        assert_eq!(default_problem.base_weight("hole_free"), LAM_HOLE_FREE);
+
+        let overridden = AnnularDecompositionProblem::new_with_hole_free_weight(spec, 10.0);
+        assert_eq!(overridden.base_weight("hole_free"), 10.0);
+        // Every other term's base weight must be completely unaffected by the override.
+        assert_eq!(overridden.base_weight("annulus_potential"), default_problem.base_weight("annulus_potential"));
+        assert_eq!(overridden.base_weight("physical_potential"), default_problem.base_weight("physical_potential"));
+        assert_eq!(overridden.base_weight("translation_gauge"), default_problem.base_weight("translation_gauge"));
+        assert_eq!(overridden.base_weight("rotation_gauge"), default_problem.base_weight("rotation_gauge"));
+        assert_eq!(
+            overridden.base_weight("interface_displacement_continuity"),
+            default_problem.base_weight("interface_displacement_continuity"),
+        );
+    }
+
     /// PH4-29's next candidate: `include_annulus_equilibrium=false` (the `new()` default)
     /// must never register `"equilibrium"`; `true` must register it on `ANNULUS_DOMAIN`'s
     /// own "interior" point set with `needs_hessian()==true` (proving it will actually get a
@@ -3863,6 +3912,95 @@ mod tests {
             println!("[#77 quasi-infinite] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
                 diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
                 diagnostic.direct_derived_mismatch_rms);
+        }
+    }
+
+    /// Issue #77 SIREN hypothesis test: controlled A/B against the same baseline config
+    /// (identical geometry/material/load/network/training/checkpoints/seed as every PH4-28..33
+    /// comparison) - ONLY `use_siren=true` differs on the annulus domain's own network. Unlike
+    /// the Fourier-feature candidate (an input-encoding change), this replaces the activation
+    /// function itself (`sin(omega_0*z)` instead of `tanh`, Sitzmann et al. 2020) — a
+    /// network-wide representational change with its own specific weight-init scheme
+    /// (`ElasticityNetConfig::init`'s `use_siren` branch). Tests whether the network's spectral
+    /// bias is an activation-function property (this candidate) rather than an input-encoding
+    /// gap (the already-rejected Fourier-feature candidate, PH4-31/32).
+    #[test]
+    #[ignore]
+    fn issue_77_annulus_siren_l5_trace() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_siren(
+            spec, device, &checkpoints, true, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 siren] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-siren-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 siren] wrote {}", path.display());
+        for diagnostic in diagnostics {
+            println!("[#77 siren] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+    }
+
+    /// Issue #77 gradient-share hypothesis (PH4-34): controlled A/B against the same baseline
+    /// config (identical geometry/material/load/network/training/checkpoints/seed as every
+    /// PH4-28..33 comparison) - ONLY `hole_free_weight` differs: `10.0` here vs the default
+    /// `100.0`. Real diagnostic evidence (`AnnularTermDiagnostic.gradient_share` across every
+    /// prior comparison run) shows `hole_free`'s raw loss is already tiny (~1e-4, effectively
+    /// satisfied) by step ~1500, yet its gradient share climbs to 70-90% of the ENTIRE
+    /// optimization's gradient budget by step 2999 - while `physical_potential` (raw ~1.0, far
+    /// from converged) gets only ~15%. Tests whether a 10x weight reduction frees gradient
+    /// budget for the energy terms that shape the stress field, without meaningfully
+    /// un-satisfying the already-small traction residual.
+    #[test]
+    #[ignore]
+    fn issue_77_hole_free_weight_reduced_l5_trace() {
+        const REDUCED_HOLE_FREE_WEIGHT: f32 = 10.0;
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_hole_free_weight(
+            spec, device, &checkpoints, REDUCED_HOLE_FREE_WEIGHT, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 hole-free-weight] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-hole-free-weight-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 hole-free-weight] wrote {}", path.display());
+        for diagnostic in diagnostics {
+            let hole = diagnostic.terms.iter().find(|t| t.name == "hole_free");
+            println!("[#77 hole-free-weight] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e} hole_free_raw={:?} hole_free_grad_share={:?}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms, hole.map(|t| t.raw), hole.and_then(|t| t.gradient_share));
         }
     }
 

@@ -28,6 +28,20 @@ pub struct ElasticityNet<B: Backend> {
     /// Raw-coordinate affine displacement residual. This deliberately bypasses Fourier
     /// features: affine fields remain exact while `out` learns only non-affine content.
     coordinate_skip: Linear<B>,
+    /// Issue #77 SIREN hypothesis test: when `true`, every layer in `layers` (including
+    /// `layers[0]`) activates with `sin(siren_omega_0 * z)` (Sitzmann et al. 2020) instead of
+    /// `tanh`. `out` stays linear either way — SIREN's own convention, matching this network's
+    /// pre-existing tanh path. Plain, non-generic, non-tensor fields are auto-skipped by
+    /// `#[derive(Module)]` (not a `Param`, not persisted, not visited) — this is metadata read
+    /// by `forward_embedded_masked`, not a learnable weight, exactly like `use_piratenet`
+    /// itself is (that flag isn't even stored — it's inferred from `gates.is_empty()` — but sin
+    /// vs tanh has no analogous structural signal to infer from, so an explicit field is
+    /// unavoidable here). NOT persisted across a checkpoint save/load round-trip — out of scope
+    /// for this research-spike test, which only ever trains and reads a model in-process.
+    use_siren: bool,
+    /// `omega_0` scale factor inside the SIREN activation. Sitzmann et al.'s own paper value
+    /// (30.0) is the default; unused when `use_siren=false`.
+    siren_omega_0: f64,
 }
 
 /// Pre-coordinate-residual record layout. Kept only to load existing checkpoints.
@@ -64,8 +78,16 @@ impl<B: Backend> ElasticityNet<B> {
         self.forward_embedded_masked(x, mask)
     }
 
+    fn activate(&self, z: Tensor<B, 2>) -> Tensor<B, 2> {
+        if self.use_siren {
+            z.mul_scalar(self.siren_omega_0).sin()
+        } else {
+            z.tanh()
+        }
+    }
+
     fn forward_embedded_masked(&self, x: Tensor<B, 2>, mask: Option<&[bool]>) -> Tensor<B, 2> {
-        let mut h = self.layers[0].forward(x).tanh();
+        let mut h = self.activate(self.layers[0].forward(x));
         for i in 1..self.layers.len() {
             let awake = match mask {
                 Some(m) => m.get(i - 1).copied().unwrap_or(true),
@@ -74,7 +96,7 @@ impl<B: Backend> ElasticityNet<B> {
             if !awake {
                 continue;
             }
-            let f = self.layers[i].forward(h.clone()).tanh();
+            let f = self.activate(self.layers[i].forward(h.clone()));
             h = match self.gates.get(i - 1) {
                 Some(alpha) => h.clone() + f.mul(alpha.val().reshape([1, 1])),
                 None => f,
@@ -419,6 +441,8 @@ impl<B: Backend> ElasticityNet<B> {
             gates: self.gates.clone(),
             out,
             coordinate_skip: self.coordinate_skip.clone(),
+            use_siren: self.use_siren,
+            siren_omega_0: self.siren_omega_0,
         }
     }
 
@@ -466,6 +490,8 @@ impl<B: Backend> ElasticityNet<B> {
             gates,
             out: self.out.clone(),
             coordinate_skip: self.coordinate_skip.clone(),
+            use_siren: self.use_siren,
+            siren_omega_0: self.siren_omega_0,
         }
     }
 
@@ -510,6 +536,8 @@ impl<B: Backend> ElasticityNet<B> {
             gates,
             out: self.out.clone(),
             coordinate_skip: self.coordinate_skip.clone(),
+            use_siren: self.use_siren,
+            siren_omega_0: self.siren_omega_0,
         }
     }
 
@@ -596,6 +624,8 @@ impl<B: Backend> ElasticityNet<B> {
             gates: self.gates.clone(),
             out,
             coordinate_skip: self.coordinate_skip.clone(),
+            use_siren: self.use_siren,
+            siren_omega_0: self.siren_omega_0,
         }
     }
 }
@@ -753,6 +783,17 @@ pub struct ElasticityNetConfig {
     /// tanh-activated layers.
     #[config(default = 1.6666666666666667)]
     pub kaiming_gain: f64,
+    /// Issue #77 SIREN hypothesis test: opt-in sinusoidal activation (`sin(siren_omega_0*z)`
+    /// instead of `tanh`, every layer in `layers` including `layers[0]`; `out` stays linear
+    /// either way). Default `false` — byte-for-byte the pre-existing tanh path. Takes priority
+    /// over `use_piratenet`'s Kaiming init below if both are ever set (not a combination this
+    /// investigation exercises — each candidate this session has been tested independently).
+    #[config(default = false)]
+    pub use_siren: bool,
+    /// `omega_0` in the SIREN activation; unused when `use_siren=false`. Sitzmann et al.
+    /// (2020)'s own paper value.
+    #[config(default = 30.0)]
+    pub siren_omega_0: f64,
 }
 
 impl ElasticityNetConfig {
@@ -760,8 +801,25 @@ impl ElasticityNetConfig {
         assert!(self.n_hidden >= 1, "need at least 1 hidden layer");
 
         let mut layers: Vec<Linear<B>> = Vec::with_capacity(self.n_hidden);
-        layers.push(LinearConfig::new(self.input_dim, self.hidden_dim).init(device));
-        let hidden_config = if self.use_piratenet {
+        let input_config = if self.use_siren {
+            // Sitzmann et al. 2020 Sec. 3.2 / supplement: first layer draws from
+            // U(-1/fan_in, 1/fan_in) so its pre-activation spans roughly [-1, 1] before the
+            // omega_0 scale is applied inside `activate()`.
+            let bound = 1.0 / self.input_dim as f64;
+            LinearConfig::new(self.input_dim, self.hidden_dim)
+                .with_initializer(Initializer::Uniform { min: -bound, max: bound })
+        } else {
+            LinearConfig::new(self.input_dim, self.hidden_dim)
+        };
+        layers.push(input_config.init(device));
+        let hidden_config = if self.use_siren {
+            // Sitzmann et al.'s "principled" hidden-layer bound: U(-sqrt(6/fan_in)/omega_0,
+            // sqrt(6/fan_in)/omega_0) keeps the omega_0-scaled pre-activation distribution
+            // stable across depth regardless of network width.
+            let bound = (6.0 / self.hidden_dim as f64).sqrt() / self.siren_omega_0;
+            LinearConfig::new(self.hidden_dim, self.hidden_dim)
+                .with_initializer(Initializer::Uniform { min: -bound, max: bound })
+        } else if self.use_piratenet {
             LinearConfig::new(self.hidden_dim, self.hidden_dim).with_initializer(
                 Initializer::KaimingNormal {
                     gain: self.kaiming_gain,
@@ -794,6 +852,8 @@ impl ElasticityNetConfig {
             gates,
             out,
             coordinate_skip,
+            use_siren: self.use_siren,
+            siren_omega_0: self.siren_omega_0,
         }
     }
 
@@ -817,6 +877,10 @@ impl<B: Backend> ElasticityNet<B> {
                 weight: Param::from_tensor(Tensor::<B, 2>::zeros([3, 2], device)),
                 bias: Some(Param::from_tensor(Tensor::<B, 1>::zeros([2], device))),
             },
+            // Every legacy checkpoint predates SIREN; it was trained (and must keep
+            // evaluating) with tanh.
+            use_siren: false,
+            siren_omega_0: 30.0,
         }
     }
 }
@@ -1532,6 +1596,99 @@ mod tests {
 
         let diff: f32 = (a - b).abs().sum().into_scalar();
         assert_eq!(diff, 0.0);
+    }
+
+    // ---- Issue #77 SIREN hypothesis test (sin(omega_0*z) activation) ----
+
+    #[test]
+    fn use_siren_default_false_is_byte_identical_to_pre_siren_forward() {
+        let device = WgpuDevice::default();
+        let config = ElasticityNetConfig::new()
+            .with_input_dim(2)
+            .with_hidden_dim(4)
+            .with_n_hidden(3)
+            .with_output_dim(2);
+        assert!(!config.use_siren, "default must stay false");
+        let model: ElasticityNet<TB> = config.init(&device);
+        let x = fixed_input(&device);
+        // Manually reproduce the pre-SIREN forward path (unconditional tanh) and confirm the
+        // default-config model matches it exactly — proves `activate()`'s branch is truly a
+        // no-op difference when `use_siren=false`, not just "close."
+        let mut h = model.layers[0].forward(x).tanh();
+        for layer in &model.layers[1..] {
+            h = layer.forward(h).tanh();
+        }
+        let expected = model.out.forward(h);
+        let actual = model.forward(fixed_input(&device));
+        let diff: f32 = (actual - expected).abs().sum().into_scalar();
+        assert_eq!(diff, 0.0);
+    }
+
+    #[test]
+    fn use_siren_enabled_produces_finite_output_and_differs_from_tanh() {
+        let device = WgpuDevice::default();
+        let siren_config = ElasticityNetConfig::new()
+            .with_input_dim(2)
+            .with_hidden_dim(8)
+            .with_n_hidden(3)
+            .with_output_dim(2)
+            .with_use_siren(true);
+        let tanh_config = ElasticityNetConfig::new()
+            .with_input_dim(2)
+            .with_hidden_dim(8)
+            .with_n_hidden(3)
+            .with_output_dim(2);
+        let siren_model: ElasticityNet<TB> = siren_config.init(&device);
+        let tanh_model: ElasticityNet<TB> = tanh_config.init(&device);
+        assert!(siren_model.use_siren);
+        assert!(!tanh_model.use_siren);
+
+        let x = fixed_input(&device);
+        let siren_out = siren_model.forward(x.clone());
+        let tanh_out = tanh_model.forward(x);
+
+        let siren_data = siren_out.into_data().to_vec::<f32>().unwrap();
+        assert!(
+            siren_data.iter().all(|v| v.is_finite()),
+            "SIREN output must be finite: {siren_data:?}"
+        );
+        // Different random inits AND a different activation function — outputs must not
+        // coincidentally match to machine precision (a real, if weak, sanity check that the
+        // SIREN branch is actually being taken, not silently falling through to tanh).
+        let tanh_data = tanh_out.into_data().to_vec::<f32>().unwrap();
+        let diff: f32 = siren_data
+            .iter()
+            .zip(&tanh_data)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(diff > 1e-6, "SIREN and tanh outputs must differ: diff={diff}");
+    }
+
+    #[test]
+    fn siren_init_bounds_match_sitzmann_formula() {
+        let device = WgpuDevice::default();
+        let config = ElasticityNetConfig::new()
+            .with_input_dim(4)
+            .with_hidden_dim(16)
+            .with_n_hidden(2)
+            .with_output_dim(2)
+            .with_use_siren(true)
+            .with_siren_omega_0(30.0);
+        let model: ElasticityNet<TB> = config.init(&device);
+
+        let first_bound = 1.0 / 4.0_f32;
+        let first_weights = model.layers[0].weight.val().into_data().to_vec::<f32>().unwrap();
+        assert!(
+            first_weights.iter().all(|&w| w.abs() <= first_bound + 1e-6),
+            "first-layer weights must respect SIREN's U(-1/fan_in, 1/fan_in) bound"
+        );
+
+        let hidden_bound = ((6.0_f32 / 16.0).sqrt() / 30.0) as f32;
+        let hidden_weights = model.layers[1].weight.val().into_data().to_vec::<f32>().unwrap();
+        assert!(
+            hidden_weights.iter().all(|&w| w.abs() <= hidden_bound + 1e-6),
+            "hidden-layer weights must respect SIREN's U(-sqrt(6/fan_in)/omega_0, ...) bound"
+        );
     }
 
     // ---- grow_width (issue #50, Net2WiderNet-style function-preserving width growth) ----

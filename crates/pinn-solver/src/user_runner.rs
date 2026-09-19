@@ -126,8 +126,10 @@ fn run_annular_decomposition_training_inner(
     interface_weight: f32,
     include_annulus_equilibrium: bool,
     annulus_n_fourier: usize,
+    annulus_use_siren: bool,
+    hole_free_weight: f32,
 ) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
-    let problem = AnnularDecompositionProblem::new_experimental(spec.clone(), interface_weight, include_annulus_equilibrium);
+    let problem = AnnularDecompositionProblem::new_experimental(spec.clone(), interface_weight, include_annulus_equilibrium, hole_free_weight);
     crate::problem::validate_loss_terms(&problem);
     // Issue #77 spectral-bias fix (PH4-31): `annulus_n_fourier=0` (every existing caller)
     // gives the exact pre-existing `spec.geometry.coordinate_embedding()` value - this is
@@ -137,11 +139,15 @@ fn run_annular_decomposition_training_inner(
     let annulus_embedding = spec.geometry.coordinate_embedding_with_fourier(annulus_n_fourier);
     let mut config = SolverConfig::default_kirsch();
     config.load = spec.load;
+    // Issue #77 SIREN hypothesis test: opt-in to the annulus domain only, same scope as every
+    // other candidate this investigation has tested - the outer domain (already representing
+    // only a small residual correction post-kinematic-decomposition) stays plain-tanh.
     let chart_cfg = ElasticityNetConfig::new()
         .with_input_dim(annulus_embedding.input_dim())
         .with_hidden_dim(spec.network.hidden_dim)
         .with_n_hidden(spec.network.n_hidden)
-        .with_output_dim(5);
+        .with_output_dim(5)
+        .with_use_siren(annulus_use_siren);
     let raw_cfg = ElasticityNetConfig::new()
         .with_input_dim(3)
         .with_hidden_dim(spec.network.hidden_dim)
@@ -234,7 +240,7 @@ pub fn run_annular_decomposition_training(
     device: BDevice,
     on_step: impl FnMut(usize, f32, f64, usize) -> bool,
 ) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
-    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new(), 100.0, false, 0)
+    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new(), 100.0, false, 0, false, 100.0)
 }
 
 /// Same production runner with opt-in, deterministic diagnostic checkpoints. No output file is
@@ -253,7 +259,7 @@ pub fn run_annular_decomposition_training_with_diagnostics(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -277,7 +283,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_interface_weight(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, interface_weight, false, 0,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, interface_weight, false, 0, false, 100.0,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -303,7 +309,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_annulus_equilibri
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, include_annulus_equilibrium, 0,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, include_annulus_equilibrium, 0, false, 100.0,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -330,7 +336,64 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_annulus_fourier(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, annulus_n_fourier,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, annulus_n_fourier, false, 100.0,
+    );
+    (annulus, outer, loss, diagnostics)
+}
+
+/// Issue #77 SIREN hypothesis test: same as
+/// [`run_annular_decomposition_training_with_diagnostics`], but with `use_siren` exposed on the
+/// annulus domain's own network to test whether SIREN's sinusoidal activation (Sitzmann et al.
+/// 2020) - a network-wide representational change, not just an input-feature addition like the
+/// Fourier-feature candidate - closes or narrows the Kt gap that eight other tested mechanisms
+/// (representation, collocation margin, sampling variance, training-dynamics/LR,
+/// interface-continuity weight, a strong-form residual, spectral-bias input features at two
+/// frequency counts, and finite-domain scale) have each been fixed or ruled out without
+/// closing. Not used by any production entry point; experimental-comparison callers only.
+pub fn run_annular_decomposition_training_with_diagnostics_and_siren(
+    spec: ProblemSpec,
+    device: BDevice,
+    diagnostic_steps: &[usize],
+    use_siren: bool,
+    on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+) -> (
+    crate::network::ElasticityNet<B>,
+    crate::network::ElasticityNet<B>,
+    f32,
+    Vec<AnnularL5Diagnostic>,
+) {
+    let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
+    let (annulus, outer, loss) = run_annular_decomposition_training_inner(
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, use_siren, 100.0,
+    );
+    (annulus, outer, loss, diagnostics)
+}
+
+/// Issue #77 gradient-share hypothesis (PH4-34): same as
+/// [`run_annular_decomposition_training_with_diagnostics`], but with `hole_free_weight` exposed
+/// on the annulus domain's own `hole_free` (traction-free boundary condition) term. Real
+/// diagnostic evidence from every prior comparison run shows `hole_free`'s raw loss converges
+/// to a tiny residual (~1e-4) by step ~1500 yet its gradient share climbs to 70-90% of the
+/// entire optimization's gradient budget by step 2999, while `physical_potential` (far from
+/// converged) gets only ~15%. Tests whether reducing this weight frees gradient budget for the
+/// energy terms that actually shape the stress field, without meaningfully un-satisfying the
+/// already-small traction residual. See `AnnularDecompositionProblem::hole_free_weight`'s own
+/// doc comment. Not used by any production entry point.
+pub fn run_annular_decomposition_training_with_diagnostics_and_hole_free_weight(
+    spec: ProblemSpec,
+    device: BDevice,
+    diagnostic_steps: &[usize],
+    hole_free_weight: f32,
+    on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+) -> (
+    crate::network::ElasticityNet<B>,
+    crate::network::ElasticityNet<B>,
+    f32,
+    Vec<AnnularL5Diagnostic>,
+) {
+    let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
+    let (annulus, outer, loss) = run_annular_decomposition_training_inner(
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, hole_free_weight,
     );
     (annulus, outer, loss, diagnostics)
 }

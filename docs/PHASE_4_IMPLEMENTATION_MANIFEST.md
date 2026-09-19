@@ -1803,3 +1803,100 @@ Full workspace regression: 0 changed production files in this step (new geometry
 tests only) - full suite run alongside this test, 0 failures.
 
 Does not close issue #77 (or #74/#76).
+
+## PH4-34a — SIREN sinusoidal activation tested: real result WORSE than baseline, same pattern
+## as the rejected Fourier-feature candidate
+
+User-directed test, following PH4-31/32's rejection of input-encoding Fourier features as a
+spectral-bias fix: does the activation FUNCTION itself (not just the input encoding) explain
+the network's apparent difficulty representing sharp near-hole structure? Implemented SIREN
+(Sitzmann et al. 2020) - `sin(omega_0*z)` replacing `tanh` in every `ElasticityNet` layer
+(including `layers[0]`; `out` stays linear either way), with SIREN's own specific weight-init
+scheme (`U(-1/fan_in, 1/fan_in)` for the first layer, `U(-sqrt(6/fan_in)/omega_0,
+sqrt(6/fan_in)/omega_0)` for hidden layers) - a genuinely different, network-wide
+representational change from an input-feature addition, opt-in via `ElasticityNetConfig::
+use_siren`/`siren_omega_0`, byte-identical default (`false`/tanh), wired to the annulus domain
+only via `run_annular_decomposition_training_with_diagnostics_and_siren` (same scope as every
+prior candidate). 5 new gate tests (byte-identical-at-false, finite-output-and-differs-from-
+tanh, init-bound verification against Sitzmann's own formula) all pass before the real run.
+
+**Real result** (`issue_77_annulus_siren_l5_trace`, identical network/training hyperparameters
+and checkpoints to every PH4-28..33 comparison - only the activation function changed):
+
+| step | baseline Kt (tanh) | SIREN Kt |
+|---|---|---|
+| 0 | 0.255 | 243.14* |
+| 300 | 0.348 | 2.315* |
+| 1500 | 1.220 | 1.092 |
+| 2999 | 1.231 | **1.058** |
+
+*Step 0/300 are extreme init noise, more pronounced than every prior candidate's init-noise
+caveat - SIREN's `sin(omega_0*z)` with `omega_0=30` on an untrained network produces a MUCH
+higher-variance random output than tanh's saturating range, visible directly in the real
+step-0 loss (`2.94e5`, several orders of magnitude above baseline's `28.7`, n_fourier=4's
+`79.8`, or even n_fourier=8's `2207`). Training loss is also visibly non-monotonic throughout
+the whole run (step 900: 1.406 -> step 1200: 1.597 -> step 1500: 1.672 -> step 1800: 1.476 ->
+... -> step 2700: 1.227, `l5_siren_run.log`) where every tanh-based comparison in this
+investigation settles smoothly - a harder optimization landscape, not a cleaner one.
+
+**Conclusion: SIREN is REJECTED as a fix for issue #77's Kt gap** - the trained-endpoint Kt
+(1.058) is worse than baseline (1.231), the same direction and rough magnitude as the rejected
+Fourier-feature candidates (PH4-31/32: 1.238 then 0.587). Combined with those two results, the
+evidence now points at BOTH tested spectral-bias remedies (input-encoding richness and
+activation-function richness) making optimization harder without buying back any of that cost
+in representational accuracy, on this specific loss landscape and training budget. This does
+not prove spectral bias is not a real property of this network (a genuinely well-tuned SIREN
+configuration - different `omega_0`, a proper per-layer init audit, more training steps to let
+the harder landscape settle - might behave differently), but two independently-implemented
+candidates both moving the wrong direction is real evidence against "add more expressive
+high-frequency capacity" as a low-effort fix, not merely an absence of evidence for it.
+
+Full workspace regression: run alongside this test; see PH4-34b for the combined suite result.
+
+Does not close issue #77 (or #74/#76).
+
+## PH4-34b — Gradient-share hypothesis (derived from this investigation's own diagnostic data,
+## not a new architecture): does `hole_free`'s late-training gradient dominance suppress Kt?
+
+While SIREN trained, re-examined the `AnnularTermDiagnostic.gradient_share` field already
+collected by EVERY prior real comparison run in this investigation (baseline, both Fourier
+sweeps, interface-weight, equilibrium, quasi-infinite) - no new run needed to form this
+hypothesis, only inspection of JSON already on disk. A consistent, previously-unremarked
+pattern emerged across five of six runs (the annulus-equilibrium run, PH4-30, is the outlier -
+see below):
+
+| run | step 1500 hole_free raw / grad_share | step 2999 hole_free raw / grad_share | step 2999 physical_potential grad_share |
+|---|---|---|---|
+| baseline | 2.18e-4 / 0.117 | 4.76e-4 / **0.784** | 0.148 |
+| interface-weight=10 | 1.35e-4 / 0.433 | 1.67e-4 / **0.780** | (not separately re-checked) |
+| quasi-infinite | 5.07e-4 / 0.360 | 2.56e-4 / **0.769** | (not separately re-checked) |
+| n_fourier=4 | 2.14e-4 / 0.361 | 1.13e-4 / 0.359 | (mixed - see note below) |
+| n_fourier=8 | 2.45e-3 / 0.896 | 6.21e-4 / **0.900** | (dominated throughout) |
+| annulus-equilibrium (PH4-30, the outlier) | 6.25e-4 / 0.007 | 1.62e-4 / 0.005 | (equilibrium term dominates instead) |
+
+`hole_free`'s RAW loss is already tiny (~1e-4, the traction-free boundary condition is
+effectively satisfied) by step 1500 in every run - but in 4 of 6 runs its GRADIENT SHARE
+climbs to 70-90% of the entire optimization's gradient budget by the final checkpoint, while
+`physical_potential` (raw ~1.0, nowhere near converged - this IS the actual energy functional
+that shapes the interior stress field) gets as little as ~15% at the same checkpoint in the
+baseline run. The optimizer spends most of its late-training gradient budget re-polishing an
+already-satisfied boundary condition instead of the term that would resolve the interior
+field's true stress concentration. This is evidence-first, not a new architecture guess - a
+different class of candidate from every prior mechanism tested (representation, sampling, LR,
+interface weight, strong-form residual, spectral bias, finite-domain scale), and the first one
+grounded directly in gradient-accounting data already collected rather than a new training run.
+
+**Implementation**: `AnnularDecompositionProblem` gained a `hole_free_weight: f32` field
+(default `LAM_HOLE_FREE`=100.0 via `new()`, byte-identical to every pre-PH4-34 caller) and
+`new_with_hole_free_weight`, mirroring the exact `interface_weight` precedent (PH4-28/29) -
+`base_weight`'s `"hole_free"` arm now reads `self.hole_free_weight` instead of the hardcoded
+constant. Threaded through `run_annular_decomposition_training_inner` (a 10th parameter,
+defaulted to `100.0` at every existing call site) and a new
+`run_annular_decomposition_training_with_diagnostics_and_hole_free_weight` entry point. 1 new
+gate test proves the override changes ONLY `hole_free`'s own base weight.
+
+**Real result pending** - `issue_77_hole_free_weight_reduced_l5_trace` (10x reduction, `100.0
+-> 10.0`) launched as a real, controlled A/B against the same baseline config/checkpoints;
+result to be appended here once the run completes.
+
+Does not close issue #77 (or #74/#76).
