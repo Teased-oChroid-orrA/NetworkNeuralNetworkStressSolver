@@ -2052,3 +2052,62 @@ obvious next step to find out, not yet run as of this entry - see the manifest's
 Does not close issue #77 (or #74/#76) - the standing instruction remains in force even for a
 real, evidenced improvement of this size; the extended-run result and any adversarial review
 should land before any closing discussion.
+
+## PH4-35 follow-up — the extended run does NOT confirm PH4-35's result: it diverges early
+## and DECLINES, ending worse than baseline. Run-to-run reproducibility is now the open question.
+
+Ran the obvious next step - `issue_77_annulus_hard_constraint_extended_l5_trace`, 12000 steps,
+identical config/seed to the 3000-step run above, checkpoints `[0, 1500, 3000, 6000, 9000,
+11999]` (mirroring `issue_77_l5_extended_convergence_trend_trace`'s own convention). **This
+was expected to show where the still-rising Kt from the 3000-step run converges. It did not
+confirm that trajectory at all**:
+
+| step | 3000-step run's Kt | extended run's Kt at the same step |
+|---|---|---|
+| 0 | 0.255 | 0.255 (identical - same seed, pre-training) |
+| 1500 | 1.196 | **1.696** |
+| 2999/3000 | **2.121** | **1.065** |
+| 6000 | (not measured) | 1.192 |
+| 9000 | (not measured) | 0.960 |
+| 11999 | (not measured) | **0.730** |
+
+Step 0 matches exactly (both runs start from the identical seeded weight init - confirms
+`B::seed` itself is deterministic). By step 1500 the two runs have ALREADY diverged
+substantially (1.196 vs 1.696), and by step 3000 they disagree by a factor of 2x (2.121 vs
+1.065) - these are not "the same trajectory, sampled at different resolution," they are two
+materially different outcomes from the same nominal configuration. The extended run's own Kt
+then DECLINES for the rest of training, ending at **0.730** - relative error 70.3% against
+the FEM target, WORSE than the pre-hard-constraint baseline (49.97%).
+
+**Ruled out as an explanation, with real evidence, before treating this as fatal**: AMR-
+schedule interaction with `max_steps` (a real, well-known class of bug where sweep timing is
+tied to a FRACTION of total budget, so the "same step number" means something different in a
+3000-step vs 12000-step run). Checked directly: `run_annular_decomposition_training_inner`
+(the function BOTH hard-constraint tests call) never reads `spec.training.amr_enabled` at all
+- confirmed by grep, that flag is read only by a separate, unrelated test's own hand-written
+loop (`issue_70_real_l5_with_amr_enabled_after_issue_74_fix`). AMR is not merely off here, it
+is not wired into this code path in the first place - not the cause.
+
+**Working, NOT YET independently confirmed, hypothesis**: this project's own already-documented
+Wgpu backend non-determinism (`docs/PHASE_4_IMPLEMENTATION_MANIFEST.md`'s own issue #74
+close-out section: "this project's own already-known Wgpu weight-init non-determinism"),
+generalized from weight-init specifically to per-step KERNEL EXECUTION - floating-point
+reduction order across GPU dispatch is not guaranteed bit-identical run to run even for the
+"same" seed and inputs, and a highly nonlinear ~3000+ step training trajectory can plausibly
+amplify a bit-level difference into a macroscopically different Kt by step 1500. This is
+consistent with step 0 matching exactly (no training yet, nothing to amplify) and the
+divergence appearing progressively from step 1500 on, not the alternative (a logic bug that
+would more likely misbehave identically or crash outright, not produce two SEPARATELY
+finite, superficially-reasonable-looking trajectories with a step-0 exact match). This
+hypothesis is not yet independently confirmed - a REPEATED 3000-step run under the identical
+config is the direct test (does it land near 2.121, near 0.7-1.2, or somewhere else entirely -
+characterizing the actual spread, not assuming it).
+
+**Honest state of PH4-35 pending that repeat**: the hard-constraint ansatz's real mechanism
+(hole_free removed, exact traction-free by construction, annulus_potential's gradient share
+freed) is verified and real - that part of PH4-35 stands. Whether it reliably PRODUCES a
+better Kt, or whether 2.121 was a favorable draw from a wide, backend-driven variance band
+that can also land at 0.73, is now genuinely open and must not be presented as settled in
+either direction until a repeat lands. Launching that repeat now.
+
+Does not close issue #77 (or #74/#76).

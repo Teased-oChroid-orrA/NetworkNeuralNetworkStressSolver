@@ -4099,6 +4099,49 @@ mod tests {
         }
     }
 
+    /// Issue #77 PH4-35 follow-up: the real 3000-step hard-constraint run showed Kt STILL
+    /// RISING at the final checkpoint (1.196 -> 2.121 between steps 1500 and 2999, the largest
+    /// single-interval jump of the whole trajectory) - unlike every prior candidate, which had
+    /// plateaued or declined by 3000 steps. Extends training 4x (12000 steps), mirroring
+    /// `issue_77_l5_extended_convergence_trend_trace`'s own checkpoint convention exactly, to
+    /// find out where Kt actually converges rather than reading a still-moving snapshot as if
+    /// it were final. Separate test, NOT modifying the canonical 3000-step
+    /// `issue_77_annulus_hard_constraint_l5_trace` - that test's own checkpoints stay as-is for
+    /// future comparability.
+    #[test]
+    #[ignore]
+    fn issue_77_annulus_hard_constraint_extended_l5_trace() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 12000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 1500, 3000, 6000, 9000, 11999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_hard_constraint(
+            spec, device, &checkpoints, true, |step, loss, _lr, _points| {
+                if step % 500 == 0 { println!("[#77 hard-constraint-extended] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-hard-constraint-extended-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 hard-constraint-extended] wrote {}", path.display());
+        for diagnostic in diagnostics {
+            println!("[#77 hard-constraint-extended] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+    }
+
     /// Issue #77 gradient-share hypothesis (PH4-34): controlled A/B against the same baseline
     /// config (identical geometry/material/load/network/training/checkpoints/seed as every
     /// PH4-28..33 comparison) - ONLY `hole_free_weight` differs: `10.0` here vs the default
