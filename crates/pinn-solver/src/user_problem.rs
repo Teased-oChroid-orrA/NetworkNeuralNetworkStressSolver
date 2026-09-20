@@ -2523,6 +2523,7 @@ impl BoundaryValueProblem for AnnulusStageProblem {
 /// FD-derived strain. Direct mDEM stress is auxiliary; direct-minus-constitutive is the
 /// explicit consistency residual surfaced for display.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_user_vis_grid(
     model: &crate::network::ElasticityNet<crate::training_core::BInner>,
     geometry: &UserGeometry,
@@ -2533,12 +2534,12 @@ pub fn evaluate_user_vis_grid(
     fd: &crate::fd_stencil::FdConfig,
     int_norm: &[[f32; 2]],
     device: &crate::training_core::BDevice,
+    ansatz: &dyn DirichletAnsatz,
+    affine_strain_pair: Option<(f64, f64)>,
 ) -> pinn_core::messages::VisFields {
-    use crate::network::fwd_embedded;
     use crate::differential_operator::production_strain as compute_strains;
-    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor};
     use crate::energy::dem_energy_per_point;
-    use crate::training_core::BInner;
+    use crate::training_core::{stencil_forward_with_ansatz, BInner};
     use ndarray::Array2;
 
     let n_total = nx * ny;
@@ -2588,20 +2589,27 @@ pub fn evaluate_user_vis_grid(
 
     let active_pts: Vec<[f32; 2]> = active.iter().map(|&i| pts[i]).collect();
     let n_act = active_pts.len();
-    let pts_t = norm_pts_to_tensor::<BInner>(&active_pts, device);
-    let stencil_coords = assemble_stencil::<BInner>(&pts_t, fd, device);
-    let raw_net = fwd_embedded::<BInner>(model, stencil_coords, geometry.coordinate_embedding(), device); // [5*n_act, 5], unscaled
+    // Issue #77 PH4-41/45: same ansatz-application + u_ref/px scaling `compute_domain_forwards`
+    // itself uses for training (via the shared `stencil_forward_with_ansatz` helper) - a bare
+    // `fwd_embedded` forward pass here would report `u_hole`/`eps_hole` alone under kinematic
+    // decomposition, mislabeled as the total field, exactly the bug PH4-41 fixed in
+    // `probe_hole_boundary_profile_derived`.
+    let (raw, _model_embedding) = stencil_forward_with_ansatz::<BInner>(
+        model, ansatz, &active_pts, fd, 1.0, u_ref as f64, px_pa, true,
+        embedding_for_model(model, geometry), None, device,
+    );
 
-    // Physical scale BEFORE the FD derivative — same convention as `compute_domain_forwards`'s
-    // `is_mdem` branch and `probe_hole_boundary_profile` (displacement by u_ref, stress by
-    // px_pa), so the strain/residual computed here matches what training itself sees.
-    let m = 5 * n_act;
-    let raw = Tensor::cat(vec![
-        raw_net.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
-        raw_net.slice([0..m, 2..5]).mul_scalar(px_pa),
-    ], 1);
-
-    let (eps_xx, eps_yy, eps_xy) = compute_strains::<BInner>(raw.clone(), n_act, fd);
+    let (mut eps_xx, mut eps_yy, mut eps_xy) = compute_strains::<BInner>(raw.clone(), n_act, fd);
+    // Second half of the PH4-41 gap: add the affine background strain directly to the
+    // FD-derived strain, matching `PhysicalPotentialEnergyTerm`/`AnnularPotentialEnergyTerm`'s
+    // own `exx.add_scalar(a_exx)` convention.
+    let affine_uv: Option<(f64, f64, f64)> = affine_strain_pair.map(|(px, py)| {
+        let (a_exx, a_eyy, a_exy) = affine_strain(px, py, material);
+        eps_xx = eps_xx.clone().add_scalar(a_exx);
+        eps_yy = eps_yy.clone().add_scalar(a_eyy);
+        eps_xy = eps_xy.clone().add_scalar(a_exy);
+        (a_exx, a_eyy, a_exy)
+    });
     let energy = dem_energy_per_point::<BInner>(eps_xx.clone(), eps_yy.clone(), eps_xy.clone(), material);
     let (sxx_fd, syy_fd, sxy_fd) =
         crate::energy::compute_stress::<BInner>(eps_xx.clone(), eps_yy.clone(), eps_xy.clone(), material);
@@ -2618,8 +2626,16 @@ pub fn evaluate_user_vis_grid(
     let energy_v = chunk(6);
 
     for (i_act, &i_full) in active.iter().enumerate() {
-        let u = center_vals[i_act * 5];
-        let v = center_vals[i_act * 5 + 1];
+        let mut u = center_vals[i_act * 5];
+        let mut v = center_vals[i_act * 5 + 1];
+        // Reported displacement is also total (affine + ansatz-transformed correction) when
+        // decomposed - `decomposition_applicable` requires the hole centered at the origin, so
+        // the plate-center-relative and hole-center-relative affine offsets coincide.
+        if let Some((a_exx, a_eyy, a_exy)) = affine_uv {
+            let (xp, yp) = (pts[i_full][0] as f64 * geometry.half_w, pts[i_full][1] as f64 * geometry.half_h);
+            u += (a_exx * xp + a_exy * yp) as f32;
+            v += (a_exy * xp + a_eyy * yp) as f32;
+        }
         let direct_sxx = center_vals[i_act * 5 + 2] as f64;
         let direct_syy = center_vals[i_act * 5 + 3] as f64;
         let direct_sxy = center_vals[i_act * 5 + 4] as f64;
@@ -2643,6 +2659,82 @@ pub fn evaluate_user_vis_grid(
         amr[i_full] = energy_v[i_act].abs();
     }
     make_vis(s_vm, s_xx, s_yy, s_xy, d_u, d_v, e_xx, e_yy, e_xy, pde, amr)
+}
+
+/// Issue #77 PH4-45: the two-domain analogue of [`evaluate_user_vis_grid`] for
+/// `AnnularDecompositionProblem`'s bonded annulus/outer model pair - `run_training_
+/// annular_decomposition` deliberately sent `vis: None` before this existed ("no correct
+/// two-model field evaluator existed" - see that call site's own doc comment) rather than
+/// splicing raw, un-reconstructed fields the way this whole investigation's own PH4-41 finding
+/// warns against.
+///
+/// Evaluates each model over the FULL grid with its own real training-time ansatz (each
+/// domain's own `affine_strain_pair` is identical for `AnnularDecompositionProblem` - both
+/// `AnnularPotentialEnergyTerm`/`PhysicalPotentialEnergyTerm(OUTER_DOMAIN)` share the same
+/// `decomposition_applicable`-gated pair, confirmed in `loss_terms()`), then splices per-cell:
+/// the annulus model's own field where a cell's physical distance from the hole center is
+/// less than `interface_radius`, the outer model's elsewhere. `collocation_density` is
+/// model-independent (a pure function of `int_norm`) - either call's copy is used, not merged.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_annular_vis_grid(
+    annulus_model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    outer_model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    geometry: &UserGeometry,
+    grid: [usize; 2],
+    u_ref: f32,
+    px_pa: f64,
+    material: &MaterialProps,
+    fd: &crate::fd_stencil::FdConfig,
+    int_norm: &[[f32; 2]],
+    device: &crate::training_core::BDevice,
+    annulus_ansatz: &dyn DirichletAnsatz,
+    outer_ansatz: &dyn DirichletAnsatz,
+    affine_strain_pair: Option<(f64, f64)>,
+    hole_center: [f64; 2],
+    interface_radius: f64,
+) -> pinn_core::messages::VisFields {
+    use ndarray::Array2;
+
+    let [nx, ny] = grid;
+    let annulus_vis = evaluate_user_vis_grid(
+        annulus_model, geometry, grid, u_ref, px_pa, material, fd, int_norm, device,
+        annulus_ansatz, affine_strain_pair,
+    );
+    let outer_vis = evaluate_user_vis_grid(
+        outer_model, geometry, grid, u_ref, px_pa, material, fd, int_norm, device,
+        outer_ansatz, affine_strain_pair,
+    );
+
+    // Same normalized-grid-coordinate convention `evaluate_user_vis_grid`'s own point loop
+    // uses (row=iy, col=ix), so the splice boundary lands exactly where each model's own
+    // domain (`AnnularDecompositionProblem::sampling_strategy`) actually trained.
+    let use_annulus = |row: usize, col: usize| -> bool {
+        let xn = -1.0 + 2.0 * col as f64 / (nx.max(2) - 1) as f64;
+        let yn = -1.0 + 2.0 * row as f64 / (ny.max(2) - 1) as f64;
+        let (xp, yp) = (xn * geometry.half_w, yn * geometry.half_h);
+        let (dx, dy) = (xp - hole_center[0], yp - hole_center[1]);
+        (dx * dx + dy * dy).sqrt() < interface_radius
+    };
+    let splice = |a: &Array2<f32>, o: &Array2<f32>| -> Array2<f32> {
+        Array2::from_shape_fn((ny, nx), |(row, col)| {
+            if use_annulus(row, col) { a[(row, col)] } else { o[(row, col)] }
+        })
+    };
+
+    pinn_core::messages::VisFields {
+        von_mises: splice(&annulus_vis.von_mises, &outer_vis.von_mises),
+        sigma_xx: splice(&annulus_vis.sigma_xx, &outer_vis.sigma_xx),
+        sigma_yy: splice(&annulus_vis.sigma_yy, &outer_vis.sigma_yy),
+        sigma_xy: splice(&annulus_vis.sigma_xy, &outer_vis.sigma_xy),
+        disp_u: splice(&annulus_vis.disp_u, &outer_vis.disp_u),
+        disp_v: splice(&annulus_vis.disp_v, &outer_vis.disp_v),
+        eps_xx: splice(&annulus_vis.eps_xx, &outer_vis.eps_xx),
+        eps_yy: splice(&annulus_vis.eps_yy, &outer_vis.eps_yy),
+        eps_xy: splice(&annulus_vis.eps_xy, &outer_vis.eps_xy),
+        pde_residual: splice(&annulus_vis.pde_residual, &outer_vis.pde_residual),
+        amr_score: splice(&annulus_vis.amr_score, &outer_vis.amr_score),
+        collocation_density: annulus_vis.collocation_density,
+    }
 }
 
 /// `enhancement.txt` items 4/C ("BC residual RMS/max") - real per-point traction/
@@ -3994,7 +4086,28 @@ mod tests {
                 measure_aware_training: false, derivative_operator_diagnostic: false, amr_enabled: false,
             },
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         }
+    }
+
+    /// Issue #77 PH4-45: real regression guard for a genuine pre-existing bug this session's
+    /// own headless smoke test caught - `run_headless_user_problem`'s "not a trivial collapse"
+    /// diagnostic used to call `model.forward` directly on a bare 3-column tensor, bypassing
+    /// the embedding transform entirely, panicking on ANY single-hole geometry (the model is
+    /// built with `net_input_dim()`=10 for `SingleHoleChart`, not 3). This never had a test
+    /// exercising `run_headless_user_problem` itself against a real hole - every PH4-24..44 run
+    /// trained through a different function. `single_hole_like_spec` is `measure_aware_
+    /// training: false`, so this exercises the plain single-domain branch specifically (not
+    /// the annular-decomposition one, which has its own separate code path).
+    #[test]
+    fn run_headless_user_problem_completes_on_a_real_single_hole_geometry_without_panicking() {
+        let mut spec = single_hole_like_spec(3);
+        spec.training.n_interior = 64;
+        spec.training.n_boundary = 32;
+        assert!(
+            crate::user_runner::run_headless_user_problem(spec),
+            "headless run against a real single-hole geometry must complete with a finite final loss"
+        );
     }
 
     #[test]
@@ -4006,6 +4119,7 @@ mod tests {
                 measure_aware_training: true, ..Default::default()
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         assert!(AnnularDecompositionProblem::supports(&spec));
         let problem = AnnularDecompositionProblem::new(spec);
@@ -4097,6 +4211,7 @@ mod tests {
                 match stage { "stage_a" => stage_a_losses.push(loss), "stage_b" => stage_b_losses.push(loss), _ => unreachable!() }
                 false
             },
+            &mut |_d, _a, _o| {},
         );
         assert!(loss.is_finite(), "Stage B final loss must be finite, got {loss}");
         assert_eq!(stage_a_losses.len(), 2, "Stage A must run its own requested step count");
@@ -4118,6 +4233,7 @@ mod tests {
                 measure_aware_training: true, ..Default::default()
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let default_problem = AnnularDecompositionProblem::new(spec.clone());
         assert_eq!(default_problem.base_weight("interface_displacement_continuity"), 100.0);
@@ -4145,6 +4261,7 @@ mod tests {
                 measure_aware_training: true, ..Default::default()
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let default_problem = AnnularDecompositionProblem::new(spec.clone());
         assert_eq!(default_problem.base_weight("hole_free"), LAM_HOLE_FREE);
@@ -4179,6 +4296,7 @@ mod tests {
                 measure_aware_training: true, ..Default::default()
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let default_problem = AnnularDecompositionProblem::new(spec.clone());
         assert!(default_problem.loss_terms().iter().any(|t| t.name() == "hole_free"),
@@ -4223,6 +4341,7 @@ mod tests {
                 measure_aware_training: true, ..Default::default()
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let default_problem = AnnularDecompositionProblem::new(spec.clone());
         let default_terms = default_problem.loss_terms();
@@ -4258,6 +4377,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let (annulus, outer, loss) = crate::user_runner::run_annular_decomposition_training(
@@ -4286,6 +4406,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let (_annulus, _outer, loss, _diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_grad_norm_rescale(
@@ -4317,6 +4438,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         // `diagnostic_steps=&[0]` (NOT `&[]`) is load-bearing: it's the diagnostic ledger path
@@ -4382,6 +4504,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let (annulus, outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_log_polar_embedding(
@@ -4407,6 +4530,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let (annulus, _outer, loss, _diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_log_polar_embedding(
@@ -4427,6 +4551,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics(
@@ -4460,6 +4585,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -4508,6 +4634,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -4549,6 +4676,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -4592,6 +4720,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -4634,6 +4763,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -4678,6 +4808,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 1500, 3000, 6000, 9000, 11999];
@@ -4730,6 +4861,7 @@ mod tests {
                 measure_aware_training: true, ..Default::default()
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         assert!(AnnularDecompositionProblem::supports(&spec));
     }
@@ -4760,6 +4892,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -4803,6 +4936,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -4848,6 +4982,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -4893,6 +5028,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -4937,6 +5073,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -4988,6 +5125,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec.clone(), true, 0.5);
         let device = crate::training_core::BDevice::default();
@@ -5032,6 +5170,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec.clone(), true, 0.5);
         let device = crate::training_core::BDevice::default();
@@ -5070,6 +5209,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1499];
@@ -5079,6 +5219,7 @@ mod tests {
                 if step % 300 == 0 { println!("[#77 sequential] {stage} step={step} loss={loss:.6e}"); }
                 false
             },
+            &mut |_d, _a, _o| {},
         );
         assert!(loss.is_finite());
         assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
@@ -5113,6 +5254,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1499];
@@ -5122,6 +5264,7 @@ mod tests {
                 if step % 300 == 0 { println!("[#77 sequential repeat] {stage} step={step} loss={loss:.6e}"); }
                 false
             },
+            &mut |_d, _a, _o| {},
         );
         assert!(loss.is_finite());
         assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
@@ -5148,6 +5291,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -5191,6 +5335,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -5230,6 +5375,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -5274,6 +5420,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -5323,6 +5470,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 1500, 3000, 6000, 9000, 11999];
@@ -5368,6 +5516,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let checkpoints = [0, 300, 1500, 2999];
@@ -5413,6 +5562,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         const WARMUP_STEPS: usize = 50;
@@ -5766,6 +5916,7 @@ mod tests {
             network: Default::default(),
             training: pinn_core::problem_spec::TrainingSpec { measure_aware_training: true, ..Default::default() },
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new(spec);
 
@@ -6682,6 +6833,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new(spec);
         let terms = problem.loss_terms();
@@ -6713,6 +6865,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new(spec);
         let names: Vec<&str> = problem.loss_terms().iter().map(|t| t.name()).collect();
@@ -6733,6 +6886,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new(spec);
         let names: Vec<&str> = problem.loss_terms().iter().map(|t| t.name()).collect();
@@ -6839,6 +6993,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         spec.formulation = FormulationSelection::Variational;
         spec.training.measure_aware_training = true;
@@ -6869,6 +7024,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         spec.formulation = FormulationSelection::Variational;
         spec.training.measure_aware_training = true;
@@ -6891,6 +7047,7 @@ mod tests {
             material: MaterialProps::al7075_t6(), load: LoadConfig::uniaxial_x(6.9e7),
             network: Default::default(), training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         spec.formulation = FormulationSelection::Variational;
         let _ = UserDefinedProblem::new(spec).loss_terms();
@@ -6908,6 +7065,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         spec.formulation = FormulationSelection::Strong;
         let problem = UserDefinedProblem::new(spec);
@@ -6939,6 +7097,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         spec.formulation = FormulationSelection::Strong;
         let problem = UserDefinedProblem::new(spec);
@@ -6970,6 +7129,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(), // Hybrid
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new(spec);
         let names: Vec<&str> = problem.loss_terms().iter().map(|t| t.name()).collect();
@@ -6996,6 +7156,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
 
         let mut only_energy = base_spec.clone();
@@ -7025,6 +7186,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: FormulationSelection::Hybrid(vec!["bogus_term".to_string()]),
+            architecture: Default::default(),
         };
         UserDefinedProblem::new(spec).loss_terms();
     }
@@ -7054,6 +7216,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         spec.formulation = FormulationSelection::Variational;
         spec.training.measure_aware_training = true;
@@ -7147,6 +7310,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new(spec);
         let report = crate::training_core::stress_source_report(&problem);
@@ -7180,6 +7344,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new(spec);
         let report = crate::training_core::boundary_operator_report(&problem);
@@ -7212,6 +7377,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new(spec);
         let report = crate::training_core::derivative_order_report(&problem);
@@ -7243,6 +7409,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new(spec);
         let terms = problem.loss_terms();
@@ -7282,6 +7449,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new(spec);
         let terms = problem.loss_terms();
@@ -7638,6 +7806,144 @@ mod tests {
             .init(&device)
     }
 
+    /// Issue #77 PH4-45 fix proof (mirrors `probe_hole_boundary_profile_derived_adds_affine_
+    /// strain_exactly`): `evaluate_user_vis_grid`'s heatmap must add the affine background
+    /// strain exactly, not silently report `u_hole`/`eps_hole` alone as if it were the total
+    /// field - the bug this fix closes. Before this fix, `evaluate_user_vis_grid` had no
+    /// `affine_strain_pair` parameter at all, so this comparison would be impossible to write
+    /// against the pre-fix signature (a real, decisive difference from the fixed one, not just
+    /// a stronger assertion on the same behavior).
+    #[test]
+    fn evaluate_user_vis_grid_adds_affine_strain_exactly() {
+        let device = crate::training_core::BDevice::default();
+        let model = tiny_model_raw();
+        let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] };
+        let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+        let material = MaterialProps::al7075_t6();
+        let (px, py) = (6.9e7_f64, 2.0e7_f64);
+
+        let without_affine = evaluate_user_vis_grid(
+            &model, &geometry, [6, 6], 1.0, 1.0, &material, &fd, &[], &device, &IdentityAnsatz, None,
+        );
+        let with_affine = evaluate_user_vis_grid(
+            &model, &geometry, [6, 6], 1.0, 1.0, &material, &fd, &[], &device, &IdentityAnsatz, Some((px, py)),
+        );
+        let (a_exx, a_eyy, _a_exy) = affine_strain(px, py, &material);
+        assert!(a_exx != 0.0 && a_eyy != 0.0, "test fixture must use a genuinely nonzero affine strain");
+
+        let mut checked = 0;
+        for ((row, col), &wo) in without_affine.eps_xx.indexed_iter() {
+            if wo.is_nan() { continue; }
+            let w = with_affine.eps_xx[(row, col)];
+            assert!((w as f64 - wo as f64 - a_exx).abs() < 1e-6 * a_exx.abs().max(1.0),
+                "eps_xx must shift by exactly a_exx={a_exx:e} at ({row},{col}): with={w} without={wo}");
+            let (w_yy, wo_yy) = (with_affine.eps_yy[(row, col)], without_affine.eps_yy[(row, col)]);
+            assert!((w_yy as f64 - wo_yy as f64 - a_eyy).abs() < 1e-6 * a_eyy.abs().max(1.0),
+                "eps_yy must shift by exactly a_eyy={a_eyy:e} at ({row},{col})");
+            let (w_sxx, wo_sxx) = (with_affine.sigma_xx[(row, col)], without_affine.sigma_xx[(row, col)]);
+            assert!(w_sxx != wo_sxx, "stress must differ once affine strain is included at ({row},{col})");
+            checked += 1;
+        }
+        assert!(checked > 0, "no unmasked grid cells were compared - test fixture is broken");
+    }
+
+    /// Issue #77 PH4-45 fix proof (mirrors `probe_hole_boundary_profile_derived_reflects_hard_
+    /// constraint_ansatz_near_hole_boundary`): `evaluate_user_vis_grid`'s heatmap must actually
+    /// apply the passed `ansatz` (not just unit-scale it) - before this fix, the function did a
+    /// bare `fwd_embedded` forward pass with no ansatz application at all, so switching
+    /// `Identity` -> `HardConstraint` would change nothing.
+    #[test]
+    fn evaluate_user_vis_grid_reflects_hard_constraint_ansatz_near_hole_boundary() {
+        let device = crate::training_core::BDevice::default();
+        let hole = HoleSpec { center: [0.0, 0.0], radius: 0.02, bc: HoleBc::Free };
+        let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![hole] };
+        let model = tiny_model(&geometry);
+        let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+        let material = MaterialProps::al7075_t6();
+        let (px, py) = (6.9e7_f64, 0.0_f64);
+        let u_ref = 1e-3_f32;
+
+        let identity_ansatz = IdentityAnsatz;
+        let hard_ansatz = crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(
+            crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+                hole_center: geometry.holes[0].center, hole_radius: geometry.holes[0].radius,
+                half_w: geometry.half_w, half_h: geometry.half_h,
+                px, py, e: material.e as f64, nu: material.nu as f64, u_ref: u_ref as f64,
+            },
+        );
+        let via_identity = evaluate_user_vis_grid(
+            &model, &geometry, [24, 24], u_ref, px, &material, &fd, &[], &device, &identity_ansatz, None,
+        );
+        let via_hard_constraint = evaluate_user_vis_grid(
+            &model, &geometry, [24, 24], u_ref, px, &material, &fd, &[], &device, &hard_ansatz, None,
+        );
+
+        let mut any_differs = false;
+        for ((row, col), &u_id) in via_identity.disp_u.indexed_iter() {
+            let u_hc = via_hard_constraint.disp_u[(row, col)];
+            if u_id.is_nan() || u_hc.is_nan() { continue; }
+            if (u_id - u_hc).abs() > 1e-9 { any_differs = true; }
+        }
+        assert!(any_differs, "hard-constraint ansatz must change disp_u somewhere on the grid - \
+                 pre-fix bug would make every unmasked cell byte-identical regardless of ansatz");
+    }
+
+    /// Issue #77 PH4-45: `evaluate_annular_vis_grid` must actually splice - the annulus
+    /// model's own field strictly inside `interface_radius`, the outer model's strictly
+    /// outside - not silently return one model's field everywhere. Uses two models with
+    /// different seeds (genuinely different raw output) so a real splice produces a real,
+    /// decisive difference between the two regions; a broken splice (e.g. always returning the
+    /// annulus model's field) would make `outer_only` region cells match `annulus_vis` instead
+    /// of `outer_vis`, caught by the assertions below.
+    #[test]
+    fn evaluate_annular_vis_grid_splices_at_the_interface_radius_not_one_model_everywhere() {
+        let device = crate::training_core::BDevice::default();
+        let hole = HoleSpec { center: [0.0, 0.0], radius: 0.01, bc: HoleBc::Free };
+        let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![hole] };
+        let interface_radius = 0.03;
+        let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+        let material = MaterialProps::al7075_t6();
+        let px = 6.9e7_f64;
+
+        use burn::tensor::backend::Backend;
+        crate::training_core::B::seed(&device, 111);
+        let annulus_model = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(geometry.coordinate_embedding().input_dim())
+            .with_hidden_dim(8).with_n_hidden(2).with_output_dim(5).init(&device);
+        crate::training_core::B::seed(&device, 222);
+        let outer_model = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5).init(&device);
+
+        let annulus_vis = evaluate_user_vis_grid(
+            &annulus_model, &geometry, [24, 24], 1.0, 1.0, &material, &fd, &[], &device, &IdentityAnsatz, None,
+        );
+        let outer_vis = evaluate_user_vis_grid(
+            &outer_model, &geometry, [24, 24], 1.0, 1.0, &material, &fd, &[], &device, &IdentityAnsatz, None,
+        );
+        let spliced = evaluate_annular_vis_grid(
+            &annulus_model, &outer_model, &geometry, [24, 24], 1.0, px, &material, &fd, &[], &device,
+            &IdentityAnsatz, &IdentityAnsatz, None, hole.center, interface_radius,
+        );
+
+        let mut checked_inside = 0;
+        let mut checked_outside = 0;
+        for ((row, col), &spliced_val) in spliced.disp_u.indexed_iter() {
+            if spliced_val.is_nan() { continue; }
+            let xn = -1.0 + 2.0 * col as f64 / 23.0;
+            let yn = -1.0 + 2.0 * row as f64 / 23.0;
+            let (xp, yp) = (xn * geometry.half_w, yn * geometry.half_h);
+            let r = (xp * xp + yp * yp).sqrt();
+            if r < interface_radius {
+                assert_eq!(spliced_val, annulus_vis.disp_u[(row, col)], "inside interface_radius must equal the annulus model's own field at ({row},{col})");
+                checked_inside += 1;
+            } else {
+                assert_eq!(spliced_val, outer_vis.disp_u[(row, col)], "outside interface_radius must equal the outer model's own field at ({row},{col})");
+                checked_outside += 1;
+            }
+        }
+        assert!(checked_inside > 0 && checked_outside > 0, "test grid must cover both sides of the interface radius: inside={checked_inside} outside={checked_outside}");
+    }
+
     #[test]
     fn evaluate_user_vis_grid_masks_every_new_field_outside_the_domain_same_as_the_original_six() {
         let geometry = two_hole_geometry();
@@ -7646,6 +7952,7 @@ mod tests {
         let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
         let vis = evaluate_user_vis_grid(
             &model, &geometry, [16, 16], 1.0, 1.0, &MaterialProps::al7075_t6(), &fd, &[], &device,
+            &IdentityAnsatz, None,
         );
         for ((row, col), &vm) in vis.von_mises.indexed_iter() {
             let masked_out = vm.is_nan();
@@ -7672,6 +7979,7 @@ mod tests {
         let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
         let vis = evaluate_user_vis_grid(
             &model, &geometry, [12, 12], 1.0, 1.0, &MaterialProps::al7075_t6(), &fd, &[], &device,
+            &IdentityAnsatz, None,
         );
         let mut any_nonzero = false;
         for &r in vis.pde_residual.iter() {
@@ -7689,6 +7997,7 @@ mod tests {
         let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
         let vis = evaluate_user_vis_grid(
             &model, &geometry, [12, 12], 1.0, 1.0, &MaterialProps::al7075_t6(), &fd, &[], &device,
+            &IdentityAnsatz, None,
         );
         for &v in vis.amr_score.iter() {
             assert!(v.is_nan() || (v.is_finite() && v >= 0.0), "amr_score (strain energy density magnitude) must never be negative, got {v}");
@@ -7706,6 +8015,7 @@ mod tests {
         let int_norm: Vec<[f32; 2]> = vec![[0.9, 0.9], [0.91, 0.92], [0.95, 0.85], [0.99, 0.99]];
         let vis = evaluate_user_vis_grid(
             &model, &geometry, [2, 2], 1.0, 1.0, &MaterialProps::al7075_t6(), &fd, &int_norm, &device,
+            &IdentityAnsatz, None,
         );
         let total: f32 = vis.collocation_density.iter().sum();
         assert!((total - int_norm.len() as f32).abs() < 1e-9, "density histogram must sum to the exact point count, got {total}");
@@ -7725,6 +8035,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let (rms, max) = probe_boundary_residuals(&model, &spec, &device);
         assert!(rms.is_finite() && rms >= 0.0, "rms must be finite and non-negative, got {rms}");
@@ -7747,6 +8058,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let (rms, max) = probe_boundary_residuals(&model, &spec, &device);
         assert!(rms.is_finite() && rms >= 0.0);
@@ -7768,6 +8080,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let rf = probe_reaction_force(&model, &spec, &device);
         assert!(rf.net_fx.is_finite() && rf.net_fy.is_finite(), "net force must be finite, got fx={} fy={}", rf.net_fx, rf.net_fy);
@@ -7830,6 +8143,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let rf = probe_reaction_force(&model, &spec, &device);
         assert!(rf.net_fx.is_finite() && rf.net_fy.is_finite());
@@ -7849,6 +8163,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let rf = probe_reaction_force(&model, &spec, &device);
         assert!(rf.equilibrium_error.is_finite(), "equilibrium_error must stay finite at zero applied load, got {}", rf.equilibrium_error);
@@ -7898,6 +8213,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let report = probe_load_transfer(&model, &spec, &device);
         let expected_prescribed_x = px * 2.0 * spec.geometry.half_h * spec.geometry.thickness;
@@ -7921,6 +8237,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let report = probe_load_transfer(&model, &spec, &device);
         assert_eq!(report.load_transfer_ratio, 1.0);
@@ -7938,6 +8255,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let report = probe_load_transfer(&model, &spec, &device);
         assert!(report.load_transfer_ratio.is_finite());
@@ -7957,6 +8275,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let result = run_no_hole_benchmark(&model, &spec, &device);
         assert!(result.sigma_xx_relative_error.is_finite());
@@ -8011,6 +8330,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = BDevice::default();
         let half_w = spec.geometry.half_w;
@@ -8082,8 +8402,10 @@ mod tests {
 
         let diag_int_norm: Vec<[f32; 2]> = sampling.sample_interior(&placeholder, 512).iter()
             .map(|&[x, y]| norm_pt(x, y)).collect();
+        let affine = decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
         let vis = evaluate_user_vis_grid(
             &model_val, &spec.geometry, [96, 96], u_ref, spec.load.px, &spec.material, &fd, &diag_int_norm, &device,
+            problem.ansatz(0), affine,
         );
         let field_check = validate_no_hole_fields(&vis, &spec);
         assert!(
@@ -8187,6 +8509,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
             },
             formulation: FormulationSelection::Variational, // overwritten per-run below
+            architecture: Default::default(),
         };
 
         let mut strong_spec = base_spec.clone();
@@ -8281,6 +8604,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         println!("=== training no-hole companion ===");
         let no_hole_model = train(&no_hole_spec, &device);
@@ -8441,6 +8765,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         println!("=== training no-hole companion (AMR off - matches the shipped canonical config) ===");
         let no_hole_model = train(&no_hole_spec, &device);
@@ -8588,6 +8913,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         println!("=== training no-hole companion (persistent AMR is hole-specific - unaffected) ===");
         let no_hole_model = train(&no_hole_spec, false, &device);
@@ -8743,6 +9069,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
             },
             formulation: FormulationSelection::Strong,
+            architecture: Default::default(),
         };
         println!("=== training Strong no-hole companion ===");
         let no_hole_model = train(&no_hole_spec, false, &device);
@@ -8844,6 +9171,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let _ = run_no_hole_benchmark(&model, &spec, &device);
     }
@@ -8937,7 +9265,10 @@ mod tests {
         // is real and lives in what the network actually learned.
         let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
         let fd = crate::fd_stencil::FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
-        let vis = evaluate_user_vis_grid(&model, &spec.geometry, [64, 64], scales.u_ref, px, &spec.material, &fd, &[], &device);
+        let vis = evaluate_user_vis_grid(
+            &model, &spec.geometry, [64, 64], scales.u_ref, px, &spec.material, &fd, &[], &device,
+            &IdentityAnsatz, None,
+        );
 
         // Step 2 ("coordinate normalization/de-normalization" + "edge/corner evaluation"): the
         // vis grid's own point generation (`evaluate_user_vis_grid`'s own body, read directly)
@@ -9075,6 +9406,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let result = run_hole_benchmark(&model, &spec, 0, &failed_no_hole_gate(), &device);
         assert!(result.is_err(), "must refuse to report Kt without a passing no-hole gate");
@@ -9092,6 +9424,7 @@ mod tests {
             geometry, material: MaterialProps::al7075_t6(), load: LoadConfig::uniaxial_x(1e7),
             network: Default::default(), training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let result = run_hole_benchmark(&model, &spec, 0, &passed_no_hole_gate(), &device).expect("gate passed, must not refuse");
         assert_eq!(result.reference_kind, HoleReferenceKind::InfiniteApprox);
@@ -9109,6 +9442,7 @@ mod tests {
             geometry, material: MaterialProps::al7075_t6(), load: LoadConfig::uniaxial_x(1e7),
             network: Default::default(), training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let result = run_hole_benchmark(&model, &spec, 0, &passed_no_hole_gate(), &device).expect("gate passed, must not refuse");
         assert_eq!(result.reference_kind, HoleReferenceKind::Finite);
@@ -9141,6 +9475,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let eb = probe_energy_balance(&model, &spec, &device);
         assert!(eb.internal_energy.is_finite(), "internal_energy must be finite, got {}", eb.internal_energy);
@@ -9162,6 +9497,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let eb = probe_energy_balance(&model, &spec, &device);
         assert!(
@@ -9174,7 +9510,9 @@ mod tests {
     #[test]
     fn no_hole_field_validation_accepts_affine_and_detects_translation() {
         use ndarray::Array2;
-        let spec = ProblemSpec { geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] }, material: MaterialProps::al7075_t6(), load: LoadConfig::uniaxial_x(1e7), network: Default::default(), training: Default::default(), formulation: pinn_core::problem_spec::default_formulation() };
+        let spec = ProblemSpec { geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] }, material: MaterialProps::al7075_t6(), load: LoadConfig::uniaxial_x(1e7), network: Default::default(), training: Default::default(), formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
+};
         let (ny, nx) = (5, 5); let a = spec.load.px / spec.material.e;
         let mut u = Array2::zeros((ny, nx)); let mut v = Array2::zeros((ny, nx));
         for iy in 0..ny { for ix in 0..nx { let x = -0.1 + 0.2 * ix as f64 / 4.0; let y = -0.1 + 0.2 * iy as f64 / 4.0; u[(iy,ix)] = (a*x) as f32; v[(iy,ix)] = (-spec.material.nu*a*y) as f32; }}
@@ -9203,6 +9541,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let (ny, nx) = (5, 7);
         let a = spec.load.px / spec.material.e;
@@ -9262,6 +9601,7 @@ mod issue_77_l5_tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let device = crate::training_core::BDevice::default();
         let no_hole = crate::user_runner::train_single_user_problem_for_benchmark(base.clone(), &device);

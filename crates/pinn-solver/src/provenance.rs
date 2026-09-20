@@ -483,6 +483,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         }
     }
 

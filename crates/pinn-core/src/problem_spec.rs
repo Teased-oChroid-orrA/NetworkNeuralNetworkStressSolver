@@ -179,6 +179,87 @@ pub fn default_formulation() -> FormulationSelection {
     ])
 }
 
+/// Issue #77 PH4-45: which of the three architectures PH4-41..44 corrected and measured to
+/// converge within 0.67-1.23% of FEM (see `PHASE_4_IMPLEMENTATION_MANIFEST.md`) trains an
+/// annular-decomposition-eligible spec's hole domain — orthogonal to `hard_constraint_ansatz`/
+/// `coordinate_embedding` below (both apply to whichever procedure is selected).
+/// `#[serde(default)]` = `Joint`, the exact pre-existing `AnnularDecompositionProblem`
+/// single-stage behavior — no existing spec's dispatch changes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum TrainingProcedure {
+    /// The exact pre-#77 dispatch: `AnnularDecompositionProblem`'s single joint optimization
+    /// when the geometry qualifies (`AnnularDecompositionProblem::supports`), the plain
+    /// single-domain `UserDefinedProblem` path otherwise. `hard_constraint_ansatz`/
+    /// `coordinate_embedding` apply to whichever branch this naturally selects.
+    #[default]
+    Joint,
+    /// Forces the single-domain `UserDefinedProblem` path (Phase 1/PH4-42's own real tested
+    /// configuration) EVEN when the geometry would otherwise also qualify for annular
+    /// decomposition - which every "L5" shape this investigation used does. Without this,
+    /// `hard_constraint_ansatz=true` on an L5-shaped spec would silently apply to the
+    /// TWO-domain annular path's annulus model instead of Phase 1's actual single-domain
+    /// model - a different, untested architecture from the one PH4-42 verified converges to
+    /// 0.67% of FEM. `coordinate_embedding` must stay `Cartesian` here (`UserDefinedProblem`
+    /// has no log-polar wiring - that's Phase 3's, annular-only).
+    SingleDomain,
+    /// Phase 2's frozen-anchor sequential two-stage procedure
+    /// (`user_runner::run_annular_decomposition_training_sequential`): train the outer domain
+    /// alone for `stage_a_steps`, freeze it, then train the annulus domain alone for
+    /// `stage_b_steps` against the frozen outer model's own interface trace.
+    SequentialTwoStage { stage_a_steps: usize, stage_b_steps: usize },
+}
+
+fn default_training_procedure() -> TrainingProcedure {
+    TrainingProcedure::Joint
+}
+
+/// Issue #77 PH4-45: selects between the annulus domain's two tested coordinate
+/// representations - `Cartesian` (the pre-existing `SingleHoleChart`/raw embedding, chosen by
+/// `UserGeometry::coordinate_embedding()`) or Phase 3's `LogPolar` reparameterization
+/// (`ξ=ln(r/a), cosθ, sinθ`, `UserGeometry::log_polar_embedding()`). `#[serde(default)]` =
+/// `Cartesian`, byte-identical to every existing spec.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum CoordinateEmbeddingSelection {
+    Cartesian,
+    LogPolar,
+}
+
+impl Default for CoordinateEmbeddingSelection {
+    fn default() -> Self {
+        Self::Cartesian
+    }
+}
+
+/// Issue #77 PH4-45: opt-in selection of the three architectures PH4-41..44 proved converge to
+/// the FEM reference within 0.67-1.23% (`PHASE_4_IMPLEMENTATION_MANIFEST.md`), replacing the
+/// prior test-only construction (`UserDefinedProblem::new_with_hard_constraint_ansatz`,
+/// `AnnularDecompositionProblem::new_with_log_polar_embedding`,
+/// `run_annular_decomposition_training_sequential`) with a TOML-reachable one. Every field
+/// `#[serde(default)]`s to the exact pre-existing behavior, so no existing spec's training
+/// changes. `hard_constraint_ansatz`/`hole_bias_fraction` require
+/// `pinn_solver::user_problem::decomposition_applicable` (one centered, traction-free hole) -
+/// the same scope `UserDefinedProblem::new_with_hard_constraint_ansatz` already asserts.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct ArchitectureSpec {
+    /// Phase 1/PH4-35's exact, closed-form hard-constraint hole ansatz
+    /// (`kirsch_hole_correction::HoleTractionFreeAnsatz`) in place of the soft `hole_free`
+    /// penalty. Applies to the hole domain of whichever `training_procedure` is selected
+    /// (the single domain under `Joint` without annular decomposition, the annulus domain
+    /// under `Joint` with it, or Stage B's annulus domain under `SequentialTwoStage`).
+    #[serde(default)]
+    pub hard_constraint_ansatz: bool,
+    /// Phase 1's near-hole stratified-sampling bias fraction (`UserSamplingStrategy::
+    /// with_hole_bias`), quadrature-compensated via `hole_bias_quadrature_weights` (PH4-41
+    /// finding 2's fix) so the energy integral stays correct under the resulting non-uniform
+    /// density. `0.0` (default) reproduces the exact pre-existing uniform-density sampling.
+    #[serde(default)]
+    pub hole_bias_fraction: f64,
+    #[serde(default)]
+    pub coordinate_embedding: CoordinateEmbeddingSelection,
+    #[serde(default = "default_training_procedure")]
+    pub training_procedure: TrainingProcedure,
+}
+
 /// The complete user-defined problem: geometry (rectangular plate + N holes), material,
 /// far-field load, network size, and training schedule. See `examples/problems/` for a
 /// documented, ready-to-edit template.
@@ -195,6 +276,11 @@ pub struct ProblemSpec {
     /// behavior) so every existing spec file keeps parsing and training identically.
     #[serde(default = "default_formulation")]
     pub formulation: FormulationSelection,
+    /// Issue #77 PH4-45. Defaults to `ArchitectureSpec::default()` (plain `Identity` ansatz,
+    /// no sampling bias, Cartesian embedding, `Joint` procedure) - byte-identical to every
+    /// existing spec file's dispatch.
+    #[serde(default)]
+    pub architecture: ArchitectureSpec,
 }
 
 #[cfg(test)]
@@ -218,6 +304,7 @@ mod tests {
             network: NetworkSpec::default(),
             training: TrainingSpec::default(),
             formulation: default_formulation(),
+            architecture: ArchitectureSpec::default(),
         }
     }
 
@@ -240,6 +327,57 @@ mod tests {
             let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
             toml::from_str::<ProblemSpec>(&contents).unwrap_or_else(|e| panic!("failed to parse {path:?}: {e}"));
         }
+    }
+
+    /// Issue #77 PH4-45: the shipped example demonstrating `[architecture]` - a real regression
+    /// guard that TOML deserialization of `hard_constraint_ansatz`/`hole_bias_fraction` and the
+    /// commented-out `SequentialTwoStage` syntax documented in the file's own comment are both
+    /// exactly what this session's real, reproducing PH4-42 result used.
+    #[test]
+    fn shipped_issue_77_hard_constraint_example_parses_with_expected_architecture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/problems/issue_77_l5_hard_constraint.toml");
+        let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
+        let spec: ProblemSpec = toml::from_str(&contents).unwrap_or_else(|e| panic!("failed to parse {path:?}: {e}"));
+        assert!(spec.architecture.hard_constraint_ansatz);
+        assert_eq!(spec.architecture.hole_bias_fraction, 0.5);
+        assert_eq!(spec.architecture.coordinate_embedding, CoordinateEmbeddingSelection::Cartesian);
+        assert_eq!(spec.architecture.training_procedure, TrainingProcedure::SingleDomain);
+        assert_eq!(spec.geometry.holes.len(), 1);
+        assert_eq!(spec.geometry.holes[0].radius, 0.005);
+    }
+
+    /// Issue #77 PH4-45: the commented `[architecture.training_procedure]` syntax the example
+    /// file's own comment documents must actually parse - written here as its own standalone
+    /// TOML fragment (not uncommented in the shipped file, since PH4-43's real verified config
+    /// used a bare spec without `hole_bias_fraction`/log-polar) so the documented syntax itself
+    /// is regression-proven, not just eyeballed.
+    #[test]
+    fn documented_sequential_two_stage_toml_syntax_round_trips() {
+        let toml_str = r#"
+            [architecture.training_procedure]
+            SequentialTwoStage = { stage_a_steps = 1500, stage_b_steps = 1500 }
+
+            [geometry]
+            half_w = 0.1
+            half_h = 0.1
+            thickness = 0.005
+            holes = []
+
+            [material]
+            e = 71.7e9
+            nu = 0.33
+            density = 2810.0
+            ultimate_strength_pa = 503e6
+
+            [load]
+            px = 6.9e7
+            py = 0.0
+        "#;
+        let parsed: ProblemSpec = toml::from_str(toml_str).expect("documented syntax must parse");
+        assert_eq!(
+            parsed.architecture.training_procedure,
+            TrainingProcedure::SequentialTwoStage { stage_a_steps: 1500, stage_b_steps: 1500 },
+        );
     }
 
     /// Issue #62 PH3-17's own real decision record, enforced: after running every "new path"
@@ -304,6 +442,45 @@ mod tests {
         assert_eq!(parsed.network, NetworkSpec::default());
         assert_eq!(parsed.training, TrainingSpec::default());
         assert_eq!(parsed.formulation, default_formulation(), "omitting [formulation] must reproduce pre-remediation behavior exactly");
+        assert_eq!(parsed.architecture, ArchitectureSpec::default(), "omitting [architecture] must reproduce pre-#77-Phase-1..3 dispatch exactly");
+    }
+
+    /// Issue #77 PH4-45: `ArchitectureSpec::default()` must be the exact pre-existing dispatch
+    /// - plain `Identity` ansatz (`hard_constraint_ansatz=false`), no sampling bias, Cartesian
+    /// embedding, `Joint` (single-stage) training procedure. A future default change here would
+    /// silently re-route every existing spec's training through a different architecture.
+    #[test]
+    fn architecture_spec_default_is_the_pre_existing_dispatch() {
+        let a = ArchitectureSpec::default();
+        assert!(!a.hard_constraint_ansatz);
+        assert_eq!(a.hole_bias_fraction, 0.0);
+        assert_eq!(a.coordinate_embedding, CoordinateEmbeddingSelection::Cartesian);
+        assert_eq!(a.training_procedure, TrainingProcedure::Joint);
+    }
+
+    #[test]
+    fn architecture_spec_round_trips_through_toml_for_every_variant() {
+        let mut spec = sample_spec();
+        for architecture in [
+            ArchitectureSpec::default(),
+            ArchitectureSpec { hard_constraint_ansatz: true, hole_bias_fraction: 0.5, ..Default::default() },
+            ArchitectureSpec { coordinate_embedding: CoordinateEmbeddingSelection::LogPolar, ..Default::default() },
+            ArchitectureSpec { training_procedure: TrainingProcedure::SingleDomain, ..Default::default() },
+            ArchitectureSpec {
+                training_procedure: TrainingProcedure::SequentialTwoStage { stage_a_steps: 1500, stage_b_steps: 1500 },
+                ..Default::default()
+            },
+            ArchitectureSpec {
+                hard_constraint_ansatz: true, hole_bias_fraction: 0.3,
+                coordinate_embedding: CoordinateEmbeddingSelection::LogPolar,
+                training_procedure: TrainingProcedure::SequentialTwoStage { stage_a_steps: 500, stage_b_steps: 2500 },
+            },
+        ] {
+            spec.architecture = architecture;
+            let toml_str = toml::to_string(&spec).expect("serialize");
+            let parsed: ProblemSpec = toml::from_str(&toml_str).expect("deserialize");
+            assert_eq!(parsed.architecture, architecture, "round-trip must preserve every field exactly");
+        }
     }
 
     #[test]

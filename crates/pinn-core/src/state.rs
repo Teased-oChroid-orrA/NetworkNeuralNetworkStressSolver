@@ -1,7 +1,7 @@
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
-use crate::messages::VisFields;
+use crate::messages::{HoleAnalysis, VisFields};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SolverStatus {
@@ -68,6 +68,13 @@ pub struct TrainingState {
     /// K_t estimate from current PINN solution
     pub kt_estimate: Option<f32>,
 
+    /// Issue #77 PH4-45: per-hole stress-concentration analysis from the latest `TrainingUpdate`
+    /// - real, non-Kirsch-specific Kt for the User-Defined-problem plain single-domain path
+    /// (`kt_estimate` above stays `None` there; that path's own real Kt lives here instead, one
+    /// entry per `UserGeometry` hole). Empty for Kirsch/pin-lug (never populated,
+    /// `TrainingUpdate::hole_analyses` is always `Vec::new()` on those paths).
+    pub hole_analyses: Vec<HoleAnalysis>,
+
     pub status: SolverStatus,
     pub error_msg: Option<String>,
 
@@ -105,6 +112,7 @@ impl TrainingState {
             disp_v:    empty,
             n_colloc: 0,
             kt_estimate: None,
+            hole_analyses: Vec::new(),
             status: SolverStatus::Idle,
             error_msg: None,
             vis_grid,

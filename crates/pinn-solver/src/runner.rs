@@ -1147,7 +1147,39 @@ pub fn run_training_user_problem(
     tx: Sender<TrainingMsg>,
     stop_rx: Receiver<ControlMsg>,
 ) {
-    if crate::user_problem::AnnularDecompositionProblem::supports(&spec) {
+    use pinn_core::problem_spec::{CoordinateEmbeddingSelection, TrainingProcedure};
+
+    // Issue #77 PH4-45: routes to whichever of the three PH4-41..44-corrected architectures
+    // `spec.architecture` selects - `ArchitectureSpec::default()` (every pre-#77 spec)
+    // reproduces the exact pre-existing dispatch below byte-identically.
+    if let TrainingProcedure::SequentialTwoStage { stage_a_steps, stage_b_steps } = spec.architecture.training_procedure {
+        assert!(
+            spec.architecture.coordinate_embedding == CoordinateEmbeddingSelection::Cartesian,
+            "SequentialTwoStage + LogPolar is an untested combination - \
+             run_annular_decomposition_training_sequential has no log-polar parameter (Phase 2 \
+             and Phase 3 were only ever verified independently, see PH4-43/PH4-44)"
+        );
+        assert!(
+            crate::user_problem::AnnularDecompositionProblem::supports(&spec),
+            "SequentialTwoStage requires the same geometry this spec would need for the Joint \
+             annular-decomposition procedure (Variational formulation, measure_aware_training, \
+             a valid annular_partition - see AnnularDecompositionProblem::supports)"
+        );
+        run_training_annular_decomposition_sequential(spec, tx, stop_rx, stage_a_steps, stage_b_steps);
+        return;
+    }
+    // Issue #77 PH4-45: `SingleDomain` forces the single-domain `UserDefinedProblem` path even
+    // when the geometry ALSO qualifies for annular decomposition - see `TrainingProcedure::
+    // SingleDomain`'s own doc comment for why this matters (Phase 1/PH4-42's real verified
+    // config is otherwise unreachable for any L5-shaped spec).
+    let force_single_domain = spec.architecture.training_procedure == TrainingProcedure::SingleDomain;
+    if force_single_domain {
+        assert!(
+            spec.architecture.coordinate_embedding == CoordinateEmbeddingSelection::Cartesian,
+            "SingleDomain + LogPolar is unsupported - UserDefinedProblem has no log-polar wiring (Phase 3's is annular-only)"
+        );
+    }
+    if !force_single_domain && crate::user_problem::AnnularDecompositionProblem::supports(&spec) {
         run_training_annular_decomposition(spec, tx, stop_rx);
         return;
     }
@@ -1188,8 +1220,17 @@ fn run_training_annular_decomposition(
     tx: Sender<TrainingMsg>,
     stop_rx: Receiver<ControlMsg>,
 ) {
+    use pinn_core::problem_spec::CoordinateEmbeddingSelection;
+
     let device = BDevice::default();
-    let problem = crate::user_problem::AnnularDecompositionProblem::new(spec.clone());
+    // Issue #77 PH4-45: `spec.architecture.hard_constraint_ansatz`/`coordinate_embedding`
+    // select PH4-42/44's corrected architectures for this Joint annular-decomposition path
+    // (default `false`/`Cartesian`, byte-identical to `AnnularDecompositionProblem::new`).
+    let use_hard_constraint = spec.architecture.hard_constraint_ansatz;
+    let use_log_polar = spec.architecture.coordinate_embedding == CoordinateEmbeddingSelection::LogPolar;
+    let problem = crate::user_problem::AnnularDecompositionProblem::new_with_log_polar_embedding(
+        spec.clone(), use_log_polar, use_hard_constraint,
+    );
     validate_loss_terms(&problem);
     let stress_source_report: Vec<(&'static str, &'static str)> = crate::training_core::stress_source_report(&problem).into_iter()
         .map(|(name, source)| (name, match source {
@@ -1221,25 +1262,222 @@ fn run_training_annular_decomposition(
             crate::problem::ConstraintKind::Unconstrained => "Unconstrained",
             crate::problem::ConstraintKind::PenaltyInequality => "PenaltyInequality",
         })).collect();
-    let _ = crate::user_runner::run_annular_decomposition_training(spec, device, |step, total_loss, lr, n_colloc| {
-        let stop = matches!(stop_rx.try_recv(), Ok(ControlMsg::Stop) | Err(crossbeam_channel::TryRecvError::Disconnected));
-        let update = TrainingUpdate {
-            step, total_loss, energy_loss: total_loss, neumann_loss: 0.0, lr: lr as f32,
-            lam_energy: 1.0, lam_neumann: 0.0, n_colloc, kt_estimate: None, vis: None,
-            amr_sweep: None, hole_analyses: Vec::new(), grad_norm: None,
-            bc_residual_rms: 0.0, bc_residual_max: 0.0, reaction_force: None,
-            energy_balance: None, network_snapshot: None, architecture_event: None,
-            gradient_share_report: None, gradient_conflict_report: None,
-            stress_source_report: stress_source_report.clone(),
-            boundary_operator_report: boundary_operator_report.clone(),
-            derivative_order_report: derivative_order_report.clone(),
-            formulation_kind_report: formulation_kind_report.clone(),
-            constraint_report: constraint_report.clone(), no_hole_benchmark: None,
-            ad_fd_strain_diagnostic: None, convergence_evidence: None,
+    // Issue #77 PH4-45: real Kt + a correct spliced heatmap, at the same "every 10th
+    // step/last step" cadence the single-domain GUI path already uses - `run_training_
+    // annular_decomposition`'s own doc comment previously explained why `vis`/`kt_estimate`
+    // were unconditionally `None` here ("no correct two-model field evaluator existed"); both
+    // now exist (`evaluate_annular_vis_grid`, the corrected `annular_l5_diagnostic`).
+    let max_steps = spec.training.max_steps;
+    let diagnostic_steps: Vec<usize> = (0..max_steps).step_by(10)
+        .chain(std::iter::once(max_steps.saturating_sub(1)))
+        .collect();
+    let partition = spec.geometry.annular_partition().expect("validated by AnnularDecompositionProblem::supports");
+    let hole = spec.geometry.holes[0].clone();
+    let interface_radius = partition.interface_radius;
+    let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+    let [nx_vis, ny_vis] = SolverConfig::default_kirsch().vis_grid;
+    let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
+    let geometry = spec.geometry.clone();
+    let material = spec.material.clone();
+    let (px, py) = (spec.load.px, spec.load.py);
+    let device_for_diag = device.clone();
+
+    // Shared with `on_diagnostic` below: both run sequentially within the same training step
+    // (diagnostic computed first, `on_step` reads it right after), never concurrently, so a
+    // `RefCell` never double-borrows here.
+    let latest: std::rc::Rc<std::cell::RefCell<Option<(f64, pinn_core::messages::VisFields)>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let latest_for_diag = latest.clone();
+    let mut on_diagnostic = move |diag: crate::user_runner::AnnularL5Diagnostic,
+                                   annulus_model: &crate::network::ElasticityNet<BInner>,
+                                   outer_model: &crate::network::ElasticityNet<BInner>| {
+        // Same ansatz construction `AnnularDecompositionProblem::new_experimental` itself uses
+        // - `outer_ansatz` is always `Identity` regardless of `use_hard_constraint` (only the
+        // annulus domain's traction-free condition is hard-enforced), mirrored here rather than
+        // captured from `problem` to avoid borrowing a `&dyn DirichletAnsatz` across this
+        // `move` closure's own lifetime.
+        let annulus_ansatz = if use_hard_constraint {
+            crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(
+                crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+                    hole_center: hole.center, hole_radius: hole.radius,
+                    half_w: geometry.half_w, half_h: geometry.half_h,
+                    px, py, e: material.e as f64, nu: material.nu as f64,
+                    u_ref: scales.u_ref as f64,
+                },
+            )
+        } else {
+            crate::kirsch_hole_correction::AnnulusAnsatz::Identity
         };
-        let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
-        stop
-    });
+        let vis = crate::user_problem::evaluate_annular_vis_grid(
+            annulus_model, outer_model, &geometry, [nx_vis, ny_vis], scales.u_ref, px,
+            &material, &fd, &[], &device_for_diag, &annulus_ansatz, &crate::pinlug_problem::IdentityAnsatz,
+            affine, hole.center, interface_radius,
+        );
+        *latest_for_diag.borrow_mut() = Some((diag.kt_derived_fd_vm, vis));
+    };
+
+    let _ = crate::user_runner::run_annular_decomposition_training_with_architecture(
+        spec, device, use_hard_constraint, use_log_polar, &diagnostic_steps,
+        |step, total_loss, lr, n_colloc| {
+            let stop = matches!(stop_rx.try_recv(), Ok(ControlMsg::Stop) | Err(crossbeam_channel::TryRecvError::Disconnected));
+            let (kt_estimate, vis) = match latest.borrow_mut().take() {
+                Some((kt, vis)) => (Some(kt as f32), Some(vis)),
+                None => (None, None),
+            };
+            let update = TrainingUpdate {
+                step, total_loss, energy_loss: total_loss, neumann_loss: 0.0, lr: lr as f32,
+                lam_energy: 1.0, lam_neumann: 0.0, n_colloc, kt_estimate, vis,
+                amr_sweep: None, hole_analyses: Vec::new(), grad_norm: None,
+                bc_residual_rms: 0.0, bc_residual_max: 0.0, reaction_force: None,
+                energy_balance: None, network_snapshot: None, architecture_event: None,
+                gradient_share_report: None, gradient_conflict_report: None,
+                stress_source_report: stress_source_report.clone(),
+                boundary_operator_report: boundary_operator_report.clone(),
+                derivative_order_report: derivative_order_report.clone(),
+                formulation_kind_report: formulation_kind_report.clone(),
+                constraint_report: constraint_report.clone(), no_hole_benchmark: None,
+                ad_fd_strain_diagnostic: None, convergence_evidence: None,
+            };
+            let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
+            stop
+        },
+        &mut on_diagnostic,
+    );
+    let _ = tx.send(TrainingMsg::Done);
+}
+
+/// Issue #77 PH4-45: production GUI dispatch for `TrainingProcedure::SequentialTwoStage`
+/// (PH4-43's corrected Phase 2 architecture) - Stage A (outer domain alone) then Stage B
+/// (annulus domain alone, anchored to Stage A's frozen interface trace). Mirrors
+/// `run_training_annular_decomposition`'s own live-Kt/vis wiring, adapted to `run_annular_
+/// decomposition_training_sequential`'s different `on_step`/diagnostic shapes: no per-step
+/// `lr`/collocation count is exposed by that function's `on_step(stage, step, loss)` signature
+/// (unlike the Joint path's `on_step(step, loss, lr, n_colloc)`), so `lr`/`n_colloc` report
+/// `0.0`/`0` rather than a fabricated value - genuinely unavailable telemetry, not a guess.
+/// `step` in the emitted `TrainingUpdate` is a single monotonic count across both stages
+/// (`stage_a`'s own step, then `stage_a_steps + stage_b`'s own step) so the GUI's loss chart
+/// reads as one continuous x-axis instead of resetting to 0 when Stage B begins.
+fn run_training_annular_decomposition_sequential(
+    spec: ProblemSpec,
+    tx: Sender<TrainingMsg>,
+    stop_rx: Receiver<ControlMsg>,
+    stage_a_steps: usize,
+    stage_b_steps: usize,
+) {
+    let device = BDevice::default();
+    let use_hard_constraint = spec.architecture.hard_constraint_ansatz;
+
+    // Built once purely for the informational term-classification reports below - Stage B's
+    // own `AnnulusStageProblem` is used for the whole run (Stage A's `OuterStageProblem` has no
+    // hole-facing terms of its own interest here), matching the Joint path's own "reports built
+    // once, cloned into every tick" precedent.
+    let report_problem = crate::user_problem::AnnulusStageProblem::new(spec.clone(), use_hard_constraint);
+    validate_loss_terms(&report_problem);
+    let stress_source_report: Vec<(&'static str, &'static str)> = crate::training_core::stress_source_report(&report_problem).into_iter()
+        .map(|(name, source)| (name, match source {
+            crate::problem::StressSource::Direct => "Direct",
+            crate::problem::StressSource::Derived => "Derived",
+            crate::problem::StressSource::Both => "Both",
+        })).collect();
+    let boundary_operator_report: Vec<(&'static str, &'static str)> = crate::training_core::boundary_operator_report(&report_problem).into_iter()
+        .map(|(name, kind)| (name, match kind {
+            crate::problem::BoundaryOperatorKind::Dirichlet => "Dirichlet",
+            crate::problem::BoundaryOperatorKind::Neumann => "Neumann",
+            crate::problem::BoundaryOperatorKind::Robin => "Robin",
+            crate::problem::BoundaryOperatorKind::Periodic => "Periodic",
+            crate::problem::BoundaryOperatorKind::Symmetry => "Symmetry",
+            crate::problem::BoundaryOperatorKind::Interface => "Interface",
+        })).collect();
+    let derivative_order_report: Vec<(&'static str, &'static str)> = crate::training_core::derivative_order_report(&report_problem).into_iter()
+        .map(|(name, order)| (name, match order {
+            crate::problem::DerivativeOrder::First => "First",
+            crate::problem::DerivativeOrder::Second => "Second",
+        })).collect();
+    let formulation_kind_report: Vec<(&'static str, &'static str)> = crate::training_core::formulation_kind_report(&report_problem).into_iter()
+        .map(|(name, kind)| (name, match kind {
+            crate::problem::FormulationKind::Strong => "Strong",
+            crate::problem::FormulationKind::Weak => "Weak",
+        })).collect();
+    let constraint_report: Vec<(&'static str, &'static str)> = crate::training_core::constraint_report(&report_problem).into_iter()
+        .map(|(name, kind)| (name, match kind {
+            crate::problem::ConstraintKind::Unconstrained => "Unconstrained",
+            crate::problem::ConstraintKind::PenaltyInequality => "PenaltyInequality",
+        })).collect();
+
+    let diagnostic_steps: Vec<usize> = (0..stage_b_steps).step_by(10)
+        .chain(std::iter::once(stage_b_steps.saturating_sub(1)))
+        .collect();
+    let partition = spec.geometry.annular_partition().expect("validated by AnnularDecompositionProblem::supports (checked by the caller)");
+    let hole = spec.geometry.holes[0].clone();
+    let interface_radius = partition.interface_radius;
+    let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+    let [nx_vis, ny_vis] = SolverConfig::default_kirsch().vis_grid;
+    let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
+    let geometry = spec.geometry.clone();
+    let material = spec.material.clone();
+    let (px, py) = (spec.load.px, spec.load.py);
+    let device_for_diag = device.clone();
+
+    let latest: std::rc::Rc<std::cell::RefCell<Option<(f64, pinn_core::messages::VisFields)>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let latest_for_diag = latest.clone();
+    let mut on_diagnostic = move |diag: &crate::user_runner::UserProblemL5Diagnostic,
+                                   annulus_model: &crate::network::ElasticityNet<BInner>,
+                                   frozen_outer_model: &crate::network::ElasticityNet<BInner>| {
+        // Same ansatz construction as `run_training_annular_decomposition`'s own
+        // `on_diagnostic` - Stage B's `AnnulusStageProblem` selects the identical
+        // `HoleTractionFreeAnsatz` when `stage_b_hard_constraint` (this function's
+        // `use_hard_constraint`) is set; the frozen outer model is always plain `Identity`.
+        let annulus_ansatz = if use_hard_constraint {
+            crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(
+                crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+                    hole_center: hole.center, hole_radius: hole.radius,
+                    half_w: geometry.half_w, half_h: geometry.half_h,
+                    px, py, e: material.e as f64, nu: material.nu as f64,
+                    u_ref: scales.u_ref as f64,
+                },
+            )
+        } else {
+            crate::kirsch_hole_correction::AnnulusAnsatz::Identity
+        };
+        let vis = crate::user_problem::evaluate_annular_vis_grid(
+            annulus_model, frozen_outer_model, &geometry, [nx_vis, ny_vis], scales.u_ref, px,
+            &material, &fd, &[], &device_for_diag, &annulus_ansatz, &crate::pinlug_problem::IdentityAnsatz,
+            affine, hole.center, interface_radius,
+        );
+        *latest_for_diag.borrow_mut() = Some((diag.kt_derived_fd_vm, vis));
+    };
+
+    let _ = crate::user_runner::run_annular_decomposition_training_sequential(
+        spec, device, stage_a_steps, stage_b_steps, use_hard_constraint, &diagnostic_steps,
+        |stage, step, total_loss| {
+            let stop = matches!(stop_rx.try_recv(), Ok(ControlMsg::Stop) | Err(crossbeam_channel::TryRecvError::Disconnected));
+            let global_step = if stage == "stage_a" { step } else { stage_a_steps + step };
+            let (kt_estimate, vis) = match latest.borrow_mut().take() {
+                Some((kt, vis)) => (Some(kt as f32), Some(vis)),
+                None => (None, None),
+            };
+            let update = TrainingUpdate {
+                step: global_step, total_loss, energy_loss: total_loss, neumann_loss: 0.0,
+                lr: 0.0, lam_energy: 1.0, lam_neumann: 0.0, n_colloc: 0, kt_estimate, vis,
+                amr_sweep: None, hole_analyses: Vec::new(), grad_norm: None,
+                bc_residual_rms: 0.0, bc_residual_max: 0.0, reaction_force: None,
+                energy_balance: None, network_snapshot: None, architecture_event: None,
+                gradient_share_report: None, gradient_conflict_report: None,
+                stress_source_report: stress_source_report.clone(),
+                boundary_operator_report: boundary_operator_report.clone(),
+                derivative_order_report: derivative_order_report.clone(),
+                formulation_kind_report: formulation_kind_report.clone(),
+                constraint_report: constraint_report.clone(), no_hole_benchmark: None,
+                ad_fd_strain_diagnostic: None, convergence_evidence: None,
+            };
+            let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
+            stop
+        },
+        &mut on_diagnostic,
+    );
     let _ = tx.send(TrainingMsg::Done);
 }
 
@@ -1393,7 +1631,14 @@ fn run_user_problem_training_from(
     let half_w = spec.geometry.half_w;
     let half_h = spec.geometry.half_h;
 
-    let problem = UserDefinedProblem::new(spec.clone());
+    // Issue #77 PH4-45: `spec.architecture.hard_constraint_ansatz`/`hole_bias_fraction`
+    // (default `false`/`0.0`, byte-identical to `UserDefinedProblem::new`) select Phase 1's
+    // corrected hard-constraint architecture for this GUI-streaming path - the same
+    // `new_with_hard_constraint_ansatz` constructor `issue_77_single_domain_hard_constraint_
+    // l5_trace` already proved converges to 0.67% of FEM.
+    let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(
+        spec.clone(), spec.architecture.hard_constraint_ansatz, spec.architecture.hole_bias_fraction,
+    );
     validate_loss_terms(&problem);
 
     let mut config = SolverConfig::default_kirsch();
@@ -1562,6 +1807,26 @@ fn run_user_problem_training_from(
         // re-sets it to `Some(...)` only for the exact step a sweep fires, matching the
         // documented contract exactly instead of only approximating it.
         problem.set_interior_weights(None);
+
+        // Issue #77 PH4-41 fix (finding 2): `UserSamplingStrategy`'s hole-biased stratified
+        // sampling (`spec.architecture.hole_bias_fraction`, `0.0` = every pre-#77 spec,
+        // byte-identical) draws a deliberately non-uniform density -
+        // `PhysicalPotentialEnergyTerm`'s unweighted-mean energy integral is only a correct
+        // Monte-Carlo estimator under uniform density, so it must be told the real per-point
+        // weight. Set right after the reset above, on the SAME "last write wins" convention
+        // this loop already uses for AMR's own weights - if a sweep or persistent-adaptive
+        // block fires later this step, its own `set_interior_weights` call below correctly
+        // overwrites this one (compensating for its OWN, unrelated density change instead).
+        // Note: PH4-42's own real verification run used the simpler `run_user_problem_
+        // training_with_diagnostics` loop, which has no AMR sweep/persistent-adaptive logic at
+        // all - combining `hole_bias_fraction>0` with a REAL firing AMR sweep on this GUI path
+        // is therefore an untested extrapolation, not a proven configuration.
+        if spec.architecture.hole_bias_fraction > 0.0 {
+            let weights = crate::user_problem::hole_bias_quadrature_weights(
+                &data.int_norm, &spec.geometry, spec.architecture.hole_bias_fraction,
+            );
+            problem.set_interior_weights(Some(weights));
+        }
 
         let mut amr_sweep_report = None;
         // Issue #62 PH3-12: real on/off switch - see `TrainingSpec::amr_enabled`'s own doc
@@ -1776,9 +2041,21 @@ fn run_user_problem_training_from(
         let mut architecture_event = None;
         let (vis, hole_analyses, bc_residual_rms, bc_residual_max, reaction_force, energy_balance, network_snapshot, no_hole_benchmark, ad_fd_strain_diagnostic) = if send_vis {
             let model_val: ElasticityNet<BInner> = model.valid();
+            // Issue #77 PH4-41/45: `ansatz` is this model's own real training-time ansatz -
+            // `problem.ansatz(0)` (`Identity`, or the hard-constraint one when
+            // `spec.architecture.hard_constraint_ansatz` selected it above).
+            // `decomposition_applicable` is the SAME gate `UserDefinedProblem::loss_terms()`
+            // itself uses to decide whether the model was trained under kinematic decomposition
+            // (and therefore whether its displacement/stress output needs the affine background
+            // added back for a total-field reading) - both the heatmap (`vis`, PH4-45 - a bare
+            // forward pass here would report `u_hole`/`eps_hole` alone, mislabeled as the total
+            // field, exactly the bug PH4-41 fixed in `probe_hole_boundary_profile_derived`) and
+            // the per-hole probes below share this one gate.
+            let ansatz = problem.ansatz(0);
+            let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
             let vis = evaluate_user_vis_grid(
                 &model_val, &spec.geometry, [nx_vis, ny_vis], u_ref, spec.load.px,
-                &spec.material, &fd, &data.int_norm, &device,
+                &spec.material, &fd, &data.int_norm, &device, ansatz, affine,
             );
             // Phase 16 ("Final Results Dashboard") - real hole-boundary stress analysis,
             // computed on the SAME cadence/model snapshot as `vis` (not every step - each
@@ -1790,20 +2067,11 @@ fn run_user_problem_training_from(
             // comment (bugSource-New #12: nothing keeps direct σ aligned to real elasticity
             // away from the traction-free BC anymore, so Kt must read the derived field).
             let hole_margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
-            // Issue #77 PH4-41: this GUI-streaming path always trains a plain
-            // `UserDefinedProblem::new(spec)` (line ~1396 of this file - `Identity` ansatz,
-            // never the hard-constraint one, which only `new_with_hard_constraint_ansatz`
-            // selects) - so `IdentityAnsatz` matches this model's own real training convention
-            // exactly. `decomposition_applicable` is the SAME gate `UserDefinedProblem::
-            // loss_terms()` itself uses to decide whether the model was trained under kinematic
-            // decomposition (and therefore whether its displacement output needs the affine
-            // background added back for a total-field reading).
-            let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
             let hole_analyses: Vec<pinn_core::messages::HoleAnalysis> = spec.geometry.holes.iter().enumerate()
                 .map(|(hole_index, hole)| {
                     let profile = crate::user_problem::probe_hole_boundary_profile_derived(
                         &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
-                        &spec.material, hole_margin, &device, &crate::pinlug_problem::IdentityAnsatz, affine,
+                        &spec.material, hole_margin, &device, ansatz, affine,
                     );
                     let mut concentration = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
                     // Issue #62 PH3-15 ("Kt SHALL report... angular refinement, radial offset
@@ -1817,14 +2085,14 @@ fn run_user_problem_training_from(
                     let kt_convergence = crate::user_problem::kt_convergence_check(
                         &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
                         &spec.material, hole_margin, nominal_stress, 0.05, &device,
-                        &crate::pinlug_problem::IdentityAnsatz, affine,
+                        ansatz, affine,
                     );
                     concentration.angular_refinement_relative_change = Some(kt_convergence.angular_relative_change);
                     concentration.radial_offset_refinement_relative_change = Some(kt_convergence.radial_relative_change);
                     concentration.refinement_converged = Some(kt_convergence.converged);
                     let stress_diagnostic = crate::user_problem::probe_hole_stress_diagnostic(
                         &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
-                        &spec.material, hole_margin, &device, &crate::pinlug_problem::IdentityAnsatz,
+                        &spec.material, hole_margin, &device, ansatz,
                     );
                     pinn_core::messages::HoleAnalysis {
                         hole_index, profile, concentration, stress_diagnostic: Some(stress_diagnostic),
@@ -2175,24 +2443,26 @@ pub fn serve_loaded_plate_checkpoint(
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
     let [nx_vis, ny_vis] = SolverConfig::default_kirsch().vis_grid;
 
+    // Issue #77 PH4-41/45: a loaded checkpoint carries no ansatz metadata (the checkpoint
+    // format only persists model weights) - `IdentityAnsatz` matches every checkpoint this
+    // codebase can currently produce, since the checkpoint-save path only ever ran a plain
+    // `UserDefinedProblem::new(spec)`. This is a real, disclosed gap, not a proven invariant:
+    // once a hard-constraint-ansatz run is checkpointed too, its reload would need the same
+    // architecture metadata `ProblemSpec.architecture` already carries - not yet wired here.
+    let ansatz = crate::pinlug_problem::IdentityAnsatz;
+    let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
     let vis = crate::user_problem::evaluate_user_vis_grid(
-        &model, &spec.geometry, [nx_vis, ny_vis], u_ref, spec.load.px, &spec.material, &fd, &[], &device,
+        &model, &spec.geometry, [nx_vis, ny_vis], u_ref, spec.load.px, &spec.material, &fd, &[], &device, &ansatz, affine,
     );
     let nominal_stress = spec.load.px.abs().max(spec.load.py.abs());
     // Derived-stress-at-margin, not direct σ at the exact boundary - see
     // `probe_hole_boundary_profile_derived`'s doc comment.
     let hole_margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
-    // Issue #77 PH4-41: a loaded checkpoint carries no ansatz metadata, and every checkpoint
-    // this codebase can produce comes from the plain GUI-streaming `UserDefinedProblem::
-    // new(spec)` path (`IdentityAnsatz` - hard-constraint mode was never wired to the GUI/
-    // checkpoint path, only to test-only entry points) - matches `run_hole_benchmark`'s own
-    // identical convention for the same reason.
-    let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
     let hole_analyses: Vec<pinn_core::messages::HoleAnalysis> = spec.geometry.holes.iter().enumerate()
         .map(|(hole_index, hole)| {
             let profile = crate::user_problem::probe_hole_boundary_profile_derived(
                 &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material, hole_margin, &device,
-                &crate::pinlug_problem::IdentityAnsatz, affine,
+                &ansatz, affine,
             );
             let mut concentration = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
             // Issue #62 PH3-15 - same real angular/radial refinement check as the live
@@ -2201,14 +2471,14 @@ pub fn serve_loaded_plate_checkpoint(
             // are negligible.
             let kt_convergence = crate::user_problem::kt_convergence_check(
                 &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material,
-                hole_margin, nominal_stress, 0.05, &device, &crate::pinlug_problem::IdentityAnsatz, affine,
+                hole_margin, nominal_stress, 0.05, &device, &ansatz, affine,
             );
             concentration.angular_refinement_relative_change = Some(kt_convergence.angular_relative_change);
             concentration.radial_offset_refinement_relative_change = Some(kt_convergence.radial_relative_change);
             concentration.refinement_converged = Some(kt_convergence.converged);
             let stress_diagnostic = crate::user_problem::probe_hole_stress_diagnostic(
                 &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
-                &spec.material, hole_margin, &device, &crate::pinlug_problem::IdentityAnsatz,
+                &spec.material, hole_margin, &device, &ansatz,
             );
             pinn_core::messages::HoleAnalysis {
                 hole_index, profile, concentration, stress_diagnostic: Some(stress_diagnostic),
@@ -2685,6 +2955,7 @@ mod tests {
             network: NetworkSpec { hidden_dim: 64, n_hidden: 3, ..Default::default() },
             training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false, derivative_operator_diagnostic: false, amr_enabled: true },
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         }
     }
 
@@ -2714,6 +2985,7 @@ mod tests {
             network: NetworkSpec { hidden_dim: 8, n_hidden: 2, ..Default::default() },
             training: TrainingSpec::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(spec.geometry.net_input_dim()).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
@@ -3225,15 +3497,17 @@ mod tests {
         // the ORIGINAL trained scale (see pinn_core::inference_envelope's doc comment: these
         // scales are baked into training, not recomputed at inference time), only swap the
         // material argument passed to the constitutive-consistency check.
+        let affine = crate::user_problem::decomposition_applicable(&trained_spec)
+            .then_some((trained_spec.load.px, trained_spec.load.py));
         let baseline = evaluate_user_vis_grid(
             &model, &trained_spec.geometry, [16, 16], u_ref, trained_spec.load.px,
-            &trained_spec.material, &fd, &[], &device,
+            &trained_spec.material, &fd, &[], &device, &crate::pinlug_problem::IdentityAnsatz, affine,
         );
         let mut perturbed_material = trained_spec.material.clone();
         perturbed_material.e *= 3.0; // "moderate" perturbation per the epic's Phase 19 wording
         let perturbed = evaluate_user_vis_grid(
             &model, &trained_spec.geometry, [16, 16], u_ref, trained_spec.load.px,
-            &perturbed_material, &fd, &[], &device,
+            &perturbed_material, &fd, &[], &device, &crate::pinlug_problem::IdentityAnsatz, affine,
         );
 
         let rms = |field: &ndarray::Array2<f32>| -> f64 {
@@ -3285,6 +3559,7 @@ mod tests {
         for _ in 0..n_calls {
             let _ = evaluate_user_vis_grid(
                 &model, &spec.geometry, [64, 64], 1.0, spec.load.px, &spec.material, &fd, &int_norm, &device,
+                &crate::pinlug_problem::IdentityAnsatz, None,
             );
         }
         let per_call_ms = start.elapsed().as_secs_f64() * 1000.0 / n_calls as f64;
@@ -3831,6 +4106,7 @@ mod tests {
             network: NetworkSpec { hidden_dim: 64, n_hidden: 3, ..Default::default() },
             training: TrainingSpec { max_steps, n_interior: 2048, n_boundary: 512, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false, derivative_operator_diagnostic: false, amr_enabled: true },
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         }
     }
 
@@ -4745,6 +5021,7 @@ mod tests {
                 measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
             },
             formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
         };
         let net_cfg = ElasticityNetConfig::new()
             .with_input_dim(spec.geometry.net_input_dim())
@@ -5304,6 +5581,7 @@ mod tests {
             },
             training: TrainingSpec { max_steps, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3, measure_aware_training: false, derivative_operator_diagnostic: false, amr_enabled: true },
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         }
     }
 

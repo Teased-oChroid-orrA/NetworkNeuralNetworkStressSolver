@@ -251,6 +251,7 @@ mod tests {
             network: NetworkSpec::default(),
             training: TrainingSpec::default(),
             formulation: crate::problem_spec::default_formulation(),
+            architecture: crate::problem_spec::ArchitectureSpec::default(),
         }
     }
 

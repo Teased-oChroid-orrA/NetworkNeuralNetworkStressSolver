@@ -3798,6 +3798,7 @@ mod tests {
             network: NetworkSpec::default(),
             training: TrainingSpec { max_steps: 1, n_interior: 1, n_boundary: 1, fd_h, lr: 1e-3, measure_aware_training: false, derivative_operator_diagnostic: false, amr_enabled: true },
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         }
     }
 
@@ -4031,6 +4032,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new(spec);
 
@@ -4098,6 +4100,7 @@ mod tests {
             network: Default::default(),
             training: Default::default(),
             formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
         };
         let problem = UserDefinedProblem::new(spec);
         let terms = problem.loss_terms();

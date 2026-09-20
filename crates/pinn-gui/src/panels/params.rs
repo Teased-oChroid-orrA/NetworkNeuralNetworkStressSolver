@@ -88,6 +88,41 @@ pub fn show(
                 ui.label(format!("Material E = {:.3e} Pa,  ν = {:.3}", spec.material.e, spec.material.nu));
                 ui.label(format!("Load Px = {:.3e} Pa,  Py = {:.3e} Pa", spec.load.px, spec.load.py));
                 ui.label(format!("Steps: {}   Interior: {}", spec.training.max_steps, spec.training.n_interior));
+
+                // Issue #77 PH4-45: read-only summary of which corrected architecture this
+                // TOML spec selected - `ProblemSpec` stays the single source of truth (no
+                // interactive widgets here, matching every other User-Defined field's
+                // TOML-only convention).
+                use pinn_core::problem_spec::{CoordinateEmbeddingSelection, TrainingProcedure};
+                let a = &spec.architecture;
+                if a.hard_constraint_ansatz || a.coordinate_embedding != CoordinateEmbeddingSelection::Cartesian
+                    || !matches!(a.training_procedure, TrainingProcedure::Joint)
+                {
+                    ui.separator();
+                    ui.label("Architecture (issue #77):");
+                    ui.label(format!(
+                        "  Hard-constraint ansatz: {}", if a.hard_constraint_ansatz { "on" } else { "off" }
+                    ));
+                    if a.hole_bias_fraction > 0.0 {
+                        ui.label(format!("  Hole-biased sampling: {:.2}", a.hole_bias_fraction));
+                    }
+                    ui.label(format!(
+                        "  Coordinate embedding: {}",
+                        match a.coordinate_embedding {
+                            CoordinateEmbeddingSelection::Cartesian => "Cartesian",
+                            CoordinateEmbeddingSelection::LogPolar => "Log-polar",
+                        }
+                    ));
+                    ui.label(format!(
+                        "  Training procedure: {}",
+                        match a.training_procedure {
+                            TrainingProcedure::Joint => "Joint".to_string(),
+                            TrainingProcedure::SingleDomain => "Single-domain (forced)".to_string(),
+                            TrainingProcedure::SequentialTwoStage { stage_a_steps, stage_b_steps } =>
+                                format!("Sequential two-stage ({stage_a_steps} + {stage_b_steps} steps)"),
+                        }
+                    ));
+                }
             }
         });
 
@@ -246,9 +281,24 @@ pub fn show(
             ui.label(format!("LR: {:.2e}", last));
         }
         ui.label(format!("Colloc pts: {}", state.n_colloc));
-        // No closed-form convergence metric exists for an arbitrary user-defined geometry
-        // (unlike Kirsch's K_t or pin-lug's interface-gap RMS) — nothing to show here.
-        if !*user.active {
+        if *user.active {
+            // Issue #77 PH4-45: two real, non-Kirsch-specific Kt sources, depending on which
+            // dispatch path trained this run - `kt_estimate` for the annular-decomposition
+            // paths (Joint/SequentialTwoStage, wired via `TrainingUpdate.kt_estimate` exactly
+            // like Kirsch's own field), `hole_analyses` for the plain single-domain path
+            // (which always leaves `kt_estimate` `None` - see `run_user_problem_training_from`'s
+            // own `TrainingUpdate` construction). No closed-form theoretical Kt exists for an
+            // arbitrary user geometry, so no "theory: X.XXX" comparison is shown here (unlike
+            // Kirsch's fixed 3.000).
+            if let Some(kt) = state.kt_estimate {
+                ui.label(format!("K_t = {:.3}", kt));
+            }
+            for h in &state.hole_analyses {
+                ui.label(format!("Hole {}: K_t = {:.3}", h.hole_index, h.concentration.kt));
+            }
+        } else {
+            // No closed-form convergence metric exists for an arbitrary user-defined geometry
+            // (unlike Kirsch's K_t or pin-lug's interface-gap RMS) — nothing to show here.
             match problem_kind {
                 ProblemKind::Kirsch => {
                     if let Some(kt) = state.kt_estimate {

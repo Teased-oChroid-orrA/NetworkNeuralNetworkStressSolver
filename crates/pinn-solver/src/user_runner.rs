@@ -150,7 +150,12 @@ fn run_annular_decomposition_training_inner(
     device: BDevice,
     mut on_step: impl FnMut(usize, f32, f64, usize) -> bool,
     diagnostic_steps: &[usize],
-    diagnostics: &mut Vec<AnnularL5Diagnostic>,
+    // Issue #77 PH4-45: a sink callback (not an accumulator) so a live GUI/headless caller can
+    // read the diagnostic's `kt` AND both models at the exact checkpoint it was computed -
+    // `AnnularL5Diagnostic` alone doesn't carry a field-reconstructible heatmap. Every existing
+    // caller below passes `&mut |d, _a, _o| diagnostics.push(d)`, reproducing the prior
+    // accumulator behavior byte-identically (same values, same order, same cadence).
+    on_diagnostic: &mut dyn FnMut(AnnularL5Diagnostic, &crate::network::ElasticityNet<crate::training_core::BInner>, &crate::network::ElasticityNet<crate::training_core::BInner>),
     interface_weight: f32,
     include_annulus_equilibrium: bool,
     annulus_n_fourier: usize,
@@ -284,7 +289,10 @@ fn run_annular_decomposition_training_inner(
         }
         if diagnostic_steps.contains(&step) {
             use burn::module::AutodiffModule;
-            diagnostics.push(annular_l5_diagnostic(step, &out, lr_annulus, lr_outer, &models[0].valid(), &spec, &fd, &device, problem.ansatz(0)));
+            let annulus_valid = models[0].valid();
+            let outer_valid = models[1].valid();
+            let diag = annular_l5_diagnostic(step, &out, lr_annulus, lr_outer, &annulus_valid, &spec, &fd, &device, problem.ansatz(0));
+            on_diagnostic(diag, &annulus_valid, &outer_valid);
         }
         // Reports the annulus domain's own LR (the one whose starvation this fix addresses) -
         // a logging/callback choice only, does not affect either domain's optimizer step.
@@ -298,6 +306,28 @@ fn run_annular_decomposition_training_inner(
     (models.next().expect("annulus model"), models.next().expect("outer model"), last_total)
 }
 
+/// Issue #77 PH4-45: production entry point exposing `use_hard_constraint`/`use_log_polar`
+/// (PH4-42/44's corrected architectures) together with a live diagnostic sink, for a caller
+/// (the GUI/headless dispatch) that wants real Kt/field data as training proceeds - not just
+/// the loss/lr telemetry `on_step` alone carries. `diagnostic_steps` controls both the Kt
+/// probe's AND `on_diagnostic`'s cadence; the caller is expected to compute
+/// `evaluate_annular_vis_grid` itself from the models `on_diagnostic` hands it (this function
+/// stays free of any GUI-specific `VisFields`/grid-size concern).
+pub fn run_annular_decomposition_training_with_architecture(
+    spec: ProblemSpec,
+    device: BDevice,
+    use_hard_constraint: bool,
+    use_log_polar: bool,
+    diagnostic_steps: &[usize],
+    on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+    on_diagnostic: &mut dyn FnMut(AnnularL5Diagnostic, &crate::network::ElasticityNet<crate::training_core::BInner>, &crate::network::ElasticityNet<crate::training_core::BInner>),
+) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
+    run_annular_decomposition_training_inner(
+        spec, device, on_step, diagnostic_steps, on_diagnostic, 100.0, false, 0, false, 100.0,
+        use_hard_constraint, 0, GRAD_NORM_DAMPING_FLOOR, use_log_polar,
+    )
+}
+
 /// Train #77's bonded annular/global model pair. Kept public so GUI production dispatch and
 /// L5 use identical optimizer, sampling, and loss wiring rather than maintaining two loops.
 pub fn run_annular_decomposition_training(
@@ -305,7 +335,7 @@ pub fn run_annular_decomposition_training(
     device: BDevice,
     on_step: impl FnMut(usize, f32, f64, usize) -> bool,
 ) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
-    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new(), 100.0, false, 0, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false)
+    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut |_d, _a, _o| {}, 100.0, false, 0, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false)
 }
 
 /// Same production runner with opt-in, deterministic diagnostic checkpoints. No output file is
@@ -324,7 +354,7 @@ pub fn run_annular_decomposition_training_with_diagnostics(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
+        spec, device, on_step, diagnostic_steps, &mut |d, _a, _o| diagnostics.push(d), 100.0, false, 0, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -348,7 +378,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_interface_weight(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, interface_weight, false, 0, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
+        spec, device, on_step, diagnostic_steps, &mut |d, _a, _o| diagnostics.push(d), interface_weight, false, 0, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -374,7 +404,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_annulus_equilibri
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, include_annulus_equilibrium, 0, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
+        spec, device, on_step, diagnostic_steps, &mut |d, _a, _o| diagnostics.push(d), 100.0, include_annulus_equilibrium, 0, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -401,7 +431,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_annulus_fourier(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, annulus_n_fourier, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
+        spec, device, on_step, diagnostic_steps, &mut |d, _a, _o| diagnostics.push(d), 100.0, false, annulus_n_fourier, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -429,7 +459,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_siren(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, use_siren, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
+        spec, device, on_step, diagnostic_steps, &mut |d, _a, _o| diagnostics.push(d), 100.0, false, 0, use_siren, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -458,7 +488,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_hole_free_weight(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, hole_free_weight, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
+        spec, device, on_step, diagnostic_steps, &mut |d, _a, _o| diagnostics.push(d), 100.0, false, 0, false, hole_free_weight, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -482,7 +512,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_hard_constraint(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, use_hard_constraint, 0, GRAD_NORM_DAMPING_FLOOR, false,
+        spec, device, on_step, diagnostic_steps, &mut |d, _a, _o| diagnostics.push(d), 100.0, false, 0, false, 100.0, use_hard_constraint, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -511,7 +541,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_log_polar_embeddi
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, use_hard_constraint, 0, GRAD_NORM_DAMPING_FLOOR, use_log_polar,
+        spec, device, on_step, diagnostic_steps, &mut |d, _a, _o| diagnostics.push(d), 100.0, false, 0, false, 100.0, use_hard_constraint, 0, GRAD_NORM_DAMPING_FLOOR, use_log_polar,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -541,7 +571,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_hard_constraint_a
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, use_hard_constraint,
+        spec, device, on_step, diagnostic_steps, &mut |d, _a, _o| diagnostics.push(d), 100.0, false, 0, false, 100.0, use_hard_constraint,
         grad_norm_rescale_period, grad_norm_damping_floor, false,
     );
     (annulus, outer, loss, diagnostics)
@@ -580,7 +610,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_grad_norm_rescale
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, false, grad_norm_rescale_period, grad_norm_damping_floor, false,
+        spec, device, on_step, diagnostic_steps, &mut |d, _a, _o| diagnostics.push(d), 100.0, false, 0, false, 100.0, false, grad_norm_rescale_period, grad_norm_damping_floor, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -649,6 +679,13 @@ pub fn run_annular_decomposition_training_sequential(
     stage_b_hard_constraint: bool,
     diagnostic_steps: &[usize],
     mut on_step: impl FnMut(&str, usize, f32) -> bool,
+    // Issue #77 PH4-45: additive live-streaming hook, called at the same point/cadence as the
+    // `diagnostics.push` below - lets a GUI/headless caller read Stage B's real per-checkpoint
+    // Kt AND both models (Stage B's own live annulus model, Stage A's frozen outer model)
+    // without waiting for this function to return. Every existing test caller passes
+    // `&mut |_d, _a, _o| {}` and keeps reading the returned `Vec<UserProblemL5Diagnostic>`
+    // exactly as before - purely additive, no existing behavior changed.
+    on_diagnostic: &mut dyn FnMut(&UserProblemL5Diagnostic, &crate::network::ElasticityNet<crate::training_core::BInner>, &crate::network::ElasticityNet<crate::training_core::BInner>),
 ) -> (
     crate::network::ElasticityNet<crate::training_core::BInner>,
     crate::network::ElasticityNet<crate::training_core::BInner>,
@@ -732,7 +769,10 @@ pub fn run_annular_decomposition_training_sequential(
         annulus_model = new_model.into_iter().next().expect("single model");
         last_loss = out.total_scalar;
         if diagnostic_steps.contains(&step) {
-            diagnostics.push(user_problem_l5_diagnostic(step, &out, &annulus_model.valid(), &spec, &fd, &device, annulus_problem.ansatz(0)));
+            let annulus_valid = annulus_model.valid();
+            let diag = user_problem_l5_diagnostic(step, &out, &annulus_valid, &spec, &fd, &device, annulus_problem.ansatz(0));
+            on_diagnostic(&diag, &annulus_valid, &frozen_outer);
+            diagnostics.push(diag);
         }
         if on_step("stage_b", step, out.total_scalar) {
             break;
@@ -932,16 +972,69 @@ pub fn run_user_problem_training_with_diagnostics(
 /// signal available — there's no closed-form convergence target for an arbitrary
 /// user-defined geometry, unlike Kirsch's K_t).
 pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
-    if AnnularDecompositionProblem::supports(&spec) {
+    use pinn_core::problem_spec::{CoordinateEmbeddingSelection, TrainingProcedure};
+
+    // Issue #77 PH4-45: same architecture dispatch as `runner::run_training_user_problem`
+    // (GUI), see that function's own comment - kept as two independent call sites (headless
+    // has no `Sender<TrainingMsg>`/GUI vis grid to stream into), same precedent as every other
+    // headless/GUI pair in this codebase (`run_headless`/`run_training`,
+    // `run_headless_pinlug`/`run_training_pinlug`).
+    if let TrainingProcedure::SequentialTwoStage { stage_a_steps, stage_b_steps } = spec.architecture.training_procedure {
+        assert!(
+            spec.architecture.coordinate_embedding == CoordinateEmbeddingSelection::Cartesian,
+            "SequentialTwoStage + LogPolar is an untested combination - see runner::run_training_user_problem's identical assertion"
+        );
+        assert!(AnnularDecompositionProblem::supports(&spec), "SequentialTwoStage requires the same geometry Joint annular decomposition would need");
+        let device = BDevice::default();
+        let use_hard_constraint = spec.architecture.hard_constraint_ansatz;
+        let (_outer, _annulus, total, diagnostics) = run_annular_decomposition_training_sequential(
+            spec, device, stage_a_steps, stage_b_steps, use_hard_constraint,
+            &[stage_b_steps.saturating_sub(1)],
+            |stage, step, loss| {
+                if step % 300 == 0 || step + 1 == stage_a_steps.max(stage_b_steps) {
+                    println!("  [#77 sequential] {stage} step={step:>6} loss={loss:.6e}");
+                }
+                false
+            },
+            &mut |_d, _a, _o| {},
+        );
+        if let Some(last) = diagnostics.last() {
+            println!("  [#77 sequential] done final_total_loss={total:.6e} kt={:.9}", last.kt_derived_fd_vm);
+        } else {
+            println!("  [#77 sequential] done final_total_loss={total:.6e}");
+        }
+        return total.is_finite();
+    }
+    // Issue #77 PH4-45: same `SingleDomain` override as `runner::run_training_user_problem`,
+    // see that call site's own comment.
+    let force_single_domain = spec.architecture.training_procedure == TrainingProcedure::SingleDomain;
+    if force_single_domain {
+        assert!(
+            spec.architecture.coordinate_embedding == CoordinateEmbeddingSelection::Cartesian,
+            "SingleDomain + LogPolar is unsupported - see runner::run_training_user_problem's identical assertion"
+        );
+    }
+    if !force_single_domain && AnnularDecompositionProblem::supports(&spec) {
         let device = BDevice::default();
         let steps = spec.training.max_steps;
-        let (_annulus, _outer, total) = run_annular_decomposition_training(spec, device, |step, loss, lr, n| {
-            if step % (steps / 10).max(1) == 0 || step + 1 == steps {
-                println!("  [#77 annular] step {step:>6} total_loss={loss:.6e} lr={lr:.3e} points={n}");
-            }
-            false
-        });
-        println!("  [#77 annular] done final_total_loss={total:.6e}");
+        let use_hard_constraint = spec.architecture.hard_constraint_ansatz;
+        let use_log_polar = spec.architecture.coordinate_embedding == CoordinateEmbeddingSelection::LogPolar;
+        let diagnostic_steps = [steps.saturating_sub(1)];
+        let mut final_kt = None;
+        let (_annulus, _outer, total) = run_annular_decomposition_training_with_architecture(
+            spec, device, use_hard_constraint, use_log_polar, &diagnostic_steps,
+            |step, loss, lr, n| {
+                if step % (steps / 10).max(1) == 0 || step + 1 == steps {
+                    println!("  [#77 annular] step {step:>6} total_loss={loss:.6e} lr={lr:.3e} points={n}");
+                }
+                false
+            },
+            &mut |diag, _a, _o| final_kt = Some(diag.kt_derived_fd_vm),
+        );
+        match final_kt {
+            Some(kt) => println!("  [#77 annular] done final_total_loss={total:.6e} kt={kt:.9}"),
+            None => println!("  [#77 annular] done final_total_loss={total:.6e}"),
+        }
         return total.is_finite();
     }
     let device = BDevice::default();
@@ -981,7 +1074,11 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         println!("  [diag] P2-08 L0 gate PASSED: affine amplitude relative_error={:.3e}", result.relative_error);
     }
 
-    let problem = UserDefinedProblem::new(spec.clone());
+    // Issue #77 PH4-45: same architecture selection as `runner::run_training_user_problem`'s
+    // single-domain branch, see that call site's own comment.
+    let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(
+        spec.clone(), spec.architecture.hard_constraint_ansatz, spec.architecture.hole_bias_fraction,
+    );
     crate::problem::validate_loss_terms(&problem);
 
     let mut config = SolverConfig::default_kirsch();
@@ -1042,6 +1139,13 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
             sampling, &placeholder_geom, &spec.load,
             spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
         );
+        // Issue #77 PH4-41 fix (finding 2) - same fix as `run_user_problem_training_with_
+        // diagnostics`, see that call site's own comment. `hole_bias_fraction()<=0.0` (every
+        // pre-#77 spec) makes this a no-op.
+        let weights = crate::user_problem::hole_bias_quadrature_weights(
+            &data.int_norm, &spec.geometry, problem.hole_bias_fraction(),
+        );
+        problem.set_interior_weights(Some(weights));
         let ctx = plate_multi_step_ctx(
             &config, &problem, &fd, &hole_fd, &data, u_ref, ref_energy, ref_stress2,
             spec.geometry.n_fourier(),
@@ -1102,6 +1206,16 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
     // than asserting a specific value. IdentityAnsatz means raw network columns 0,1 (u,v)
     // need only the same u_ref physical-unit scaling `compute_domain_forwards` applies —
     // no ansatz dx/dy factor to replicate (always (1.0, 1.0)).
+    //
+    // Issue #77 PH4-45: a real, pre-existing bug caught by this session's own headless smoke
+    // test of a holed geometry - this block used to call `model.forward(eval_t)` directly on a
+    // bare 3-column `[xn, yn, 0.0]` tensor, bypassing the embedding transform entirely. That
+    // panicked on any single-hole geometry (`net_cfg` above builds the model with
+    // `net_input_dim()` = 10 for `SingleHoleChart`, not 3) - it happened to go unexercised
+    // until now because every real PH4-24..44 run trained through a different function
+    // (`run_user_problem_training_with_diagnostics`/`run_annular_decomposition_training*`),
+    // never this plain headless path against a REAL hole. Fixed by routing through
+    // `fwd_embedded`, the same embedding-aware forward every other real call site uses.
     let eval_pts = sampling.sample_interior(&placeholder_geom, 32);
     let eval_norm: Vec<f32> = eval_pts.iter()
         .flat_map(|&[x, y]| { let [nx, ny] = normalize_point(x, y, half_w, half_h); [nx, ny, 0.0f32] })
@@ -1110,7 +1224,7 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
     let eval_t = burn::tensor::Tensor::<B, 2>::from_data(
         burn::tensor::TensorData::new(eval_norm, vec![n_eval, 3]), &device,
     );
-    let raw = model.forward(eval_t);
+    let raw = crate::network::fwd_embedded::<B>(&model, eval_t, spec.geometry.coordinate_embedding(), &device);
     let max_abs_disp: f32 = raw.slice([0..n_eval, 0..2])
         .mul_scalar(u_ref as f64)
         .abs()
@@ -1134,8 +1248,13 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         let model_val: crate::network::ElasticityNet<crate::training_core::BInner> = model.valid();
         let diag_int_norm: Vec<[f32; 2]> = sampling.sample_interior(&placeholder_geom, 512).iter()
             .map(|&[x, y]| normalize_point(x, y, half_w, half_h)).collect();
+        // Issue #77 PH4-45: same field-reconstruction fix as the GUI's own vis-cadence block -
+        // `problem.ansatz(0)` is this model's own real training-time ansatz, and
+        // `decomposition_applicable` mirrors `UserDefinedProblem::loss_terms()`'s own gate.
+        let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
         let vis = crate::user_problem::evaluate_user_vis_grid(
             &model_val, &spec.geometry, [96, 96], u_ref, spec.load.px, &spec.material, &fd, &diag_int_norm, &device,
+            problem.ansatz(0), affine,
         );
         let pde_vals: Vec<f32> = vis.pde_residual.iter().copied().filter(|v| v.is_finite()).collect();
         let (pde_rms, pde_max) = crate::training_core::residual_stats(&pde_vals);

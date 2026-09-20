@@ -2701,3 +2701,77 @@ result of the kind PH4-35 flagged for a prior (pre-measurement-fix) experiment.
 
 Does not close issue #77 as a GitHub issue on its own (see PH4-42's own closing note) - reported
 alongside Phase 1/2 as the third leg of the same corrected-measurement evidence base.
+
+## PH4-45 — GUI/headless wiring for the three PH4-41..44-corrected architectures, plus two
+## real pre-existing bugs found and fixed along the way
+
+Following commit `4644c64` (PH4-41..44), a user request to "make sure the GUI is properly
+wired for all of these changes" surfaced a real audit finding: none of the three corrected
+architectures were reachable outside test code, AND the GUI heatmap
+(`user_problem::evaluate_user_vis_grid`) had the exact same field-reconstruction bug PH4-41
+fixed in the diagnostic probe - a bare forward pass, no ansatz, no affine background - for any
+`decomposition_applicable` spec, independent of this investigation's own three architectures.
+Full detail lives in CLAUDE.md's own "Issue #77 PH4-45" section; this entry is the short
+pointer + the real numbers.
+
+**What shipped**: `ProblemSpec.architecture: ArchitectureSpec` (TOML-selectable
+`hard_constraint_ansatz`/`hole_bias_fraction`/`coordinate_embedding`/`training_procedure`,
+every field `#[serde(default)]` to the exact pre-#77 dispatch); the `evaluate_user_vis_grid`
+fix (11 call sites, 2 closed-form proofs); `evaluate_annular_vis_grid` (the two-domain splice
+evaluator, 1 closed-form proof); a sink-based live-diagnostic mechanism replacing the
+accumulator-`Vec` pattern in `run_annular_decomposition_training_inner`/`_sequential` (11 + 3
+call sites, purely mechanical, same values/order/cadence); GUI surfacing in `pinn-gui`
+(`TrainingState.hole_analyses`, architecture summary + Kt display in `params.rs`).
+
+**`TrainingProcedure::SingleDomain` exists because the first version of this dispatch was
+wrong.** Every "L5" geometry this whole investigation used (the same shape PH4-24 through
+PH4-44 all trained on) qualifies for BOTH the single-domain `UserDefinedProblem` path AND
+`AnnularDecompositionProblem`'s two-domain Joint path. `hard_constraint_ansatz=true` alone is
+ambiguous between them - PH4-42's own real verified result used the single-domain
+architecture specifically, a genuinely different model from the two-domain one. Caught before
+it shipped silently: writing `examples/problems/issue_77_l5_hard_constraint.toml` to reproduce
+PH4-42's exact config surfaced that the natural dispatch order (annular-support check first)
+would have routed it through the wrong architecture. Fixed by adding an explicit
+`TrainingProcedure::SingleDomain` variant that forces the single-domain branch.
+
+**A second real, pre-existing bug, caught by this session's own real headless smoke test, not
+by any pre-existing test**: `run_headless_user_problem`'s "not a trivial collapse" diagnostic
+called `model.forward()` directly on a bare 3-column tensor, bypassing the embedding transform
+- panicked on ANY single-hole geometry, because the model itself is built with
+`net_input_dim()`=10 for `SingleHoleChart`, not 3. This had gone unexercised because every
+real PH4-24..44 run trained through a different function, never this exact plain-headless
+path against a real hole. Confirmed via a real release-binary run:
+```
+thread 'main' panicked at burn-ir-0.21.0/src/builder.rs:233:61:
+called `Result::unwrap()` on an `Err` value: IncompatibleShapes { left: Shape { dims: [32, 3] }, right: Shape { dims: [10, 64] } }
+```
+Fixed by routing through `fwd_embedded` (the same embedding-aware forward every other real
+call site already uses); regression-proven by a new test exercising
+`run_headless_user_problem` against a real single-hole geometry end-to-end (the first test in
+this codebase to do so).
+
+**Verified end-to-end via real release-binary headless runs**, not just unit tests, after both
+fixes:
+- `SingleDomain` + hard-constraint + hole-bias (the exact shipped example TOML): dispatches to
+  the single-domain path (confirmed by banner text and the absence of a `hole_free` term in
+  the printed term ledger, matching hard-constraint's expected structural suppression), 5
+  steps complete without a panic, Kt printed.
+- `SequentialTwoStage` (stage_a_steps=3, stage_b_steps=3): both stages print, Kt printed at
+  the end (`kt=2.491744696` - a real number from a 3-step Stage B, expected to be far from
+  converged, not a convergence claim, just a wiring proof).
+- `Joint` + `LogPolar` + hard-constraint together (the annular two-domain path with Phase 3's
+  embedding): dispatches to the annular path, 10 steps complete, Kt printed
+  (`kt=2.457462029`).
+- A pre-existing `[architecture]`-free example (`single_hole_plate.toml`): unchanged dispatch,
+  unchanged output shape, `hole_free` term present as before - confirms the default path is
+  still byte-identical in behavior (the trivial-collapse fix changes what would have panicked,
+  not what already worked).
+
+Full workspace regression after every change in this pass: 537 passed, 0 failed (excluding the
+same 1 pre-existing, unrelated failure `compute_loss_for_lbfgs_panics_on_lams_missing_a_real_
+term_key` PH4-41's own entry already disclosed, confirmed failing on unmodified `d9f38fe`).
+
+**Not done in this pass**: a real mouse-driven GUI click-through - the same disclosed gap the
+original "GUI wiring for user-defined problems" section already flagged for its own earlier
+work, for the same reason (headless verification of the identical underlying code already
+establishes correctness; the GUI runner is a thin streaming wrapper around it).

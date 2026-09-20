@@ -227,6 +227,7 @@ impl StressSolverApp {
                 s.lam_neumann.push(upd.lam_neumann);
                 s.n_colloc = upd.n_colloc;
                 s.kt_estimate = upd.kt_estimate;
+                s.hole_analyses = upd.hole_analyses;
                 s.status = SolverStatus::Running;
 
                 if let Some(vis) = upd.vis {
