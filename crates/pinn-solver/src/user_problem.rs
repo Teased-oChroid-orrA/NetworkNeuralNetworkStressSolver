@@ -122,7 +122,7 @@ fn affine_strain(px: f64, py: f64, material: &MaterialProps) -> (f64, f64, f64) 
 /// for no-hole/multi-hole/off-center/Fixed-bc geometries — those fall back to the
 /// existing, unmodified behavior byte-for-byte (no `affine_strain`/`affine_target` field
 /// is ever `Some` for them).
-fn decomposition_applicable(spec: &ProblemSpec) -> bool {
+pub(crate) fn decomposition_applicable(spec: &ProblemSpec) -> bool {
     matches!(
         spec.geometry.holes.as_slice(),
         [HoleSpec { bc: HoleBc::Free, center, .. }] if center[0] == 0.0 && center[1] == 0.0
@@ -447,6 +447,11 @@ impl UserSamplingStrategy {
         self
     }
 
+    /// See [`Self::hole_bias_fraction`]'s own doc comment — exposed so a caller can compute
+    /// matching quadrature weights via [`hole_bias_quadrature_weights`] without duplicating
+    /// this struct's own bias-fraction/geometry state.
+    pub fn hole_bias_fraction(&self) -> f64 { self.hole_bias_fraction }
+
     /// Like `UserGeometry::contains`, but excludes a `self.anchor_margin_m`-wide annulus just
     /// outside each hole too — deliberately DIFFERENT from `contains`'s general "is this a
     /// physically valid point" semantics (used for display/masking, where a point at
@@ -474,6 +479,63 @@ impl UserSamplingStrategy {
         }
         true
     }
+}
+
+/// Issue #77 PH4-41 fix (finding 2): per-point quadrature weights compensating for
+/// `UserSamplingStrategy::sample_interior`'s own hole-biased stratified sampling
+/// (`hole_bias_fraction>0`, Phase 1's own addition). Reuses `pinn_core::amr::
+/// compensation_weights` — the SAME "leaf_area*n/total_area" mechanism AMR already uses to
+/// correct for its own non-uniform sampling density — rather than inventing a second
+/// integration-weight scheme. Classifies each point as inside/outside the bias stratum purely
+/// from its own distance to the hole center (the SAME `HOLE_BIAS_RADIUS_MULTIPLIER*hole.radius`
+/// boundary `sample_interior` itself uses), so it works on any point set that sampler produced
+/// without needing `sample_interior` to expose stratum membership directly.
+///
+/// `hole_bias_fraction<=0.0` (every pre-Phase-1 caller, and every geometry that isn't the
+/// single-centered-hole case this bias targets) returns all-`1.0` weights — byte-identical to
+/// `PhysicalPotentialEnergyTerm`'s existing `domain_integral_tensor` (unweighted mean) path,
+/// since `domain_integral_weighted_tensor_matches_unweighted_tensor_when_weights_are_uniform`
+/// already proves uniform weights of `1.0` reduce to the same result.
+pub(crate) fn hole_bias_quadrature_weights(
+    points_norm: &[[f32; 2]],
+    geometry: &UserGeometry,
+    hole_bias_fraction: f64,
+) -> Vec<f64> {
+    let [hole] = geometry.holes.as_slice() else {
+        return vec![1.0; points_norm.len()];
+    };
+    if hole_bias_fraction <= 0.0 {
+        return vec![1.0; points_norm.len()];
+    }
+    let points: Vec<[f64; 2]> = points_norm.iter()
+        .map(|p| [p[0] as f64 * geometry.half_w, p[1] as f64 * geometry.half_h])
+        .collect();
+    let bias_r = HOLE_BIAS_RADIUS_MULTIPLIER * hole.radius;
+    let bias_r2 = bias_r * bias_r;
+    let in_bias = |p: &[f64; 2]| -> bool {
+        let (dx, dy) = (p[0] - hole.center[0], p[1] - hole.center[1]);
+        dx * dx + dy * dy <= bias_r2
+    };
+    let n_biased = points.iter().filter(|p| in_bias(p)).count();
+    let n_remaining = points.len() - n_biased;
+    // Physical area each stratum represents - the SAME areas `sample_interior`'s own uniform-
+    // in-r^2 draw (biased stratum) and whole-plate-minus-that-disk draw (remainder) are meant
+    // to cover, independent of how many points actually landed in each this particular call.
+    let hole_area = std::f64::consts::PI * hole.radius * hole.radius;
+    let bias_area = (std::f64::consts::PI * bias_r2 - hole_area).max(0.0);
+    let plate_area = 4.0 * geometry.half_w * geometry.half_h - hole_area;
+    let remaining_area = (plate_area - bias_area).max(0.0);
+    let samples: Vec<pinn_core::amr::DensitySample> = points.iter().map(|&p| {
+        let leaf_area = if in_bias(&p) {
+            if n_biased > 0 { bias_area / n_biased as f64 } else { 0.0 }
+        } else if n_remaining > 0 {
+            remaining_area / n_remaining as f64
+        } else {
+            0.0
+        };
+        pinn_core::amr::DensitySample { point: p, leaf_area }
+    }).collect();
+    pinn_core::amr::compensation_weights(&samples)
 }
 
 impl DomainSamplingStrategy for UserSamplingStrategy {
@@ -1605,6 +1667,11 @@ impl UserDefinedProblem {
 
     pub fn spec(&self) -> &ProblemSpec { &self.spec }
 
+    /// See `UserSamplingStrategy::hole_bias_fraction`'s own doc comment - exposed so a caller
+    /// can compute matching quadrature weights (`hole_bias_quadrature_weights`) without
+    /// reaching into this struct's own private `sampling` field.
+    pub fn hole_bias_fraction(&self) -> f64 { self.sampling.hole_bias_fraction() }
+
     /// Issue #62 PH3-04: sets the per-interior-point AMR density-compensation weights the NEXT
     /// `loss_terms()` call's `InteriorEnergyTerm` will use (only when `spec.training.measure_
     /// aware_training` is also true - `InteriorEnergyTerm::compute` ignores this entirely
@@ -2285,7 +2352,19 @@ impl BoundaryValueProblem for OuterStageProblem {
             ds_per_point.push(2.0 * self.spec.geometry.half_w / per_edge as f64);
         }
         let hole = &self.spec.geometry.holes[0];
-        let (a_exx, a_eyy, _) = affine_strain(self.spec.load.px, self.spec.load.py, &self.spec.material);
+        // Issue #77 PH4-41 fix (finding 3): `PhysicalPotentialEnergyTerm`'s own `affine_strain`
+        // is now `Some(...)`, matching `AnnularDecompositionProblem`'s own established outer-
+        // domain convention exactly - Stage A's model represents `u_hole` (the correction)
+        // alone, same as Stage B's `AnnulusStageProblem`, so `evaluate_frozen_outer_interface_
+        // displacement`'s direct raw-output read (no affine addition of its own) is now
+        // comparing like-for-like against Stage B's own `u_hole`-only output via
+        // `FrozenInterfaceAnchorTerm`, instead of the field-convention mismatch (`u_total` vs
+        // `u_hole`) this fix closes. The interface anchor TARGET below is therefore also
+        // corrected to `hx, hy` alone (the closed-form hole correction only, no `a_exx*x`/
+        // `a_eyy*y` term) - it must target the SAME `u_hole` convention the now-decomposed
+        // energy term trains the model toward, or Stage A's own energy and boundary-condition
+        // terms would disagree on what the model output represents.
+        let affine_strain_pair = Some((self.spec.load.px, self.spec.load.py));
         let interface_pts = phase2_interface_parametrization();
         let (target_u, target_v): (Vec<f32>, Vec<f32>) = interface_pts.thetas.iter().map(|&theta| {
             let (x, y) = (partition.interface_radius * theta.cos(), partition.interface_radius * theta.sin());
@@ -2293,7 +2372,7 @@ impl BoundaryValueProblem for OuterStageProblem {
                 x, y, hole.radius, self.spec.material.e as f64, self.spec.material.nu as f64,
                 self.spec.load.px, self.spec.load.py,
             );
-            ((a_exx * x + hx) as f32, (a_eyy * y + hy) as f32)
+            (hx as f32, hy as f32)
         }).unzip();
         vec![
             Box::new(PhysicalPotentialEnergyTerm {
@@ -2301,7 +2380,7 @@ impl BoundaryValueProblem for OuterStageProblem {
                 px: self.spec.load.px, py: self.spec.load.py, measure_aware: true,
                 domain_area: outer_area, thickness: self.spec.geometry.thickness,
                 ref_energy: scales.ref_energy, ref_energy_absolute, interior_weights: None,
-                ds_per_point, affine_strain: None,
+                ds_per_point, affine_strain: affine_strain_pair,
             }),
             Box::new(OuterInterfaceAnchorTerm {
                 domain: OUTER_DOMAIN, target_u, target_v,
@@ -3153,8 +3232,15 @@ pub fn run_hole_benchmark(
     let scales = crate::training_core::compute_reference_scales_for_plate(spec);
     let fd = crate::fd_stencil::FdConfig::new(spec.training.fd_h, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
     let margin = ring_anchor_margin_m(spec.training.fd_h, geometry);
+    // Issue #77 PH4-41: `run_hole_benchmark` only ever validates the plain `UserDefinedProblem::
+    // new(spec)` path (no hard-constraint ansatz concept here) - `IdentityAnsatz` matches that
+    // model's own training convention exactly. `decomposition_applicable` is the SAME gate
+    // `UserDefinedProblem::loss_terms()` itself uses to decide whether the model was trained
+    // under kinematic decomposition.
+    let affine = decomposition_applicable(spec).then_some((spec.load.px, spec.load.py));
     let profile = probe_hole_boundary_profile_derived(
         model, geometry, hole, 72, &fd, scales.u_ref, spec.load.px, &spec.material, margin, device,
+        &IdentityAnsatz, affine,
     );
     let nominal_stress = spec.load.px.abs().max(spec.load.py.abs());
     let sc = stress_concentration_from_profile(&profile, nominal_stress);
@@ -3489,6 +3575,26 @@ pub fn dependency_chain_for_kt(derived: bool) -> String {
 /// `contains_for_collocation` exists for. The exact-boundary, direct-σ variant stays available
 /// for a DIFFERENT, still-meaningful question — "is the traction-free condition satisfied" —
 /// not concentration. See [`PROBE_HOLE_BOUNDARY_PROFILE_DERIVED_SOURCE`].
+///
+/// **Issue #77 PH4-41 fix**: this function used to read the network's own raw output, scaled
+/// only by `u_ref`/`px_pa` (unit conversion) — bypassing BOTH the domain's `DirichletAnsatz`
+/// (the hard-constraint ansatz's own envelope suppression and exact closed-form Kirsch
+/// correction) AND `affine_strain`'s own contribution (added only inside training's loss terms,
+/// never exposed on the displacement itself under kinematic decomposition). That meant every
+/// real Kt/stress number this whole investigation reported (`annular_l5_diagnostic`,
+/// `user_problem_l5_diagnostic`, and everything downstream of them) measured a PARTIAL field,
+/// not total physical displacement/stress — confirmed by direct comparison against
+/// `training_core::compute_domain_forwards`'s own `u_col = raw_net*ansatz.eval() +
+/// ansatz.additive()` convention, which this function never applied. Now takes the SAME
+/// `ansatz`/`affine_strain` the caller's own problem uses for training (no independent
+/// convention of its own to drift out of sync again), reusing `training_core::
+/// stencil_forward_with_ansatz` — the single shared implementation `compute_domain_forwards`
+/// itself now also calls, so there is exactly one "how ansatz + u_ref combine" in this crate.
+/// `ansatz` and `affine_strain` MUST be the exact same values the caller's `loss_terms()` used
+/// to train `model` - passing `&IdentityAnsatz`/`None` for a model actually trained under the
+/// hard-constraint ansatz or kinematic decomposition would silently reintroduce this same bug
+/// in a new place.
+#[allow(clippy::too_many_arguments)]
 pub fn probe_hole_boundary_profile_derived(
     model: &crate::network::ElasticityNet<crate::training_core::BInner>,
     geometry: &UserGeometry,
@@ -3500,12 +3606,12 @@ pub fn probe_hole_boundary_profile_derived(
     material: &MaterialProps,
     margin: f64,
     device: &crate::training_core::BDevice,
+    ansatz: &dyn DirichletAnsatz,
+    affine_strain_pair: Option<(f64, f64)>,
 ) -> Vec<HoleBoundaryPoint> {
     use crate::energy::compute_stress;
     use crate::differential_operator::production_strain as compute_strains;
-    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor};
-    use crate::network::fwd_embedded;
-    use crate::training_core::BInner;
+    use crate::training_core::{stencil_forward_with_ansatz, BInner};
 
     let n = n_theta.max(1);
     let half_w = geometry.half_w;
@@ -3524,17 +3630,28 @@ pub fn probe_hole_boundary_profile_derived(
         pts_norm.push([(x / half_w) as f32, (y / half_h) as f32]);
     }
 
-    let pts_t = norm_pts_to_tensor::<BInner>(&pts_norm, device);
-    let stencil = assemble_stencil::<BInner>(&pts_t, fd, device);
-    let raw_stencil = fwd_embedded::<BInner>(model, stencil, embedding_for_model(model, geometry), device);
-
-    let m = 5 * n;
-    let scaled = Tensor::cat(vec![
-        raw_stencil.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
-        raw_stencil.slice([0..m, 2..5]).mul_scalar(px_pa),
-    ], 1);
+    // Same ansatz-application + u_ref/px scaling `compute_domain_forwards` itself uses for
+    // training - `scaled` here is genuinely total (ansatz-transformed) displacement/direct-
+    // stress, not raw network output, closing the first half of the PH4-41 gap.
+    let (scaled, _embedding) = stencil_forward_with_ansatz::<BInner>(
+        model, ansatz, &pts_norm, fd, 1.0, u_ref as f64, px_pa, true,
+        embedding_for_model(model, geometry), None, device,
+    );
     let center_uv = scaled.clone().slice([0..n, 0..2]);
-    let (eps_xx, eps_yy, eps_xy) = compute_strains::<BInner>(scaled, n, fd);
+    let (mut eps_xx, mut eps_yy, mut eps_xy) = compute_strains::<BInner>(scaled, n, fd);
+    // Second half of the PH4-41 gap: `affine_strain`'s own contribution is added directly to
+    // the FD-derived strain, exactly matching `PhysicalPotentialEnergyTerm`/
+    // `AnnularPotentialEnergyTerm::compute()`'s own `exx.add_scalar(a_exx)` convention (the
+    // network under kinematic decomposition represents `eps_hole`/`u_hole` alone; total strain
+    // requires this addition, which training already does internally but this diagnostic
+    // never did).
+    let affine_uv: Option<(f64, f64, f64, f64, f64)> = affine_strain_pair.map(|(px, py)| {
+        let (a_exx, a_eyy, a_exy) = affine_strain(px, py, material);
+        eps_xx = eps_xx.clone().add_scalar(a_exx);
+        eps_yy = eps_yy.clone().add_scalar(a_eyy);
+        eps_xy = eps_xy.clone().add_scalar(a_exy);
+        (a_exx, a_eyy, a_exy, px, py)
+    });
     let (sxx_t, syy_t, sxy_t) = compute_stress::<BInner>(eps_xx.clone(), eps_yy.clone(), eps_xy.clone(), material);
 
     let uv_vals: Vec<f32> = center_uv.into_data().to_vec().unwrap_or_else(|_| vec![0.0; 2 * n]);
@@ -3549,8 +3666,17 @@ pub fn probe_hole_boundary_profile_derived(
         let (sxx, syy, sxy) = (sxx_vals[i], syy_vals[i], sxy_vals[i]);
         let vm = ((sxx * sxx - sxx * syy + syy * syy + 3.0 * sxy * sxy) as f64).sqrt() as f32;
         let (x, y) = pts_phys[i];
+        // Reported displacement: also total (affine + ansatz-transformed correction) when
+        // decomposed - a plain point-value addition (not FD-differenced, since it's reported
+        // for inspection, not itself differentiated further).
+        let (mut ux, mut uy) = (uv_vals[i * 2], uv_vals[i * 2 + 1]);
+        if let Some((a_exx, a_eyy, a_exy, _px, _py)) = affine_uv {
+            let (dx, dy) = (x - hole.center[0], y - hole.center[1]);
+            ux += (a_exx * dx + a_exy * dy) as f32;
+            uy += (a_exy * dx + a_eyy * dy) as f32;
+        }
         HoleBoundaryPoint {
-            theta_deg: thetas[i], x, y, ux: uv_vals[i * 2], uy: uv_vals[i * 2 + 1],
+            theta_deg: thetas[i], x, y, ux, uy,
             eps_xx: exx_vals[i], eps_yy: eyy_vals[i], eps_xy: exy_vals[i],
             sxx, syy, sxy, von_mises: vm,
         }
@@ -3560,6 +3686,17 @@ pub fn probe_hole_boundary_profile_derived(
 /// Measure direct-versus-derived stress at the same FD-safe ring. The direct boundary profile
 /// cannot answer this question because its coordinates lie on `r=R`, while derived stress needs
 /// a margin so its finite-difference stencil stays outside the hole.
+///
+/// **Issue #77 PH4-41**: `ansatz` is threaded through to `probe_hole_boundary_profile_derived`
+/// so `derived`'s displacement (and thus its FD strain/stress) reflects the real ansatz
+/// transform (needed for a meaningful reading under the hard-constraint ansatz). `affine_strain`
+/// is deliberately NOT added here (`None` is always passed downstream) - `direct` reads the raw
+/// mDEM stress columns, which NEVER include an affine contribution by construction anywhere in
+/// this codebase (nothing adds affine to the direct stress output), so adding it only to
+/// `derived` would make this specific direct-vs-derived CONSISTENCY check compare two
+/// deliberately mismatched conventions - the opposite of what it's measuring. This is a
+/// narrower, self-consistency diagnostic, not the total-field Kt measurement
+/// `probe_hole_boundary_profile_derived`'s own callers use.
 pub fn probe_hole_stress_diagnostic(
     model: &crate::network::ElasticityNet<crate::training_core::BInner>,
     geometry: &UserGeometry,
@@ -3571,13 +3708,14 @@ pub fn probe_hole_stress_diagnostic(
     material: &MaterialProps,
     margin: f64,
     device: &crate::training_core::BDevice,
+    ansatz: &dyn DirichletAnsatz,
 ) -> pinn_core::messages::HoleStressDiagnostic {
     let radius = hole.radius + margin;
     let direct = probe_hole_stress_profile_direct_at_radius(
         model, geometry, hole, n_theta, fd, u_ref, px_pa, radius, device,
     );
     let derived = probe_hole_boundary_profile_derived(
-        model, geometry, hole, n_theta, fd, u_ref, px_pa, material, margin, device,
+        model, geometry, hole, n_theta, fd, u_ref, px_pa, material, margin, device, ansatz, None,
     );
     let n = direct.len().min(derived.len()).max(1) as f64;
     let mut direct_stress2 = 0.0;
@@ -3758,9 +3896,13 @@ pub fn kt_convergence_check(
     nominal_stress: f64,
     tolerance: f64,
     device: &crate::training_core::BDevice,
+    ansatz: &dyn DirichletAnsatz,
+    affine_strain_pair: Option<(f64, f64)>,
 ) -> KtConvergenceReport {
     let kt_of = |n_theta: usize, margin: f64| -> f64 {
-        let profile = probe_hole_boundary_profile_derived(model, geometry, hole, n_theta, fd, u_ref, px_pa, material, margin, device);
+        let profile = probe_hole_boundary_profile_derived(
+            model, geometry, hole, n_theta, fd, u_ref, px_pa, material, margin, device, ansatz, affine_strain_pair,
+        );
         stress_concentration_from_profile(&profile, nominal_stress).kt
     };
 
@@ -6089,6 +6231,50 @@ mod tests {
         }
     }
 
+    /// Issue #77 PH4-41 fix proof (finding 2): `hole_bias_quadrature_weights` must recover the
+    /// TRUE domain integral of a NON-constant field (`f(x,y)=x^2+y^2`, closed-form integral
+    /// `(4ab/3)(a^2+b^2)` over the square minus `pi*hole.radius^4/2` for the centered hole
+    /// disk) under BOTH `fraction=0.0` (unbiased) and `fraction=0.5` (hole-biased) sampling - a
+    /// constant integrand could not catch this bug (uniform-vs-biased density is invisible to a
+    /// constant function), which is why this test deliberately uses a spatially-varying one.
+    /// Also proves the UNWEIGHTED mean (the pre-fix behavior) is measurably WRONG under bias,
+    /// making this a genuine regression proof, not just a "close enough" sanity check.
+    #[test]
+    fn hole_bias_quadrature_weights_recovers_true_integral_under_biased_and_unbiased_sampling() {
+        let geometry = l5_geometry();
+        let placeholder = geometry.to_placeholder();
+        let n = 8192;
+        let hole = geometry.holes[0];
+        let (a, b) = (geometry.half_w, geometry.half_h);
+        let square_integral = (4.0 * a * b / 3.0) * (a * a + b * b);
+        let hole_integral = std::f64::consts::PI * hole.radius.powi(4) / 2.0;
+        let exact = square_integral - hole_integral;
+        let plate_area = 4.0 * a * b - std::f64::consts::PI * hole.radius * hole.radius;
+
+        for fraction in [0.0_f64, 0.5] {
+            let sampler = UserSamplingStrategy::new(geometry.clone(), 1e-3).with_hole_bias(fraction);
+            let pts = sampler.sample_interior(&placeholder, n);
+            let pts_norm: Vec<[f32; 2]> = pts.iter().map(|p| [(p[0] / a) as f32, (p[1] / b) as f32]).collect();
+            let weights = hole_bias_quadrature_weights(&pts_norm, &geometry, fraction);
+            let f = |p: &[f64; 2]| p[0] * p[0] + p[1] * p[1];
+
+            let weighted_mean: f64 = pts.iter().zip(&weights).map(|(p, &w)| f(p) * w).sum::<f64>() / pts.len() as f64;
+            let weighted_estimate = weighted_mean * plate_area;
+            let rel_err = (weighted_estimate - exact).abs() / exact.abs();
+            assert!(rel_err < 0.08,
+                "fraction={fraction}: weighted estimate={weighted_estimate:e} exact={exact:e} rel_err={rel_err}");
+
+            if fraction > 0.0 {
+                let unweighted_mean: f64 = pts.iter().map(f).sum::<f64>() / pts.len() as f64;
+                let unweighted_estimate = unweighted_mean * plate_area;
+                let unweighted_rel_err = (unweighted_estimate - exact).abs() / exact.abs();
+                assert!(unweighted_rel_err > 0.15,
+                    "the UNWEIGHTED mean under bias should be measurably wrong (this is the bug \
+                     the fix closes) - got rel_err={unweighted_rel_err}, expected a real, large error");
+            }
+        }
+    }
+
     /// Issue #77 Phase 1: real, tiny end-to-end training run proving the combined path
     /// (hard-constraint ansatz + hole-biased sampling) trains without panicking and stays
     /// finite - same discipline as `annular_decomposition_two_model_runner_smoke_is_finite`
@@ -7182,6 +7368,7 @@ mod tests {
         );
         let derived = probe_hole_boundary_profile_derived(
             &model, &geometry, &hole, 16, &fd, 1.0, 1.0, &MaterialProps::al7075_t6(), margin, &device,
+            &IdentityAnsatz, None,
         );
         assert_eq!(direct.len(), derived.len());
         for (d, c) in direct.iter().zip(&derived) {
@@ -7189,11 +7376,132 @@ mod tests {
                 "direct and derived stress must be sampled at identical coordinates");
         }
         let diagnostic = probe_hole_stress_diagnostic(
-            &model, &geometry, &hole, 16, &fd, 1.0, 1.0, &MaterialProps::al7075_t6(), margin, &device,
+            &model, &geometry, &hole, 16, &fd, 1.0, 1.0, &MaterialProps::al7075_t6(), margin, &device, &IdentityAnsatz,
         );
         assert_eq!(diagnostic.radial_offset_m, margin);
         assert!(diagnostic.stress_mismatch_rms.is_finite() && diagnostic.stress_mismatch_max.is_finite());
         assert!(diagnostic.direct_traction_rms.is_finite() && diagnostic.derived_traction_rms.is_finite());
+    }
+
+    /// Issue #77 PH4-41 fix proof (finding 1, affine half): `probe_hole_boundary_profile_derived`
+    /// with `affine_strain_pair=Some((px,py))` must differ from the SAME call with `None` by
+    /// EXACTLY `affine_strain(px,py,material)`'s own constant values, for ANY network - this is
+    /// an unconditional, network-independent arithmetic identity (the fix adds a known constant
+    /// to FD-derived strain, `eps_xx.add_scalar(a_exx)`, not something that depends on what the
+    /// network predicts), so a real (not zeroed/mocked) freshly-initialized network is a valid
+    /// probe. Before this fix, both calls would have been byte-identical (the function never
+    /// read `affine_strain_pair` at all) - this test fails against the pre-fix function and
+    /// passes against the fixed one, making it a genuine regression proof, not just a shape check.
+    #[test]
+    fn probe_hole_boundary_profile_derived_adds_affine_strain_exactly() {
+        let device = crate::training_core::BDevice::default();
+        let model = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
+            .init(&device);
+        let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] };
+        let hole = HoleSpec { center: [0.0, 0.0], radius: 0.02, bc: HoleBc::Free };
+        let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+        let material = MaterialProps::al7075_t6();
+        let margin = 0.003;
+        let (px, py) = (6.9e7_f64, 2.0e7_f64);
+
+        let without_affine = probe_hole_boundary_profile_derived(
+            &model, &geometry, &hole, 16, &fd, 1.0, 1.0, &material, margin, &device, &IdentityAnsatz, None,
+        );
+        let with_affine = probe_hole_boundary_profile_derived(
+            &model, &geometry, &hole, 16, &fd, 1.0, 1.0, &material, margin, &device, &IdentityAnsatz, Some((px, py)),
+        );
+        let (a_exx, a_eyy, a_exy) = affine_strain(px, py, &material);
+        assert!(a_exx != 0.0 && a_eyy != 0.0, "test fixture must use a genuinely nonzero affine strain, got ({a_exx}, {a_eyy})");
+
+        for (w, wo) in with_affine.iter().zip(&without_affine) {
+            assert!((w.eps_xx as f64 - wo.eps_xx as f64 - a_exx).abs() < 1e-6 * a_exx.abs().max(1.0),
+                "eps_xx must shift by exactly a_exx={a_exx:e}: with={} without={}", w.eps_xx, wo.eps_xx);
+            assert!((w.eps_yy as f64 - wo.eps_yy as f64 - a_eyy).abs() < 1e-6 * a_eyy.abs().max(1.0),
+                "eps_yy must shift by exactly a_eyy={a_eyy:e}: with={} without={}", w.eps_yy, wo.eps_yy);
+            assert!((w.eps_xy as f64 - wo.eps_xy as f64 - a_exy).abs() < 1e-9,
+                "eps_xy must shift by exactly a_exy={a_exy:e} (0 for this shear-free load): with={} without={}", w.eps_xy, wo.eps_xy);
+            // sxx/syy/sxy must therefore also differ (Hooke's law is linear, so a nonzero
+            // strain shift produces a nonzero stress shift) - a real, decisive symptom of the
+            // pre-fix bug: before this fix, `with_affine`/`without_affine` were byte-identical.
+            assert!(w.sxx != wo.sxx || w.syy != wo.syy,
+                "stress must differ once affine strain is included - pre-fix bug would make these identical");
+        }
+    }
+
+    /// Issue #77 PH4-41 fix proof (finding 1, ansatz half): under the hard-constraint ansatz,
+    /// the reconstructed displacement very close to the hole boundary must be DOMINATED by the
+    /// exact closed-form Kirsch correction (`kirsch_hole_correction::kirsch_hole_displacement`),
+    /// not by the network's own (small, freshly-initialized) raw output - because
+    /// `traction_free_envelope` suppresses the network's contribution toward zero at `r=a`
+    /// while the additive correction is NOT suppressed. Before this fix,
+    /// `probe_hole_boundary_profile_derived` never called `ansatz.eval()`/`ansatz.additive()`
+    /// at all, so switching from `Identity` to `HardConstraint` would have changed NOTHING -
+    /// this test fails against the pre-fix function (both ansatz choices give byte-identical
+    /// `ux`/`uy`) and passes against the fixed one.
+    #[test]
+    fn probe_hole_boundary_profile_derived_reflects_hard_constraint_ansatz_near_hole_boundary() {
+        let device = crate::training_core::BDevice::default();
+        let model = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
+            .init(&device);
+        let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] };
+        let hole = HoleSpec { center: [0.0, 0.0], radius: 0.02, bc: HoleBc::Free };
+        let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+        let material = MaterialProps::al7075_t6();
+        // A small margin (hole-relative, matching hole_ring_margin_m's own 0.02*radius
+        // convention) so the envelope is still close to its r=a value (heavily suppressing the
+        // network), making the closed-form correction's dominance a decisive, not marginal,
+        // effect.
+        let margin = 0.02 * hole.radius;
+        let (px, py) = (6.9e7_f64, 0.0_f64);
+        let u_ref = 1e-3_f32; // a physically plausible displacement reference scale
+
+        let identity_ansatz = IdentityAnsatz;
+        let hard_ansatz = crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(
+            crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+                hole_center: hole.center, hole_radius: hole.radius,
+                half_w: geometry.half_w, half_h: geometry.half_h,
+                px, py, e: material.e as f64, nu: material.nu as f64, u_ref: u_ref as f64,
+            },
+        );
+        let via_identity = probe_hole_boundary_profile_derived(
+            &model, &geometry, &hole, 8, &fd, u_ref, px, &material, margin, &device, &identity_ansatz, None,
+        );
+        let via_hard_constraint = probe_hole_boundary_profile_derived(
+            &model, &geometry, &hole, 8, &fd, u_ref, px, &material, margin, &device, &hard_ansatz, None,
+        );
+
+        let r = hole.radius + margin;
+        // RMS comparison across all probed points, not a per-point relative error (which is
+        // ill-conditioned wherever the closed-form correction's own component crosses zero by
+        // symmetry - e.g. `u_hole_x` vanishes at certain angles for a uniaxial load; comparing
+        // a tiny "got" against a near-zero "expected" there would blow up a naive relative
+        // error despite both being genuinely, correctly small). RMS magnitude is well-
+        // conditioned everywhere and still a real, decisive proof.
+        let mut sq_diff = 0.0_f64;
+        let mut sq_expected = 0.0_f64;
+        for (via_id, via_hard) in via_identity.iter().zip(&via_hard_constraint) {
+            assert!((via_id.ux - via_hard.ux).abs() > 1e-9 || (via_id.uy - via_hard.uy).abs() > 1e-9,
+                "hard-constraint ansatz must change the reconstructed displacement - pre-fix bug \
+                 would make these byte-identical regardless of which ansatz is passed");
+            let (x, y) = (via_hard.x, via_hard.y);
+            let (expected_ux, expected_uy) = crate::kirsch_hole_correction::kirsch_hole_displacement(
+                x, y, hole.radius, material.e as f64, material.nu as f64, px, py,
+            );
+            let (dx, dy) = (via_hard.ux as f64 - expected_ux, via_hard.uy as f64 - expected_uy);
+            sq_diff += dx * dx + dy * dy;
+            sq_expected += expected_ux * expected_ux + expected_uy * expected_uy;
+        }
+        // Envelope at this small margin: phi(r) = 1 - exp(-((r-a)/a)^2) with (r-a)/a=0.02 -
+        // phi ~ 4e-4, so the network's own (bounded, freshly-initialized) contribution is
+        // suppressed to well under 1% of a typical correction magnitude - the reconstructed
+        // displacement should closely track the closed form in aggregate, not equal it exactly
+        // (the network's suppressed-but-nonzero contribution is real and expected).
+        let rms_rel_err = (sq_diff / sq_expected.max(1e-30)).sqrt();
+        assert!(rms_rel_err < 0.1,
+            "RMS reconstructed displacement at r={r:.6} should closely track the closed-form \
+             Kirsch correction under the hard-constraint ansatz: rms_rel_err={rms_rel_err}");
     }
 
     #[test]
@@ -7287,6 +7595,7 @@ mod tests {
         let margin = ring_anchor_margin_m(TEST_FD_H, &geometry);
         let report = kt_convergence_check(
             &model, &geometry, &hole, 32, &fd, 1.0, 1e7, &material, margin, 1e7, 0.5, &device,
+            &IdentityAnsatz, None,
         );
         assert!(report.kt_coarse.is_finite(), "{report:?}");
         assert!(report.kt_fine_angular.is_finite(), "{report:?}");
@@ -8967,9 +9276,14 @@ mod issue_77_l5_tests {
         let annulus = annulus.valid();
         let scales = crate::training_core::compute_reference_scales_for_plate(&hole);
         let fd = crate::fd_stencil::FdConfig::new(hole.training.fd_h, 2.0 * hole.geometry.half_w, 2.0 * hole.geometry.half_h);
+        // Issue #77 PH4-41: `run_annular_decomposition_training` always uses `Identity` (never
+        // the hard-constraint ansatz), and this geometry is exactly the `decomposition_
+        // applicable` case (one centered Free hole) - matches training's own real convention.
+        let affine = decomposition_applicable(&hole).then_some((hole.load.px, hole.load.py));
         let profile = probe_hole_boundary_profile_derived(
             &annulus, &hole.geometry, &hole.geometry.holes[0], 144, &fd, scales.u_ref,
             scales.stress_ref, &hole.material, ring_anchor_margin_m(hole.training.fd_h, &hole.geometry), &device,
+            &IdentityAnsatz, affine,
         );
         let kt = stress_concentration_from_profile(&profile, hole.load.px.abs()).kt;
         let error = (kt - FEM_KT).abs() / FEM_KT;

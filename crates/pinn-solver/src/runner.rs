@@ -1790,11 +1790,20 @@ fn run_user_problem_training_from(
             // comment (bugSource-New #12: nothing keeps direct σ aligned to real elasticity
             // away from the traction-free BC anymore, so Kt must read the derived field).
             let hole_margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+            // Issue #77 PH4-41: this GUI-streaming path always trains a plain
+            // `UserDefinedProblem::new(spec)` (line ~1396 of this file - `Identity` ansatz,
+            // never the hard-constraint one, which only `new_with_hard_constraint_ansatz`
+            // selects) - so `IdentityAnsatz` matches this model's own real training convention
+            // exactly. `decomposition_applicable` is the SAME gate `UserDefinedProblem::
+            // loss_terms()` itself uses to decide whether the model was trained under kinematic
+            // decomposition (and therefore whether its displacement output needs the affine
+            // background added back for a total-field reading).
+            let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
             let hole_analyses: Vec<pinn_core::messages::HoleAnalysis> = spec.geometry.holes.iter().enumerate()
                 .map(|(hole_index, hole)| {
                     let profile = crate::user_problem::probe_hole_boundary_profile_derived(
                         &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
-                        &spec.material, hole_margin, &device,
+                        &spec.material, hole_margin, &device, &crate::pinlug_problem::IdentityAnsatz, affine,
                     );
                     let mut concentration = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
                     // Issue #62 PH3-15 ("Kt SHALL report... angular refinement, radial offset
@@ -1808,13 +1817,14 @@ fn run_user_problem_training_from(
                     let kt_convergence = crate::user_problem::kt_convergence_check(
                         &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
                         &spec.material, hole_margin, nominal_stress, 0.05, &device,
+                        &crate::pinlug_problem::IdentityAnsatz, affine,
                     );
                     concentration.angular_refinement_relative_change = Some(kt_convergence.angular_relative_change);
                     concentration.radial_offset_refinement_relative_change = Some(kt_convergence.radial_relative_change);
                     concentration.refinement_converged = Some(kt_convergence.converged);
                     let stress_diagnostic = crate::user_problem::probe_hole_stress_diagnostic(
                         &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
-                        &spec.material, hole_margin, &device,
+                        &spec.material, hole_margin, &device, &crate::pinlug_problem::IdentityAnsatz,
                     );
                     pinn_core::messages::HoleAnalysis {
                         hole_index, profile, concentration, stress_diagnostic: Some(stress_diagnostic),
@@ -2172,10 +2182,17 @@ pub fn serve_loaded_plate_checkpoint(
     // Derived-stress-at-margin, not direct σ at the exact boundary - see
     // `probe_hole_boundary_profile_derived`'s doc comment.
     let hole_margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+    // Issue #77 PH4-41: a loaded checkpoint carries no ansatz metadata, and every checkpoint
+    // this codebase can produce comes from the plain GUI-streaming `UserDefinedProblem::
+    // new(spec)` path (`IdentityAnsatz` - hard-constraint mode was never wired to the GUI/
+    // checkpoint path, only to test-only entry points) - matches `run_hole_benchmark`'s own
+    // identical convention for the same reason.
+    let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
     let hole_analyses: Vec<pinn_core::messages::HoleAnalysis> = spec.geometry.holes.iter().enumerate()
         .map(|(hole_index, hole)| {
             let profile = crate::user_problem::probe_hole_boundary_profile_derived(
                 &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material, hole_margin, &device,
+                &crate::pinlug_problem::IdentityAnsatz, affine,
             );
             let mut concentration = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
             // Issue #62 PH3-15 - same real angular/radial refinement check as the live
@@ -2184,14 +2201,14 @@ pub fn serve_loaded_plate_checkpoint(
             // are negligible.
             let kt_convergence = crate::user_problem::kt_convergence_check(
                 &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material,
-                hole_margin, nominal_stress, 0.05, &device,
+                hole_margin, nominal_stress, 0.05, &device, &crate::pinlug_problem::IdentityAnsatz, affine,
             );
             concentration.angular_refinement_relative_change = Some(kt_convergence.angular_relative_change);
             concentration.radial_offset_refinement_relative_change = Some(kt_convergence.radial_relative_change);
             concentration.refinement_converged = Some(kt_convergence.converged);
             let stress_diagnostic = crate::user_problem::probe_hole_stress_diagnostic(
                 &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
-                &spec.material, hole_margin, &device,
+                &spec.material, hole_margin, &device, &crate::pinlug_problem::IdentityAnsatz,
             );
             pinn_core::messages::HoleAnalysis {
                 hole_index, profile, concentration, stress_diagnostic: Some(stress_diagnostic),
@@ -5254,9 +5271,11 @@ mod tests {
         let margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
 
         let nominal_stress = spec.load.px.abs().max(spec.load.py.abs());
+        let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
         for (i, hole) in spec.geometry.holes.iter().enumerate() {
             let profile = crate::user_problem::probe_hole_boundary_profile_derived(
                 &model, &spec.geometry, hole, 144, &fd, u_ref, spec.load.px, &spec.material, margin, &device,
+                &crate::pinlug_problem::IdentityAnsatz, affine,
             );
             let sc = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
             println!("  [single-hole-kt] hole {i}: max_von_mises={:.4e} Pa (at theta={:.1} deg)  nominal={:.4e} Pa  Kt={:.4}",

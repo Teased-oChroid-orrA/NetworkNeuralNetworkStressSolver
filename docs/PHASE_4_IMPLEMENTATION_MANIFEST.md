@@ -2492,3 +2492,212 @@ Does not close issue #77 (or #74/#76). Eighteen independently-evidenced mechanis
 loss-term/gradient-reweighting variants plus three structurally distinct architectures — have
 now been tested with real evidence. The Kt gap remains open, and the evidence increasingly
 points away from this architecture's loss-term/domain-coupling structure entirely.
+
+## PH4-41 — Trust-but-verify catches three real, confirmed measurement/formulation defects in
+## PH4-38/39/40; the "architecture-limit" conclusion was premature. Fixed, and the corrected
+## measurement changes everything.
+
+An external review of commit `d9f38fe` claimed concrete correctness defects undermined PH4-38/
+39/40's conclusion. Rather than accept or dismiss this on faith, every claim was independently
+re-traced against the actual code, read-only, before any fix. **All three were confirmed real**:
+
+**1. `probe_hole_boundary_profile_derived` (`user_problem.rs`) never applied the domain's
+`DirichletAnsatz` or `affine_strain`'s own contribution** — it called `fwd_embedded` (a bare
+model forward pass) and only applied `u_ref`/`px_pa` unit scaling, bypassing the SAME ansatz
+transform (`u_col = raw*ansatz.eval() + ansatz.additive()`) `compute_domain_forwards` applies
+for training. Under kinematic decomposition (`decomposition_applicable`, true for every L5 spec
+in this whole investigation since PH4-24), the network represents `u_hole` alone — `u_affine` is
+added only inside specific loss terms' own strain computation, never exposed on the displacement
+itself. This probe — used by EVERY real Kt measurement since PH4-24 (`annular_l5_diagnostic`,
+this session's `user_problem_l5_diagnostic`) — was therefore reading a partial field: missing
+`u_affine` always, and ALSO missing the hard-constraint ansatz's own envelope/exact-correction
+whenever that ansatz was active. Because von Mises is nonlinear, no post-hoc scalar correction
+could repair an already-computed Kt from this — the field had to be reconstructed correctly.
+
+**2. Phase 1's hole-biased sampling changed point density without a compensating quadrature
+weight** — `PhysicalPotentialEnergyTerm`'s unweighted-mean energy integral is only a correct
+Monte-Carlo estimator under uniform density; `UserDefinedProblem::set_interior_weights` was never
+called, so the energy accounting was silently biased whenever `hole_bias_fraction>0`.
+
+**3. Phase 2's `OuterStageProblem` used `affine_strain: None` while `AnnulusStageProblem` and the
+established `AnnularDecompositionProblem` both use `affine_strain: Some(...)`** for the outer
+domain — Stage A's model represented `u_total`, Stage B's represented `u_hole` alone, and
+`FrozenInterfaceAnchorTerm` compared them directly, a genuine field-convention mismatch.
+
+**The fourth review claim (hard-constraint envelope zeroes STRAIN, not just traction, at the
+boundary) is accurate but was already disclosed, intentional design** — `kirsch_hole_
+correction.rs`'s own module doc comment already states this; no code change needed.
+
+**Fixes** (`crates/pinn-solver/src/training_core.rs`, `user_problem.rs`, `user_runner.rs`,
+`runner.rs`):
+- Extracted the ansatz-application arithmetic from `compute_domain_forwards` into a new shared
+  `pub(crate) fn stencil_forward_with_ansatz` — the training path now CALLS this instead of
+  duplicating it, and `probe_hole_boundary_profile_derived` now calls the SAME function, then
+  adds `affine_strain`'s own contribution to FD-derived strain exactly as `PhysicalPotentialEnergyTerm`/
+  `AnnularPotentialEnergyTerm::compute()` already do. `ansatz`/`affine_strain_pair` are now
+  required parameters (no silent default) — every one of the 11 real call sites across
+  `runner.rs`/`user_runner.rs`/`user_problem.rs` was individually updated to pass its own
+  problem's real training convention (the Rust compiler enforced complete coverage — a missed
+  call site is a compile error, not a silent gap). `kt_convergence_check`/`probe_hole_stress_diagnostic`
+  threaded the same parameters through.
+- Added `UserSamplingStrategy`/`UserDefinedProblem::hole_bias_fraction()` accessors and a new
+  `hole_bias_quadrature_weights` function (reusing `pinn_core::amr::compensation_weights` — the
+  SAME mechanism AMR already uses for its own non-uniform density, not a new scheme), wired
+  through `set_interior_weights` before every step in both Phase 1 training loops.
+- `OuterStageProblem` now uses `affine_strain: affine_strain_pair` (matching `AnnularDecompositionProblem`'s
+  outer domain exactly) and its `OuterInterfaceAnchorTerm` target was corrected to the closed-form
+  hole correction alone (no affine term), keeping Stage A's own energy and boundary-condition
+  terms internally consistent.
+
+**Verification, closed-form/oracle-only, no training** (the load-bearing proof, per the plan's
+own "fix measurement first" ordering): `probe_hole_boundary_profile_derived_adds_affine_strain_exactly`
+(the affine addition is an exact, network-independent arithmetic identity — fails against the
+pre-fix function, passes against the fixed one); `probe_hole_boundary_profile_derived_reflects_hard_constraint_ansatz_near_hole_boundary`
+(reconstructed displacement near `r=a` under the hard-constraint ansatz closely tracks the
+independently-verified closed-form Kirsch correction, RMS relative error <10%, vs. byte-identical-
+regardless-of-ansatz before the fix); `hole_bias_quadrature_weights_recovers_true_integral_under_biased_and_unbiased_sampling`
+(a non-constant integrand's true domain integral is recovered under both `fraction=0.0` and
+`0.5`, AND the test proves the unweighted mean under bias is measurably wrong — a genuine
+regression proof, not a sanity check). Full targeted regression (`cargo test -p pinn-core -p
+pinn-solver --features ndarray-backend -- --test-threads=1`): **535 passed, 0 failed, 57
+ignored** — zero regressions on Kirsch, pin-lug, or `AnnularDecompositionProblem`'s existing
+simultaneous-joint path.
+
+Does not close issue #77 (or #74/#76) on its own — this entry is the fix; PH4-42 reports the
+real, corrected re-measurement.
+
+## PH4-42 — Real, corrected re-measurement: Phase 1 (single-domain hard-constraint) reproduces
+## Kt=2.444 (0.67% error vs FEM) across two independent samples. The Kt gap this investigation
+## has chased since PH4-24 is closed.
+
+Re-ran `issue_77_single_domain_hard_constraint_l5_trace` (and its repeat) with PH4-41's fix
+applied — identical L5 config to every PH4-28..40 comparison, `hole_bias_fraction=0.5`.
+
+| sample | Kt @ step 2999 | relative error vs FEM (2.460638516) |
+|---|---|---|
+| run 1 | 2.444127304 | 0.67% |
+| run 2 (repeat) | 2.444273623 | 0.67% |
+
+**Both samples agree to within 0.006% of each other** — low variance (nothing like PH4-35's
+43.9% CV), and both land inside this investigation's own 5% acceptance gate by a wide margin.
+The loss trajectory is flat and stable from step 300 onward in both runs (~0.995, noise-level
+step-to-step variation) — no sign of the "still rising"/instability pattern every prior real
+candidate in this investigation showed. `physical_potential` (the actual energy functional
+shaping the stress field) holds 89.5% gradient share at the final checkpoint - the highest of
+any configuration in the whole investigation, and this time it corresponds to a genuinely
+correct result, not an artifact.
+
+**What PH4-38's own real numbers (Kt=7.71, "unstable, still rising") actually were**: an artifact
+of the SAME training run being measured with the broken probe (missing ansatz + affine, and
+trained against a biased, unweighted energy integral). The architecture and training were never
+unstable — the *measurement* was wrong, and the *energy the model was actually being trained
+against* was wrong (Finding 2 alone changes what "correct" means for the optimizer to converge
+to). PH4-38, PH4-39, and PH4-40's own real numbers are kept in this file unmodified, as a
+historical record of what the broken instrumentation reported - they are not deleted, but they
+are now explicitly superseded and must not be cited as evidence of anything about this
+architecture's viability.
+
+**Honest scope of what remains unverified**: Phase 2 (sequential two-stage) and Phase 3
+(log-polar embedding) have NOT yet been re-run with the fix as of this entry — see the next
+entries for their own real, corrected numbers, whichever direction they land. **Every Kt number
+in this manifest from PH4-24 through PH4-37 (the annular-decomposition investigation's own
+fifteen reweighting candidates) used the SAME broken `probe_hole_boundary_profile_derived` this
+entry's fix corrects** — those numbers were internally comparable to each other (all measured
+the same wrong way) but their ABSOLUTE values, and any conclusion drawn from comparing them
+against the FEM target specifically, should be treated as unverified pending a future
+re-measurement pass. That re-measurement is explicitly out of scope for this session (fifteen
+more real ~35-40 minute runs) - flagged here, not silently left implicit.
+
+Closes the specific numerical target issue #77 originally set out to hit (Kt within 5% of the
+FEM reference) for the single-domain hard-constraint configuration. Does not itself close issue
+#77 as a GitHub issue — that decision, and whether the two-domain/annular-decomposition
+architecture's own PH4-24..37 history should be re-measured, revisited, or retired in favor of
+Phase 1's simpler single-domain design, is a project-owner call informed by this real evidence,
+not an automatic consequence of one passing number.
+
+## PH4-43 — Phase 2 (sequential two-stage) real corrected re-measurement: Kt=2.4386, 0.89%
+## error. Confirms PH4-42's result is not specific to the single-domain architecture.
+
+Re-ran `issue_77_sequential_two_stage_l5_trace` with PH4-41's fix applied (both the measurement
+fix and finding 3's `OuterStageProblem` field-convention fix) - same 1500/1500 step split, hard-
+constraint active in Stage B, identical L5 config.
+
+Kt=**2.438579710** at Stage B's final step (1499) - relative error **0.89%** vs the FEM
+reference (2.460638516), comfortably inside the 5% gate. `annulus_potential` holds 95.2%
+gradient share (`frozen_interface_anchor`, the one-directional boundary condition, a real but
+non-dominant 4.8%) - the cleanest gradient-share split of any configuration in this entire
+investigation, and now corresponding to a correct result rather than an artifact of the broken
+probe. Stage B's own loss trajectory is smoothly decreasing (2.02 -> 0.86 -> 0.49) rather than
+the flat-then-declining pattern PH4-39's own pre-fix measurement showed.
+
+**This is strong, independent confirmation of PH4-42's finding**: two structurally different
+training procedures (Phase 1's single joint optimization, Phase 2's sequential two-stage with a
+frozen one-directional interface anchor) — sharing only the exact hard-constraint ansatz and the
+corrected measurement/formulation — both converge to essentially the same physical answer
+(~2.44 vs Phase 1's ~2.444). This is what should be expected if both are correctly solving the
+same BVP, and is real evidence the result is a property of the corrected physics/formulation,
+not an artifact specific to one training procedure.
+
+Does not close issue #77 as a GitHub issue on its own (see PH4-42's own closing note) - reported
+alongside it as further real, reproducing evidence.
+
+## PH4-44 — Phase 3 (conformal log-polar embedding) real corrected re-measurement: Kt=2.4303,
+## 1.23% error. Third independent architecture confirms the same physical answer.
+
+Re-ran `issue_77_annulus_log_polar_l5_trace` with PH4-41's fix applied (measurement fix only -
+Phase 3's training loop is `AnnularDecompositionProblem`-based like Phase 2's Stage B, already
+using the correct `affine_strain_pair`/hard-constraint-ansatz convention pre-fix, so findings 2/3
+do not apply here; only the diagnostic probe itself was wrong). Same L5 config as the original
+pre-fix run: `hidden_dim=64, n_hidden=8, max_steps=3000, n_interior=4096, n_boundary=4096,
+fd_h=1e-3, lr=1e-3, amr_enabled=true`, log-polar coordinate embedding
+(`xi=ln(r/a), cos(theta), sin(theta)`) on the annulus domain, checkpoints at steps
+`[0, 300, 1500, 2999]`.
+
+Loss trajectory is unaffected by the fix as expected (6.17 -> 2.07 -> 1.32 -> 1.10 -> 1.03 ->
+1.006 -> 1.000 -> 1.000), confirming this run shares only the measurement correction, not a
+training-loop change. Real corrected Kt at each checkpoint:
+
+- step=0: kt=2.460061913 (a fresh, untrained hard-constraint model - this is the exact-ansatz
+  zero-correction baseline, and it already lands almost exactly on the FEM reference by
+  construction, the same sanity property PH4-24's own manifest text originally called for)
+- step=300: kt=2.443544348
+- step=1500: kt=2.426585043
+- step=2999: kt=**2.430265043** - relative error **1.23%** vs the FEM reference (2.460638516),
+  inside the 5% gate but the largest of the three corrected architectures (Phase 1: 0.67%,
+  Phase 2: 0.89%, Phase 3: 1.23%).
+
+**Not monotonic** - Kt drifts from the near-exact step-0 value down to 2.4266 at step 1500, then
+partially recovers to 2.4303 by step 2999, rather than approaching the FEM value monotonically
+from a large initial gap the way Phase 1/2 do. `physical_potential`'s raw loss also plateaus
+essentially flat from step ~1800 onward (1.0002 -> 1.0000 -> 0.9998), suggesting the run reached
+a genuine local optimum of this formulation rather than being cut off mid-descent. Final gradient
+share: `annulus_potential` 84.5%, `physical_potential` 5.4%, `interface_traction_continuity`
+6.6%, `translation_gauge` 1.5%, `interface_displacement_continuity` 2.0%, `rotation_gauge`
+~0% - physically-dominated, no term starved, consistent with Phase 1/2's own gradient-share
+profile.
+
+`derived_traction_rms`/`mismatch_rms` (the FD-derived-vs-direct-model traction self-consistency
+check) sit at ~5.3e7/~8.5e7 Pa at step 2999 - a real, nonzero self-consistency gap, though this
+exact diagnostic pair has shown comparable-magnitude ratios across this investigation's history
+(not a new anomaly introduced by this fix) and is not itself a Kt-accuracy measure; noted here
+for completeness rather than investigated further in this pass.
+
+**Third independent architecture, third confirmation of the same physical answer.** Phase 1
+(single joint optimization, 0.67%), Phase 2 (sequential two-stage, frozen anchor, 0.89%), and
+Phase 3 (log-polar conformal embedding, direct joint optimization, 1.23%) now all land within
+1.3% of the FEM reference once the shared measurement/formulation defects are fixed - despite
+using three structurally different training procedures and, for Phase 3, a genuinely different
+coordinate representation of the same domain. This strengthens PH4-42/43's conclusion: the
+result is a property of the corrected hard-constraint-ansatz physics, not an artifact of any one
+architecture or training procedure.
+
+**Repeat run** (`issue_77_annulus_log_polar_l5_trace_repeat`, same config, independent `.init()`
+seed) confirms reproducibility: kt=2.460061913 (step 0, identical to the original - the
+zero-correction ansatz baseline is deterministic as expected) -> 2.443568464 (step 300) ->
+2.426138667 (step 1500) -> **2.434856580** (step 2999) - relative error **1.05%**. The two runs'
+final-step Kt values (2.430265043 vs 2.434856580) differ by only 0.19% of the Kt value itself,
+and both land in the same 1.0-1.3% error band - tight, reproducible, not a favorable-outlier
+result of the kind PH4-35 flagged for a prior (pre-measurement-fix) experiment.
+
+Does not close issue #77 as a GitHub issue on its own (see PH4-42's own closing note) - reported
+alongside Phase 1/2 as the third leg of the same corrected-measurement evidence base.

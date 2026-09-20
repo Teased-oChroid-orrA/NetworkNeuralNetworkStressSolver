@@ -45,6 +45,7 @@ use crate::{
     problem::{BoundaryValueProblem, DomainForwardOutputs, LossTerm},
     saw_brdr::SawBrdr,
 };
+use pinn_core::{problem::DirichletAnsatz, user_geometry::CoordinateEmbedding};
 
 #[cfg(not(feature = "ndarray-backend"))]
 pub type BInner = burn::backend::Wgpu;
@@ -1380,6 +1381,100 @@ struct Computed<Bk: Backend> {
 /// strains/normals), returned as a `Vec<Computed>` — Rust's borrow checker requires the
 /// owning Vec to be fully populated (and therefore stable) before any `&Tensor` into it is
 /// taken, so callers build their borrowing `DomainForwardOutputs` map from the returned Vec.
+/// Applies a domain's [`DirichletAnsatz`] to a raw network forward pass at a 5-row-per-point FD
+/// stencil batch, then rescales to physical units — the EXACT arithmetic
+/// `compute_domain_forwards` itself used to compute inline (`u_col = raw_net[:,0]*ansatz.eval().0
+/// + ansatz.additive().0`, `v_col` likewise, both `*u_ref`, stress columns `*px` for mDEM),
+/// extracted so there is exactly one implementation of "how ansatz + u_ref combine" — not two
+/// that can independently drift out of sync, which is precisely what happened before this
+/// extraction: `user_problem::probe_hole_boundary_profile_derived` (the Kt/stress diagnostic
+/// every real `issue_77_*` test relies on) had its own, second, ansatz-free implementation that
+/// silently diverged from this one — see that function's own doc comment and
+/// `PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-41 for the real, confirmed bug this caused across
+/// the whole investigation.
+///
+/// `k`: `DirichletAnsatz::eval`'s own warm-start/gauge parameter — every call site in this
+/// codebase passes `1.0` (every ansatz actually in use, `IdentityAnsatz`/`AnnulusAnsatz`,
+/// ignores it entirely; kept as a real parameter rather than a hardcoded constant only because
+/// the trait itself declares it, not because any current caller varies it).
+///
+/// Returns the full `[5*n_pts, output_dim]` physical-unit stencil batch (center + 4 FD-shifted
+/// arms, `assemble_stencil`'s own row order) — callers slice `[0..n_pts, ..]` for the center-row
+/// values and FD-difference the full batch for derivatives, exactly as
+/// `compute_domain_forwards`'s own post-processing already does — PLUS the resolved
+/// `CoordinateEmbedding` (the model-input-width dispatch that decides `Raw` vs. the caller's own
+/// chart/log-polar variant), so a caller needing a SECOND forward pass at the same model (e.g.
+/// `compute_domain_forwards`'s own second-order Hessian stencil) can reuse it instead of
+/// re-implementing the same panic-on-mismatch dispatch logic a second time.
+pub(crate) fn stencil_forward_with_ansatz<Bk: Backend<Device = BDevice>>(
+    model: &ElasticityNet<Bk>,
+    ansatz: &dyn DirichletAnsatz,
+    norm_pts: &[[f32; 2]],
+    fd: &FdConfig,
+    k: f32,
+    u_ref: f64,
+    px: f64,
+    is_mdem: bool,
+    coordinate_embedding: CoordinateEmbedding,
+    forward_mask: Option<&[bool]>,
+    device: &BDevice,
+) -> (Tensor<Bk, 2>, CoordinateEmbedding) {
+    let n_pts = norm_pts.len();
+    let m = 5 * n_pts;
+    let mut dx_v = Vec::with_capacity(m);
+    let mut dy_v = Vec::with_capacity(m);
+    let mut add_x_v = Vec::with_capacity(m);
+    let mut add_y_v = Vec::with_capacity(m);
+    for &(sx, sy) in &[(0.0f32, 0.0f32), (fd.hx, 0.0), (-fd.hx, 0.0), (0.0, fd.hy), (0.0, -fd.hy)] {
+        for p in norm_pts {
+            let xn = p[0] + sx;
+            let yn = p[1] + sy;
+            let (dx, dy) = ansatz.eval(xn, yn, k);
+            dx_v.push(dx);
+            dy_v.push(dy);
+            let (ax, ay) = ansatz.additive(xn, yn);
+            add_x_v.push(ax);
+            add_y_v.push(ay);
+        }
+    }
+
+    let pts_t = norm_pts_to_tensor::<Bk>(norm_pts, device);
+    let stencil = assemble_stencil::<Bk>(&pts_t, fd, device);
+
+    let model_embedding = if model.input_dim() == 3 {
+        CoordinateEmbedding::Raw
+    } else if model.input_dim() == coordinate_embedding.input_dim() {
+        coordinate_embedding
+    } else {
+        panic!("unsupported domain input width {}; expected raw 3 or geometry-chart {}", model.input_dim(), coordinate_embedding.input_dim());
+    };
+    let raw_net = fwd_embedded_masked::<Bk>(model, stencil, model_embedding, device, forward_mask);
+    debug_assert_eq!(raw_net.dims()[0], m, "stencil row count must match 5*n_pts");
+    let dx_t = Tensor::<Bk, 2>::from_data(TensorData::new(dx_v, vec![m, 1]), device);
+    let dy_t = Tensor::<Bk, 2>::from_data(TensorData::new(dy_v, vec![m, 1]), device);
+    let add_x_t = Tensor::<Bk, 2>::from_data(TensorData::new(add_x_v, vec![m, 1]), device);
+    let add_y_t = Tensor::<Bk, 2>::from_data(TensorData::new(add_y_v, vec![m, 1]), device);
+    let u_col = raw_net.clone().slice([0..m, 0..1]) * dx_t + add_x_t;
+    let v_col = raw_net.clone().slice([0..m, 1..2]) * dy_t + add_y_t;
+    let ansatz_out = if is_mdem {
+        let s_xx = raw_net.clone().slice([0..m, 2..3]);
+        let s_yy = raw_net.clone().slice([0..m, 3..4]);
+        let s_xy = raw_net.slice([0..m, 4..5]);
+        Tensor::cat(vec![u_col, v_col, s_xx, s_yy, s_xy], 1)
+    } else {
+        Tensor::cat(vec![u_col, v_col], 1)
+    };
+    let raw = if is_mdem {
+        Tensor::cat(vec![
+            ansatz_out.clone().slice([0..m, 0..2]).mul_scalar(u_ref),
+            ansatz_out.slice([0..m, 2..5]).mul_scalar(px),
+        ], 1)
+    } else {
+        ansatz_out.mul_scalar(u_ref)
+    };
+    (raw, model_embedding)
+}
+
 fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
     ctx: &crate::problem::MultiStepCtx,
     models: &[&ElasticityNet<Bk>],
@@ -1474,78 +1569,15 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
         // existed.
         let point_fd: &FdConfig = if ps_name.ends_with("_fd") { ctx.hole_fd } else { ctx.fd };
 
-        // Compute the per-stencil-row (dx, dy) Dirichlet-ansatz scale factors directly from
-        // `norm_pts` (already CPU-resident) + the 4 known FD shift offsets, in exactly the
-        // row order `assemble_stencil` lays the [5*n_pts, 3] stencil batch out in (centre,
-        // x+hx, x-hx, y+hy, y-hy) — this is 100% deterministic from inputs already on the
-        // CPU, so there is no need to round-trip the GPU stencil tensor back to host memory
-        // just to read its x/y columns back out (see issue #17).
-        let m = 5 * n_pts;
-        let mut dx_v = Vec::with_capacity(m);
-        let mut dy_v = Vec::with_capacity(m);
-        // Issue #77 hard-constraint hole ansatz (PH4-35): additive per-point correction,
-        // `(0.0, 0.0)` for every ansatz that doesn't override `DirichletAnsatz::additive` —
-        // computed at every stencil-shifted point, same as `dx_v`/`dy_v`, so FD differencing
-        // of `raw_net*dx + additive` correctly picks up the closed-form correction's OWN
-        // spatial variation (its contribution to strain), not just its value at the centre.
-        let mut add_x_v = Vec::with_capacity(m);
-        let mut add_y_v = Vec::with_capacity(m);
-        for &(sx, sy) in &[(0.0f32, 0.0f32), (point_fd.hx, 0.0), (-point_fd.hx, 0.0), (0.0, point_fd.hy), (0.0, -point_fd.hy)] {
-            for p in norm_pts {
-                let xn = p[0] + sx;
-                let yn = p[1] + sy;
-                let (dx, dy) = ansatz.eval(xn, yn, ctx.k);
-                dx_v.push(dx);
-                dy_v.push(dy);
-                let (ax, ay) = ansatz.additive(xn, yn);
-                add_x_v.push(ax);
-                add_y_v.push(ay);
-            }
-        }
-
-        let pts_t = norm_pts_to_tensor::<Bk>(norm_pts, device);
-        let stencil = assemble_stencil::<Bk>(&pts_t, point_fd, device);
-
-        // Apply this domain's Dirichlet ansatz pointwise (columns 0,1 = u,v) via the
-        // per-point (dx, dy) scale factors `DirichletAnsatz::eval` returns, then scale to
-        // physical units exactly as `step_physics`'s `scale_out` does: displacement cols by
-        // u_ref [m], and (mDEM only) stress cols 2..5 by Px [Pa].
-        // Domain decomposition may pair a raw-coordinate outer model (3 inputs) with a
-        // chart-enriched annular model (10 inputs). The model's saved architecture is the
-        // authoritative per-domain contract; the ctx embedding describes the chart variant.
-        let model_embedding = if model.input_dim() == 3 {
-            pinn_core::user_geometry::CoordinateEmbedding::Raw
-        } else if model.input_dim() == coordinate_embedding.input_dim() {
-            coordinate_embedding
-        } else {
-            panic!("unsupported domain input width {}; expected raw 3 or geometry-chart {}", model.input_dim(), coordinate_embedding.input_dim());
-        };
-        let raw_net = fwd_embedded_masked::<Bk>(
-            model, stencil, model_embedding, device, forward_masks[model_idx],
+        // Issue #77 PH4-41: this used to be ~65 lines of ansatz-application arithmetic inline
+        // here — now a call to `stencil_forward_with_ansatz`, the single shared implementation
+        // also used by the (fixed) Kt/stress diagnostic probe. See that function's own doc
+        // comment for why this extraction exists and what bug it closes. Byte-identical
+        // behavior: same operations, same order, just no longer duplicated.
+        let (raw, model_embedding) = stencil_forward_with_ansatz::<Bk>(
+            model, ansatz, norm_pts, point_fd, ctx.k, u_ref_f64, px, is_mdem,
+            coordinate_embedding, forward_masks[model_idx], device,
         );
-        debug_assert_eq!(raw_net.dims()[0], m, "stencil row count must match 5*n_pts");
-        let dx_t = Tensor::<Bk, 2>::from_data(TensorData::new(dx_v, vec![m, 1]), device);
-        let dy_t = Tensor::<Bk, 2>::from_data(TensorData::new(dy_v, vec![m, 1]), device);
-        let add_x_t = Tensor::<Bk, 2>::from_data(TensorData::new(add_x_v, vec![m, 1]), device);
-        let add_y_t = Tensor::<Bk, 2>::from_data(TensorData::new(add_y_v, vec![m, 1]), device);
-        let u_col = raw_net.clone().slice([0..m, 0..1]) * dx_t + add_x_t;
-        let v_col = raw_net.clone().slice([0..m, 1..2]) * dy_t + add_y_t;
-        let ansatz_out = if is_mdem {
-            let s_xx = raw_net.clone().slice([0..m, 2..3]);
-            let s_yy = raw_net.clone().slice([0..m, 3..4]);
-            let s_xy = raw_net.slice([0..m, 4..5]);
-            Tensor::cat(vec![u_col, v_col, s_xx, s_yy, s_xy], 1)
-        } else {
-            Tensor::cat(vec![u_col, v_col], 1)
-        };
-        let raw = if is_mdem {
-            Tensor::cat(vec![
-                ansatz_out.clone().slice([0..m, 0..2]).mul_scalar(u_ref_f64),
-                ansatz_out.slice([0..m, 2..5]).mul_scalar(px),
-            ], 1)
-        } else {
-            ansatz_out.mul_scalar(u_ref_f64)
-        };
         let raw_out = raw.clone().slice([0..n_pts, 0..raw.dims()[1]]);
         // Direct σ at the 4 FD-shifted positions - zero extra forward pass, just extracting
         // columns 2..5 from the SAME `raw` stencil rows `compute_strains` below reads columns
@@ -1580,6 +1612,11 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
             // the base step, not a hypothetical concern).
             let fd2 = crate::fd_stencil::hessian_fd_config(point_fd);
             let m9 = 9 * n_pts;
+            // Recomputed here (cheap, pure - `norm_pts_to_tensor` has no side effects) rather
+            // than reusing a `pts_t` from the extracted `stencil_forward_with_ansatz` call
+            // above, which no longer exposes its own intermediate tensor now that the 5-point
+            // stencil logic lives in that shared function.
+            let pts_t = norm_pts_to_tensor::<Bk>(norm_pts, device);
             let stencil2 = crate::fd_stencil::assemble_second_order_stencil::<Bk>(&pts_t, &fd2, device);
             let raw_net2 = fwd_embedded_masked::<Bk>(model, stencil2, model_embedding, device, forward_masks[model_idx]);
             debug_assert_eq!(raw_net2.dims()[0], m9, "second-order stencil row count must match 9*n_pts");

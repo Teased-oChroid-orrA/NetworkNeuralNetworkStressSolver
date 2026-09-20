@@ -62,6 +62,7 @@ pub struct AnnularTermDiagnostic {
     pub gradient_share: Option<f32>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn annular_l5_diagnostic(
     step: usize,
     out: &StepOutput,
@@ -71,18 +72,25 @@ fn annular_l5_diagnostic(
     spec: &ProblemSpec,
     fd: &FdConfig,
     device: &BDevice,
+    ansatz: &dyn pinn_core::problem::DirichletAnsatz,
 ) -> AnnularL5Diagnostic {
     let scales = crate::training_core::compute_reference_scales_for_plate(spec);
     let hole = &spec.geometry.holes[0];
     let margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+    // Issue #77 PH4-41: `ansatz` is the annulus domain's OWN real ansatz (`AnnularDecompositionProblem::
+    // ansatz(0)` - `Identity` or the hard-constraint one), and `affine` mirrors the SAME
+    // `decomposition_applicable` gate `AnnularDecompositionProblem::loss_terms()` itself uses -
+    // every real Kt number this whole investigation (PH4-24 through PH4-40) reported came from
+    // this function, previously missing both.
+    let affine = crate::user_problem::decomposition_applicable(spec).then_some((spec.load.px, spec.load.py));
     let profile = crate::user_problem::probe_hole_boundary_profile_derived(
         model, &spec.geometry, hole, 144, fd, scales.u_ref, scales.stress_ref,
-        &spec.material, margin, device,
+        &spec.material, margin, device, ansatz, affine,
     );
     let kt = crate::user_problem::stress_concentration_from_profile(&profile, spec.load.px.abs()).kt;
     let stress = crate::user_problem::probe_hole_stress_diagnostic(
         model, &spec.geometry, hole, 144, fd, scales.u_ref, scales.stress_ref,
-        &spec.material, margin, device,
+        &spec.material, margin, device, ansatz,
     );
     let raw = out.raw_scalar_by_name.as_ref();
     let weights = out.lam_by_name.as_ref();
@@ -276,7 +284,7 @@ fn run_annular_decomposition_training_inner(
         }
         if diagnostic_steps.contains(&step) {
             use burn::module::AutodiffModule;
-            diagnostics.push(annular_l5_diagnostic(step, &out, lr_annulus, lr_outer, &models[0].valid(), &spec, &fd, &device));
+            diagnostics.push(annular_l5_diagnostic(step, &out, lr_annulus, lr_outer, &models[0].valid(), &spec, &fd, &device, problem.ansatz(0)));
         }
         // Reports the annulus domain's own LR (the one whose starvation this fix addresses) -
         // a logging/callback choice only, does not affect either domain's optimizer step.
@@ -724,7 +732,7 @@ pub fn run_annular_decomposition_training_sequential(
         annulus_model = new_model.into_iter().next().expect("single model");
         last_loss = out.total_scalar;
         if diagnostic_steps.contains(&step) {
-            diagnostics.push(user_problem_l5_diagnostic(step, &out, &annulus_model.valid(), &spec, &fd, &device));
+            diagnostics.push(user_problem_l5_diagnostic(step, &out, &annulus_model.valid(), &spec, &fd, &device, annulus_problem.ansatz(0)));
         }
         if on_step("stage_b", step, out.total_scalar) {
             break;
@@ -777,6 +785,12 @@ pub(crate) fn train_user_problem_for_benchmark(
             problem.sampling_strategy(0), &placeholder, &spec.load, spec.training.n_interior,
             spec.training.n_boundary, spec.geometry.half_w, spec.geometry.half_h,
         );
+        // Issue #77 PH4-41 fix (finding 2) - see `run_user_problem_training_with_diagnostics`'s
+        // identical comment for the full rationale.
+        let weights = crate::user_problem::hole_bias_quadrature_weights(
+            &data.int_norm, &spec.geometry, problem.hole_bias_fraction(),
+        );
+        problem.set_interior_weights(Some(weights));
         let ctx = plate_multi_step_ctx(
             &config, problem, &fd, &hole_fd, &data, scales.u_ref, scales.ref_energy, scales.ref_stress2,
             spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
@@ -812,13 +826,19 @@ fn user_problem_l5_diagnostic(
     spec: &ProblemSpec,
     fd: &FdConfig,
     device: &BDevice,
+    ansatz: &dyn pinn_core::problem::DirichletAnsatz,
 ) -> UserProblemL5Diagnostic {
     let scales = crate::training_core::compute_reference_scales_for_plate(spec);
     let hole = &spec.geometry.holes[0];
     let margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+    // Issue #77 PH4-41: same fix as `annular_l5_diagnostic` - `ansatz` is the caller's own
+    // domain ansatz (Phase 1's `UserDefinedProblem` or Phase 2's `AnnulusStageProblem`), and
+    // `affine` mirrors the SAME `decomposition_applicable` gate both problems' own
+    // `loss_terms()` use.
+    let affine = crate::user_problem::decomposition_applicable(spec).then_some((spec.load.px, spec.load.py));
     let profile = crate::user_problem::probe_hole_boundary_profile_derived(
         model, &spec.geometry, hole, 144, fd, scales.u_ref, scales.stress_ref,
-        &spec.material, margin, device,
+        &spec.material, margin, device, ansatz, affine,
     );
     let kt = crate::user_problem::stress_concentration_from_profile(&profile, spec.load.px.abs()).kt;
     let raw = out.raw_scalar_by_name.as_ref();
@@ -872,6 +892,19 @@ pub fn run_user_problem_training_with_diagnostics(
             problem.sampling_strategy(0), &placeholder, &spec.load, spec.training.n_interior,
             spec.training.n_boundary, spec.geometry.half_w, spec.geometry.half_h,
         );
+        // Issue #77 PH4-41 fix (finding 2): `UserSamplingStrategy`'s hole-biased stratified
+        // sampling (opt-in, Phase 1's own addition) draws a deliberately non-uniform point
+        // density - `PhysicalPotentialEnergyTerm`'s own unweighted-mean energy integral
+        // (`domain_integral_tensor`) is only a correct Monte-Carlo estimator under UNIFORM
+        // density, so it must be told the real per-point weight whenever bias is active.
+        // `hole_bias_fraction()<=0.0` (every pre-Phase-1 caller) makes `hole_bias_quadrature_
+        // weights` return all-`1.0`, which `set_interior_weights(Some(...))` treats identically
+        // to `None` (both feed `domain_integral_tensor`'s own uniform-mean path) - byte-
+        // identical for every existing caller.
+        let weights = crate::user_problem::hole_bias_quadrature_weights(
+            &data.int_norm, &spec.geometry, problem.hole_bias_fraction(),
+        );
+        problem.set_interior_weights(Some(weights));
         let ctx = plate_multi_step_ctx(
             &config, &problem, &fd, &hole_fd, &data, scales.u_ref, scales.ref_energy, scales.ref_stress2,
             spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), diagnostic_steps.contains(&step), step,
@@ -883,7 +916,7 @@ pub fn run_user_problem_training_with_diagnostics(
         last_loss = out.total_scalar;
         if diagnostic_steps.contains(&step) {
             use burn::module::AutodiffModule;
-            diagnostics.push(user_problem_l5_diagnostic(step, &out, &model.valid(), &spec, &fd, &device));
+            diagnostics.push(user_problem_l5_diagnostic(step, &out, &model.valid(), &spec, &fd, &device, problem.ansatz(0)));
         }
         if on_step(step, out.total_scalar, out.lr, data.int_norm.len()) {
             break;
@@ -1142,9 +1175,13 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         // Derived-stress-at-margin, not direct σ at the exact boundary - see
         // `probe_hole_boundary_profile_derived`'s doc comment.
         let hole_margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+        // Issue #77 PH4-41: this headless path always trains a plain `UserDefinedProblem::
+        // new(spec)` (`IdentityAnsatz`) - see `run_headless_user_problem`'s own construction.
+        let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
         for (i, hole) in spec.geometry.holes.iter().enumerate() {
             let profile = crate::user_problem::probe_hole_boundary_profile_derived(
                 &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material, hole_margin, &device,
+                &crate::pinlug_problem::IdentityAnsatz, affine,
             );
             let sc = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
             println!("  [diag] hole {i}: max_von_mises={:.4e} Pa  nominal={:.4e} Pa  Kt={:.4}", sc.max_von_mises, sc.nominal_stress, sc.kt);
@@ -1153,7 +1190,7 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
             // actually converged, or still drifting with resolution/margin?
             let convergence = crate::user_problem::kt_convergence_check(
                 &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material,
-                hole_margin, nominal_stress, 0.1, &device,
+                hole_margin, nominal_stress, 0.1, &device, &crate::pinlug_problem::IdentityAnsatz, affine,
             );
             if convergence.converged {
                 println!("  [diag] hole {i}: Kt convergence OK (angular Δ={:.3}, radial Δ={:.3})", convergence.angular_relative_change, convergence.radial_relative_change);
