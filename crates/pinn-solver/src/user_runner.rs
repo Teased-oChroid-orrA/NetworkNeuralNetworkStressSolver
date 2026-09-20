@@ -21,7 +21,8 @@ use crate::{
     user_problem::{
         plate_normalize_point as normalize_point, resample_plate_step_data, plate_multi_step_ctx,
         plate_multi_domain_step_ctx, resample_domain_step_data, AnnularDecompositionProblem,
-        UserDefinedProblem,
+        UserDefinedProblem, OuterStageProblem, AnnulusStageProblem, phase2_interface_parametrization,
+        ANNULUS_DOMAIN, OUTER_DOMAIN,
     },
 };
 
@@ -117,6 +118,25 @@ pub fn write_annular_l5_diagnostics_json(
 
 /// Train #77's bonded annular/global model pair. Kept public so GUI production dispatch and
 /// L5 use identical optimizer, sampling, and loss wiring rather than maintaining two loops.
+/// Issue #77 root-cause fix, Step 1 (see the investigation-branch plan and
+/// `saw_brdr::grad_norm_damping_factors`'s own doc comment for the full mechanism): `0` means
+/// the mechanism is fully disabled — every existing call site passes `0`, byte-identical to
+/// before this parameter existed. A nonzero value is the step interval at which
+/// `run_annular_decomposition_training_inner`'s loop, below, re-probes real per-term gradient
+/// norms and recalibrates `SawBrdr`'s base weights via `grad_norm_damping_factors` — pulling a
+/// gradient-dominant CONSTRAINT term (e.g. `interface_traction_continuity`) back down toward
+/// the pinned physical-functional terms' own gradient scale, never amplifying anything.
+///
+/// PH4-36 Step 1 real result (`issue_77_grad_norm_rescale_l5_trace`, `period=150`,
+/// `floor=0.1`): the mechanism DID activate (`hole_free`'s weight was damped from its default
+/// `100.0` to `39.62` by the final checkpoint, combined `physical_potential`+`annulus_potential`
+/// gradient share rose from PH4-34b's baseline ~18% to ~30%) but `hole_free` STILL dominated at
+/// 64.2% share and Kt (1.261) did not meaningfully move past baseline (1.231, PH4-28) - within
+/// this whole investigation's established noise band. `default_floor` (below) stays `0.1` for
+/// every pre-existing caller; a caller MAY now pass a lower floor for a genuinely more
+/// aggressive damping test, per the plan's own Step 1 escalation before moving to Step 2.
+const GRAD_NORM_DAMPING_FLOOR: f32 = 0.1;
+
 fn run_annular_decomposition_training_inner(
     spec: ProblemSpec,
     device: BDevice,
@@ -129,9 +149,13 @@ fn run_annular_decomposition_training_inner(
     annulus_use_siren: bool,
     hole_free_weight: f32,
     annulus_use_hard_constraint: bool,
+    grad_norm_rescale_period: usize,
+    grad_norm_damping_floor: f32,
+    annulus_use_log_polar: bool,
 ) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
     let problem = AnnularDecompositionProblem::new_experimental(
         spec.clone(), interface_weight, include_annulus_equilibrium, hole_free_weight, annulus_use_hard_constraint,
+        annulus_use_log_polar,
     );
     crate::problem::validate_loss_terms(&problem);
     // Issue #77 spectral-bias fix (PH4-31): `annulus_n_fourier=0` (every existing caller)
@@ -139,7 +163,16 @@ fn run_annular_decomposition_training_inner(
     // purely additive. Computed once and reused for both the annulus model's own input width
     // AND the per-step ctx's embedding (they must always agree, or the forward pass panics on
     // a width mismatch inside `compute_domain_forwards`).
-    let annulus_embedding = spec.geometry.coordinate_embedding_with_fourier(annulus_n_fourier);
+    //
+    // Issue #77 Phase 3 architectural redesign: `annulus_use_log_polar` (default `false`,
+    // byte-identical) overrides to the log-polar embedding instead - deliberately NOT combined
+    // with `annulus_n_fourier` (Fourier features are themselves a rejected candidate, PH4-31/32;
+    // stacking two representation changes would confound which one caused any observed effect).
+    let annulus_embedding = if annulus_use_log_polar {
+        spec.geometry.log_polar_embedding()
+    } else {
+        spec.geometry.coordinate_embedding_with_fourier(annulus_n_fourier)
+    };
     let mut config = SolverConfig::default_kirsch();
     config.load = spec.load;
     // Issue #77 SIREN hypothesis test: opt-in to the annulus domain only, same scope as every
@@ -164,8 +197,13 @@ fn run_annular_decomposition_training_inner(
     let mut optims = (0..2).map(|_| DomainOptim {
         weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim(),
     }).collect::<Vec<_>>();
-    let base_weights = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
-    let mut saw = SawBrdr::with_base(base_weights, 0.95);
+    let term_order: Vec<&'static str> = problem.loss_terms().iter().map(|t| t.name()).collect();
+    // Kept separately from `saw.base_weights` (see `SawBrdr::base_weights`'s own doc comment):
+    // issue #77's grad-norm rescale below always recalibrates from this ORIGINAL set, never
+    // from the previous refresh's already-rescaled weights, so repeated refreshes don't
+    // compound into runaway shrink.
+    let base_weights: Vec<f32> = term_order.iter().map(|&n| problem.base_weight(n)).collect();
+    let mut saw = SawBrdr::with_base(base_weights.clone(), 0.95);
     // Issue #77 Step 4 (`PHASE_4_IMPLEMENTATION_MANIFEST.md`'s PH4-26): a single shared
     // `LrSchedule` reading TOTAL loss was found to collapse LR for BOTH domains once
     // `physical_potential` (outer) plateaus almost immediately post-decomposition — starving
@@ -196,11 +234,16 @@ fn run_annular_decomposition_training_inner(
             problem.domains()[1].id, problem.sampling_strategy(1), &placeholder, &spec.load,
             n_outer, spec.training.n_boundary, spec.geometry.half_w, spec.geometry.half_h,
         );
+        // Issue #77 grad-norm rescale (Step 1): `period=0` (every existing caller) makes this
+        // always `false`, so `probe_term_gradients` reduces to exactly its pre-existing
+        // expression below — byte-identical. A nonzero period ORs in an extra probe step on
+        // its own cadence, independent of `diagnostic_steps`.
+        let grad_norm_probe_step = grad_norm_rescale_period > 0 && step % grad_norm_rescale_period == 0;
         let mut ctx = plate_multi_domain_step_ctx(
             &config, &problem, &fd, &hole_fd,
             &annulus_data, &outer_data,
             scales.u_ref, scales.ref_energy, scales.ref_stress2, spec.geometry.n_fourier(),
-            annulus_embedding, diagnostic_steps.contains(&step), step,
+            annulus_embedding, diagnostic_steps.contains(&step) || grad_norm_probe_step, step,
         );
         // One-step lag: this step's own per-term losses aren't known until `step_physics_multi`
         // runs below, so (like every LR schedule) this reacts to the LAST observed reading.
@@ -220,6 +263,17 @@ fn run_annular_decomposition_training_inner(
         );
         models = new_models;
         last_total = out.total_scalar;
+        if grad_norm_probe_step {
+            if let Some(norms) = out.term_grad_norms.as_ref() {
+                let factors = crate::saw_brdr::grad_norm_damping_factors(
+                    norms, &["physical_potential", "annulus_potential"], grad_norm_damping_floor,
+                );
+                let rescaled: Vec<f32> = term_order.iter().zip(base_weights.iter())
+                    .map(|(&name, &orig)| orig * factors.get(name).copied().unwrap_or(1.0))
+                    .collect();
+                saw.set_base_weights(rescaled);
+            }
+        }
         if diagnostic_steps.contains(&step) {
             use burn::module::AutodiffModule;
             diagnostics.push(annular_l5_diagnostic(step, &out, lr_annulus, lr_outer, &models[0].valid(), &spec, &fd, &device));
@@ -243,7 +297,7 @@ pub fn run_annular_decomposition_training(
     device: BDevice,
     on_step: impl FnMut(usize, f32, f64, usize) -> bool,
 ) -> (crate::network::ElasticityNet<B>, crate::network::ElasticityNet<B>, f32) {
-    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new(), 100.0, false, 0, false, 100.0, false)
+    run_annular_decomposition_training_inner(spec, device, on_step, &[], &mut Vec::new(), 100.0, false, 0, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false)
 }
 
 /// Same production runner with opt-in, deterministic diagnostic checkpoints. No output file is
@@ -262,7 +316,7 @@ pub fn run_annular_decomposition_training_with_diagnostics(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, false,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -286,7 +340,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_interface_weight(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, interface_weight, false, 0, false, 100.0, false,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, interface_weight, false, 0, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -312,7 +366,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_annulus_equilibri
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, include_annulus_equilibrium, 0, false, 100.0, false,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, include_annulus_equilibrium, 0, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -339,7 +393,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_annulus_fourier(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, annulus_n_fourier, false, 100.0, false,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, annulus_n_fourier, false, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -367,7 +421,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_siren(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, use_siren, 100.0, false,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, use_siren, 100.0, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -396,7 +450,7 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_hole_free_weight(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, hole_free_weight, false,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, hole_free_weight, false, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
 }
@@ -420,9 +474,264 @@ pub fn run_annular_decomposition_training_with_diagnostics_and_hard_constraint(
 ) {
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
     let (annulus, outer, loss) = run_annular_decomposition_training_inner(
-        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, use_hard_constraint,
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, use_hard_constraint, 0, GRAD_NORM_DAMPING_FLOOR, false,
     );
     (annulus, outer, loss, diagnostics)
+}
+
+/// Issue #77 Phase 3 architectural redesign: same as
+/// [`run_annular_decomposition_training_with_diagnostics`], but with the annulus domain's own
+/// coordinate embedding switched to `CoordinateEmbedding::LogPolar` instead of `SingleHoleChart`
+/// — a true reparameterization of the network's input coordinate system (not another feature
+/// added on top of raw x,y, which PH4-31/32 already tried as Fourier features and rejected).
+/// `use_hard_constraint` lets this combine with Phase 1/PH4-35's exact hole ansatz (orthogonal
+/// axes — representation vs. traction-free enforcement); not combined with `annulus_n_fourier`
+/// or SIREN in this pass, to keep which representation change caused any observed effect
+/// unambiguous. Not used by any production entry point; experimental-comparison callers only.
+pub fn run_annular_decomposition_training_with_diagnostics_and_log_polar_embedding(
+    spec: ProblemSpec,
+    device: BDevice,
+    diagnostic_steps: &[usize],
+    use_log_polar: bool,
+    use_hard_constraint: bool,
+    on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+) -> (
+    crate::network::ElasticityNet<B>,
+    crate::network::ElasticityNet<B>,
+    f32,
+    Vec<AnnularL5Diagnostic>,
+) {
+    let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
+    let (annulus, outer, loss) = run_annular_decomposition_training_inner(
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, use_hard_constraint, 0, GRAD_NORM_DAMPING_FLOOR, use_log_polar,
+    );
+    (annulus, outer, loss, diagnostics)
+}
+
+/// Issue #77 PH4-36 Step 2: combines PH4-35's hard-constraint hole ansatz WITH the grad-norm
+/// rescale mechanism (Step 1). PH4-35's own real diagnostic showed that removing `hole_free`
+/// does NOT hand the freed gradient budget to `physical_potential`/`annulus_potential` - it
+/// hands it to whichever term is next structurally privileged, `interface_traction_continuity`
+/// (62.8% share, unaddressed by PH4-35 itself). Since `grad_norm_damping_factors` is generic
+/// over "every active term except the reference set" (`saw_brdr.rs`'s own doc comment), it
+/// applies automatically to `interface_traction_continuity`/`interface_displacement_
+/// continuity`/`translation_gauge`/`rotation_gauge` once `hole_free` is absent under
+/// `use_hard_constraint=true` - no new rescale logic needed, only this combined entry point.
+pub fn run_annular_decomposition_training_with_diagnostics_and_hard_constraint_and_grad_norm_rescale(
+    spec: ProblemSpec,
+    device: BDevice,
+    diagnostic_steps: &[usize],
+    use_hard_constraint: bool,
+    grad_norm_rescale_period: usize,
+    grad_norm_damping_floor: f32,
+    on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+) -> (
+    crate::network::ElasticityNet<B>,
+    crate::network::ElasticityNet<B>,
+    f32,
+    Vec<AnnularL5Diagnostic>,
+) {
+    let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
+    let (annulus, outer, loss) = run_annular_decomposition_training_inner(
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, use_hard_constraint,
+        grad_norm_rescale_period, grad_norm_damping_floor, false,
+    );
+    (annulus, outer, loss, diagnostics)
+}
+
+/// Issue #77 root-cause fix, Step 1: same as
+/// [`run_annular_decomposition_training_with_diagnostics`], but with `grad_norm_rescale_period`
+/// exposed — the gradient-norm-aware base-weight recalibration this investigation's own plan
+/// document identifies as the untried mechanism behind all twelve prior candidates' failures
+/// (`SawBrdr::update` reacts only to loss-VALUE decay rate, never to a term's real
+/// backpropagated gradient magnitude; PH4-34b's own nominal-weight-reduction test proved the
+/// two are only loosely coupled). `0` disables the mechanism entirely (byte-identical to every
+/// other entry point above). A nonzero value re-probes real per-term gradient norms every that
+/// many steps and rescales `SawBrdr`'s base weights via `saw_brdr::grad_norm_damping_factors`
+/// — damping a gradient-dominant CONSTRAINT term back toward the pinned physical-functional
+/// terms' own scale, never amplifying anything and never touching `physical_potential`/
+/// `annulus_potential` themselves (that pin is enforced independently, in `step_physics_multi`'s
+/// own hardcoded match arm — see `grad_norm_damping_factors`'s doc comment). Not used by any
+/// production entry point; experimental-comparison callers only. `grad_norm_damping_floor`
+/// lets a caller escalate to a MORE aggressive damping than the module default
+/// (`GRAD_NORM_DAMPING_FLOOR`, `0.1`) - see that constant's own doc comment for the real
+/// `floor=0.1` result that motivated exposing this as a real, separately-testable parameter
+/// rather than a hardcoded constant.
+pub fn run_annular_decomposition_training_with_diagnostics_and_grad_norm_rescale(
+    spec: ProblemSpec,
+    device: BDevice,
+    diagnostic_steps: &[usize],
+    grad_norm_rescale_period: usize,
+    grad_norm_damping_floor: f32,
+    on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+) -> (
+    crate::network::ElasticityNet<B>,
+    crate::network::ElasticityNet<B>,
+    f32,
+    Vec<AnnularL5Diagnostic>,
+) {
+    let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
+    let (annulus, outer, loss) = run_annular_decomposition_training_inner(
+        spec, device, on_step, diagnostic_steps, &mut diagnostics, 100.0, false, 0, false, 100.0, false, grad_norm_rescale_period, grad_norm_damping_floor, false,
+    );
+    (annulus, outer, loss, diagnostics)
+}
+
+/// Issue #77 Phase 2 architectural redesign: real, tiny-forward-pass evaluation of a FROZEN
+/// (non-autodiff, `BInner`) model's displacement at a fixed set of physical points — used to
+/// read Stage A's trained outer model's own interface trace once, before Stage B starts (the
+/// model never changes during Stage B, so its interface trace is provably invariant across
+/// every one of Stage B's steps — computing it once, not "fresh each step" as a naive
+/// re-evaluation would, is a real efficiency this frozen-model design affords, not an
+/// approximation). No FD stencil needed (a value read, not a derivative) — a plain
+/// `fwd_embedded` forward pass, `u_ref`-rescaled by hand exactly like `probe_hole_boundary_
+/// profile_derived`'s own convention (`fwd_embedded`'s raw output is in NORMALIZED units).
+fn evaluate_frozen_outer_interface_displacement(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    geometry: &pinn_core::user_geometry::UserGeometry,
+    interface_radius: f64,
+    thetas: &[f64],
+    u_ref: f32,
+    device: &BDevice,
+) -> (Vec<f32>, Vec<f32>) {
+    use crate::network::fwd_embedded;
+    use crate::fd_stencil::norm_pts_to_tensor;
+    use crate::training_core::BInner;
+    let n = thetas.len();
+    let pts_norm: Vec<[f32; 2]> = thetas.iter().map(|&theta| {
+        let (x, y) = (interface_radius * theta.cos(), interface_radius * theta.sin());
+        [(x / geometry.half_w) as f32, (y / geometry.half_h) as f32]
+    }).collect();
+    let pts_t = norm_pts_to_tensor::<BInner>(&pts_norm, device);
+    // The frozen model here is always the OUTER domain's own model, which `OuterStageProblem`
+    // always constructs raw (`with_input_dim(3)`, matching `AnnularDecompositionProblem`'s own
+    // outer model convention) - NOT `geometry.coordinate_embedding()` (the chart embedding,
+    // sized for the ANNULUS model), which would silently mismatch this model's actual 3-column
+    // width and panic deep inside the matmul, not with a clear "wrong embedding" message.
+    let raw = fwd_embedded::<BInner>(model, pts_t, pinn_core::user_geometry::CoordinateEmbedding::Raw, device);
+    let u: Vec<f32> = raw.clone().slice([0..n, 0..1]).reshape([n]).mul_scalar(u_ref as f64)
+        .into_data().to_vec().unwrap_or_else(|_| vec![0.0; n]);
+    let v: Vec<f32> = raw.slice([0..n, 1..2]).reshape([n]).mul_scalar(u_ref as f64)
+        .into_data().to_vec().unwrap_or_else(|_| vec![0.0; n]);
+    (u, v)
+}
+
+/// Issue #77 Phase 2 architectural redesign: sequential two-stage training with ONE-DIRECTIONAL
+/// domain coupling — see `OuterStageProblem`/`AnnulusStageProblem`'s own doc comments
+/// (`user_problem.rs`) and the investigation-branch plan's Phase 2 design for the full
+/// rationale. A third, independent training function — matches this codebase's own established
+/// "two step-driver functions by design" precedent for structurally different loops (frozen
+/// `step_physics`/additive `step_physics_multi`) rather than forcing a third shape through
+/// `run_annular_decomposition_training_inner`'s existing simultaneous-joint loop, which stays
+/// completely unmodified.
+///
+/// Stage A trains the outer domain alone (against the EXACT closed-form interface trace, no
+/// live annulus network) for `stage_a_steps`; the resulting model is frozen (`AutodiffModule::
+/// valid()`) and its own interface displacement evaluated ONCE. Stage B trains the annulus
+/// domain alone for `stage_b_steps`, anchored to that frozen, fixed target — no term in either
+/// stage has an adaptively-reweighted coefficient; every registered term keeps its plain static
+/// `base_weight` (`OuterStageProblem`/`AnnulusStageProblem::base_weight`), matching this
+/// redesign's explicit "no more reweighting" scope.
+#[allow(clippy::too_many_arguments)]
+pub fn run_annular_decomposition_training_sequential(
+    spec: ProblemSpec,
+    device: BDevice,
+    stage_a_steps: usize,
+    stage_b_steps: usize,
+    stage_b_hard_constraint: bool,
+    diagnostic_steps: &[usize],
+    mut on_step: impl FnMut(&str, usize, f32) -> bool,
+) -> (
+    crate::network::ElasticityNet<crate::training_core::BInner>,
+    crate::network::ElasticityNet<crate::training_core::BInner>,
+    f32,
+    Vec<UserProblemL5Diagnostic>,
+) {
+    use burn::module::AutodiffModule;
+
+    let mut config = SolverConfig::default_kirsch();
+    config.load = spec.load;
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+    let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
+    let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+    let placeholder = spec.geometry.to_placeholder();
+
+    // --- Stage A: outer domain alone, anchored to the exact closed-form interface trace.
+    let outer_problem = OuterStageProblem::new(spec.clone());
+    crate::problem::validate_loss_terms(&outer_problem);
+    let raw_cfg = ElasticityNetConfig::new().with_input_dim(3)
+        .with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden).with_output_dim(5);
+    // Same outer-model seed convention `run_annular_decomposition_training_inner` already
+    // established, so Stage A's outer model starts from the identical init every other
+    // annular-decomposition comparison's own outer model does.
+    B::seed(&device, spec.network.model_init_seed ^ 0xA77A_0001);
+    let mut outer_model = raw_cfg.init(&device);
+    let mut outer_optim = DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() };
+    let mut outer_saw = SawBrdr::with_base(outer_problem.loss_terms().iter().map(|t| outer_problem.base_weight(t.name())).collect(), 0.95);
+    let mut outer_lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+    for step in 0..stage_a_steps {
+        let data = resample_domain_step_data(
+            OUTER_DOMAIN, outer_problem.sampling_strategy(0), &placeholder, &spec.load,
+            spec.training.n_interior, spec.training.n_boundary, spec.geometry.half_w, spec.geometry.half_h,
+        );
+        let ctx = plate_multi_step_ctx(
+            &config, &outer_problem, &fd, &hole_fd, &data, scales.u_ref, scales.ref_energy, scales.ref_stress2,
+            spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
+        );
+        let (new_model, out) = step_physics_multi(
+            vec![outer_model], std::slice::from_mut(&mut outer_optim), &ctx, &mut outer_saw, &mut outer_lr_sched, &device, 0, 1.0, 1.0,
+        );
+        outer_model = new_model.into_iter().next().expect("single model");
+        if on_step("stage_a", step, out.total_scalar) {
+            break;
+        }
+    }
+    let frozen_outer = outer_model.valid();
+
+    // --- Stage B: annulus domain alone, anchored to the frozen outer model's OWN interface
+    // trace, evaluated once (see `evaluate_frozen_outer_interface_displacement`'s own doc
+    // comment for why once is correct, not an approximation).
+    let partition = spec.geometry.annular_partition().expect("validated by OuterStageProblem/AnnulusStageProblem constructors");
+    let interface = phase2_interface_parametrization();
+    let (target_u, target_v) = evaluate_frozen_outer_interface_displacement(
+        &frozen_outer, &spec.geometry, partition.interface_radius, &interface.thetas, scales.u_ref, &device,
+    );
+    let annulus_problem = AnnulusStageProblem::new(spec.clone(), stage_b_hard_constraint);
+    annulus_problem.set_frozen_interface_target(target_u, target_v);
+    crate::problem::validate_loss_terms(&annulus_problem);
+    let chart_cfg = ElasticityNetConfig::new()
+        .with_input_dim(spec.geometry.coordinate_embedding().input_dim())
+        .with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden).with_output_dim(5);
+    B::seed(&device, spec.network.model_init_seed);
+    let mut annulus_model = chart_cfg.init(&device);
+    let mut annulus_optim = DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() };
+    let mut annulus_saw = SawBrdr::with_base(annulus_problem.loss_terms().iter().map(|t| annulus_problem.base_weight(t.name())).collect(), 0.95);
+    let mut annulus_lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+    let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
+    let mut last_loss = f32::NAN;
+    for step in 0..stage_b_steps {
+        let data = resample_domain_step_data(
+            ANNULUS_DOMAIN, annulus_problem.sampling_strategy(0), &placeholder, &spec.load,
+            spec.training.n_interior, 0, spec.geometry.half_w, spec.geometry.half_h,
+        );
+        let ctx = plate_multi_step_ctx(
+            &config, &annulus_problem, &fd, &hole_fd, &data, scales.u_ref, scales.ref_energy, scales.ref_stress2,
+            spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), diagnostic_steps.contains(&step), step,
+        );
+        let (new_model, out) = step_physics_multi(
+            vec![annulus_model], std::slice::from_mut(&mut annulus_optim), &ctx, &mut annulus_saw, &mut annulus_lr_sched, &device, 0, 1.0, 1.0,
+        );
+        annulus_model = new_model.into_iter().next().expect("single model");
+        last_loss = out.total_scalar;
+        if diagnostic_steps.contains(&step) {
+            diagnostics.push(user_problem_l5_diagnostic(step, &out, &annulus_model.valid(), &spec, &fd, &device));
+        }
+        if on_step("stage_b", step, out.total_scalar) {
+            break;
+        }
+    }
+    sync_device(&device);
+    (frozen_outer, annulus_model.valid(), last_loss, diagnostics)
 }
 
 /// Minimal deterministic single-model loop for benchmark companions. Production UI/headless
@@ -433,7 +742,22 @@ pub(crate) fn train_single_user_problem_for_benchmark(
 ) -> crate::network::ElasticityNet<crate::training_core::BInner> {
     assert!(!AnnularDecompositionProblem::supports(&spec), "benchmark helper is single-model only");
     let problem = UserDefinedProblem::new(spec.clone());
-    crate::problem::validate_loss_terms(&problem);
+    train_user_problem_for_benchmark(&problem, spec, device).0
+}
+
+/// Issue #77 Phase 1: same minimal training loop as
+/// [`train_single_user_problem_for_benchmark`], but accepting an already-constructed `problem`
+/// (e.g. one built via `UserDefinedProblem::new_with_hard_constraint_ansatz`) instead of always
+/// building a plain `UserDefinedProblem::new(spec)` internally — lets test code exercise a real,
+/// tiny end-to-end training run for any `UserDefinedProblem` configuration, not only the plain
+/// default. Returns the trained model AND its final step's total loss (the benchmark caller
+/// only ever needed the model; Phase 1's smoke test needs to assert the loss stayed finite).
+pub(crate) fn train_user_problem_for_benchmark(
+    problem: &UserDefinedProblem,
+    spec: ProblemSpec,
+    device: &BDevice,
+) -> (crate::network::ElasticityNet<crate::training_core::BInner>, f32) {
+    crate::problem::validate_loss_terms(problem);
     let mut config = SolverConfig::default_kirsch();
     config.load = spec.load;
     let net_cfg = ElasticityNetConfig::new().with_input_dim(spec.geometry.net_input_dim())
@@ -447,6 +771,102 @@ pub(crate) fn train_single_user_problem_for_benchmark(
     let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
     let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
     let placeholder = spec.geometry.to_placeholder();
+    let mut last_loss = f32::NAN;
+    for step in 0..spec.training.max_steps {
+        let data = resample_plate_step_data(
+            problem.sampling_strategy(0), &placeholder, &spec.load, spec.training.n_interior,
+            spec.training.n_boundary, spec.geometry.half_w, spec.geometry.half_h,
+        );
+        let ctx = plate_multi_step_ctx(
+            &config, problem, &fd, &hole_fd, &data, scales.u_ref, scales.ref_energy, scales.ref_stress2,
+            spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
+        );
+        let (new_model, out) = step_physics_multi(
+            vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, device, 0, 1.0, 1.0,
+        );
+        model = new_model.into_iter().next().expect("single model");
+        last_loss = out.total_scalar;
+    }
+    use burn::module::AutodiffModule;
+    (model.valid(), last_loss)
+}
+
+/// Issue #77 Phase 1 architectural redesign: single-domain analogue of `AnnularL5Diagnostic` —
+/// no `annulus_lr`/`outer_lr` (there is only one model, one learning rate) or direct-vs-derived
+/// stress-mismatch fields (single-domain models don't have a second domain to disagree with);
+/// otherwise the same real, deterministic per-checkpoint record (`AnnularTermDiagnostic` is
+/// already generic over term name/raw/weight/gradient-norm/gradient-share and reused verbatim).
+#[derive(Debug, Clone, Serialize)]
+pub struct UserProblemL5Diagnostic {
+    pub step: usize,
+    pub total_loss: f32,
+    pub learning_rate: f64,
+    pub kt_derived_fd_vm: f64,
+    pub terms: Vec<AnnularTermDiagnostic>,
+}
+
+fn user_problem_l5_diagnostic(
+    step: usize,
+    out: &StepOutput,
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    spec: &ProblemSpec,
+    fd: &FdConfig,
+    device: &BDevice,
+) -> UserProblemL5Diagnostic {
+    let scales = crate::training_core::compute_reference_scales_for_plate(spec);
+    let hole = &spec.geometry.holes[0];
+    let margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+    let profile = crate::user_problem::probe_hole_boundary_profile_derived(
+        model, &spec.geometry, hole, 144, fd, scales.u_ref, scales.stress_ref,
+        &spec.material, margin, device,
+    );
+    let kt = crate::user_problem::stress_concentration_from_profile(&profile, spec.load.px.abs()).kt;
+    let raw = out.raw_scalar_by_name.as_ref();
+    let weights = out.lam_by_name.as_ref();
+    let norms = out.term_grad_norms.as_ref();
+    let shares = out.gradient_share_report.as_ref();
+    let mut names: Vec<&str> = raw.into_iter().flat_map(|m| m.keys().copied()).collect();
+    names.sort_unstable();
+    let terms = names.into_iter().map(|name| AnnularTermDiagnostic {
+        name: name.to_owned(),
+        raw: raw.and_then(|m| m.get(name)).copied().unwrap_or(f32::NAN),
+        effective_weight: weights.and_then(|m| m.get(name)).copied().unwrap_or(f64::NAN),
+        gradient_norm: norms.and_then(|m| m.get(name)).copied(),
+        gradient_share: shares.and_then(|s| s.shares.get(name)).copied(),
+    }).collect();
+    UserProblemL5Diagnostic { step, total_loss: out.total_scalar, learning_rate: out.lr, kt_derived_fd_vm: kt, terms }
+}
+
+/// Issue #77 Phase 1: real Kt-measuring training loop for an already-constructed
+/// `UserDefinedProblem` (e.g. via `new_with_hard_constraint_ansatz`) — the single-domain
+/// counterpart of `run_annular_decomposition_training_with_diagnostics`, giving Phase 1's real
+/// L5 comparison test the same checkpoint/diagnostic machinery every PH4-28..37 comparison test
+/// already relies on, instead of a bespoke inline loop. Requires
+/// `decomposition_applicable(&spec)` (one centered, traction-free hole — same scope
+/// `probe_hole_boundary_profile_derived`'s own `hole = &spec.geometry.holes[0]` assumes).
+pub fn run_user_problem_training_with_diagnostics(
+    problem: UserDefinedProblem,
+    spec: ProblemSpec,
+    device: BDevice,
+    diagnostic_steps: &[usize],
+    mut on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+) -> (crate::network::ElasticityNet<crate::training_core::BInner>, f32, Vec<UserProblemL5Diagnostic>) {
+    crate::problem::validate_loss_terms(&problem);
+    let mut config = SolverConfig::default_kirsch();
+    config.load = spec.load;
+    let net_cfg = ElasticityNetConfig::new().with_input_dim(spec.geometry.net_input_dim())
+        .with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden).with_output_dim(5);
+    B::seed(&device, spec.network.model_init_seed);
+    let mut model = net_cfg.init(&device);
+    let mut optim = DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() };
+    let mut saw = SawBrdr::with_base(problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect(), 0.95);
+    let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+    let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
+    let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+    let placeholder = spec.geometry.to_placeholder();
+    let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
+    let mut last_loss = f32::NAN;
     for step in 0..spec.training.max_steps {
         let data = resample_plate_step_data(
             problem.sampling_strategy(0), &placeholder, &spec.load, spec.training.n_interior,
@@ -454,15 +874,24 @@ pub(crate) fn train_single_user_problem_for_benchmark(
         );
         let ctx = plate_multi_step_ctx(
             &config, &problem, &fd, &hole_fd, &data, scales.u_ref, scales.ref_energy, scales.ref_stress2,
-            spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, step,
+            spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), diagnostic_steps.contains(&step), step,
         );
-        let (new_model, _) = step_physics_multi(
-            vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, device, 0, 1.0, 1.0,
+        let (new_model, out) = step_physics_multi(
+            vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
         );
         model = new_model.into_iter().next().expect("single model");
+        last_loss = out.total_scalar;
+        if diagnostic_steps.contains(&step) {
+            use burn::module::AutodiffModule;
+            diagnostics.push(user_problem_l5_diagnostic(step, &out, &model.valid(), &spec, &fd, &device));
+        }
+        if on_step(step, out.total_scalar, out.lr, data.int_norm.len()) {
+            break;
+        }
     }
+    sync_device(&device);
     use burn::module::AutodiffModule;
-    model.valid()
+    (model.valid(), last_loss, diagnostics)
 }
 
 /// Trains a [`UserDefinedProblem`] built from `spec` headlessly, printing progress. Returns

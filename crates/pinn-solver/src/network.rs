@@ -1016,6 +1016,43 @@ fn chart_embed<Bk: Backend>(
     Tensor::cat(cols, 1)
 }
 
+/// Issue #77 Phase 3 architectural redesign: `(ξ, cosθ, sinθ)` — `ξ = ln(r)` in the SAME
+/// hole-relative normalized units `chart_embed`'s own `qx,qy` already use (`inv_radius` scales
+/// physical distance so `r=1` exactly at the hole boundary, making `ξ=0` there and `ξ<0`
+/// strictly inside the excluded hole region — never reached by a valid collocation point, same
+/// invariant `chart_embed`'s own `1/r` singularity-avoidance already relies on). `cosθ,sinθ`
+/// (not raw `θ`) avoid the angular wraparound discontinuity at `θ=±π` a raw angle would create.
+///
+/// **Deliberately requires zero FD-stencil/derivative-machinery changes.** FD stencils
+/// (`fd_stencil::assemble_stencil`) are built and differenced in PHYSICAL `(x,y)` space
+/// upstream of this function; central-difference strain recovery only ever needs
+/// `∂(network_output)/∂x, ∂(network_output)/∂y` at fixed physical points, and this embedding —
+/// like `chart_embed`'s own much richer 7-feature reparameterization before it — is just part
+/// of the black-box forward function being differenced. No chain-rule-through-the-embedding
+/// code is needed for this to be a mathematically valid strain: physical finite differences of
+/// a composed function `strain ≈ (f(embed(x+h)) - f(embed(x-h))) / 2h` still converge to the
+/// correct physical derivative regardless of what `embed` internally computes, exactly the same
+/// as it already does for `chart_embed`.
+fn log_polar_embed<Bk: Backend>(
+    input: Tensor<Bk, 2>,
+    center_norm: [f32; 2],
+    inv_radius: [f32; 2],
+    epsilon: f32,
+) -> Tensor<Bk, 2> {
+    let n = input.dims()[0];
+    let x = input.clone().slice([0..n, 0..1]);
+    let y = input.clone().slice([0..n, 1..2]);
+    let qx = x.sub_scalar(center_norm[0] as f64).mul_scalar(inv_radius[0] as f64);
+    let qy = y.sub_scalar(center_norm[1] as f64).mul_scalar(inv_radius[1] as f64);
+    let r2 = qx.clone().powf_scalar(2.0) + qy.clone().powf_scalar(2.0);
+    let safe_r2 = r2.clamp_min((epsilon as f64).powi(2));
+    let r = safe_r2.sqrt();
+    let xi = r.clone().log();
+    let cos_theta = qx / r.clone();
+    let sin_theta = qy / r;
+    Tensor::cat(vec![input, xi, cos_theta, sin_theta], 1)
+}
+
 pub fn fwd_embedded_masked<Bk: Backend>(
     model: &ElasticityNet<Bk>,
     input: Tensor<Bk, 2>,
@@ -1029,6 +1066,8 @@ pub fn fwd_embedded_masked<Bk: Backend>(
         CoordinateEmbedding::Raw => input,
         CoordinateEmbedding::SingleHoleChart { center_norm, inv_radius, epsilon, n_fourier } =>
             chart_embed(input, center_norm, inv_radius, epsilon, n_fourier),
+        CoordinateEmbedding::LogPolar { center_norm, inv_radius, epsilon } =>
+            log_polar_embed(input, center_norm, inv_radius, epsilon),
     };
     model.forward_with_coordinates_masked(embedded, coords, mask)
 }
@@ -2221,5 +2260,90 @@ mod tests {
             values.iter().all(|v| v.is_finite()),
             "pruned gated network produced non-finite output"
         );
+    }
+
+    // ─── Issue #77 Phase 3 architectural redesign: log-polar coordinate embedding ─────────
+
+    /// Dimension count matches `CoordinateEmbedding::LogPolar::input_dim()`'s own formula
+    /// (`6` — 3 raw prefix columns + `ξ, cosθ, sinθ`), the same "the two must agree or model
+    /// construction and the real embedding width silently diverge" invariant
+    /// `chart_embed_dimension_matches_coordinate_embedding_input_dim_formula` already proves
+    /// for `SingleHoleChart`.
+    #[test]
+    fn log_polar_embed_dimension_matches_coordinate_embedding_input_dim_formula() {
+        use crate::training_core::{BDevice, BInner};
+        let device = BDevice::default();
+        let input = Tensor::<BInner, 2>::from_data(
+            TensorData::new(vec![0.30, -0.25, 0.0], vec![1, 3]), &device,
+        );
+        let dims = log_polar_embed(input, [0.25, -0.25], [20.0, 10.0], 1e-4).dims();
+        let expected = pinn_core::user_geometry::CoordinateEmbedding::LogPolar {
+            center_norm: [0.25, -0.25], inv_radius: [20.0, 10.0], epsilon: 1e-4,
+        }.input_dim();
+        assert_eq!(dims, [1, expected]);
+    }
+
+    /// Known-value check: `center_norm=[0,0], inv_radius=[1,1]` (so `qx=x, qy=y` directly) at
+    /// two hand-picked points — `(1,0)` (`r=1, θ=0`: `ξ=ln(1)=0, cosθ=1, sinθ=0`, exactly the
+    /// hole boundary itself in these normalized units) and `(0,2)` (`r=2, θ=π/2`: `ξ=ln(2),
+    /// cosθ=0, sinθ=1`).
+    #[test]
+    fn log_polar_embed_matches_hand_computed_value_at_known_points() {
+        use crate::training_core::{BDevice, BInner};
+        let device = BDevice::default();
+        let input = Tensor::<BInner, 2>::from_data(
+            TensorData::new(vec![1.0_f32, 0.0, 0.0, 0.0, 2.0, 0.0], vec![2, 3]), &device,
+        );
+        let v: Vec<f32> = log_polar_embed(input, [0.0, 0.0], [1.0, 1.0], 1e-4).into_data().to_vec().unwrap();
+        // Row layout: [x, y, z, xi, cos_theta, sin_theta] per row, 6 columns.
+        let (xi0, cos0, sin0) = (v[3], v[4], v[5]);
+        let (xi1, cos1, sin1) = (v[9], v[10], v[11]);
+        assert!(xi0.abs() < 1e-5, "expected xi=ln(1)=0 at r=1, got {xi0}");
+        assert!((cos0 - 1.0).abs() < 1e-5 && sin0.abs() < 1e-5, "expected (cos,sin)=(1,0) at theta=0, got ({cos0},{sin0})");
+        assert!((xi1 - 2.0_f32.ln()).abs() < 1e-5, "expected xi=ln(2) at r=2, got {xi1}");
+        assert!(cos1.abs() < 1e-5 && (sin1 - 1.0).abs() < 1e-5, "expected (cos,sin)=(0,1) at theta=pi/2, got ({cos1},{sin1})");
+    }
+
+    /// FD-continuity: central difference of `ξ=ln(r)` along the radial direction must match
+    /// the analytic `d(ln r)/dr = 1/r` — confirms the embedding is smooth (no kink) exactly
+    /// where `fd_stencil`'s physical-space central differences will actually probe it, the
+    /// same property `chart_embed_is_fd_continuous_across_hole_boundary` already proves for
+    /// `SingleHoleChart`'s own `r`/`psi` columns.
+    #[test]
+    fn log_polar_embed_xi_is_fd_continuous_and_matches_analytic_radial_derivative() {
+        use crate::training_core::{BDevice, BInner};
+        let device = BDevice::default();
+        let h = 1e-4_f32;
+        // Point at r=2 along +x (theta=0): center_norm=[0,0], inv_radius=[1,1] so qx=x.
+        let input = Tensor::<BInner, 2>::from_data(TensorData::new(
+            vec![2.0 - h, 0.0, 0.0, 2.0, 0.0, 0.0, 2.0 + h, 0.0, 0.0],
+            vec![3, 3],
+        ), &device);
+        let v: Vec<f32> = log_polar_embed(input, [0.0, 0.0], [1.0, 1.0], 1e-4).into_data().to_vec().unwrap();
+        let xi = |row: usize| v[row * 6 + 3];
+        let d_xi_dr = (xi(2) - xi(0)) / (2.0 * h);
+        let analytic = 1.0 / 2.0_f32; // d(ln r)/dr = 1/r at r=2
+        assert!((d_xi_dr - analytic).abs() < 1e-3, "FD d(xi)/dr={d_xi_dr}, analytic 1/r={analytic}");
+    }
+
+    /// `LogPolar` must dispatch correctly through `fwd_embedded_masked` — a real, tiny forward
+    /// pass proving the match arm added for this variant produces a finite, correctly-shaped
+    /// output, not just that `log_polar_embed` itself is correct in isolation.
+    #[test]
+    fn fwd_embedded_masked_dispatches_log_polar_embedding_and_stays_finite() {
+        use crate::training_core::{BDevice, BInner};
+        let device = BDevice::default();
+        let cfg = ElasticityNetConfig::new().with_input_dim(6).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
+        let model: ElasticityNet<BInner> = cfg.init(&device);
+        let input = Tensor::<BInner, 2>::from_data(
+            TensorData::new(vec![0.3_f32, -0.2, 0.0, 0.5, 0.1, 0.0], vec![2, 3]), &device,
+        );
+        let embedding = pinn_core::user_geometry::CoordinateEmbedding::LogPolar {
+            center_norm: [0.0, 0.0], inv_radius: [20.0, 20.0], epsilon: 1e-4,
+        };
+        let out = fwd_embedded_masked(&model, input, embedding, &device, None);
+        assert_eq!(out.dims(), [2, 5]);
+        let data: Vec<f32> = out.into_data().to_vec().unwrap();
+        assert!(data.iter().all(|v| v.is_finite()), "LogPolar-embedded forward pass produced non-finite output: {data:?}");
     }
 }

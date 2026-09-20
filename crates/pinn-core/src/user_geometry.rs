@@ -92,6 +92,25 @@ pub enum CoordinateEmbedding {
         /// this tests the spectral-bias hypothesis directly).
         n_fourier: usize,
     },
+    /// Issue #77 Phase 3 architectural redesign: a true reparameterization of the network's own
+    /// coordinate input to `(ξ, cosθ, sinθ)` — `ξ = ln(r/hole_radius)`, hole-relative log-polar —
+    /// appended to the raw `(x,y,z)` prefix (mirrors `SingleHoleChart`'s own "raw prefix + derived
+    /// features" convention exactly, see `network::chart_embed`'s doc comment). Unlike
+    /// `SingleHoleChart`'s additive FEATURES on top of raw coordinates (already tried as Fourier
+    /// features, PH4-31/32, and rejected), this asks the network to condition on a coordinate
+    /// system whose natural symmetry actually matches the field near the hole — no near-hole
+    /// singularity in the INPUT space itself (`r→a` is `ξ→-∞`, but training only ever samples a
+    /// bounded, FD-safe range of `ξ`, same as every other embedding's own near-hole exclusion
+    /// margin). `cosθ,sinθ` (not raw `θ`) avoids the angular wraparound discontinuity at `θ=±π`.
+    /// FD stencils remain in PHYSICAL `(x,y)` space, unaffected — this embedding is transparent
+    /// to the existing FD/derivative machinery exactly like `SingleHoleChart` already is (no
+    /// stencil/differential-operator changes needed, confirmed in `network.rs`'s own doc comment
+    /// for `log_polar_embed`).
+    LogPolar {
+        center_norm: [f32; 2],
+        inv_radius: [f32; 2],
+        epsilon: f32,
+    },
 }
 
 impl CoordinateEmbedding {
@@ -101,6 +120,8 @@ impl CoordinateEmbedding {
             // 10 base chart columns + 4 columns (sin/cos of qx, sin/cos of qy) per frequency
             // band - same `4*n_fourier` convention `network::fourier_embed` already uses.
             Self::SingleHoleChart { n_fourier, .. } => 10 + 4 * n_fourier,
+            // 3 raw prefix columns + (ξ, cosθ, sinθ).
+            Self::LogPolar { .. } => 6,
         }
     }
 }
@@ -259,6 +280,26 @@ impl UserGeometry {
             // alter physical features at collocation or FD-stencil points.
             epsilon: 1e-4,
             n_fourier,
+        }
+    }
+
+    /// Issue #77 Phase 3 architectural redesign: the log-polar embedding, opt-in (never the
+    /// result of [`Self::coordinate_embedding`]/[`Self::coordinate_embedding_with_fourier`],
+    /// which stay `SingleHoleChart`/`Raw` unchanged). Same no-hole/multi-hole fallback to `Raw`
+    /// as [`Self::coordinate_embedding_with_fourier`] — this representation only makes sense
+    /// relative to exactly one hole's own center/radius.
+    pub fn log_polar_embedding(&self) -> CoordinateEmbedding {
+        let [hole] = self.holes.as_slice() else {
+            return CoordinateEmbedding::Raw;
+        };
+        let radius = hole.radius as f32;
+        CoordinateEmbedding::LogPolar {
+            center_norm: [
+                (hole.center[0] / self.half_w) as f32,
+                (hole.center[1] / self.half_h) as f32,
+            ],
+            inv_radius: [(self.half_w as f32) / radius, (self.half_h as f32) / radius],
+            epsilon: 1e-4,
         }
     }
 

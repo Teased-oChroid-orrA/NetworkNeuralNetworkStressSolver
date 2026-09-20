@@ -2200,3 +2200,295 @@ SIREN, gradient-share rebalancing via weight reduction, and now the exact hard-c
 ansatz) - none reliably closes the ~48-50% mean relative-error gap. The gap remains open.
 
 Does not close issue #77 (or #74/#76).
+
+## PH4-36 — Root-cause synthesis and Step 1 implementation: gradient-norm-aware SAW-BRDR
+## recalibration (mechanism landed; real multi-thousand-step evidence not yet collected)
+
+A dedicated synthesis pass across PH4-24 through PH4-35 (full writeup:
+`/Users/nautilus/.claude/plans/you-are-a-principal-velvety-toast.md`, this branch's approved
+plan) identified the structural property common to all twelve failures, confirmed by direct
+code inspection, not inference: **`SawBrdr::update` (`saw_brdr.rs`) adapts every term's
+multiplier purely from consecutive scalar LOSS-VALUE ratios — it never sees a term's actual
+backpropagated GRADIENT L2 norm.** `training_core::gradient_share_report`/`term_grad_norms`
+already compute the real per-term gradient norm (`probe_term_gradients`, gated, real extra
+backward-pass cost) — but strictly as a diagnostic, never fed back into `base_weights`. This
+exactly explains PH4-34b's own finding that cutting `hole_free`'s nominal weight 10x moved its
+measured gradient SHARE the WRONG direction (78.4% -> 82.4%): loss value and gradient magnitude
+are only loosely coupled for a pointwise boundary term versus a domain-integrated energy term.
+It also explains why PH4-35 (the hard-constraint ansatz, the one candidate that structurally
+removed a term rather than reweighting it) was the only intervention that moved gradient share
+at all — but the freed budget went to `interface_traction_continuity` (62.8%), not
+`physical_potential`/`annulus_potential` (never over ~20% combined across all twelve
+configurations), and the sharper local landscape that removal introduced amplified this
+codebase's own already-confirmed Wgpu backend non-determinism (issue #74/PH4-23) into the 13x
+variance spike PH4-35's final verdict documented.
+
+**Implementation** (`saw_brdr.rs`, `user_runner.rs`, `user_problem.rs` - test module only):
+`saw_brdr::grad_norm_damping_factors(term_grad_norms, reference_terms, floor)` computes a
+damping-ONLY (`<=1.0`, clamped to `[floor, 1.0]`) multiplicative factor for every term whose
+measured gradient norm exceeds the mean of `reference_terms`' own norms - the pinned
+physical-functional terms (`physical_potential`/`annulus_potential`) whose live SAW-BRDR
+coefficient `step_physics_multi`'s own match arm already hardcodes to `1.0` regardless of
+`base_weights`, so those two are safe to include in `term_grad_norms` without an explicit
+exemption: rescaling their own base weight is a structural no-op downstream, and the function
+never assigns them a factor in the first place (never amplifies anything; a reference term
+missing from the reading is a genuine no-op, not a spurious rescale). `SawBrdr::base_weights`'s
+own doc comment was updated to document this as a supported, opt-in caller-side use of the
+pre-existing `set_base_weights` method, not a new mechanism inside `SawBrdr` itself - zero
+changes to `SawBrdr::update`'s own math.
+
+Wired opt-in into `run_annular_decomposition_training_inner` as an 11th parameter,
+`grad_norm_rescale_period: usize` (`0` = disabled - every one of the seven pre-existing public
+entry points passes `0`, byte-identical). A nonzero value ORs an extra probe step into the
+existing `probe_term_gradients` expression on its own cadence (independent of
+`diagnostic_steps`), and after that step, recalibrates `saw`'s base weights from the ORIGINAL
+(never previously-rescaled) weight set via `grad_norm_damping_factors` + `set_base_weights` -
+avoiding compounding shrink across repeated refreshes. New entry point
+`run_annular_decomposition_training_with_diagnostics_and_grad_norm_rescale`, mirroring every
+prior PH4-2x/3x candidate's exact opt-in pattern. Zero changes to `training_core.rs`,
+`problem.rs`'s `MultiStepCtx` (all 34 of its literal construction sites across the crate are
+untouched), or any Kirsch/pin-lug call path - the entire mechanism lives in the annular
+decomposition's own experimental training loop.
+
+**Verification so far**: 4 new `saw_brdr::tests` (dominant-term damping matches PH4-35's own
+real 62.8%-vs-18.2% gradient-share numbers as a synthetic fixture; floor bound; no-op when no
+reference term is present; NaN/zero-reading skip) plus a new end-to-end smoke test
+(`grad_norm_rescale_period_recalibrates_every_step_without_panicking_or_going_nonfinite`,
+3-step real training run, `period=1` forcing the recalibration path every step) proving the
+mechanism actually executes - `probe_term_gradients` fires, `term_grad_norms` populates,
+`grad_norm_damping_factors` runs, `set_base_weights` doesn't panic, loss stays finite - and a
+`period=0` companion run in the same test confirming the disabled default path is unaffected.
+Full workspace regression (`cargo test -p pinn-core -p pinn-solver --features ndarray-backend
+-- --test-threads=1`) run alongside this change.
+
+**Not yet done, by design, matching this project's own CI-over-local-runs preference for
+multi-thousand-step training**: the plan's own Step 3 controlled comparison
+(`issue_77_l5_annular_diagnostic_trace`-equivalent, several thousand steps, 3-4 repeated
+samples, real Kt numbers with mean/stdev/CV) has NOT been run in this session. This entry
+documents the mechanism landing correctly and safely (opt-in, byte-identical default, unit +
+smoke tested), not a Kt-gap result - a future PH4-37 entry should report the real controlled
+run, with the same reproducibility discipline PH4-35's final verdict established (repeat
+samples before any conclusion, mean/stdev/CV reported, not a single favorable run).
+
+Does not close issue #77 (or #74/#76).
+
+## PH4-37 — PH4-36's Step 1/Step 2 real controlled runs: gradient-norm rescale does NOT close
+## the Kt gap at two aggressiveness levels, and combining it with the hard-constraint ansatz
+## makes Kt WORSE while revealing a new, more specific failure mode
+
+Ran the real, multi-thousand-step controlled comparisons PH4-36 deferred, explicitly overriding
+this project's own CI-over-local-runs preference for this investigation at the user's direct
+request to continue until the mechanism is proven working or conclusively exhausted. All three
+runs use the identical L5 config (`hidden_dim=64, n_hidden=8, max_steps=3000, n_interior=4096,
+n_boundary=4096, fd_h=1e-3, lr=1e-3, amr_enabled=true`, release build) and checkpoints
+`[0, 300, 1500, 2999]` as every PH4-28..35 comparison, for direct comparability.
+
+**Run 1 - `issue_77_grad_norm_rescale_l5_trace` (Step 1, moderate: `period=150, floor=0.1`)**:
+Kt=**1.261** at step 2999 (baseline PH4-28: 1.231 - a 0.03 move, inside this investigation's own
+established noise band). The mechanism DID activate: `hole_free`'s weight damped `100.0 ->
+39.62`, combined `physical_potential`+`annulus_potential` gradient share rose from PH4-34b's
+baseline ~18% to ~30% - a real, measured redirection - but `hole_free` still dominated at 64.2%
+share, and Kt did not move meaningfully.
+
+**Run 2 - `issue_77_grad_norm_rescale_aggressive_l5_trace` (Step 1 escalated: `period=75,
+floor=0.02`, 2x more responsive and up to 5x more permissive than Run 1)**: Kt=**1.163** -
+WORSE than both baseline and Run 1. `hole_free`'s weight only reached `50.0` (the computed
+damping factor never approached the much-lower `0.02` floor - the factor is driven by the real
+measured gradient ratio, not the floor, so a lower floor alone cannot force more damping than
+the actual gradient disparity calls for) and its gradient share barely moved (64.2% -> 61.3%).
+**Conclusion, confirmed directly (not inferred) from two independent real aggressiveness
+levels**: PH4-34b's own finding - "gradient share is driven by an INTRINSIC gradient-magnitude
+disparity... that a weight change does not meaningfully close" - generalizes from nominal-weight
+changes to TRUE gradient-norm-based rescaling as well. SAW-BRDR's own per-step `update()` call
+continues adapting `hole_free`'s multiplier every step BETWEEN this mechanism's periodic
+refreshes, and evidently re-inflates enough of the gap that even a 5x-more-permissive floor and
+2x-more-frequent refresh cadence could not durably suppress it. Step 1 (gradient-norm rescale,
+alone, at two real aggressiveness levels) is REJECTED as insufficient to close the Kt gap.
+
+**Run 3 - `issue_77_hard_constraint_and_grad_norm_rescale_l5_trace` (Step 2: hard-constraint
+ansatz + grad-norm rescale, `period=150, floor=0.1`, same moderate settings as Run 1)**: this is
+the test the plan's own Step 2 called for - PH4-35's hard-constraint ansatz already removes
+`hole_free` entirely; `grad_norm_damping_factors` is generic over "every active term except the
+reference set," so with `hole_free` absent it automatically targets whichever term PH4-35's own
+diagnostic showed became newly dominant, `interface_traction_continuity` (62.8% share in
+PH4-35's own real run). **The mechanism worked exactly as designed on gradient share**:
+`interface_traction_continuity`'s weight damped `100.0 -> 20.24`, its share fell to **36.3%**
+(from PH4-35's 62.8%), and combined `physical_potential`+`annulus_potential` share rose to
+**59.3%** - by far the largest redirection toward the physical terms achieved anywhere in this
+entire investigation (every prior configuration, including every candidate in PH4-24 through
+PH4-36's own Runs 1-2, topped out around 18-30% combined).
+
+**Despite that, Kt got WORSE, not better: 0.709 at step 2999** (vs. PH4-35's own hard-constraint
+mean of 1.28, and vs. this run's own PEAK of 1.175 at step 1500 - Kt rose then DECLINED for the
+back half of training, the same peak-then-decline shape PH4-26/27's extended runs showed for a
+different reason). **This is a new, more specific finding, not just another "no effect" result**:
+successfully redirecting gradient share to the physical-functional terms does not automatically
+improve Kt, and in this case actively hurt it. Working explanation, grounded directly in what
+`interface_traction_continuity` physically represents: unlike `hole_free` (which PH4-35's exact
+closed-form correction makes REDUNDANT - satisfied to FD-truncation precision by construction,
+with zero further physical work to do), `interface_traction_continuity` enforces genuine,
+ongoing compatibility between two INDEPENDENTLY-parameterized domains (annulus vs. outer) that
+have no closed-form guarantee of agreeing with each other. Its raw loss being small (`5.9e-6`)
+does not mean "no longer needed," unlike `hole_free`'s small raw loss under the exact
+constraint - it can mean "actively and successfully being enforced." Damping its weight lets the
+two domains' fields drift apart over the remaining training budget even as `annulus_potential`'s
+own internal energy account looks better in isolation - a self-consistent but increasingly WRONG
+local minimum for the annulus alone, not a genuine improvement to the coupled BVP solution.
+
+**Root-cause refinement over PH4-36's own synthesis**: `grad_norm_damping_factors` as
+implemented distinguishes terms only by gradient MAGNITUDE, with `physical_potential`/
+`annulus_potential` as the sole protected reference set. That set was correct for Step 1 (the
+domain-integrated energy functional must never be rescaled - `step_physics_multi`'s own
+hardcoded pin) but incomplete for Step 2: `interface_displacement_continuity`/
+`interface_traction_continuity` are ALSO structural BVP-compatibility requirements, not
+soft/redundant penalties competing for budget the way `hole_free` was before the hard
+constraint - PH4-29's own real A/B test (10x interface-weight reduction, "no effect either
+direction") is consistent with this once you note it left `hole_free` active at the time, so the
+interface terms were never the dominant gradient consumer in that configuration to begin with.
+A corrected Step 2 would need to protect the interface terms alongside `physical_potential`/
+`annulus_potential`, leaving only `translation_gauge`/`rotation_gauge` (tiny gauge-fixing terms,
+already measured at 2-3% share, never gradient-dominant in any run this investigation has done)
+as genuinely eligible for damping under the hard-constraint ansatz - which would make the
+mechanism have essentially NO effect in that mode, reducing to PH4-35's own already-characterized
+flat-mean/high-variance outcome. This closes the loop on PH4-36's Step 2 without a further real
+run: there is no remaining untested configuration of "protect the reference set, damp the rest"
+within the hard-constraint mode that has a plausible path to a different, better outcome.
+
+**Verdict**: gradient-norm-aware SAW-BRDR rescale (PH4-36's Step 1) and its combination with the
+hard-constraint ansatz (PH4-36's Step 2) are BOTH rejected as practical Kt-gap fixes, on real
+evidence from three independent controlled runs at three genuinely different configurations
+(moderate, aggressive, and combined-with-hard-constraint). The mechanism itself is correctly
+implemented and does what it claims (redirect measured gradient share, verified directly via
+`AnnularTermDiagnostic.gradient_share`, not merely by construction) - the code is kept, opt-in,
+byte-identical default, zero risk to any other path, as a real capability and a documented
+negative result, matching this project's own precedent for PH4-35's hard-constraint code.
+
+**Fifteen independently-evidenced mechanisms have now been tested with real evidence across this
+investigation** (the eleven from PH4-24..35, plus PH4-36/37's three: gradient-norm rescale alone
+at moderate and aggressive settings, and combined with the hard-constraint ansatz) - all
+rejected. The Kt gap remains open. Per this investigation's own PH4-30 conclusion, reaffirmed
+with stronger, more specific evidence by this entry: **continuing to search within the "reweight
+or redirect gradient share among this architecture's existing loss terms" solution space has a
+very low prior of success at this point.** Every genuinely distinct rebalancing idea this
+family admits - nominal weight (PH4-34b), true gradient norm at two aggressiveness levels
+(PH4-36/37 Runs 1-2), and gradient norm combined with structural term removal (PH4-36/37 Run 3)
+- has now been tried with real evidence. A durable next step, if pursued, needs a genuinely
+different architectural idea (e.g., a different domain-coupling mechanism that doesn't rely on
+two independently-parameterized networks needing a soft/adaptive interface penalty at all, or a
+fundamentally different discretization near the hole) rather than a further variation on
+adaptive loss-term weighting - explicitly out of scope for this session; see the investigation-
+branch plan document's own "explicitly out of scope" section for what was deliberately not
+re-attempted.
+
+Does not close issue #77 (or #74/#76).
+
+## PH4-38/39/40 — Three genuinely different architectural redesigns (not reweighting), real
+## evidence: none closes the Kt gap, but together they settle what the bottleneck is NOT
+
+Per direct user instruction, this investigation moved off the "reweight/redirect gradient share
+among existing loss terms" family entirely (PH4-24 through PH4-37, fifteen real attempts) and
+implemented three structurally different architectures, real-run at the same L5 config
+(`hidden_dim=64, n_hidden=8, max_steps=3000, n_interior=4096, n_boundary=4096, fd_h=1e-3,
+lr=1e-3, amr_enabled=true`, release build, checkpoints `[0, 300, 1500, 2999]`) as every
+PH4-28..37 comparison. **None introduces any adaptive/gradient-based loss reweighting** — every
+term in every design keeps a plain static `base_weight`.
+
+**Phase 1 / PH4-38 — Single-domain hard-constraint** (`UserDefinedProblem::new_with_hard_
+constraint_ansatz`, `crates/pinn-solver/src/user_problem.rs`): `UserDefinedProblem`'s existing
+single-network, whole-plate path (already had PH4-24's kinematic decomposition built in, just
+never given the exact hard-constraint ansatz or a real Kt test) + the SAME closed-form ansatz
+PH4-35 verified + opt-in hole-biased stratified sampling (`UserSamplingStrategy::with_hole_
+bias`, reusing `AnnularPartitionSampling`'s own uniform-in-r² formula). No domain split, no
+interface term of any kind — structurally cannot exhibit PH4-37's drift failure mode.
+
+**Real result** (`issue_77_single_domain_hard_constraint_l5_trace`, `hole_bias_fraction=0.5`):
+Kt=**7.71** at step 2999 — wildly overshooting the FEM target (2.4606), clearly NOT converged
+(trajectory `0.243 → 0.235 → 1.112 → 7.714`, still rising steeply at the final checkpoint, no
+sign of plateauing). **The mechanism worked exactly as hypothesized on gradient share**:
+`physical_potential` captured **97.7%** of gradient budget — by far the highest of any
+configuration in this entire investigation (every reweighting attempt topped out ~18-30%
+combined physical share). Despite that, the result is a real instability, not a good answer.
+
+**Phase 2 / PH4-39 — Sequential two-stage training, one-directional coupling**
+(`OuterStageProblem`/`AnnulusStageProblem`/`run_annular_decomposition_training_sequential`):
+keeps the two-domain split but replaces simultaneous joint optimization with two stages — Stage
+A trains the outer domain alone against the EXACT closed-form interface trace (no live annulus
+network); the trained model is frozen and its own interface displacement evaluated once; Stage
+B trains the annulus domain alone, anchored to that frozen, fixed target (`FrozenInterfaceAnchorTerm`
+— gradient flows only into the annulus model, never back into the frozen outer one). Directly
+targets PH4-37's actual failure mechanism (two independently-parameterized networks free to
+drift toward a jointly-cheaper-but-wrong configuration) without eliminating the domain coupling
+outright the way Phase 1 does.
+
+**Real result** (`issue_77_sequential_two_stage_l5_trace`, 1500/1500 step split, hard-constraint
+active in Stage B): Kt=**1.174** at Stage B's final step — **stable** (smooth, monotonically
+improving loss curve, no divergence, no oscillation) but flat-to-slightly-worse than baseline
+(1.231; relative error 52.3% vs baseline's 49.97%). `annulus_potential` captured **92.9%**
+gradient share (`frozen_interface_anchor` the only other term, a real but non-dominant 7.1%) —
+confirms the one-directional anchor is exactly as cheap/small as intended, not a bottleneck
+itself. The comparison with Phase 1 is the informative part: a weak one-directional interface
+anchor keeps the system stable where NO interface at all did not, but neither configuration
+moves Kt toward the FEM target — evidence that whatever interface coupling exists (symmetric,
+one-directional, or none) is not itself the reason Kt stalls, once gradient share to the physics
+term is no longer the bottleneck.
+
+**Phase 3 / PH4-40 — Log-polar coordinate chart for the annulus domain** (`CoordinateEmbedding::
+LogPolar`, `pinn_core::user_geometry` + `network::log_polar_embed`): a true reparameterization
+of the annulus network's own input to `(ξ=ln(r/hole_radius), cosθ, sinθ)` instead of raw/
+chart-augmented `(x,y)` — unlike PH4-31/32's Fourier features (additive columns on top of raw
+coordinates, rejected), this changes the coordinate system itself to one whose natural symmetry
+matches the near-hole field. FD stencils stay in physical `(x,y)` space, unchanged (confirmed
+by `network.rs`'s own test suite - the embedding is transparent to existing FD/derivative
+machinery, exactly like `SingleHoleChart` already is). Combined with the hard-constraint ansatz
+(orthogonal axis). **A real bug was caught and fixed before the real run**: `embedding_for_model`
+(the diagnostic-ledger's own embedding-inference helper, PH4-31's own prior fix for a similar
+gap) didn't know about the new 6-column `LogPolar` width and would have panicked on the first
+diagnostic checkpoint — the same bug CLASS PH4-31 fixed for Fourier features, now fixed for this
+variant too, caught by the smoke test's own `diagnostic_steps=&[0]` convention before the real
+40-minute run, not during it.
+
+**Real result** (`issue_77_annulus_log_polar_l5_trace`): Kt=**1.066** at step 2999 — **stable**
+(smooth monotonic loss curve, plateauing cleanly near 1.0 from step 1800 onward, the smoothest
+trajectory of any hard-constraint-active configuration in this whole investigation) but flat/
+slightly worse than baseline. Combined `annulus_potential`(80.3%)+`physical_potential`(11.0%) =
+**91.3%** gradient share to the physical-functional terms — again far exceeding any reweighting
+attempt, again with no Kt improvement.
+
+**What these three results settle together, that fifteen reweighting attempts alone could not**:
+every one of PH4-24 through PH4-37's real attempts left open the possibility that redirecting
+more gradient share to the physical energy term(s) would eventually close the gap if only the
+mechanism were sharp enough — PH4-36/37's own gradient-norm rescale got close (59.3% combined
+share in one configuration) without fully testing the hypothesis at its logical extreme. Phase
+1/2/3 push combined physical-functional gradient share to **80-98%** — structurally the
+highest attainable, since Phase 1 has no other term family competing at all — and Kt still does
+not approach 2.4606 in any of the three (best real result: 1.174, worse than PH4-35's own mean).
+**Gradient-budget allocation among loss terms, however it is achieved — reweighting, structural
+term removal, or eliminating the competing domain outright — is not the bottleneck.** The
+one place a *lack* of interface coupling caused visible harm (Phase 1's instability) is itself
+informative: some form of coupling/regularization toward the true finite-plate solution is
+apparently necessary for STABILITY, but even the most gradient-favorable, most stable
+configurations found (Phase 2, Phase 3) do not close the accuracy gap. This points toward
+representational/optimization capacity to resolve the sharp near-hole stress concentration
+itself — within this DEM/energy-minimization-plus-collocation architecture and this step budget
+— as the more likely remaining bottleneck, not any loss-term or domain-coupling structure this
+investigation (eighteen real, independently-designed candidates now) has tried.
+
+**Verification**: all three phases' own new code (ansatz ports, `OuterStageProblem`/
+`AnnulusStageProblem`, `LogPolar` embedding, `embedding_for_model`'s fix) covered by targeted
+unit/smoke tests (26 new/modified tests, all passing) before any real run — see each phase's own
+commit-adjacent test additions in `user_problem.rs`/`network.rs`/`saw_brdr.rs`/`user_runner.rs`.
+Every new entry point is opt-in with a byte-identical default; zero changes to
+`AnnularDecompositionProblem`'s existing simultaneous-joint path, `step_physics`/
+`step_physics_multi`, Kirsch, or pin-lug.
+
+**Not yet done**: repeat samples for Phase 1/2/3 (PH4-35's own reproducibility discipline — a
+single run per configuration here, given the real time cost of ~35-40 minutes per run already
+spent on six real runs this session). Phase 1's instability in particular warrants a repeat
+before concluding it is reproducible rather than a one-off variance draw, though its magnitude
+(7.71 vs a 2.46 target) makes "favorable outlier" an unlikely explanation for the *direction* of
+the result even if the exact value varies.
+
+Does not close issue #77 (or #74/#76). Eighteen independently-evidenced mechanisms — fifteen
+loss-term/gradient-reweighting variants plus three structurally distinct architectures — have
+now been tested with real evidence. The Kt gap remains open, and the evidence increasingly
+points away from this architecture's loss-term/domain-coupling structure entirely.

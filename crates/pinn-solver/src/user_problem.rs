@@ -388,7 +388,23 @@ pub struct UserSamplingStrategy {
     /// every call" artifact is fixed.
     interior_calls: std::sync::atomic::AtomicU64,
     boundary_calls: std::sync::atomic::AtomicU64,
+    /// Issue #77 Phase 1 architectural redesign (single-domain hard-constraint): fraction of
+    /// `sample_interior`'s budget drawn from a near-hole-biased stratum instead of the plain
+    /// whole-plate draw — see [`Self::sample_interior`]'s own doc comment for the mechanism.
+    /// `0.0` via [`Self::new`] is byte-identical to every pre-existing caller; set only via
+    /// [`Self::with_hole_bias`] (builder-style, so none of this struct's ~14 existing
+    /// `UserSamplingStrategy::new` call sites need to change). Scoped to exactly one centered
+    /// hole (mirrors `decomposition_applicable`'s own scope) — the v1 boundary matching this
+    /// redesign's own target geometry; multi-hole/off-center biasing is out of scope, not
+    /// silently approximated.
+    hole_bias_fraction: f64,
 }
+
+/// Outer radius of the near-hole-biased sampling stratum, as a multiple of hole radius — reuses
+/// the SAME `3*radius` convention `AnnularPartitionSampling`'s own `interface_radius` and every
+/// PH4-24..37 comparison's hard-constraint envelope saturation point already established, not a
+/// newly chosen constant.
+const HOLE_BIAS_RADIUS_MULTIPLIER: f64 = 3.0;
 
 impl UserSamplingStrategy {
     /// `fd_h`: the training config's FD step in *normalized* coordinates
@@ -418,7 +434,17 @@ impl UserSamplingStrategy {
             geometry, hole_names, hole_fd_names, anchor_margin_m,
             interior_calls: std::sync::atomic::AtomicU64::new(0),
             boundary_calls: std::sync::atomic::AtomicU64::new(0),
+            hole_bias_fraction: 0.0,
         }
+    }
+
+    /// See [`Self::hole_bias_fraction`]'s own doc comment. Builder-style (consumes `self`) so
+    /// every existing `UserSamplingStrategy::new(...)` call site stays byte-identical unless it
+    /// explicitly opts in by chaining this.
+    pub fn with_hole_bias(mut self, fraction: f64) -> Self {
+        assert!((0.0..=1.0).contains(&fraction), "hole_bias fraction must be in [0,1], got {fraction}");
+        self.hole_bias_fraction = fraction;
+        self
     }
 
     /// Like `UserGeometry::contains`, but excludes a `self.anchor_margin_m`-wide annulus just
@@ -470,18 +496,64 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
         let call = self.interior_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut rng = LcgRng::new(SEED_INTERIOR ^ call.wrapping_mul(CALL_SEED_MIX));
         let mut pts = Vec::with_capacity(n);
-        let nx = (n as f64).sqrt().ceil() as usize;
-        let ny = n.div_ceil(nx);
+
+        // Issue #77 Phase 1 architectural redesign: near-hole-biased stratum, opt-in via
+        // `hole_bias_fraction` (0.0 = every pre-existing caller, making this block a complete
+        // no-op — `bias_hole` is `None`, `n_biased` is `0`). Scoped to exactly one hole (see
+        // `hole_bias_fraction`'s own doc comment). Draws uniform-in-r^2 over
+        // `[hole.radius + anchor_margin_m, HOLE_BIAS_RADIUS_MULTIPLIER * hole.radius]` — the
+        // SAME formula `AnnularPartitionSampling::sample_interior`'s own `is_annulus` branch
+        // already uses and is already tested, adapted to a single-domain sampler instead of a
+        // second domain. `contains_for_collocation` (not a bespoke check) enforces the same
+        // FD-safety/plate-bounds/other-hole-exclusion invariants every other draw in this
+        // function already relies on.
+        let bias_hole = (self.hole_bias_fraction > 0.0 && self.geometry.holes.len() == 1)
+            .then(|| self.geometry.holes[0]);
+        if let Some(hole) = bias_hole {
+            let n_biased = (n as f64 * self.hole_bias_fraction).round() as usize;
+            let r0 = hole.radius + self.anchor_margin_m;
+            let r1 = HOLE_BIAS_RADIUS_MULTIPLIER * hole.radius;
+            let (r0sq, r1sq) = (r0 * r0, r1 * r1);
+            let mut attempts = 0usize;
+            let max_attempts = n_biased.max(1) * REJECTION_SAMPLE_ATTEMPTS_FACTOR;
+            while pts.len() < n_biased && attempts < max_attempts {
+                attempts += 1;
+                let r = (r0sq + rng.next_f64() * (r1sq - r0sq)).sqrt();
+                let theta = 2.0 * std::f64::consts::PI * rng.next_f64();
+                let x = hole.center[0] + r * theta.cos();
+                let y = hole.center[1] + r * theta.sin();
+                if self.contains_for_collocation(x, y) {
+                    pts.push([x, y]);
+                }
+            }
+        }
+        // The bias stratum's own outer radius, excluded from the draw below so the biased
+        // region's density isn't further inflated by double-counting — `None` (every
+        // pre-existing caller) makes `excludes_bias` an unconditional `true`, byte-identical.
+        let bias_r1sq = bias_hole.map(|h| (HOLE_BIAS_RADIUS_MULTIPLIER * h.radius).powi(2));
+        let excludes_bias = |x: f64, y: f64| -> bool {
+            match (bias_hole, bias_r1sq) {
+                (Some(h), Some(r1sq)) => {
+                    let (dx, dy) = (x - h.center[0], y - h.center[1]);
+                    dx * dx + dy * dy >= r1sq
+                }
+                _ => true,
+            }
+        };
+
+        let n_remaining = n.saturating_sub(pts.len());
+        let nx = (n_remaining as f64).sqrt().ceil().max(1.0) as usize;
+        let ny = n_remaining.div_ceil(nx.max(1)).max(1);
         let cells = nx * ny;
-        for i in 0..n {
-            let cell = i * cells / n;
+        for i in 0..n_remaining {
+            let cell = i * cells / n_remaining;
             let ix = cell % nx;
             let iy = cell / nx;
             let jitter_x = rng.next_f64();
             let jitter_y = rng.next_f64();
             let x = -self.geometry.half_w + (ix as f64 + jitter_x) * 2.0 * self.geometry.half_w / nx as f64;
             let y = -self.geometry.half_h + (iy as f64 + jitter_y) * 2.0 * self.geometry.half_h / ny as f64;
-            if self.contains_for_collocation(x, y) {
+            if self.contains_for_collocation(x, y) && excludes_bias(x, y) {
                 pts.push([x, y]);
             }
         }
@@ -491,7 +563,7 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
             attempts += 1;
             let x = (rng.next_f64() * 2.0 - 1.0) * self.geometry.half_w;
             let y = (rng.next_f64() * 2.0 - 1.0) * self.geometry.half_h;
-            if self.contains_for_collocation(x, y) {
+            if self.contains_for_collocation(x, y) && excludes_bias(x, y) {
                 pts.push([x, y]);
             }
         }
@@ -1445,7 +1517,12 @@ pub struct UserDefinedProblem {
     spec: ProblemSpec,
     domains: Vec<DomainSpec>,
     sampling: UserSamplingStrategy,
-    ansatz: IdentityAnsatz,
+    /// Issue #77 Phase 1 architectural redesign: `Identity` (every pre-existing caller,
+    /// byte-identical) or the SAME exact closed-form hard-constraint ansatz
+    /// `AnnularDecompositionProblem::annulus_ansatz` uses — reused directly, not a new type,
+    /// since it's already general enough (see `kirsch_hole_correction::AnnulusAnsatz`'s own doc
+    /// comment). Set only via [`UserDefinedProblem::new_with_hard_constraint_ansatz`].
+    ansatz: crate::kirsch_hole_correction::AnnulusAnsatz,
     /// Same leaking convention as `UserSamplingStrategy::hole_names` — content-equal
     /// `&'static str`s independently leaked here are fine (`HashMap<&'static str, _>`
     /// lookups compare by string content, not pointer identity).
@@ -1480,9 +1557,50 @@ impl UserDefinedProblem {
             .collect();
         let sampling = UserSamplingStrategy::new(spec.geometry.clone(), spec.training.fd_h);
         UserDefinedProblem {
-            spec, domains, sampling, ansatz: IdentityAnsatz, hole_names,
+            spec, domains, sampling, ansatz: crate::kirsch_hole_correction::AnnulusAnsatz::Identity, hole_names,
             current_interior_weights: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Issue #77 Phase 1 architectural redesign: single-domain hard-constraint. Requires
+    /// `decomposition_applicable(&spec)` (one centered, traction-free hole) — same scope the
+    /// kinematic decomposition this ansatz builds on already restricts itself to (asserted, not
+    /// silently ignored, since a hard constraint targeting a hole that doesn't exist in this
+    /// shape would be a real misconfiguration, not a graceful fallback). `false` produces the
+    /// byte-identical `Self::new` result. Also opts into [`UserSamplingStrategy::with_hole_bias`]
+    /// at `hole_bias_fraction` (`0.0` = today's plain whole-plate draw, matching
+    /// `AnnularDecompositionProblem`'s own `n_annulus = n_interior/2` convention when set to
+    /// `0.5`) — bundled into one constructor since the hard constraint's own effectiveness
+    /// depends on the network actually seeing enough near-hole collocation density to learn the
+    /// finite-plate correction beyond the exact infinite-plate closed form.
+    pub fn new_with_hard_constraint_ansatz(spec: ProblemSpec, use_hard_constraint: bool, hole_bias_fraction: f64) -> Self {
+        let mut problem = Self::new(spec.clone());
+        if hole_bias_fraction > 0.0 {
+            problem.sampling = problem.sampling.with_hole_bias(hole_bias_fraction);
+        }
+        if use_hard_constraint {
+            assert!(decomposition_applicable(&spec),
+                "hard-constraint ansatz requires one centered, traction-free hole - see decomposition_applicable");
+            let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+            let hole = &spec.geometry.holes[0];
+            problem.ansatz = crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(
+                crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+                    hole_center: hole.center, hole_radius: hole.radius,
+                    half_w: spec.geometry.half_w, half_h: spec.geometry.half_h,
+                    px: spec.load.px, py: spec.load.py,
+                    e: spec.material.e as f64, nu: spec.material.nu as f64,
+                    u_ref: scales.u_ref as f64,
+                },
+            );
+        }
+        problem
+    }
+
+    /// `true` iff `ansatz` is `AnnulusAnsatz::HardConstraint` — the single source of truth for
+    /// "should the soft `hole_free` penalty be skipped" (`loss_terms()`), mirroring
+    /// `AnnularDecompositionProblem::hard_constraint_active`'s exact same pattern.
+    fn hard_constraint_active(&self) -> bool {
+        matches!(self.ansatz, crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(_))
     }
 
     pub fn spec(&self) -> &ProblemSpec { &self.spec }
@@ -1639,6 +1757,16 @@ impl BoundaryValueProblem for UserDefinedProblem {
         for (i, (hole, &name)) in self.spec.geometry.holes.iter().zip(self.hole_names.iter()).enumerate() {
             if hole.bc == HoleBc::Fixed || hole_free_active {
                 let use_decomposed = decomposed && hole.bc == HoleBc::Free;
+                // Issue #77 Phase 1: under the hard-constraint ansatz the traction-free
+                // condition is already exact by construction (`kirsch_hole_correction`'s own
+                // module doc comment) - registering the soft `hole_free` penalty on top would
+                // be redundant at best and reintroduce the exact gradient-competition problem
+                // this ansatz exists to eliminate. Mirrors `AnnularDecompositionProblem::
+                // loss_terms()`'s identical `if decomposed && !self.hard_constraint_active()`
+                // gate exactly.
+                if use_decomposed && self.hard_constraint_active() {
+                    continue;
+                }
                 let point_set = if use_decomposed { self.sampling.hole_fd_names[i] } else { name };
                 let affine_target = if use_decomposed { affine_strain_pair } else { None };
                 terms.push(Box::new(HoleBcTerm {
@@ -1744,6 +1872,16 @@ pub struct AnnularDecompositionProblem {
     /// whether reducing this weight frees gradient budget for the energy terms without
     /// un-satisfying the (already nearly-exact) traction-free condition.
     hole_free_weight: f32,
+    /// Issue #77 Phase 3 architectural redesign: `false` (every pre-existing caller) keeps the
+    /// annulus domain's existing `SingleHoleChart` embedding, byte-identical. `true` (via
+    /// `new_with_log_polar_embedding`) switches it to `CoordinateEmbedding::LogPolar` instead —
+    /// see that embedding's own doc comment (`pinn_core::user_geometry`) for the full rationale.
+    /// Orthogonal to `annulus_use_hard_constraint`/`annulus_n_fourier`/`annulus_use_siren` —
+    /// combinable with the hard-constraint ansatz (representation and traction-free enforcement
+    /// are independent axes), though not exercised combined with Fourier features or SIREN in
+    /// this pass (log-polar is itself the representation change; stacking it with another one
+    /// would confound which change caused any observed effect).
+    use_log_polar_embedding: bool,
 }
 
 impl AnnularDecompositionProblem {
@@ -1755,22 +1893,22 @@ impl AnnularDecompositionProblem {
     }
 
     pub fn new(spec: ProblemSpec) -> Self {
-        Self::new_experimental(spec, 100.0, false, LAM_HOLE_FREE, false)
+        Self::new_experimental(spec, 100.0, false, LAM_HOLE_FREE, false, false)
     }
 
     /// See `interface_weight`'s own doc comment.
     pub fn new_with_interface_weight(spec: ProblemSpec, interface_weight: f32) -> Self {
-        Self::new_experimental(spec, interface_weight, false, LAM_HOLE_FREE, false)
+        Self::new_experimental(spec, interface_weight, false, LAM_HOLE_FREE, false, false)
     }
 
     /// See `include_annulus_equilibrium`'s own doc comment.
     pub fn new_with_annulus_equilibrium(spec: ProblemSpec, include_annulus_equilibrium: bool) -> Self {
-        Self::new_experimental(spec, 100.0, include_annulus_equilibrium, LAM_HOLE_FREE, false)
+        Self::new_experimental(spec, 100.0, include_annulus_equilibrium, LAM_HOLE_FREE, false, false)
     }
 
     /// See `hole_free_weight`'s own doc comment (PH4-34).
     pub fn new_with_hole_free_weight(spec: ProblemSpec, hole_free_weight: f32) -> Self {
-        Self::new_experimental(spec, 100.0, false, hole_free_weight, false)
+        Self::new_experimental(spec, 100.0, false, hole_free_weight, false, false)
     }
 
     /// Issue #77 PH4-35: the exact, closed-form hard-constraint hole ansatz — see
@@ -1779,12 +1917,27 @@ impl AnnularDecompositionProblem {
     /// all (see `loss_terms()`'s own comment) — it would be redundant with an already-exact
     /// constraint, and penalizing an already-exact residual serves no purpose.
     pub fn new_with_hard_constraint_ansatz(spec: ProblemSpec, use_hard_constraint: bool) -> Self {
-        Self::new_experimental(spec, 100.0, false, LAM_HOLE_FREE, use_hard_constraint)
+        Self::new_experimental(spec, 100.0, false, LAM_HOLE_FREE, use_hard_constraint, false)
     }
+
+    /// Issue #77 Phase 3 architectural redesign: see `use_log_polar_embedding`'s own doc
+    /// comment. Combinable with the hard-constraint ansatz (`use_hard_constraint`) since
+    /// representation and traction-free enforcement are independent axes.
+    pub fn new_with_log_polar_embedding(spec: ProblemSpec, use_log_polar_embedding: bool, use_hard_constraint: bool) -> Self {
+        Self::new_experimental(spec, 100.0, false, LAM_HOLE_FREE, use_hard_constraint, use_log_polar_embedding)
+    }
+
+    /// Issue #77 Phase 3: `true` iff `use_log_polar_embedding` was set — the CALLER
+    /// (`user_runner::run_annular_decomposition_training_inner`) is the single source of truth
+    /// for the actual embedding value (it also owns `annulus_n_fourier`, which this flag is
+    /// deliberately independent of — see `use_log_polar_embedding`'s own doc comment on why
+    /// the two aren't combined), so this struct only exposes the flag, not a computed
+    /// embedding, to avoid two places that could silently disagree on how `n_fourier` combines.
+    pub fn use_log_polar_embedding(&self) -> bool { self.use_log_polar_embedding }
 
     pub(crate) fn new_experimental(
         spec: ProblemSpec, interface_weight: f32, include_annulus_equilibrium: bool, hole_free_weight: f32,
-        use_hard_constraint: bool,
+        use_hard_constraint: bool, use_log_polar_embedding: bool,
     ) -> Self {
         assert!(Self::supports(&spec),
             "annular decomposition requires one safely-contained Free hole, Variational formulation, and measure-aware training");
@@ -1832,6 +1985,7 @@ impl AnnularDecompositionProblem {
             interface_weight,
             include_annulus_equilibrium,
             hole_free_weight,
+            use_log_polar_embedding,
         }
     }
 
@@ -1987,6 +2141,290 @@ impl BoundaryValueProblem for AnnularDecompositionProblem {
             "hole_free" => self.hole_free_weight,
             "equilibrium" => LAM_EQUILIBRIUM_PLATE,
             other => panic!("AnnularDecompositionProblem::base_weight: unknown term '{other}'"),
+        }
+    }
+    fn phase1_steps(&self) -> usize { 0 }
+    fn convergence_metric(&self, _state: &[DomainState<B>]) -> Option<f64> { None }
+    fn convergence_target(&self) -> f64 { 0.0 }
+}
+
+/// Issue #77 Phase 2 architectural redesign: sequential two-stage training with ONE-DIRECTIONAL
+/// domain coupling, replacing simultaneous joint optimization's symmetric interface-continuity
+/// terms — see the investigation-branch plan's own Phase 2 design for the full rationale (PH4-37
+/// found that a symmetric two-way interface constraint lets two independently-parameterized
+/// networks drift toward a jointly-cheaper-but-wrong configuration once gradient budget is
+/// redirected away from it; a one-directional anchor cannot exhibit that failure mode, since
+/// only one side is ever free to move to satisfy it).
+///
+/// Builds the SAME `InterfaceParametrization` shape `AnnularDecompositionProblem::new_experimental`
+/// uses (`HOLE_RING_POINTS` angles) — deliberately NOT shared/reused from that function (frozen-
+/// adjacent, heavily tested code this module's own convention treats as risk-averse to touch);
+/// a few duplicated lines here is the smaller-blast-radius choice.
+pub(crate) fn phase2_interface_parametrization() -> std::sync::Arc<InterfaceParametrization> {
+    std::sync::Arc::new(InterfaceParametrization {
+        thetas: (0..HOLE_RING_POINTS)
+            .map(|i| 2.0 * std::f64::consts::PI * i as f64 / HOLE_RING_POINTS as f64)
+            .collect(),
+    })
+}
+
+/// Stage A's own loss term: anchors the OUTER domain's interface trace to the EXACT closed-form
+/// field (`u_affine + kirsch_hole_displacement`, evaluated once per point at construction time,
+/// not a live annulus network — there isn't one during Stage A) instead of a symmetric
+/// consistency constraint against a second network. Same normalization convention
+/// (`inv_u_ref_sq`) as `InterfaceDisplacementContinuityTerm`, whose raw-column-read pattern this
+/// mirrors — `raw_out`'s `u,v` columns are already PHYSICAL displacement (meters) by the time
+/// `compute()` sees them (the ansatz's multiplicative/additive contribution and the `u_ref`
+/// rescale both happen earlier, in `compute_domain_forwards`).
+struct OuterInterfaceAnchorTerm {
+    domain: DomainId,
+    target_u: Vec<f32>,
+    target_v: Vec<f32>,
+    inv_u_ref_sq: f64,
+}
+impl LossTerm for OuterInterfaceAnchorTerm {
+    fn name(&self) -> &'static str { "outer_interface_anchor" }
+    fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
+    fn point_sets(&self) -> Vec<&'static str> { vec!["interface"] }
+    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Dirichlet) }
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
+    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        let d = inputs.iter().find(|i| i.domain == self.domain).expect("outer_interface_anchor: domain missing");
+        let n = d.raw_out.dims()[0];
+        let device = d.raw_out.device();
+        let u = d.raw_out.clone().slice([0..n, 0..1]).reshape([n]);
+        let v = d.raw_out.clone().slice([0..n, 1..2]).reshape([n]);
+        let target_u = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(self.target_u.clone(), [n]), &device);
+        let target_v = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(self.target_v.clone(), [n]), &device);
+        let du = u - target_u;
+        let dv = v - target_v;
+        (du.clone() * du + dv.clone() * dv).mean().mul_scalar(self.inv_u_ref_sq)
+    }
+}
+
+/// Stage B's own loss term: anchors the ANNULUS domain's interface trace to Stage A's now-
+/// FROZEN outer model's own forward-pass output at the interface points — a fixed target
+/// recomputed fresh each step from the frozen model (which is in inference mode, no gradient
+/// graph), so this is structurally a one-directional Dirichlet-style anchor, not a symmetric
+/// constraint: only the annulus model's own parameters ever receive a gradient from this term.
+struct FrozenInterfaceAnchorTerm {
+    domain: DomainId,
+    target_u: Vec<f32>,
+    target_v: Vec<f32>,
+    inv_u_ref_sq: f64,
+}
+impl LossTerm for FrozenInterfaceAnchorTerm {
+    fn name(&self) -> &'static str { "frozen_interface_anchor" }
+    fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
+    fn point_sets(&self) -> Vec<&'static str> { vec!["interface"] }
+    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Dirichlet) }
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
+    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        let d = inputs.iter().find(|i| i.domain == self.domain).expect("frozen_interface_anchor: domain missing");
+        let n = d.raw_out.dims()[0];
+        let device = d.raw_out.device();
+        let u = d.raw_out.clone().slice([0..n, 0..1]).reshape([n]);
+        let v = d.raw_out.clone().slice([0..n, 1..2]).reshape([n]);
+        let target_u = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(self.target_u.clone(), [n]), &device);
+        let target_v = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(self.target_v.clone(), [n]), &device);
+        let du = u - target_u;
+        let dv = v - target_v;
+        (du.clone() * du + dv.clone() * dv).mean().mul_scalar(self.inv_u_ref_sq)
+    }
+}
+
+/// Stage A BVP: the OUTER domain alone, anchored to the exact closed-form field at the
+/// interface instead of a live annulus network. Reuses `AnnularPartitionSampling` (the SAME
+/// sampler `AnnularDecompositionProblem` already uses for its own outer domain) and
+/// `PhysicalPotentialEnergyTerm`/gauge terms unchanged — only the interface term differs.
+pub struct OuterStageProblem {
+    spec: ProblemSpec,
+    domains: Vec<DomainSpec>,
+    sampling: AnnularPartitionSampling,
+    ansatz: IdentityAnsatz,
+}
+impl OuterStageProblem {
+    pub fn new(spec: ProblemSpec) -> Self {
+        assert!(AnnularDecompositionProblem::supports(&spec),
+            "sequential two-stage training requires the same scope AnnularDecompositionProblem does");
+        let placeholder = spec.geometry.to_placeholder();
+        let interface = phase2_interface_parametrization();
+        let sampling = AnnularPartitionSampling::new(spec.geometry.clone(), spec.training.fd_h, false, ANNULUS_DOMAIN, interface);
+        Self {
+            domains: vec![DomainSpec { id: OUTER_DOMAIN, geometry: placeholder, material: spec.material.clone(), output_dim: 5 }],
+            spec, sampling, ansatz: IdentityAnsatz,
+        }
+    }
+}
+impl BoundaryValueProblem for OuterStageProblem {
+    fn domains(&self) -> &[DomainSpec] { &self.domains }
+    fn sampling_strategy(&self, domain_idx: usize) -> &dyn DomainSamplingStrategy {
+        assert_eq!(domain_idx, 0);
+        &self.sampling
+    }
+    fn ansatz(&self, domain_idx: usize) -> &dyn DirichletAnsatz {
+        assert_eq!(domain_idx, 0);
+        &self.ansatz
+    }
+    fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
+        let scales = crate::training_core::compute_reference_scales_for_plate(&self.spec);
+        let partition = self.spec.geometry.annular_partition().expect("validated by constructor");
+        let outer_area = 4.0 * self.spec.geometry.half_w * self.spec.geometry.half_h
+            - std::f64::consts::PI * partition.interface_radius.powi(2);
+        let ref_energy_absolute = scales.ref_energy as f64 * outer_area * self.spec.geometry.thickness;
+        let per_edge = (self.spec.training.n_boundary / 4).max(1);
+        let mut ds_per_point = Vec::with_capacity(per_edge * 4);
+        for _ in 0..per_edge {
+            ds_per_point.push(2.0 * self.spec.geometry.half_h / per_edge as f64);
+            ds_per_point.push(2.0 * self.spec.geometry.half_h / per_edge as f64);
+            ds_per_point.push(2.0 * self.spec.geometry.half_w / per_edge as f64);
+            ds_per_point.push(2.0 * self.spec.geometry.half_w / per_edge as f64);
+        }
+        let hole = &self.spec.geometry.holes[0];
+        let (a_exx, a_eyy, _) = affine_strain(self.spec.load.px, self.spec.load.py, &self.spec.material);
+        let interface_pts = phase2_interface_parametrization();
+        let (target_u, target_v): (Vec<f32>, Vec<f32>) = interface_pts.thetas.iter().map(|&theta| {
+            let (x, y) = (partition.interface_radius * theta.cos(), partition.interface_radius * theta.sin());
+            let (hx, hy) = crate::kirsch_hole_correction::kirsch_hole_displacement(
+                x, y, hole.radius, self.spec.material.e as f64, self.spec.material.nu as f64,
+                self.spec.load.px, self.spec.load.py,
+            );
+            ((a_exx * x + hx) as f32, (a_eyy * y + hy) as f32)
+        }).unzip();
+        vec![
+            Box::new(PhysicalPotentialEnergyTerm {
+                domain: OUTER_DOMAIN, material: self.spec.material.clone(),
+                px: self.spec.load.px, py: self.spec.load.py, measure_aware: true,
+                domain_area: outer_area, thickness: self.spec.geometry.thickness,
+                ref_energy: scales.ref_energy, ref_energy_absolute, interior_weights: None,
+                ds_per_point, affine_strain: None,
+            }),
+            Box::new(OuterInterfaceAnchorTerm {
+                domain: OUTER_DOMAIN, target_u, target_v,
+                inv_u_ref_sq: 1.0 / (scales.u_ref as f64).powi(2).max(1e-30),
+            }),
+            Box::new(TranslationGaugeTerm {
+                domain: OUTER_DOMAIN,
+                inv_u_ref_sq: 1.0 / (scales.u_ref as f64).powi(2).max(1e-30),
+            }),
+            Box::new(RotationGaugeTerm {
+                domain: OUTER_DOMAIN, half_w: self.spec.geometry.half_w, half_h: self.spec.geometry.half_h,
+            }),
+        ]
+    }
+    fn base_weight(&self, term_name: &str) -> f32 {
+        match term_name {
+            "physical_potential" => LAM_PHYSICAL_POTENTIAL,
+            "outer_interface_anchor" => LAM_PHYSICAL_POTENTIAL * 10.0, // real, ongoing BC - same order as interface_weight's own default (100.0/10 relative to unit Pi), not a redundant penalty
+            "translation_gauge" => LAM_TRANSLATION_GAUGE,
+            "rotation_gauge" => LAM_ROTATION_GAUGE,
+            other => panic!("OuterStageProblem::base_weight: unknown term '{other}'"),
+        }
+    }
+    fn phase1_steps(&self) -> usize { 0 }
+    fn convergence_metric(&self, _state: &[DomainState<B>]) -> Option<f64> { None }
+    fn convergence_target(&self) -> f64 { 0.0 }
+}
+
+/// Stage B BVP: the ANNULUS domain alone, anchored to Stage A's frozen outer model's interface
+/// trace instead of a live, jointly-trained outer network. `frozen_target` is recomputed fresh
+/// each step by the caller (`user_runner::run_annular_decomposition_training_sequential`) from
+/// the frozen model's own forward pass and threaded in via `set_frozen_interface_target` —
+/// interior mutability for the same reason `UserDefinedProblem::current_interior_weights` uses
+/// it (a per-step value the shared `&self` `loss_terms()` trait method can't otherwise carry).
+pub struct AnnulusStageProblem {
+    spec: ProblemSpec,
+    domains: Vec<DomainSpec>,
+    sampling: AnnularPartitionSampling,
+    ansatz: crate::kirsch_hole_correction::AnnulusAnsatz,
+    frozen_target: std::sync::Mutex<Option<(Vec<f32>, Vec<f32>)>>,
+}
+impl AnnulusStageProblem {
+    pub fn new(spec: ProblemSpec, use_hard_constraint: bool) -> Self {
+        assert!(AnnularDecompositionProblem::supports(&spec),
+            "sequential two-stage training requires the same scope AnnularDecompositionProblem does");
+        let placeholder = spec.geometry.to_placeholder();
+        let interface = phase2_interface_parametrization();
+        let sampling = AnnularPartitionSampling::new(spec.geometry.clone(), spec.training.fd_h, true, OUTER_DOMAIN, interface);
+        let ansatz = if use_hard_constraint {
+            let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+            let hole = &spec.geometry.holes[0];
+            crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(
+                crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+                    hole_center: hole.center, hole_radius: hole.radius,
+                    half_w: spec.geometry.half_w, half_h: spec.geometry.half_h,
+                    px: spec.load.px, py: spec.load.py,
+                    e: spec.material.e as f64, nu: spec.material.nu as f64,
+                    u_ref: scales.u_ref as f64,
+                },
+            )
+        } else {
+            crate::kirsch_hole_correction::AnnulusAnsatz::Identity
+        };
+        Self {
+            domains: vec![DomainSpec { id: ANNULUS_DOMAIN, geometry: placeholder, material: spec.material.clone(), output_dim: 5 }],
+            spec, sampling, ansatz, frozen_target: std::sync::Mutex::new(None),
+        }
+    }
+    fn hard_constraint_active(&self) -> bool {
+        matches!(self.ansatz, crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(_))
+    }
+    /// Called by the training loop, once per step, with the frozen outer model's OWN forward
+    /// pass evaluated at the same interface points `loss_terms()` will read — see this struct's
+    /// own doc comment.
+    pub fn set_frozen_interface_target(&self, target_u: Vec<f32>, target_v: Vec<f32>) {
+        *self.frozen_target.lock().unwrap() = Some((target_u, target_v));
+    }
+}
+impl BoundaryValueProblem for AnnulusStageProblem {
+    fn domains(&self) -> &[DomainSpec] { &self.domains }
+    fn sampling_strategy(&self, domain_idx: usize) -> &dyn DomainSamplingStrategy {
+        assert_eq!(domain_idx, 0);
+        &self.sampling
+    }
+    fn ansatz(&self, domain_idx: usize) -> &dyn DirichletAnsatz {
+        assert_eq!(domain_idx, 0);
+        &self.ansatz
+    }
+    fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
+        let scales = crate::training_core::compute_reference_scales_for_plate(&self.spec);
+        let partition = self.spec.geometry.annular_partition().expect("validated by constructor");
+        let annulus_area = std::f64::consts::PI * (partition.interface_radius.powi(2) - partition.hole_radius.powi(2));
+        let ref_energy_absolute = scales.ref_energy as f64 * annulus_area * self.spec.geometry.thickness;
+        let decomposed = decomposition_applicable(&self.spec);
+        let affine_strain_pair = if decomposed { Some((self.spec.load.px, self.spec.load.py)) } else { None };
+        let mut terms: Vec<Box<dyn LossTerm>> = vec![
+            Box::new(AnnularPotentialEnergyTerm {
+                material: self.spec.material.clone(), domain_area: annulus_area,
+                thickness: self.spec.geometry.thickness, ref_energy_absolute,
+                affine_strain: affine_strain_pair,
+            }),
+        ];
+        let (target_u, target_v) = self.frozen_target.lock().unwrap().clone()
+            .expect("AnnulusStageProblem::loss_terms called before set_frozen_interface_target");
+        terms.push(Box::new(FrozenInterfaceAnchorTerm {
+            domain: ANNULUS_DOMAIN, target_u, target_v,
+            inv_u_ref_sq: 1.0 / (scales.u_ref as f64).powi(2).max(1e-30),
+        }));
+        if decomposed && !self.hard_constraint_active() {
+            terms.push(Box::new(HoleBcTerm {
+                domain: ANNULUS_DOMAIN, point_set: "hole_0_fd", bc: HoleBc::Free,
+                ref_stress2: scales.ref_stress2, material: self.spec.material.clone(),
+                affine_target: affine_strain_pair,
+            }));
+        }
+        terms
+    }
+    fn base_weight(&self, term_name: &str) -> f32 {
+        match term_name {
+            "annulus_potential" => LAM_PHYSICAL_POTENTIAL,
+            "frozen_interface_anchor" => LAM_PHYSICAL_POTENTIAL * 10.0,
+            "hole_free" => LAM_HOLE_FREE,
+            other => panic!("AnnulusStageProblem::base_weight: unknown term '{other}'"),
         }
     }
     fn phase1_steps(&self) -> usize { 0 }
@@ -2904,6 +3342,14 @@ fn embedding_for_model(
     if dim == 3 {
         return CoordinateEmbedding::Raw;
     }
+    // Issue #77 Phase 3: `LogPolar`'s own fixed width (6) - checked BEFORE the plain-chart
+    // comparison below so a log-polar model (dim=6) never falls through toward the Fourier
+    // branch (which only ever matches dim>10) and panics, the exact bug class PH4-31's own
+    // fix here exists to prevent for a different embedding variant.
+    let log_polar = geometry.log_polar_embedding();
+    if dim == log_polar.input_dim() && matches!(log_polar, CoordinateEmbedding::LogPolar { .. }) {
+        return log_polar;
+    }
     let plain = geometry.coordinate_embedding();
     if dim == plain.input_dim() {
         return plain;
@@ -3428,6 +3874,96 @@ mod tests {
         assert!(terms.iter().any(|t| t.name() == "interface_traction_continuity"));
     }
 
+    /// Issue #77 Phase 2 architectural redesign: `OuterStageProblem` is a genuine single-domain
+    /// BVP (only `OUTER_DOMAIN`), registers the new one-directional `outer_interface_anchor`
+    /// term instead of a symmetric interface-continuity pair, and never registers `hole_free`
+    /// (there's no hole-adjacent term in the outer domain at all, same as
+    /// `AnnularDecompositionProblem`'s own outer-domain term set).
+    #[test]
+    fn outer_stage_problem_is_single_domain_with_one_directional_interface_anchor() {
+        let spec = single_hole_like_spec(1);
+        let mut spec = spec;
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        let problem = OuterStageProblem::new(spec);
+        crate::problem::validate_loss_terms(&problem);
+        assert_eq!(problem.domains().iter().map(|d| d.id).collect::<Vec<_>>(), vec![OUTER_DOMAIN]);
+        let terms = problem.loss_terms();
+        assert!(terms.iter().any(|t| t.name() == "outer_interface_anchor"),
+            "Stage A must register the one-directional anchor term");
+        assert!(terms.iter().all(|t| t.name() != "interface_displacement_continuity"
+            && t.name() != "interface_traction_continuity"),
+            "Stage A must never register the SYMMETRIC interface terms - that's the whole point of the redesign");
+        assert!(terms.iter().all(|t| t.name() != "hole_free"));
+    }
+
+    /// Same registration proof for `AnnulusStageProblem`: single domain (`ANNULUS_DOMAIN`
+    /// only), registers `frozen_interface_anchor` (never the symmetric pair), and its
+    /// `hole_free`/hard-constraint gating mirrors `AnnularDecompositionProblem`'s own exactly.
+    /// Requires `set_frozen_interface_target` to have been called first (asserted, not
+    /// silently defaulted to zero - a real, deliberate misuse-prevention gate, matching this
+    /// codebase's own "fail loudly on misconfiguration" discipline).
+    #[test]
+    fn annulus_stage_problem_is_single_domain_with_one_directional_interface_anchor() {
+        let mut spec = single_hole_like_spec(1);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+
+        let soft = AnnulusStageProblem::new(spec.clone(), false);
+        soft.set_frozen_interface_target(vec![0.0; HOLE_RING_POINTS], vec![0.0; HOLE_RING_POINTS]);
+        crate::problem::validate_loss_terms(&soft);
+        assert_eq!(soft.domains().iter().map(|d| d.id).collect::<Vec<_>>(), vec![ANNULUS_DOMAIN]);
+        let soft_terms = soft.loss_terms();
+        assert!(soft_terms.iter().any(|t| t.name() == "frozen_interface_anchor"));
+        assert!(soft_terms.iter().all(|t| t.name() != "interface_displacement_continuity"
+            && t.name() != "interface_traction_continuity"));
+        assert!(soft_terms.iter().any(|t| t.name() == "hole_free"), "soft mode must still register hole_free");
+
+        let hard = AnnulusStageProblem::new(spec, true);
+        hard.set_frozen_interface_target(vec![0.0; HOLE_RING_POINTS], vec![0.0; HOLE_RING_POINTS]);
+        let hard_terms = hard.loss_terms();
+        assert!(hard_terms.iter().all(|t| t.name() != "hole_free"), "hard-constraint mode must NOT register hole_free");
+    }
+
+    #[test]
+    #[should_panic(expected = "set_frozen_interface_target")]
+    fn annulus_stage_problem_panics_if_loss_terms_called_before_target_set() {
+        let mut spec = single_hole_like_spec(1);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        let problem = AnnulusStageProblem::new(spec, false);
+        let _ = problem.loss_terms(); // no set_frozen_interface_target call - must panic, not silently use a zero target
+    }
+
+    /// Issue #77 Phase 2: real, tiny end-to-end sequential run (Stage A then Stage B) proving
+    /// the full pipeline - outer training, freezing, frozen-target evaluation, annulus training
+    /// against that frozen target - trains without panicking and stays finite in both stages.
+    #[test]
+    fn sequential_two_stage_smoke_is_finite() {
+        let mut spec = single_hole_like_spec(2);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        spec.training.n_interior = 64;
+        spec.training.n_boundary = 32;
+        spec.network = pinn_core::problem_spec::NetworkSpec { hidden_dim: 12, n_hidden: 2, ..Default::default() };
+        let device = crate::training_core::BDevice::default();
+        let mut stage_a_losses = Vec::new();
+        let mut stage_b_losses = Vec::new();
+        let (_outer, _annulus, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_sequential(
+            spec, device, 2, 2, true, &[0, 1],
+            |stage, _step, loss| {
+                match stage { "stage_a" => stage_a_losses.push(loss), "stage_b" => stage_b_losses.push(loss), _ => unreachable!() }
+                false
+            },
+        );
+        assert!(loss.is_finite(), "Stage B final loss must be finite, got {loss}");
+        assert_eq!(stage_a_losses.len(), 2, "Stage A must run its own requested step count");
+        assert_eq!(stage_b_losses.len(), 2, "Stage B must run its own requested step count");
+        assert!(stage_a_losses.iter().all(|l| l.is_finite()));
+        assert!(stage_b_losses.iter().all(|l| l.is_finite()));
+        assert_eq!(diagnostics.len(), 2, "both diagnostic checkpoints must fire during Stage B");
+    }
+
     /// Issue #77 candidate (b): `new_with_interface_weight`'s default arm (`new()`) must be
     /// byte-identical to the pre-#77-candidate-(b) hardcoded `100.0` - a real override must
     /// actually change what `base_weight` returns for both interface terms, and nothing else.
@@ -3590,6 +4126,37 @@ mod tests {
         assert_eq!(outer.input_dim(), 3);
     }
 
+    /// Issue #77 root-cause fix, Step 1: `grad_norm_rescale_period=1` forces the recalibration
+    /// path to run on EVERY step of a tiny (3-step) real training run — a genuine end-to-end
+    /// smoke test that `probe_term_gradients` gets set, `StepOutput.term_grad_norms` gets
+    /// populated, `grad_norm_damping_factors` runs against it, and `saw.set_base_weights`
+    /// doesn't panic or produce a non-finite loss, not just a static wiring check.
+    /// `grad_norm_rescale_period=0` in a second run proves the disabled default path is
+    /// unaffected (still trains to a finite loss).
+    #[test]
+    fn grad_norm_rescale_period_recalibrates_every_step_without_panicking_or_going_nonfinite() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(), material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 12, n_hidden: 2, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let (_annulus, _outer, loss, _diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_grad_norm_rescale(
+            spec.clone(), device.clone(), &[], 1, 0.1, |_step, _loss, _lr, _points| false,
+        );
+        assert!(loss.is_finite(), "loss must stay finite with grad-norm rescale active every step, got {loss}");
+
+        let (_annulus0, _outer0, loss0, _diagnostics0) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_grad_norm_rescale(
+            spec, device, &[], 0, 0.1, |_step, _loss, _lr, _points| false,
+        );
+        assert!(loss0.is_finite(), "period=0 (disabled) must still train to a finite loss, got {loss0}");
+    }
+
     /// Issue #77 spectral-bias fix (PH4-31): the annulus model's real, constructed
     /// `input_dim()` must reflect `annulus_n_fourier` (`10 + 4*n_fourier`), and the outer
     /// model must be COMPLETELY unaffected (stays raw 3-input) - a real, tiny end-to-end
@@ -3645,6 +4212,66 @@ mod tests {
             .with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
         let fourier_model = fourier_cfg.init(&crate::training_core::BDevice::default());
         assert_eq!(embedding_for_model(&fourier_model, &hole_geom), hole_geom.coordinate_embedding_with_fourier(4));
+
+        // Issue #77 Phase 3: a log-polar model (input_dim=6) must resolve to LogPolar, not
+        // fall through toward the Fourier branch and panic - the same bug class PH4-31's own
+        // fix prevented for a different embedding variant, now covered for this one too.
+        let log_polar_cfg = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(hole_geom.log_polar_embedding().input_dim())
+            .with_hidden_dim(8).with_n_hidden(2).with_output_dim(5);
+        let log_polar_model = log_polar_cfg.init(&crate::training_core::BDevice::default());
+        assert_eq!(embedding_for_model(&log_polar_model, &hole_geom), hole_geom.log_polar_embedding());
+    }
+
+    /// Issue #77 Phase 3 architectural redesign: same discipline as
+    /// `annulus_fourier_embedding_changes_only_the_annulus_models_input_dim` - real, tiny
+    /// end-to-end smoke run with `diagnostic_steps=&[0]` (load-bearing: exercises the
+    /// diagnostic-ledger forward pass, not just the main training step, which is exactly where
+    /// `embedding_for_model`'s own LogPolar gap would have panicked before the fix above).
+    /// Annulus model must use the log-polar width; outer model must be completely unaffected.
+    #[test]
+    fn annulus_log_polar_embedding_changes_only_the_annulus_models_input_dim() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(), material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 12, n_hidden: 2, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 2, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let (annulus, outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_log_polar_embedding(
+            spec, device, &[0], true, false, |_step, _loss, _lr, _points| false,
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), 1, "diagnostic checkpoint must actually fire and succeed");
+        assert!(diagnostics[0].kt_derived_fd_vm.is_finite());
+        assert_eq!(annulus.input_dim(), 6, "annulus model must use the log-polar embedding's width");
+        assert_eq!(outer.input_dim(), 3, "outer model must be completely unaffected");
+    }
+
+    /// `use_log_polar=false` must be byte-identical to the pre-Phase-3 default - the annulus
+    /// model keeps its `SingleHoleChart` width.
+    #[test]
+    fn log_polar_embedding_disabled_by_default_keeps_chart_embedding() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(), material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 12, n_hidden: 2, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 1, n_interior: 64, n_boundary: 32, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: false,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let (annulus, _outer, loss, _diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_log_polar_embedding(
+            spec, device, &[], false, false, |_step, _loss, _lr, _points| false,
+        );
+        assert!(loss.is_finite());
+        assert_eq!(annulus.input_dim(), 10, "disabled must keep the pre-existing SingleHoleChart width");
     }
 
     #[test]
@@ -4055,6 +4682,389 @@ mod tests {
         }
     }
 
+    /// Issue #77 PH4-36 Step 1: controlled A/B against the same baseline config (identical
+    /// geometry/material/load/network/training/checkpoints/seed as every PH4-28..35
+    /// comparison) - ONLY `grad_norm_rescale_period` differs: `150` here (a real periodic
+    /// gradient-norm-aware SAW-BRDR base-weight recalibration, `saw_brdr::grad_norm_damping_
+    /// factors`) vs `0` (disabled) for every prior run. Baseline Kt at step 2999 is `1.231`
+    /// (PH4-28's own real number, same config) - see PH4-36's own manifest entry for the full
+    /// mechanism rationale. The plan's own Step 3 calls for running this BEFORE combining with
+    /// a gentler hard-constraint envelope (Step 2), to isolate whether gradient-norm balancing
+    /// alone - with the low, already-characterized variance of the soft-`hole_free` baseline -
+    /// can already redirect gradient share toward `physical_potential`/`annulus_potential` and
+    /// move Kt.
+    #[test]
+    #[ignore]
+    fn issue_77_grad_norm_rescale_l5_trace() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_grad_norm_rescale(
+            spec, device, &checkpoints, 150, 0.1, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 grad-norm-rescale] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-grad-norm-rescale-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 grad-norm-rescale] wrote {}", path.display());
+        for diagnostic in &diagnostics {
+            println!("[#77 grad-norm-rescale] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+        if let Some(last) = diagnostics.last() {
+            for t in &last.terms {
+                println!("[#77 grad-norm-rescale] final term={} raw={:.6e} weight={:.4} grad_norm={:?} grad_share={:?}",
+                    t.name, t.raw, t.effective_weight, t.gradient_norm, t.gradient_share);
+            }
+        }
+    }
+
+    /// Issue #77 PH4-36 Step 1 reproducibility: exact repeat of
+    /// [`issue_77_grad_norm_rescale_l5_trace`] (same config, same seed, genuinely independent
+    /// process invocation) - PH4-35's own history is the reason this exists from the start
+    /// rather than being added only after a surprising result: a single favorable run must
+    /// never be reported as a breakthrough without a repeat first.
+    #[test]
+    #[ignore]
+    fn issue_77_grad_norm_rescale_l5_trace_repeat() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_grad_norm_rescale(
+            spec, device, &checkpoints, 150, 0.1, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 grad-norm-rescale-repeat] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-grad-norm-rescale-repeat-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 grad-norm-rescale-repeat] wrote {}", path.display());
+        for diagnostic in &diagnostics {
+            println!("[#77 grad-norm-rescale-repeat] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+    }
+
+    /// Issue #77 PH4-36 Step 1 escalation: `issue_77_grad_norm_rescale_l5_trace`'s real result
+    /// (`period=150, floor=0.1`) showed the mechanism genuinely activating - `hole_free`'s
+    /// weight damped `100.0 -> 39.62` by the final checkpoint, combined `physical_potential`+
+    /// `annulus_potential` gradient share rising from PH4-34b's baseline ~18% to ~30% - but
+    /// `hole_free` STILL dominated at 64.2% share and Kt (1.261) did not meaningfully move past
+    /// baseline (1.231). This tests a genuinely more aggressive configuration - `period=75`
+    /// (twice as responsive to hole_free's own real-time gradient dominance) and `floor=0.02`
+    /// (allows a much larger nominal-weight cut than `0.1`'s floor did) - before concluding
+    /// Step 1 alone cannot move Kt and escalating to Step 2 (a gentler hard-constraint envelope,
+    /// combined with this mechanism).
+    #[test]
+    #[ignore]
+    fn issue_77_grad_norm_rescale_aggressive_l5_trace() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_grad_norm_rescale(
+            spec, device, &checkpoints, 75, 0.02, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 grad-norm-rescale-aggressive] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-grad-norm-rescale-aggressive-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 grad-norm-rescale-aggressive] wrote {}", path.display());
+        for diagnostic in &diagnostics {
+            println!("[#77 grad-norm-rescale-aggressive] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+        if let Some(last) = diagnostics.last() {
+            for t in &last.terms {
+                println!("[#77 grad-norm-rescale-aggressive] final term={} raw={:.6e} weight={:.4} grad_norm={:?} grad_share={:?}",
+                    t.name, t.raw, t.effective_weight, t.gradient_norm, t.gradient_share);
+            }
+        }
+    }
+
+    /// Issue #77 Phase 1 architectural redesign (PH4-38): single-domain hard-constraint. NOT a
+    /// reweighting scheme (per the redesign plan's own explicit "no more reweighting"
+    /// constraint) - `UserDefinedProblem`'s single network spans the WHOLE plate, so there is no
+    /// second domain and no interface term for `interface_traction_continuity` to become or
+    /// need to be protected from (PH4-37's actual failure mode structurally cannot occur here).
+    /// Combines the exact hard-constraint ansatz (`use_hard_constraint=true`) with hole-biased
+    /// sampling (`hole_bias_fraction=0.5`, matching `AnnularDecompositionProblem`'s own
+    /// `n_annulus = n_interior/2` convention) so the network still sees dense near-hole
+    /// collocation despite having no dedicated annulus domain. Same geometry/material/load/
+    /// network/training/checkpoints as every PH4-28..37 comparison, so this Kt number is
+    /// directly comparable (baseline 1.231; PH4-35 hard-constraint mean 1.2825, CV 43.9%).
+    #[test]
+    #[ignore]
+    fn issue_77_single_domain_hard_constraint_l5_trace() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec.clone(), true, 0.5);
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_model, loss, diagnostics) = crate::user_runner::run_user_problem_training_with_diagnostics(
+            problem, spec, device, &checkpoints, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 single-domain hard-constraint] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-single-domain-hard-constraint-diagnostics.json");
+        let text = serde_json::to_string_pretty(&diagnostics).expect("UserProblemL5Diagnostic must serialize");
+        std::fs::write(&path, text).unwrap();
+        println!("[#77 single-domain hard-constraint] wrote {}", path.display());
+        for diagnostic in &diagnostics {
+            println!("[#77 single-domain hard-constraint] step={} kt={:.9}", diagnostic.step, diagnostic.kt_derived_fd_vm);
+        }
+        if let Some(last) = diagnostics.last() {
+            for t in &last.terms {
+                println!("[#77 single-domain hard-constraint] final term={} raw={:.6e} weight={:.4} grad_norm={:?} grad_share={:?}",
+                    t.name, t.raw, t.effective_weight, t.gradient_norm, t.gradient_share);
+            }
+        }
+    }
+
+    /// Issue #77 Phase 1 reproducibility: exact repeat of
+    /// [`issue_77_single_domain_hard_constraint_l5_trace`] - same discipline PH4-35's own
+    /// history established (a single favorable run is never reported as a breakthrough without
+    /// a repeat first).
+    #[test]
+    #[ignore]
+    fn issue_77_single_domain_hard_constraint_l5_trace_repeat() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec.clone(), true, 0.5);
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_model, loss, diagnostics) = crate::user_runner::run_user_problem_training_with_diagnostics(
+            problem, spec, device, &checkpoints, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 single-domain hard-constraint repeat] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        for diagnostic in &diagnostics {
+            println!("[#77 single-domain hard-constraint repeat] step={} kt={:.9}", diagnostic.step, diagnostic.kt_derived_fd_vm);
+        }
+    }
+
+    /// Issue #77 Phase 2 architectural redesign (PH4-39): sequential two-stage training with
+    /// one-directional domain coupling. Same total step budget (3000) as every PH4-28..38
+    /// comparison, split 1500/1500 between Stage A (outer alone) and Stage B (annulus alone,
+    /// hard-constraint ansatz active) as the plan's own first real split. Same
+    /// geometry/material/load/network/checkpoints, so directly comparable (baseline 1.231;
+    /// PH4-35 hard-constraint mean 1.2825 CV 43.9%; PH4-38 single-domain result — see that
+    /// entry). Checkpoints are relative to Stage B's own step counter (Stage B is where the
+    /// hole-adjacent field, and therefore Kt, is actually represented).
+    #[test]
+    #[ignore]
+    fn issue_77_sequential_two_stage_l5_trace() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1499];
+        let (_outer, _annulus, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_sequential(
+            spec, device, 1500, 1500, true, &checkpoints,
+            |stage, step, loss| {
+                if step % 300 == 0 { println!("[#77 sequential] {stage} step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-sequential-two-stage-diagnostics.json");
+        let text = serde_json::to_string_pretty(&diagnostics).expect("UserProblemL5Diagnostic must serialize");
+        std::fs::write(&path, text).unwrap();
+        println!("[#77 sequential] wrote {}", path.display());
+        for diagnostic in &diagnostics {
+            println!("[#77 sequential] stage_b_step={} kt={:.9}", diagnostic.step, diagnostic.kt_derived_fd_vm);
+        }
+        if let Some(last) = diagnostics.last() {
+            for t in &last.terms {
+                println!("[#77 sequential] final term={} raw={:.6e} weight={:.4} grad_norm={:?} grad_share={:?}",
+                    t.name, t.raw, t.effective_weight, t.gradient_norm, t.gradient_share);
+            }
+        }
+    }
+
+    /// Issue #77 Phase 2 reproducibility: exact repeat of
+    /// [`issue_77_sequential_two_stage_l5_trace`] - same discipline PH4-35's own history
+    /// established.
+    #[test]
+    #[ignore]
+    fn issue_77_sequential_two_stage_l5_trace_repeat() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1499];
+        let (_outer, _annulus, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_sequential(
+            spec, device, 1500, 1500, true, &checkpoints,
+            |stage, step, loss| {
+                if step % 300 == 0 { println!("[#77 sequential repeat] {stage} step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        for diagnostic in &diagnostics {
+            println!("[#77 sequential repeat] stage_b_step={} kt={:.9}", diagnostic.step, diagnostic.kt_derived_fd_vm);
+        }
+    }
+
+    /// Issue #77 Phase 3 architectural redesign (PH4-40): log-polar coordinate embedding for
+    /// the annulus domain, combined with the hard-constraint ansatz (Phase 1/PH4-35 - the two
+    /// are orthogonal axes). Same geometry/material/load/network/training/checkpoints as every
+    /// PH4-28..39 comparison, so directly comparable (baseline 1.231; PH4-35 hard-constraint
+    /// mean 1.2825 CV 43.9%; PH4-38/39 — see those entries).
+    #[test]
+    #[ignore]
+    fn issue_77_annulus_log_polar_l5_trace() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_log_polar_embedding(
+            spec, device, &checkpoints, true, true, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 log-polar] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-log-polar-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 log-polar] wrote {}", path.display());
+        for diagnostic in &diagnostics {
+            println!("[#77 log-polar] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+        if let Some(last) = diagnostics.last() {
+            for t in &last.terms {
+                println!("[#77 log-polar] final term={} raw={:.6e} weight={:.4} grad_norm={:?} grad_share={:?}",
+                    t.name, t.raw, t.effective_weight, t.gradient_norm, t.gradient_share);
+            }
+        }
+    }
+
+    /// Issue #77 Phase 3 reproducibility: exact repeat of
+    /// [`issue_77_annulus_log_polar_l5_trace`] - same discipline PH4-35's own history
+    /// established.
+    #[test]
+    #[ignore]
+    fn issue_77_annulus_log_polar_l5_trace_repeat() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_log_polar_embedding(
+            spec, device, &checkpoints, true, true, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 log-polar repeat] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        for diagnostic in &diagnostics {
+            println!("[#77 log-polar repeat] step={} kt={:.9}", diagnostic.step, diagnostic.kt_derived_fd_vm);
+        }
+    }
+
     /// Issue #77 PH4-35: controlled A/B against the same baseline config (identical geometry/
     /// material/load/network/training/checkpoints/seed as every PH4-28..34 comparison) - ONLY
     /// the ansatz differs: the exact, closed-form hard-constraint hole ansatz
@@ -4096,6 +5106,56 @@ mod tests {
             println!("[#77 hard-constraint] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
                 diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
                 diagnostic.direct_derived_mismatch_rms);
+        }
+    }
+
+    /// Issue #77 PH4-36 Step 2: hard-constraint ansatz (PH4-35) COMBINED with grad-norm rescale
+    /// (Step 1). PH4-35's own real diagnostic showed removing `hole_free` redirects gradient
+    /// share to `interface_traction_continuity` (62.8%), NOT to `physical_potential`/
+    /// `annulus_potential` (never over ~20% combined) - an unaddressed finding this test
+    /// targets directly: `grad_norm_damping_factors` applies automatically to whatever term is
+    /// NOT `physical_potential`/`annulus_potential`, so with `hole_free` absent (hard-constraint
+    /// active) it should now damp `interface_traction_continuity` instead. `period=150,
+    /// floor=0.1` - the SAME moderate settings as the first (non-escalated) Step 1 test, so this
+    /// result is directly comparable to both PH4-35's own hard-constraint-alone numbers and
+    /// `issue_77_grad_norm_rescale_l5_trace`'s own grad-norm-alone number.
+    #[test]
+    #[ignore]
+    fn issue_77_hard_constraint_and_grad_norm_rescale_l5_trace() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(),
+            material: MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 },
+            load: LoadConfig::uniaxial_x(6.9e7),
+            network: pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() },
+            training: pinn_core::problem_spec::TrainingSpec {
+                max_steps: 3000, n_interior: 4096, n_boundary: 4096, fd_h: 1e-3, lr: 1e-3,
+                measure_aware_training: true, derivative_operator_diagnostic: false, amr_enabled: true,
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+        };
+        let device = crate::training_core::BDevice::default();
+        let checkpoints = [0, 300, 1500, 2999];
+        let (_annulus, _outer, loss, diagnostics) = crate::user_runner::run_annular_decomposition_training_with_diagnostics_and_hard_constraint_and_grad_norm_rescale(
+            spec, device, &checkpoints, true, 150, 0.1, |step, loss, _lr, _points| {
+                if step % 300 == 0 { println!("[#77 hard-constraint+grad-norm] step={step} loss={loss:.6e}"); }
+                false
+            },
+        );
+        assert!(loss.is_finite());
+        assert_eq!(diagnostics.len(), checkpoints.len(), "missing checkpoints: {diagnostics:?}");
+        let path = std::env::temp_dir().join("issue-77-l5-hard-constraint-and-grad-norm-rescale-diagnostics.json");
+        crate::user_runner::write_annular_l5_diagnostics_json(&path, &diagnostics).unwrap();
+        println!("[#77 hard-constraint+grad-norm] wrote {}", path.display());
+        for diagnostic in &diagnostics {
+            println!("[#77 hard-constraint+grad-norm] step={} kt={:.9} derived_traction_rms={:.6e} mismatch_rms={:.6e}",
+                diagnostic.step, diagnostic.kt_derived_fd_vm, diagnostic.derived_traction_rms,
+                diagnostic.direct_derived_mismatch_rms);
+        }
+        if let Some(last) = diagnostics.last() {
+            for t in &last.terms {
+                println!("[#77 hard-constraint+grad-norm] final term={} raw={:.6e} weight={:.4} grad_norm={:?} grad_share={:?}",
+                    t.name, t.raw, t.effective_weight, t.gradient_norm, t.gradient_share);
+            }
         }
     }
 
@@ -4940,6 +6000,112 @@ mod tests {
         let no_hole_problem = UserDefinedProblem::new(no_hole);
         assert!(no_hole_problem.loss_terms().iter().all(|t| t.name() != "hole_free"),
             "no-hole geometry must be byte-for-byte unaffected");
+    }
+
+    /// Issue #77 Phase 1 architectural redesign: `new_with_hard_constraint_ansatz(spec, false,
+    /// 0.0)` must be byte-identical to `new()` — `hole_free` still registers, ansatz stays
+    /// `Identity`. `true` must register the exact hard-constraint ansatz and NOT register
+    /// `hole_free`, mirroring `AnnularDecompositionProblem`'s own
+    /// `hard_constraint_ansatz_default_false_is_byte_identical_...` test exactly, adapted to
+    /// this single-domain problem.
+    #[test]
+    fn single_domain_hard_constraint_default_false_is_byte_identical_and_true_wires_in_the_exact_correction() {
+        let mut spec = single_hole_like_spec(1);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+
+        let default_problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec.clone(), false, 0.0);
+        assert!(default_problem.loss_terms().iter().any(|t| t.name() == "hole_free"),
+            "default (hard-constraint disabled) must still register the soft hole_free term");
+        let default_ansatz = default_problem.ansatz(0);
+        let (dx, dy) = default_ansatz.eval(0.06, 0.02, 1.0);
+        assert_eq!((dx, dy), (1.0, 1.0), "default ansatz must be the pre-existing Identity");
+        assert_eq!(default_ansatz.additive(0.06, 0.02), (0.0, 0.0));
+
+        let hard_problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec, true, 0.0);
+        assert!(hard_problem.loss_terms().iter().all(|t| t.name() != "hole_free"),
+            "hard-constraint mode must NOT register the now-redundant soft hole_free term");
+        let hard_ansatz = hard_problem.ansatz(0);
+        let (dx2, dy2) = hard_ansatz.eval(0.06, 0.02, 1.0);
+        assert!((0.0..=1.0).contains(&dx2) && dx2 < 1.0, "envelope must suppress below 1.0 near the hole, got {dx2}");
+        assert_eq!(dx2, dy2);
+        let (ax, ay) = hard_ansatz.additive(0.06, 0.02);
+        assert!(ax != 0.0 || ay != 0.0, "hard-constraint additive correction must be nonzero away from the hole center");
+    }
+
+    /// A geometry that doesn't qualify (`decomposition_applicable` false) must PANIC when the
+    /// hard constraint is requested, not silently ignore it - a real misconfiguration, not a
+    /// graceful fallback (matches this codebase's own "fail loudly" discipline elsewhere).
+    #[test]
+    #[should_panic(expected = "hard-constraint ansatz requires one centered")]
+    fn single_domain_hard_constraint_panics_on_unsupported_geometry() {
+        let mut spec = single_hole_like_spec(1);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        spec.geometry.holes[0].center = [0.01, 0.0]; // off-center - decomposition_applicable is false
+        let _ = UserDefinedProblem::new_with_hard_constraint_ansatz(spec, true, 0.0);
+    }
+
+    /// Issue #77 Phase 1: `hole_bias_fraction=0.0` (every pre-existing `UserSamplingStrategy`
+    /// caller) must draw the byte-identical point count/distribution as before this existed -
+    /// proven here by an exact-count check (the real behavioral guarantee; the RNG SEQUENCE
+    /// itself is unchanged because the biased-stratum block is structurally skipped, not fed a
+    /// zero-sized loop). A nonzero fraction must land the expected SHARE of points within the
+    /// bias radius, and every point (biased or not) must still respect the FD-safety margin.
+    #[test]
+    fn hole_bias_fraction_zero_is_unbiased_and_nonzero_concentrates_near_the_hole() {
+        let geometry = l5_geometry();
+        let placeholder = geometry.to_placeholder();
+        let n = 2048;
+
+        let unbiased = UserSamplingStrategy::new(geometry.clone(), 1e-3);
+        let pts_unbiased = unbiased.sample_interior(&placeholder, n);
+        assert_eq!(pts_unbiased.len(), n, "unbiased draw must hit the exact requested count");
+
+        let biased = UserSamplingStrategy::new(geometry.clone(), 1e-3).with_hole_bias(0.5);
+        let pts_biased = biased.sample_interior(&placeholder, n);
+        assert_eq!(pts_biased.len(), n, "biased draw must still hit the exact requested count");
+
+        let hole = geometry.holes[0];
+        let bias_r = super::HOLE_BIAS_RADIUS_MULTIPLIER * hole.radius;
+        let near_hole = |p: &[f64; 2]| {
+            let (dx, dy) = (p[0] - hole.center[0], p[1] - hole.center[1]);
+            (dx * dx + dy * dy).sqrt() <= bias_r
+        };
+        let share_unbiased = pts_unbiased.iter().filter(|p| near_hole(p)).count() as f64 / n as f64;
+        let share_biased = pts_biased.iter().filter(|p| near_hole(p)).count() as f64 / n as f64;
+        // Near-hole area is a small fraction of the whole plate for L5's geometry - the
+        // unbiased share should be well under the biased target (~0.5), and the biased share
+        // should land close to the requested 0.5 fraction (within stratified-sampling slop).
+        assert!(share_unbiased < 0.1, "unbiased near-hole share should be small, got {share_unbiased}");
+        assert!(share_biased > 0.4, "biased near-hole share should approach the 0.5 target, got {share_biased}");
+
+        // FD-safety: every point, biased or not, must clear the anchor margin around the hole.
+        let margin = ring_anchor_margin_m(1e-3, &geometry);
+        for p in pts_biased.iter().chain(pts_unbiased.iter()) {
+            let (dx, dy) = (p[0] - hole.center[0], p[1] - hole.center[1]);
+            let r = (dx * dx + dy * dy).sqrt();
+            assert!(r >= hole.radius + margin - 1e-9, "point at r={r} violates FD-safety margin");
+        }
+    }
+
+    /// Issue #77 Phase 1: real, tiny end-to-end training run proving the combined path
+    /// (hard-constraint ansatz + hole-biased sampling) trains without panicking and stays
+    /// finite - same discipline as `annular_decomposition_two_model_runner_smoke_is_finite`
+    /// and this branch's own grad-norm-rescale smoke test.
+    #[test]
+    fn single_domain_hard_constraint_and_hole_bias_smoke_is_finite() {
+        let mut spec = single_hole_like_spec(3);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        spec.training.n_interior = 64;
+        spec.training.n_boundary = 32;
+        spec.network = pinn_core::problem_spec::NetworkSpec { hidden_dim: 12, n_hidden: 2, ..Default::default() };
+
+        let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec.clone(), true, 0.5);
+        let device = crate::training_core::BDevice::default();
+        let (_model, loss) = crate::user_runner::train_user_problem_for_benchmark(&problem, spec, &device);
+        assert!(loss.is_finite(), "single-domain hard-constraint + hole-bias must train to a finite loss, got {loss}");
     }
 
     /// Same registration proof for `AnnularDecompositionProblem`, plus the point-set-consumption
