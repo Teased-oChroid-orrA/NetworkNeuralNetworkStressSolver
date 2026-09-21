@@ -222,6 +222,10 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to read --problem-spec file '{spec_path}': {e}"))?;
         let spec: pinn_core::problem_spec::ProblemSpec = toml::from_str(&spec_str)
             .map_err(|e| anyhow::anyhow!("failed to parse --problem-spec TOML '{spec_path}': {e}"))?;
+        // Issue #78 Stage 1.2: fail fast on a geometrically-nonsensical spec (a hole outside
+        // the plate, two holes overlapping) before spending any time constructing a problem or
+        // starting training on it.
+        spec.geometry.validate().map_err(|e| anyhow::anyhow!("invalid geometry in '{spec_path}': {e}"))?;
         let ok = pinn_solver::user_runner::run_headless_user_problem(spec);
         return if ok {
             Ok(())

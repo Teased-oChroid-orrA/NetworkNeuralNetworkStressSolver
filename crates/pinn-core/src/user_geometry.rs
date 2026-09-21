@@ -40,6 +40,84 @@ pub struct HoleSpec {
     pub bc: HoleBc,
 }
 
+/// Edge-referenced hole placement (TOML input layer only — see `UserGeometry`'s custom
+/// `Deserialize` impl, which is the only consumer of this type). `HoleSpec.center` already
+/// accepts arbitrary off-center coordinates; this exists purely so a TOML author can place a
+/// hole by distance from a plate edge (the engineering-drawing convention) instead of computing
+/// a raw `[x, y]` relative to the plate centroid by hand. Every field optional so `serde` can
+/// deserialize whichever convention a given hole entry actually used; [`resolve_hole`]
+/// validates that exactly one convention was used per hole and resolves it into a real
+/// `HoleSpec` before `UserGeometry` is ever constructed — this type itself never appears
+/// outside a TOML load, is never constructed directly by production code, and carries no
+/// physics of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+struct HoleSpecRaw {
+    #[serde(default)]
+    center: Option<[f64; 2]>,
+    /// Distance [m] from the plate's left edge (`x = -half_w`) to the hole center.
+    #[serde(default)]
+    from_left: Option<f64>,
+    /// Distance [m] from the plate's right edge (`x = +half_w`) to the hole center.
+    #[serde(default)]
+    from_right: Option<f64>,
+    /// Distance [m] from the plate's top edge (`y = +half_h`) to the hole center.
+    #[serde(default)]
+    from_top: Option<f64>,
+    /// Distance [m] from the plate's bottom edge (`y = -half_h`) to the hole center.
+    #[serde(default)]
+    from_bottom: Option<f64>,
+    radius: f64,
+    bc: HoleBc,
+}
+
+/// Resolves one [`HoleSpecRaw`] into a real [`HoleSpec`], given the plate's own `half_w`/
+/// `half_h` (only known once the REST of `UserGeometry` has been deserialized — the reason this
+/// resolution happens in `UserGeometry`'s own custom `Deserialize` impl, not in a per-field
+/// `HoleSpec`/`HoleSpecRaw` deserializer, which has no access to sibling fields). Accepts
+/// exactly one placement convention: the existing `center = [x, y]` with every `from_*` field
+/// absent, OR exactly one X-axis reference (`from_left` XOR `from_right`) plus exactly one
+/// Y-axis reference (`from_top` XOR `from_bottom`) with `center` absent. Every other
+/// combination — `center` mixed with any `from_*`, two references on the same axis, zero
+/// references on an axis when `center` is absent — is a clear, named error rather than a
+/// silent fallback to `[0, 0]` or an arbitrarily-chosen reference, matching this codebase's
+/// "loud, not silent" failure convention (e.g. `base_weight`'s own `panic!` on an unknown loss
+/// term, `--problem-spec`'s own `anyhow::bail!` on a non-finite result).
+fn resolve_hole(index: usize, raw: HoleSpecRaw, half_w: f64, half_h: f64) -> Result<HoleSpec, String> {
+    let x_refs = raw.from_left.is_some() as u8 + raw.from_right.is_some() as u8;
+    let y_refs = raw.from_top.is_some() as u8 + raw.from_bottom.is_some() as u8;
+
+    let center = match (raw.center, x_refs, y_refs) {
+        (Some(center), 0, 0) => center,
+        (Some(_), _, _) => {
+            return Err(format!(
+                "geometry.holes[{index}]: specify EITHER `center = [x, y]` OR edge-reference \
+                 fields (`from_left`/`from_right`/`from_top`/`from_bottom`), never both"
+            ));
+        }
+        (None, 1, 1) => {
+            let x = match (raw.from_left, raw.from_right) {
+                (Some(fl), None) => -half_w + fl,
+                (None, Some(fr)) => half_w - fr,
+                _ => unreachable!("x_refs == 1 guarantees exactly one of from_left/from_right is Some"),
+            };
+            let y = match (raw.from_bottom, raw.from_top) {
+                (Some(fb), None) => -half_h + fb,
+                (None, Some(ft)) => half_h - ft,
+                _ => unreachable!("y_refs == 1 guarantees exactly one of from_bottom/from_top is Some"),
+            };
+            [x, y]
+        }
+        (None, xr, yr) => {
+            return Err(format!(
+                "geometry.holes[{index}]: no `center` given, so exactly one X-axis reference \
+                 (`from_left` XOR `from_right`) and exactly one Y-axis reference (`from_top` \
+                 XOR `from_bottom`) are required — found {xr} X-axis and {yr} Y-axis reference(s)"
+            ));
+        }
+    };
+    Ok(HoleSpec { center, radius: raw.radius, bc: raw.bc })
+}
+
 /// First #77 annular-decomposition interface: three hole radii from the center. This retains
 /// two radii of material beyond the free boundary while leaving a substantial outer domain for
 /// the L5 small-hole geometry. It is geometry-owned, not duplicated in sampler/runner code.
@@ -156,7 +234,7 @@ impl StencilValidity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UserGeometry {
     /// Plate half-width in x [m] — full width = 2*half_w.
     pub half_w: f64,
@@ -167,7 +245,90 @@ pub struct UserGeometry {
     pub holes: Vec<HoleSpec>,
 }
 
+/// Deliberately hand-written, not derived — see [`HoleSpecRaw`]/[`resolve_hole`]'s own doc
+/// comments. Every hole's `[x, y]` center may be given directly OR via edge-referenced
+/// distances; resolving the latter needs `half_w`/`half_h`, which are only available once
+/// deserialized here alongside `holes`, not inside a per-hole `Deserialize` impl. `Serialize`
+/// stays derived and unaffected — round-tripping a parsed spec always re-emits `center =
+/// [x, y]`, never edge references (this is a convenience input format, not a storage format).
+impl<'de> Deserialize<'de> for UserGeometry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct UserGeometryRaw {
+            half_w: f64,
+            half_h: f64,
+            thickness: f64,
+            #[serde(default)]
+            holes: Vec<HoleSpecRaw>,
+        }
+
+        let raw = UserGeometryRaw::deserialize(deserializer)?;
+        let holes = raw
+            .holes
+            .into_iter()
+            .enumerate()
+            .map(|(i, h)| resolve_hole(i, h, raw.half_w, raw.half_h))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(serde::de::Error::custom)?;
+        Ok(UserGeometry { half_w: raw.half_w, half_h: raw.half_h, thickness: raw.thickness, holes })
+    }
+}
+
 impl UserGeometry {
+    /// Issue #78 Stage 1.2: rejects a geometrically-nonsensical spec before training ever
+    /// starts - a hole (partly or wholly) outside the plate, a non-positive radius, or two
+    /// holes overlapping. Returns the first violation found (not every violation collected) -
+    /// matches this codebase's own established "loud, not silent" convention (e.g.
+    /// `--problem-spec`'s own `anyhow::bail!` on a non-finite result, `UserDefinedProblem::
+    /// base_weight`'s `panic!` on an unrecognized term name) of failing fast with a clear
+    /// message rather than continuing with silently-wrong geometry.
+    ///
+    /// Deliberately a pure GEOMETRIC check, not an FD-safety-margin check: `pinn-core` has no
+    /// dependency on `pinn-solver` (an established architectural rule - see this crate's own
+    /// module docs), where the real per-run FD-stencil-safety margin formula
+    /// (`ring_anchor_margin_m`, a function of `training.fd_h` and this geometry's own
+    /// dimensions) actually lives. This catches the unambiguous case - literal overlap or
+    /// out-of-bounds - not "too close for a numerically safe FD stencil at this run's specific
+    /// `fd_h`," which stays an open, narrower gap (see issue #78's own tracked doc).
+    pub fn validate(&self) -> Result<(), String> {
+        for (i, hole) in self.holes.iter().enumerate() {
+            if !(hole.radius > 0.0) {
+                return Err(format!("geometry.holes[{i}]: radius must be positive, got {}", hole.radius));
+            }
+            let (cx, cy) = (hole.center[0], hole.center[1]);
+            if cx - hole.radius < -self.half_w
+                || cx + hole.radius > self.half_w
+                || cy - hole.radius < -self.half_h
+                || cy + hole.radius > self.half_h
+            {
+                return Err(format!(
+                    "geometry.holes[{i}]: hole (center=[{cx}, {cy}], radius={}) extends outside \
+                     the plate (half_w={}, half_h={})",
+                    hole.radius, self.half_w, self.half_h
+                ));
+            }
+        }
+        for i in 0..self.holes.len() {
+            for j in (i + 1)..self.holes.len() {
+                let (a, b) = (&self.holes[i], &self.holes[j]);
+                let dx = a.center[0] - b.center[0];
+                let dy = a.center[1] - b.center[1];
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist < a.radius + b.radius {
+                    return Err(format!(
+                        "geometry.holes[{i}] and geometry.holes[{j}] overlap: center distance \
+                         {dist} is less than the sum of their radii ({} + {} = {})",
+                        a.radius, b.radius, a.radius + b.radius
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// #77's first decomposition supports exactly one circular hole. Multi-hole partition
     /// ownership is deliberately deferred rather than silently assigning overlap regions.
     pub fn annular_partition(&self) -> Option<AnnularPartition> {
@@ -451,6 +612,193 @@ mod tests {
                 HoleSpec { center: [0.5, 0.0], radius: 0.1, bc: HoleBc::Fixed },
             ],
         }
+    }
+
+    /// Stage 0 (issue #78): the existing `center = [x, y]` convention must round-trip through
+    /// `UserGeometry`'s new custom `Deserialize` impl byte-identically to before this change.
+    #[test]
+    fn deserialize_center_convention_is_unchanged() {
+        let toml_str = r#"
+            half_w = 0.1
+            half_h = 0.2
+            thickness = 0.005
+
+            [[holes]]
+            center = [0.03, -0.02]
+            radius = 0.01
+            bc = "Free"
+        "#;
+        let geom: UserGeometry = toml::from_str(toml_str).expect("existing center convention must still parse");
+        assert_eq!(geom.holes, vec![HoleSpec { center: [0.03, -0.02], radius: 0.01, bc: HoleBc::Free }]);
+    }
+
+    /// Stage 0 (issue #78): each of the 4 valid edge-reference combinations resolves to the
+    /// exact closed-form coordinate — not just "parses without error".
+    #[test]
+    fn deserialize_resolves_every_valid_edge_reference_combination() {
+        // half_w=0.10, half_h=0.05: x in [-0.10, 0.10], y in [-0.05, 0.05].
+        let cases: [(&str, [f64; 2]); 4] = [
+            ("from_left = 0.03\nfrom_bottom = 0.01", [-0.10 + 0.03, -0.05 + 0.01]),
+            ("from_left = 0.03\nfrom_top = 0.01", [-0.10 + 0.03, 0.05 - 0.01]),
+            ("from_right = 0.03\nfrom_bottom = 0.01", [0.10 - 0.03, -0.05 + 0.01]),
+            ("from_right = 0.03\nfrom_top = 0.01", [0.10 - 0.03, 0.05 - 0.01]),
+        ];
+        for (refs, expected_center) in cases {
+            let toml_str = format!(
+                "half_w = 0.10\nhalf_h = 0.05\nthickness = 0.005\n\n[[holes]]\n{refs}\nradius = 0.005\nbc = \"Free\"\n"
+            );
+            let geom: UserGeometry = toml::from_str(&toml_str)
+                .unwrap_or_else(|e| panic!("valid edge-reference combination must parse ({refs:?}): {e}"));
+            assert_eq!(geom.holes.len(), 1);
+            let center = geom.holes[0].center;
+            assert!(
+                (center[0] - expected_center[0]).abs() < 1e-12 && (center[1] - expected_center[1]).abs() < 1e-12,
+                "combination {refs:?}: expected center {expected_center:?}, got {center:?}"
+            );
+        }
+    }
+
+    /// Stage 0 (issue #78): every invalid combination must produce a clear parse error, never
+    /// a silent fallback to `[0, 0]` or an arbitrarily-picked reference.
+    #[test]
+    fn deserialize_rejects_every_invalid_hole_placement_combination() {
+        let base = |holes_body: &str| format!(
+            "half_w = 0.10\nhalf_h = 0.05\nthickness = 0.005\n\n[[holes]]\n{holes_body}\nradius = 0.005\nbc = \"Free\"\n"
+        );
+        let invalid = [
+            // center mixed with a reference field.
+            "center = [0.0, 0.0]\nfrom_left = 0.01",
+            // two references on the same axis (X).
+            "from_left = 0.01\nfrom_right = 0.01\nfrom_bottom = 0.01",
+            // two references on the same axis (Y).
+            "from_left = 0.01\nfrom_top = 0.01\nfrom_bottom = 0.01",
+            // only an X-axis reference, no Y-axis reference, no center.
+            "from_left = 0.01",
+            // no center and no reference fields at all.
+            "",
+        ];
+        for body in invalid {
+            let toml_str = base(body);
+            let result: Result<UserGeometry, _> = toml::from_str(&toml_str);
+            assert!(result.is_err(), "expected a parse error for hole body {body:?}, got {result:?}");
+        }
+    }
+
+    /// Stage 0 (issue #78): a 3-hole spec mixing all three placement styles (explicit center,
+    /// and two different edge-reference combinations) resolves every hole correctly and
+    /// independently — the resolution is per-hole, not spec-wide.
+    #[test]
+    fn deserialize_resolves_mixed_placement_styles_across_multiple_holes() {
+        let toml_str = r#"
+            half_w = 0.10
+            half_h = 0.05
+            thickness = 0.005
+
+            [[holes]]
+            center = [0.0, 0.0]
+            radius = 0.005
+            bc = "Free"
+
+            [[holes]]
+            from_left = 0.02
+            from_bottom = 0.01
+            radius = 0.004
+            bc = "Fixed"
+
+            [[holes]]
+            from_right = 0.02
+            from_top = 0.01
+            radius = 0.004
+            bc = "Free"
+        "#;
+        let geom: UserGeometry = toml::from_str(toml_str).expect("mixed placement styles must parse");
+        assert_eq!(geom.holes.len(), 3);
+        assert_eq!(geom.holes[0].center, [0.0, 0.0]);
+        assert!((geom.holes[1].center[0] - (-0.10 + 0.02)).abs() < 1e-12);
+        assert!((geom.holes[1].center[1] - (-0.05 + 0.01)).abs() < 1e-12);
+        assert!((geom.holes[2].center[0] - (0.10 - 0.02)).abs() < 1e-12);
+        assert!((geom.holes[2].center[1] - (0.05 - 0.01)).abs() < 1e-12);
+    }
+
+    /// Issue #78 Stage 1.2: `validate()` accepts every real shipped multi-hole example's own
+    /// geometry (real, well-separated, in-bounds holes).
+    #[test]
+    fn validate_accepts_a_sane_multi_hole_geometry() {
+        assert!(two_hole_geometry().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_a_hole_extending_past_the_left_edge() {
+        let geom = UserGeometry {
+            half_w: 0.1, half_h: 0.1, thickness: 0.005,
+            holes: vec![HoleSpec { center: [-0.095, 0.0], radius: 0.01, bc: HoleBc::Free }],
+        };
+        assert!(geom.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_a_hole_extending_past_every_edge_direction() {
+        let cases = [
+            [-0.095, 0.0],  // past left
+            [0.095, 0.0],   // past right
+            [0.0, 0.095],   // past top
+            [0.0, -0.095],  // past bottom
+        ];
+        for center in cases {
+            let geom = UserGeometry {
+                half_w: 0.1, half_h: 0.1, thickness: 0.005,
+                holes: vec![HoleSpec { center, radius: 0.01, bc: HoleBc::Free }],
+            };
+            assert!(geom.validate().is_err(), "expected rejection for hole at {center:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_non_positive_radius() {
+        let geom = UserGeometry {
+            half_w: 0.1, half_h: 0.1, thickness: 0.005,
+            holes: vec![HoleSpec { center: [0.0, 0.0], radius: 0.0, bc: HoleBc::Free }],
+        };
+        assert!(geom.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_two_overlapping_holes() {
+        let geom = UserGeometry {
+            half_w: 0.1, half_h: 0.1, thickness: 0.005,
+            holes: vec![
+                HoleSpec { center: [-0.01, 0.0], radius: 0.02, bc: HoleBc::Free },
+                HoleSpec { center: [0.01, 0.0], radius: 0.02, bc: HoleBc::Fixed },
+            ],
+        };
+        assert!(geom.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_two_holes_exactly_tangent() {
+        // Distance between centers == sum of radii exactly - touching, not overlapping.
+        let geom = UserGeometry {
+            half_w: 0.1, half_h: 0.1, thickness: 0.005,
+            holes: vec![
+                HoleSpec { center: [-0.01, 0.0], radius: 0.01, bc: HoleBc::Free },
+                HoleSpec { center: [0.01, 0.0], radius: 0.01, bc: HoleBc::Fixed },
+            ],
+        };
+        assert!(geom.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_reports_the_first_violation_for_a_three_hole_spec_with_one_bad_hole() {
+        let geom = UserGeometry {
+            half_w: 0.1, half_h: 0.1, thickness: 0.005,
+            holes: vec![
+                HoleSpec { center: [-0.05, 0.0], radius: 0.01, bc: HoleBc::Free },
+                HoleSpec { center: [0.095, 0.0], radius: 0.01, bc: HoleBc::Fixed }, // out of bounds
+                HoleSpec { center: [0.0, 0.05], radius: 0.01, bc: HoleBc::Free },
+            ],
+        };
+        let err = geom.validate().expect_err("hole 1 is out of bounds");
+        assert!(err.contains("holes[1]"), "error should identify the offending hole: {err}");
     }
 
     #[test]

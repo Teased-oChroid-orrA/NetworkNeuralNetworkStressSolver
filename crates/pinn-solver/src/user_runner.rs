@@ -784,6 +784,10 @@ pub fn run_annular_decomposition_training_sequential(
 
 /// Minimal deterministic single-model loop for benchmark companions. Production UI/headless
 /// retain their richer reporting loops; this avoids copying that training math into L5 tests.
+/// `#[allow(dead_code)]`: only ever called from `#[cfg(test)]` code (`user_problem.rs`'s own
+/// benchmark tests), so a plain `cargo build`/`cargo build --lib` (which doesn't compile test
+/// code) genuinely sees no call site - a false-positive `dead_code`, not actually unused.
+#[allow(dead_code)]
 pub(crate) fn train_single_user_problem_for_benchmark(
     spec: ProblemSpec,
     device: &BDevice,
@@ -800,6 +804,9 @@ pub(crate) fn train_single_user_problem_for_benchmark(
 /// tiny end-to-end training run for any `UserDefinedProblem` configuration, not only the plain
 /// default. Returns the trained model AND its final step's total loss (the benchmark caller
 /// only ever needed the model; Phase 1's smoke test needs to assert the loss stayed finite).
+/// `#[allow(dead_code)]`: same "test-only call site" false-positive as
+/// [`train_single_user_problem_for_benchmark`]'s own attribute - see that doc comment.
+#[allow(dead_code)]
 pub(crate) fn train_user_problem_for_benchmark(
     problem: &UserDefinedProblem,
     spec: ProblemSpec,
@@ -1130,6 +1137,23 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         );
     }
 
+    // Issue #78 investigation: real per-step Kt evidence, not just the final value. Every
+    // prior headless run only measured Kt ONCE, after training completed - meaning "total_loss
+    // goes flat around step 300 but training continues to step 3000" could not be distinguished
+    // from "Kt itself is still improving while total_loss looks flat" vs "training has
+    // genuinely stalled" without a NEW run. Computed once here (static for the whole run, same
+    // values `loss_terms()`/the final diagnostic block use) so the periodic print below is
+    // cheap (a real small forward pass per checkpoint, at the same 10-checkpoint cadence the
+    // loss line already uses - not the per-step hot loop).
+    let live_kt_ansatz = problem.ansatz(0);
+    let live_kt_affine = (crate::user_problem::decomposition_applicable(&spec) || problem.hard_constraint_active())
+        .then_some((spec.load.px, spec.load.py));
+    let live_kt_margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+    let live_kt_nominal_stress = spec.load.px.abs().max(spec.load.py.abs());
+    let live_kt_free_holes: Vec<usize> = spec.geometry.holes.iter().enumerate()
+        .filter(|(_, h)| h.bc == pinn_core::user_geometry::HoleBc::Free)
+        .map(|(i, _)| i).collect();
+
     let mut last_total = f32::NAN;
     for step in 0..spec.training.max_steps {
         // Issue #73: shared with `runner::run_user_problem_training_from` - see
@@ -1196,6 +1220,23 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
                     "  [diag] PH4 trend: normalized_Pi={raw:.6e} physical_weight={physical_weight:.6e} translation_gauge={translation:.6e}"
                 );
             }
+            // Issue #78 investigation: real per-step Kt, not just the final one - see this
+            // block's own setup comment above `for step in 0..` for why this exists. A real
+            // small forward pass per Free hole, only at this same 10-checkpoint cadence.
+            if !live_kt_free_holes.is_empty() {
+                use burn::module::AutodiffModule;
+                let model_val: crate::network::ElasticityNet<crate::training_core::BInner> = model.valid();
+                let kts: Vec<String> = live_kt_free_holes.iter().map(|&i| {
+                    let hole = &spec.geometry.holes[i];
+                    let profile = crate::user_problem::probe_hole_boundary_profile_derived(
+                        &model_val, &spec.geometry, hole, 36, &fd, u_ref, spec.load.px, &spec.material,
+                        live_kt_margin, &device, live_kt_ansatz, live_kt_affine,
+                    );
+                    let kt = crate::user_problem::stress_concentration_from_profile(&profile, live_kt_nominal_stress).kt;
+                    format!("hole{i}={kt:.4}")
+                }).collect();
+                println!("  [diag] live Kt (Free holes): {}", kts.join(" "));
+            }
         }
     }
     sync_device(&device);
@@ -1249,9 +1290,11 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         let diag_int_norm: Vec<[f32; 2]> = sampling.sample_interior(&placeholder_geom, 512).iter()
             .map(|&[x, y]| normalize_point(x, y, half_w, half_h)).collect();
         // Issue #77 PH4-45: same field-reconstruction fix as the GUI's own vis-cadence block -
-        // `problem.ansatz(0)` is this model's own real training-time ansatz, and
-        // `decomposition_applicable` mirrors `UserDefinedProblem::loss_terms()`'s own gate.
-        let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
+        // `problem.ansatz(0)` is this model's own real training-time ansatz, and the affine
+        // gate mirrors `UserDefinedProblem::loss_terms()`'s own generalized (issue #78)
+        // `decomposed || hard_constraint_active()` condition - see that gate's own doc comment.
+        let affine = (crate::user_problem::decomposition_applicable(&spec) || problem.hard_constraint_active())
+            .then_some((spec.load.px, spec.load.py));
         let vis = crate::user_problem::evaluate_user_vis_grid(
             &model_val, &spec.geometry, [96, 96], u_ref, spec.load.px, &spec.material, &fd, &diag_int_norm, &device,
             problem.ansatz(0), affine,
@@ -1266,7 +1309,7 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         // solution warning - directly motivated by the real Debug_runs evidence (a collapsed
         // solution with nonzero-but-far-too-small stress, which a bare displacement check
         // alone would have missed).
-        let load_transfer = crate::user_problem::probe_load_transfer(&model_val, &spec, &device);
+        let load_transfer = crate::user_problem::probe_load_transfer(&model_val, &spec, &device, problem.ansatz(0), affine);
         println!(
             "  [diag] load transfer ratio={:.4}  predicted=({:.3e},{:.3e}) N  prescribed=({:.3e},{:.3e}) N",
             load_transfer.load_transfer_ratio, load_transfer.predicted_load_x, load_transfer.predicted_load_y,
@@ -1284,7 +1327,7 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         // never wired into any printed output) - this closes that gap, giving hole geometries
         // the same "independently-computed, not training-loss-derived" validation no-hole
         // geometries already get from `validate_no_hole_fields`.
-        let reaction_force = crate::user_problem::probe_reaction_force(&model_val, &spec, &device);
+        let reaction_force = crate::user_problem::probe_reaction_force(&model_val, &spec, &device, problem.ansatz(0), affine);
         println!(
             "  [diag] reaction force (closed-boundary equilibrium): net=({:.3e},{:.3e}) N  reference={:.3e} N  equilibrium_error={:.4e}",
             reaction_force.net_fx, reaction_force.net_fy, reaction_force.reference_force, reaction_force.equilibrium_error,
@@ -1294,13 +1337,27 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         // Derived-stress-at-margin, not direct σ at the exact boundary - see
         // `probe_hole_boundary_profile_derived`'s doc comment.
         let hole_margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
-        // Issue #77 PH4-41: this headless path always trains a plain `UserDefinedProblem::
-        // new(spec)` (`IdentityAnsatz`) - see `run_headless_user_problem`'s own construction.
-        let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
+        // Issue #78 real bug fix: this comment used to claim "this headless path always trains
+        // a plain UserDefinedProblem::new(spec) (IdentityAnsatz)" - true when PH4-41 wrote it,
+        // FALSE since PH4-45 wired `spec.architecture.hard_constraint_ansatz` through to
+        // `new_with_hard_constraint_ansatz` above (this function's own `problem` construction).
+        // This diagnostic loop kept reconstructing the field with a hardcoded `IdentityAnsatz`
+        // regardless - silently wrong for ANY hard-constraint-ansatz spec, undetected until this
+        // session's own real `--headless` verification run on an off-center multi-hole geometry
+        // measured Kt≈0.46-0.59 against a real FEM ground truth of ≈2.9-3.1 and traced the gap
+        // to this exact call site reconstructing "raw network output" as if it WERE the physical
+        // field, discarding both the multiplicative envelope and the additive closed-form
+        // correction the model was actually trained with. `evaluate_user_vis_grid` (the sibling
+        // call directly above) was already correctly fixed to `problem.ansatz(0)` during
+        // PH4-45 - this loop was the one call site that migration missed. Now uses the model's
+        // own real training-time ansatz and the same generalized affine gate as `loss_terms()`.
+        let affine = (crate::user_problem::decomposition_applicable(&spec) || problem.hard_constraint_active())
+            .then_some((spec.load.px, spec.load.py));
+        let ansatz = problem.ansatz(0);
         for (i, hole) in spec.geometry.holes.iter().enumerate() {
             let profile = crate::user_problem::probe_hole_boundary_profile_derived(
                 &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material, hole_margin, &device,
-                &crate::pinlug_problem::IdentityAnsatz, affine,
+                ansatz, affine,
             );
             let sc = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
             println!("  [diag] hole {i}: max_von_mises={:.4e} Pa  nominal={:.4e} Pa  Kt={:.4}", sc.max_von_mises, sc.nominal_stress, sc.kt);
@@ -1309,7 +1366,7 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
             // actually converged, or still drifting with resolution/margin?
             let convergence = crate::user_problem::kt_convergence_check(
                 &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material,
-                hole_margin, nominal_stress, 0.1, &device, &crate::pinlug_problem::IdentityAnsatz, affine,
+                hole_margin, nominal_stress, 0.1, &device, ansatz, affine,
             );
             if convergence.converged {
                 println!("  [diag] hole {i}: Kt convergence OK (angular Δ={:.3}, radial Δ={:.3})", convergence.angular_relative_change, convergence.radial_relative_change);

@@ -1,0 +1,44 @@
+# Issue #78 Stage 0: places the hole by distance from two plate edges (the engineering-drawing
+# convention) instead of computing a raw [x, y] center relative to the plate centroid by hand.
+# `center = [x, y]` still works exactly as before (see single_hole_plate.toml) - this is an
+# alternative input convention, not a replacement, and both may be mixed across different holes
+# in the same [[geometry.holes]] list.
+#
+# A hole gives EITHER `center = [x, y]` OR exactly one X-axis reference (`from_left` XOR
+# `from_right`) plus exactly one Y-axis reference (`from_top` XOR `from_bottom`) - never both,
+# never a mix, never two references on the same axis. Any other combination is a clear parse
+# error, not a silent fallback.
+#
+# Run with: cargo run -p pinn-app --release -- --headless --problem-spec examples/problems/hole_by_edge_reference.toml
+
+[geometry]
+half_w = 0.10   # full width  = 0.20 m
+half_h = 0.10   # full height = 0.20 m
+thickness = 0.005
+
+[[geometry.holes]]
+from_left = 0.06     # 60 mm from the left edge (x = -half_w)
+from_bottom = 0.03   # 30 mm from the bottom edge (y = -half_h)
+radius = 0.01
+bc = "Free"
+
+[material]
+e = 71.7e9               # Al 7075-T6
+nu = 0.33
+density = 2810.0
+ultimate_strength_pa = 503e6
+
+[load]
+px = 6.9e7                # far-field traction in x, ~10 ksi
+py = 0.0
+
+[network]
+hidden_dim = 64
+n_hidden = 8
+
+[training]
+max_steps = 2000
+n_interior = 2048
+n_boundary = 512
+fd_h = 1e-3
+lr = 1e-3

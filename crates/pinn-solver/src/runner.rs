@@ -2052,7 +2052,14 @@ fn run_user_problem_training_from(
             // field, exactly the bug PH4-41 fixed in `probe_hole_boundary_profile_derived`) and
             // the per-hole probes below share this one gate.
             let ansatz = problem.ansatz(0);
-            let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
+            // Issue #78: generalized from `decomposition_applicable` alone to match
+            // `UserDefinedProblem::loss_terms()`'s own generalized `decomposed ||
+            // hard_constraint_active()` gate - see that gate's own doc comment for why an
+            // off-center/multi-hole `MultiHoleHardConstraint` spec needs this same affine
+            // relief even though it never satisfies `decomposition_applicable`'s narrower
+            // single-centered-hole scope.
+            let affine = (crate::user_problem::decomposition_applicable(&spec) || problem.hard_constraint_active())
+                .then_some((spec.load.px, spec.load.py));
             let vis = evaluate_user_vis_grid(
                 &model_val, &spec.geometry, [nx_vis, ny_vis], u_ref, spec.load.px,
                 &spec.material, &fd, &data.int_norm, &device, ansatz, affine,
@@ -2101,7 +2108,7 @@ fn run_user_problem_training_from(
                 .collect();
             // `enhancement.txt` items 4/C ("BC residual RMS/max") - same vis cadence as
             // above, a real side probe, not part of the per-step loss computation.
-            let (bc_rms, bc_max) = crate::user_problem::probe_boundary_residuals(&model_val, &spec, &device);
+            let (bc_rms, bc_max) = crate::user_problem::probe_boundary_residuals(&model_val, &spec, &device, ansatz, affine);
 
             // Issue #62 PH3-10: real per-tick convergence samples - `bc_rms` above and
             // `out.grad_norm` (already computed by `step_physics_multi`, this cadence's own
@@ -2128,7 +2135,7 @@ fn run_user_problem_training_from(
             // `enhancement.md` Phase 9 ("Force Equilibrium Validation") - same vis cadence,
             // same "side probe" precedent (see `ReactionForce`'s doc comment in
             // `pinn_core::messages`).
-            let rf = crate::user_problem::probe_reaction_force(&model_val, &spec, &device);
+            let rf = crate::user_problem::probe_reaction_force(&model_val, &spec, &device, ansatz, affine);
             // `enhancement.md` Phase 10 ("Energy Validation") - same vis cadence/side-probe
             // precedent as `reaction_force` above.
             let eb = crate::user_problem::probe_energy_balance(&model_val, &spec, &device);
@@ -2378,7 +2385,12 @@ fn run_user_problem_training_from(
                     None
                 };
                 let energy_balance = crate::user_problem::probe_energy_balance(&model_val, &live_spec, &device);
-                let reaction_force = crate::user_problem::probe_reaction_force(&model_val, &live_spec, &device);
+                // Issue #78: same generalized ansatz/affine wiring as the training loop's own
+                // vis-cadence probe above - `problem` (this model's own real training-time
+                // problem) is still in scope in this post-training serving loop.
+                let checkpoint_affine = (crate::user_problem::decomposition_applicable(&live_spec) || problem.hard_constraint_active())
+                    .then_some((live_spec.load.px, live_spec.load.py));
+                let reaction_force = crate::user_problem::probe_reaction_force(&model_val, &live_spec, &device, problem.ansatz(0), checkpoint_affine);
                 // Reuses the SAME accumulated history `convergence_evidence` is built from on
                 // the final training-loop update (issue #62 PH3-10) - training has already
                 // finished by the time this serving loop runs, so this history is complete.
@@ -2484,8 +2496,8 @@ pub fn serve_loaded_plate_checkpoint(
                 hole_index, profile, concentration, stress_diagnostic: Some(stress_diagnostic),
             }
         }).collect();
-    let (bc_residual_rms, bc_residual_max) = crate::user_problem::probe_boundary_residuals(&model, &spec, &device);
-    let reaction_force = crate::user_problem::probe_reaction_force(&model, &spec, &device);
+    let (bc_residual_rms, bc_residual_max) = crate::user_problem::probe_boundary_residuals(&model, &spec, &device, &ansatz, affine);
+    let reaction_force = crate::user_problem::probe_reaction_force(&model, &spec, &device, &ansatz, affine);
     let energy_balance = crate::user_problem::probe_energy_balance(&model, &spec, &device);
     let network_snapshot = crate::network::network_snapshot(&model);
     // Transient - constructed only to enumerate `loss_terms()`, no network/training involved.

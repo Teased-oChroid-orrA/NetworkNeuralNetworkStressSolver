@@ -129,6 +129,19 @@ pub(crate) fn decomposition_applicable(spec: &ProblemSpec) -> bool {
     )
 }
 
+/// Issue #78 (multi-hole Kt): the N-hole generalization of `decomposition_applicable`'s own
+/// eligibility check, but for `AnnulusAnsatz::MultiHoleHardConstraint`'s construction gate
+/// specifically — every hole with `bc == HoleBc::Free` is eligible for its own closed-form
+/// correction, with NO count or centering restriction.
+/// `kirsch_hole_correction::HoleTractionFreeAnsatz::physical_xy` already translates by
+/// `hole_center` per-hole; centering was never a mathematical requirement of that math, only
+/// `decomposition_applicable`'s own deliberate first-verified-case scope narrowing for the
+/// SEPARATE kinematic-decomposition mechanism (`affine_strain_pair`/`use_decomposed` in
+/// `UserDefinedProblem::loss_terms()`), which this function does not touch or replace.
+fn free_holes(spec: &ProblemSpec) -> Vec<&HoleSpec> {
+    spec.geometry.holes.iter().filter(|h| h.bc == HoleBc::Free).collect()
+}
+
 /// Points sampled around each hole's circumference, per hole — a fixed, generous default;
 /// not user-configurable in v1 (see `ProblemSpec`'s scope note).
 const HOLE_RING_POINTS: usize = 64;
@@ -393,10 +406,11 @@ pub struct UserSamplingStrategy {
     /// whole-plate draw — see [`Self::sample_interior`]'s own doc comment for the mechanism.
     /// `0.0` via [`Self::new`] is byte-identical to every pre-existing caller; set only via
     /// [`Self::with_hole_bias`] (builder-style, so none of this struct's ~14 existing
-    /// `UserSamplingStrategy::new` call sites need to change). Scoped to exactly one centered
-    /// hole (mirrors `decomposition_applicable`'s own scope) — the v1 boundary matching this
-    /// redesign's own target geometry; multi-hole/off-center biasing is out of scope, not
-    /// silently approximated.
+    /// `UserSamplingStrategy::new` call sites need to change). Issue #78: generalized from
+    /// exactly one centered hole to EVERY `HoleBc::Free` hole (any count, any position) — the
+    /// total fraction is split evenly across however many Free holes exist; a geometry with
+    /// zero Free holes makes this an unconditional no-op regardless of the fraction, same as
+    /// `fraction=0.0` (nothing to bias toward).
     hole_bias_fraction: f64,
 }
 
@@ -491,39 +505,58 @@ impl UserSamplingStrategy {
 /// boundary `sample_interior` itself uses), so it works on any point set that sampler produced
 /// without needing `sample_interior` to expose stratum membership directly.
 ///
-/// `hole_bias_fraction<=0.0` (every pre-Phase-1 caller, and every geometry that isn't the
-/// single-centered-hole case this bias targets) returns all-`1.0` weights — byte-identical to
-/// `PhysicalPotentialEnergyTerm`'s existing `domain_integral_tensor` (unweighted mean) path,
-/// since `domain_integral_weighted_tensor_matches_unweighted_tensor_when_weights_are_uniform`
-/// already proves uniform weights of `1.0` reduce to the same result.
+/// `hole_bias_fraction<=0.0`, or a geometry with no `HoleBc::Free` holes at all, returns
+/// all-`1.0` weights — byte-identical to `PhysicalPotentialEnergyTerm`'s existing
+/// `domain_integral_tensor` (unweighted mean) path, since `domain_integral_weighted_tensor_
+/// matches_unweighted_tensor_when_weights_are_uniform` already proves uniform weights of `1.0`
+/// reduce to the same result.
+///
+/// Issue #78: generalized from one bias disk to N (one per `HoleBc::Free` hole, matching
+/// `UserSamplingStrategy::sample_interior`'s own N-hole generalization) — a point is "in bias"
+/// if it falls within ANY Free hole's own `HOLE_BIAS_RADIUS_MULTIPLIER*radius` disk. Assumes
+/// (asserted, loudly) that no two Free holes' bias disks overlap — an untested edge case for
+/// very closely-spaced holes, flagged rather than silently producing wrong quadrature weights
+/// via double-counted area, per this codebase's "loud not silent" convention.
 pub(crate) fn hole_bias_quadrature_weights(
     points_norm: &[[f32; 2]],
     geometry: &UserGeometry,
     hole_bias_fraction: f64,
 ) -> Vec<f64> {
-    let [hole] = geometry.holes.as_slice() else {
+    let free: Vec<&HoleSpec> = geometry.holes.iter().filter(|h| h.bc == HoleBc::Free).collect();
+    if free.is_empty() || hole_bias_fraction <= 0.0 {
         return vec![1.0; points_norm.len()];
-    };
-    if hole_bias_fraction <= 0.0 {
-        return vec![1.0; points_norm.len()];
+    }
+    for i in 0..free.len() {
+        for j in (i + 1)..free.len() {
+            let (dx, dy) = (free[i].center[0] - free[j].center[0], free[i].center[1] - free[j].center[1]);
+            let sep = (dx * dx + dy * dy).sqrt();
+            let sum_bias_r = HOLE_BIAS_RADIUS_MULTIPLIER * (free[i].radius + free[j].radius);
+            assert!(sep >= sum_bias_r,
+                "hole_bias_quadrature_weights: Free holes {i} and {j} have overlapping bias \
+                 disks (separation={sep}, sum of bias radii={sum_bias_r}) - not handled, see \
+                 this function's own doc comment");
+        }
     }
     let points: Vec<[f64; 2]> = points_norm.iter()
         .map(|p| [p[0] as f64 * geometry.half_w, p[1] as f64 * geometry.half_h])
         .collect();
-    let bias_r = HOLE_BIAS_RADIUS_MULTIPLIER * hole.radius;
-    let bias_r2 = bias_r * bias_r;
+    let bias_r2: Vec<f64> = free.iter().map(|h| (HOLE_BIAS_RADIUS_MULTIPLIER * h.radius).powi(2)).collect();
     let in_bias = |p: &[f64; 2]| -> bool {
-        let (dx, dy) = (p[0] - hole.center[0], p[1] - hole.center[1]);
-        dx * dx + dy * dy <= bias_r2
+        free.iter().zip(&bias_r2).any(|(hole, &r2)| {
+            let (dx, dy) = (p[0] - hole.center[0], p[1] - hole.center[1]);
+            dx * dx + dy * dy <= r2
+        })
     };
     let n_biased = points.iter().filter(|p| in_bias(p)).count();
     let n_remaining = points.len() - n_biased;
     // Physical area each stratum represents - the SAME areas `sample_interior`'s own uniform-
-    // in-r^2 draw (biased stratum) and whole-plate-minus-that-disk draw (remainder) are meant
+    // in-r^2 draw (biased strata) and whole-plate-minus-those-disks draw (remainder) are meant
     // to cover, independent of how many points actually landed in each this particular call.
-    let hole_area = std::f64::consts::PI * hole.radius * hole.radius;
-    let bias_area = (std::f64::consts::PI * bias_r2 - hole_area).max(0.0);
-    let plate_area = 4.0 * geometry.half_w * geometry.half_h - hole_area;
+    let all_hole_area: f64 = geometry.holes.iter().map(|h| std::f64::consts::PI * h.radius * h.radius).sum();
+    let bias_area: f64 = free.iter().zip(&bias_r2).map(|(h, &r2)| {
+        (std::f64::consts::PI * r2 - std::f64::consts::PI * h.radius * h.radius).max(0.0)
+    }).sum();
+    let plate_area = 4.0 * geometry.half_w * geometry.half_h - all_hole_area;
     let remaining_area = (plate_area - bias_area).max(0.0);
     let samples: Vec<pinn_core::amr::DensitySample> = points.iter().map(|&p| {
         let leaf_area = if in_bias(&p) {
@@ -561,24 +594,31 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
 
         // Issue #77 Phase 1 architectural redesign: near-hole-biased stratum, opt-in via
         // `hole_bias_fraction` (0.0 = every pre-existing caller, making this block a complete
-        // no-op — `bias_hole` is `None`, `n_biased` is `0`). Scoped to exactly one hole (see
-        // `hole_bias_fraction`'s own doc comment). Draws uniform-in-r^2 over
-        // `[hole.radius + anchor_margin_m, HOLE_BIAS_RADIUS_MULTIPLIER * hole.radius]` — the
-        // SAME formula `AnnularPartitionSampling::sample_interior`'s own `is_annulus` branch
-        // already uses and is already tested, adapted to a single-domain sampler instead of a
-        // second domain. `contains_for_collocation` (not a bespoke check) enforces the same
-        // FD-safety/plate-bounds/other-hole-exclusion invariants every other draw in this
-        // function already relies on.
-        let bias_hole = (self.hole_bias_fraction > 0.0 && self.geometry.holes.len() == 1)
-            .then(|| self.geometry.holes[0]);
-        if let Some(hole) = bias_hole {
-            let n_biased = (n as f64 * self.hole_bias_fraction).round() as usize;
+        // no-op — `bias_holes` is empty). Issue #78: generalized from exactly one hole to
+        // EVERY `HoleBc::Free` hole, splitting the total fraction evenly across them (N=1
+        // reduces byte-identically to the original single-hole formula — same `n_biased`,
+        // same `max_attempts`, same RNG draw order, since the loop runs exactly once). Draws
+        // uniform-in-r^2 over `[hole.radius + anchor_margin_m, HOLE_BIAS_RADIUS_MULTIPLIER *
+        // hole.radius]` per hole — the SAME formula `AnnularPartitionSampling::sample_interior`'s
+        // own `is_annulus` branch already uses and is already tested, adapted to a
+        // single-domain sampler instead of a second domain. `contains_for_collocation` (not a
+        // bespoke check) enforces the same FD-safety/plate-bounds/other-hole-exclusion
+        // invariants every other draw in this function already relies on.
+        let bias_holes: Vec<HoleSpec> = if self.hole_bias_fraction > 0.0 {
+            self.geometry.holes.iter().copied().filter(|h| h.bc == HoleBc::Free).collect()
+        } else {
+            Vec::new()
+        };
+        let per_hole_fraction = if bias_holes.is_empty() { 0.0 } else { self.hole_bias_fraction / bias_holes.len() as f64 };
+        for hole in &bias_holes {
+            let n_biased = (n as f64 * per_hole_fraction).round() as usize;
             let r0 = hole.radius + self.anchor_margin_m;
             let r1 = HOLE_BIAS_RADIUS_MULTIPLIER * hole.radius;
             let (r0sq, r1sq) = (r0 * r0, r1 * r1);
             let mut attempts = 0usize;
             let max_attempts = n_biased.max(1) * REJECTION_SAMPLE_ATTEMPTS_FACTOR;
-            while pts.len() < n_biased && attempts < max_attempts {
+            let mut drawn = 0usize;
+            while drawn < n_biased && attempts < max_attempts {
                 attempts += 1;
                 let r = (r0sq + rng.next_f64() * (r1sq - r0sq)).sqrt();
                 let theta = 2.0 * std::f64::consts::PI * rng.next_f64();
@@ -586,21 +626,22 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
                 let y = hole.center[1] + r * theta.sin();
                 if self.contains_for_collocation(x, y) {
                     pts.push([x, y]);
+                    drawn += 1;
                 }
             }
         }
-        // The bias stratum's own outer radius, excluded from the draw below so the biased
-        // region's density isn't further inflated by double-counting — `None` (every
-        // pre-existing caller) makes `excludes_bias` an unconditional `true`, byte-identical.
-        let bias_r1sq = bias_hole.map(|h| (HOLE_BIAS_RADIUS_MULTIPLIER * h.radius).powi(2));
+        // The bias strata's own outer radii, excluded from the draw below so the biased
+        // regions' density isn't further inflated by double-counting — an empty `bias_holes`
+        // (every pre-existing caller, or a geometry with no Free hole) makes `excludes_bias`
+        // an unconditional `true` (`.all()` over an empty iterator), byte-identical.
+        let bias_r1sq: Vec<(HoleSpec, f64)> = bias_holes.iter()
+            .map(|&h| (h, (HOLE_BIAS_RADIUS_MULTIPLIER * h.radius).powi(2)))
+            .collect();
         let excludes_bias = |x: f64, y: f64| -> bool {
-            match (bias_hole, bias_r1sq) {
-                (Some(h), Some(r1sq)) => {
-                    let (dx, dy) = (x - h.center[0], y - h.center[1]);
-                    dx * dx + dy * dy >= r1sq
-                }
-                _ => true,
-            }
+            bias_r1sq.iter().all(|(h, r1sq)| {
+                let (dx, dy) = (x - h.center[0], y - h.center[1]);
+                dx * dx + dy * dy >= *r1sq
+            })
         };
 
         let n_remaining = n.saturating_sub(pts.len());
@@ -1318,6 +1359,24 @@ impl LossTerm for ExternalWorkTerm {
     }
 }
 
+/// Issue #78 Stage 1.1: `HoleBcTerm::name` for the `occurrence`-th hole (0-indexed among holes
+/// sharing this `bc`) - the FIRST hole of a given BC keeps the exact pre-#78 constant name
+/// (`"hole_free"`/`"hole_fixed"`), so every existing single-hole or mixed-BC (e.g. one Free +
+/// one Fixed) spec's term names, `base_weight` lookups, and diagnostics stay byte-identical.
+/// Only the 2nd+ hole of the SAME bc (the actual colliding case) gets a numeric suffix. Leaks
+/// the formatted string, matching `UserSamplingStrategy::new`'s own `hole_names`/`hole_fd_names`
+/// per-index-leaked-`&'static str` convention for the identical reason: `LossTerm::name()`'s
+/// trait contract is `&'static str`, and these names are computed once per problem (not
+/// per-step), so the one-time leak is bounded and never repeats within a training run.
+fn hole_bc_term_name(bc: HoleBc, occurrence: usize) -> &'static str {
+    let base = match bc { HoleBc::Free => "hole_free", HoleBc::Fixed => "hole_fixed" };
+    if occurrence == 0 {
+        base
+    } else {
+        Box::leak(format!("{base}_{occurrence}").into_boxed_str())
+    }
+}
+
 /// One hole's boundary condition — `Free` mirrors `pinlug_problem::LugFreeEdgeTractionTerm`
 /// (`hole_traction_loss_direct` on direct mDEM stress columns, implicit zero target);
 /// `Fixed` mirrors `pinlug_problem::LugShankAnchorTerm` (`mean(u^2+v^2)` on direct mDEM
@@ -1339,6 +1398,17 @@ struct HoleBcTerm {
     /// `decomposition_applicable`'s scope) preserves the exact original direct-stress,
     /// zero-target, exact-radius-ring behavior byte-for-byte.
     affine_target: Option<(f64, f64)>,
+    /// Issue #78 Stage 1.1 fix: this term's own identity for SAW-BRDR/diagnostics lookup
+    /// (`lam_by_name`/`raw_scalar_by_name`/`term_grad_norms`, all `HashMap<&str, _>` keyed by
+    /// `name()`). Before this field existed, `name()` returned the CONSTANT `"hole_free"`/
+    /// `"hole_fixed"` regardless of which hole this term belonged to - two holes sharing a BC
+    /// (e.g. `triple_hole_plate.toml`'s two Free holes) collided in every one of those maps,
+    /// silently discarding one hole's own SAW-adapted weight and diagnostics in favor of
+    /// whichever hole's entry was inserted last. Computed once in `loss_terms()` (see
+    /// `hole_bc_term_name`'s own doc comment for the exact naming rule - unsuffixed for the
+    /// FIRST hole of a given BC, matching every pre-#78 spec's term name byte-for-byte, so
+    /// only the actual colliding case's behavior changes at all).
+    name: &'static str,
 }
 
 /// Equality constraints for a bonded artificial interface between two subdomains. Both
@@ -1406,9 +1476,7 @@ impl LossTerm for InterfaceTractionContinuityTerm {
     }
 }
 impl LossTerm for HoleBcTerm {
-    fn name(&self) -> &'static str {
-        match self.bc { HoleBc::Free => "hole_free", HoleBc::Fixed => "hole_fixed" }
-    }
+    fn name(&self) -> &'static str { self.name }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn point_sets(&self) -> Vec<&'static str> { vec![self.point_set] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
@@ -1624,45 +1692,61 @@ impl UserDefinedProblem {
         }
     }
 
-    /// Issue #77 Phase 1 architectural redesign: single-domain hard-constraint. Requires
-    /// `decomposition_applicable(&spec)` (one centered, traction-free hole) — same scope the
-    /// kinematic decomposition this ansatz builds on already restricts itself to (asserted, not
-    /// silently ignored, since a hard constraint targeting a hole that doesn't exist in this
-    /// shape would be a real misconfiguration, not a graceful fallback). `false` produces the
-    /// byte-identical `Self::new` result. Also opts into [`UserSamplingStrategy::with_hole_bias`]
-    /// at `hole_bias_fraction` (`0.0` = today's plain whole-plate draw, matching
-    /// `AnnularDecompositionProblem`'s own `n_annulus = n_interior/2` convention when set to
-    /// `0.5`) — bundled into one constructor since the hard constraint's own effectiveness
-    /// depends on the network actually seeing enough near-hole collocation density to learn the
-    /// finite-plate correction beyond the exact infinite-plate closed form.
+    /// Issue #77 Phase 1 architectural redesign: single-domain hard-constraint. `false` produces
+    /// the byte-identical `Self::new` result. Also opts into
+    /// [`UserSamplingStrategy::with_hole_bias`] at `hole_bias_fraction` (`0.0` = today's plain
+    /// whole-plate draw, matching `AnnularDecompositionProblem`'s own `n_annulus = n_interior/2`
+    /// convention when set to `0.5`) — bundled into one constructor since the hard constraint's
+    /// own effectiveness depends on the network actually seeing enough near-hole collocation
+    /// density to learn the finite-plate correction beyond the exact infinite-plate closed form.
+    ///
+    /// Issue #78 (multi-hole Kt): generalized from requiring exactly one centered `Free` hole
+    /// (`decomposition_applicable`) to [`free_holes`]'s own broader eligibility — EVERY
+    /// `HoleBc::Free` hole, any count, any position, each gets its own closed-form correction
+    /// (`AnnulusAnsatz::MultiHoleHardConstraint`). Requires at least one Free hole (asserted, not
+    /// silently ignored — a hard constraint requested on a geometry with no eligible hole at all
+    /// is a real misconfiguration, not a graceful fallback). A single-element case is exactly
+    /// the old `HardConstraint` computation, wrapped in the new variant — see
+    /// `multi_hole_reduces_to_single_hole_hard_constraint_when_n_equals_one`
+    /// (`kirsch_hole_correction.rs`) for the byte-identical-output proof.
     pub fn new_with_hard_constraint_ansatz(spec: ProblemSpec, use_hard_constraint: bool, hole_bias_fraction: f64) -> Self {
         let mut problem = Self::new(spec.clone());
         if hole_bias_fraction > 0.0 {
             problem.sampling = problem.sampling.with_hole_bias(hole_bias_fraction);
         }
         if use_hard_constraint {
-            assert!(decomposition_applicable(&spec),
-                "hard-constraint ansatz requires one centered, traction-free hole - see decomposition_applicable");
+            let holes = free_holes(&spec);
+            assert!(!holes.is_empty(),
+                "hard-constraint ansatz requires at least one Free hole - see free_holes");
             let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
-            let hole = &spec.geometry.holes[0];
-            problem.ansatz = crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(
+            let sub_ansatzes = holes.into_iter().map(|hole| {
                 crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
                     hole_center: hole.center, hole_radius: hole.radius,
                     half_w: spec.geometry.half_w, half_h: spec.geometry.half_h,
                     px: spec.load.px, py: spec.load.py,
                     e: spec.material.e as f64, nu: spec.material.nu as f64,
                     u_ref: scales.u_ref as f64,
-                },
-            );
+                }
+            }).collect();
+            problem.ansatz = crate::kirsch_hole_correction::AnnulusAnsatz::MultiHoleHardConstraint(sub_ansatzes);
         }
         problem
     }
 
-    /// `true` iff `ansatz` is `AnnulusAnsatz::HardConstraint` — the single source of truth for
-    /// "should the soft `hole_free` penalty be skipped" (`loss_terms()`), mirroring
-    /// `AnnularDecompositionProblem::hard_constraint_active`'s exact same pattern.
-    fn hard_constraint_active(&self) -> bool {
-        matches!(self.ansatz, crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(_))
+    /// `true` iff `ansatz` is `AnnulusAnsatz::HardConstraint` or `MultiHoleHardConstraint` — the
+    /// single source of truth for "should the soft `hole_free` penalty be skipped" and "should
+    /// the affine background be subtracted from the network's own learning target" (see
+    /// `loss_terms()`'s `affine_strain_pair` gate), mirroring `AnnularDecompositionProblem::
+    /// hard_constraint_active`'s exact same pattern (that struct stays single-hole-only,
+    /// untouched by issue #78). `pub(crate)` so `user_runner.rs`'s own Kt-diagnostic call sites
+    /// can key their ansatz/affine reconstruction off the SAME source of truth `loss_terms()`
+    /// used during training, instead of independently guessing - see this session's real,
+    /// previously-unfixed `run_headless_user_problem` bug this generalization surfaced
+    /// (`docs/multi-hole-fem-ground-truth-investigation.md`'s own write-up).
+    pub(crate) fn hard_constraint_active(&self) -> bool {
+        matches!(self.ansatz,
+            crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(_)
+                | crate::kirsch_hole_correction::AnnulusAnsatz::MultiHoleHardConstraint(_))
     }
 
     pub fn spec(&self) -> &ProblemSpec { &self.spec }
@@ -1783,7 +1867,25 @@ impl BoundaryValueProblem for UserDefinedProblem {
         // every new field below stays `None`, preserving the exact original behavior.
         let decomposed = decomposition_applicable(&self.spec);
         let hole_free_active = !matches!(self.spec.formulation, FormulationSelection::Variational) || decomposed;
-        let affine_strain_pair = if decomposed { Some((self.spec.load.px, self.spec.load.py)) } else { None };
+        // Issue #78 (multi-hole Kt): `affine_strain_pair`'s own activation generalizes from
+        // `decomposed` alone (`decomposition_applicable`'s single-centered-hole scope) to
+        // `decomposed || self.hard_constraint_active()` - a strict OR, so every pre-existing
+        // `decomposed=true` case (with or without the hard constraint) keeps its exact prior
+        // `Some((px,py))` value, byte-for-byte. The NEW case this adds is `decomposed=false,
+        // hard_constraint_active()=true` (an off-center or multi-hole `MultiHoleHardConstraint`
+        // spec): `PhysicalPotentialEnergyTerm`'s `affine_strain` field adds a spatially UNIFORM
+        // constant strain - independent of hole count/position by construction - so there is no
+        // reason this relief should stay scoped to the narrower kinematic-decomposition
+        // eligibility. Without this, the network's own (ansatz-suppressed) output has to learn
+        // the ENTIRE affine far-field background from scratch on top of refining the hole
+        // correction - the exact gradient-competition failure mode the original L5 fix existed
+        // to eliminate, just reintroduced for every off-center/multi-hole hard-constraint spec.
+        // Confirmed as the real root cause of this session's own measured Kt≈0.46-0.59 (vs FEM's
+        // ≈2.9-3.1) on `triple_hole_plate.toml`'s real off-center 2-Free-hole geometry before
+        // this fix - not a training-hyperparameter/undersampling issue (a 33% larger
+        // n_interior/n_boundary run reproduced the same stuck Kt).
+        let affine_active = decomposed || self.hard_constraint_active();
+        let affine_strain_pair = affine_active.then_some((self.spec.load.px, self.spec.load.py));
 
         let mut terms: Vec<Box<dyn LossTerm>> = Vec::new();
         if active_base.contains("physical_potential") {
@@ -1821,6 +1923,9 @@ impl BoundaryValueProblem for UserDefinedProblem {
                 measure_aware, thickness, ref_energy_absolute, ds_per_point,
             }));
         }
+        // Issue #78 Stage 1.1: per-BC occurrence counters feeding `hole_bc_term_name` - see
+        // that function's own doc comment for why only the 2nd+ same-BC hole's name changes.
+        let (mut free_occurrence, mut fixed_occurrence) = (0usize, 0usize);
         for (i, (hole, &name)) in self.spec.geometry.holes.iter().zip(self.hole_names.iter()).enumerate() {
             if hole.bc == HoleBc::Fixed || hole_free_active {
                 let use_decomposed = decomposed && hole.bc == HoleBc::Free;
@@ -1828,17 +1933,27 @@ impl BoundaryValueProblem for UserDefinedProblem {
                 // condition is already exact by construction (`kirsch_hole_correction`'s own
                 // module doc comment) - registering the soft `hole_free` penalty on top would
                 // be redundant at best and reintroduce the exact gradient-competition problem
-                // this ansatz exists to eliminate. Mirrors `AnnularDecompositionProblem::
-                // loss_terms()`'s identical `if decomposed && !self.hard_constraint_active()`
-                // gate exactly.
-                if use_decomposed && self.hard_constraint_active() {
+                // this ansatz exists to eliminate. Issue #78: generalized from "this IS the
+                // one decomposed hole" (`use_decomposed`, which stays scoped to
+                // `decomposition_applicable`'s single-centered-hole case) to "this Free hole is
+                // covered by the active hard-constraint ansatz" - `MultiHoleHardConstraint`
+                // covers every `HoleBc::Free` hole regardless of `decomposed`, so the older,
+                // narrower `use_decomposed &&` prefix is dropped; `Fixed` holes are never
+                // matched here (`hole.bc == HoleBc::Free` guards it) so Stage 1's own
+                // already-correct N-hole soft-penalty handling for them is unaffected.
+                if hole.bc == HoleBc::Free && self.hard_constraint_active() {
                     continue;
                 }
                 let point_set = if use_decomposed { self.sampling.hole_fd_names[i] } else { name };
                 let affine_target = if use_decomposed { affine_strain_pair } else { None };
+                let occurrence = match hole.bc {
+                    HoleBc::Free => { let o = free_occurrence; free_occurrence += 1; o }
+                    HoleBc::Fixed => { let o = fixed_occurrence; fixed_occurrence += 1; o }
+                };
                 terms.push(Box::new(HoleBcTerm {
                     domain: USER_DOMAIN, point_set, bc: hole.bc, ref_stress2,
                     material: self.spec.material.clone(), affine_target,
+                    name: hole_bc_term_name(hole.bc, occurrence),
                 }));
             }
         }
@@ -1873,10 +1988,14 @@ impl BoundaryValueProblem for UserDefinedProblem {
             "equilibrium" => LAM_EQUILIBRIUM_PLATE,
             "outer_traction" => LAM_OUTER_TRACTION,
             "external_work" => LAM_EXTERNAL_WORK,
-            "hole_free" => LAM_HOLE_FREE,
-            "hole_fixed" => LAM_HOLE_FIXED,
             "translation_gauge" => LAM_TRANSLATION_GAUGE,
             "rotation_gauge" => LAM_ROTATION_GAUGE,
+            // Issue #78 Stage 1.1: `hole_bc_term_name` suffixes the 2nd+ hole sharing a BC
+            // (e.g. "hole_free_1") - every such hole gets the SAME base weight as the first
+            // (there's no per-hole-specific weight tuning, only per-BC-type), so match by
+            // prefix rather than requiring a second per-index match arm.
+            other if other == "hole_free" || other.starts_with("hole_free_") => LAM_HOLE_FREE,
+            other if other == "hole_fixed" || other.starts_with("hole_fixed_") => LAM_HOLE_FIXED,
             other => panic!("UserDefinedProblem::base_weight: unknown loss term '{other}'"),
         }
     }
@@ -2182,6 +2301,9 @@ impl BoundaryValueProblem for AnnularDecompositionProblem {
                 domain: ANNULUS_DOMAIN, point_set: "hole_0_fd", bc: HoleBc::Free,
                 ref_stress2: scales.ref_stress2, material: self.spec.material.clone(),
                 affine_target: affine_strain_pair,
+                // Single-hole-only scope (`decomposition_applicable` requires exactly one
+                // centered Free hole) - always the first (and only) hole of its BC.
+                name: hole_bc_term_name(HoleBc::Free, 0),
             }));
         }
         if self.include_annulus_equilibrium {
@@ -2494,6 +2616,9 @@ impl BoundaryValueProblem for AnnulusStageProblem {
                 domain: ANNULUS_DOMAIN, point_set: "hole_0_fd", bc: HoleBc::Free,
                 ref_stress2: scales.ref_stress2, material: self.spec.material.clone(),
                 affine_target: affine_strain_pair,
+                // Single-hole-only scope, same rationale as `AnnularDecompositionProblem`'s
+                // own identical construction site.
+                name: hole_bc_term_name(HoleBc::Free, 0),
             }));
         }
         terms
@@ -2744,16 +2869,32 @@ pub fn evaluate_annular_vis_grid(
 /// a side probe at the existing vis cadence (mirrors `training_core::probe_interior_energy_
 /// residuals`'s own "side probe, not the hot per-step path" precedent), NOT a change to
 /// `step_physics_multi`'s per-step loss computation.
+/// Issue #78 real bug fix: `ansatz`/`affine_strain_pair` parameters, threaded through exactly
+/// like `probe_hole_boundary_profile_derived`'s own PH4-41 fix - this function used to read the
+/// model via a bare `fwd_embedded` forward, completely bypassing any active `AnnulusAnsatz`
+/// (multiplicative envelope + additive closed-form correction) and any active kinematic-
+/// decomposition affine background. Under a hard-constraint-ansatz model this made the outer-
+/// boundary residual (and therefore `probe_load_transfer`/`probe_reaction_force`, which both
+/// call this for their own traction numbers) read the RAW NETWORK'S OWN residual output as if
+/// it WERE the physical field - a small quantity by design (the ansatz suppresses/supplies most
+/// of the real field), producing a spurious near-zero "trivial collapse" reading even on a
+/// genuinely well-trained hard-constraint model. Found via this session's own real off-center
+/// multi-hole `--headless` verification run, which printed a P2-09 trivial-solution warning
+/// (2.3% load transfer) on a model whose OWN Kt read correctly at ~2.5 (close to FEM's ~2.9-3.1)
+/// once `probe_hole_boundary_profile_derived`'s already-correct ansatz/affine wiring was used -
+/// the mismatch traced directly to this function's stale reconstruction.
 pub fn probe_boundary_residuals(
     model: &crate::network::ElasticityNet<crate::training_core::BInner>,
     spec: &ProblemSpec,
     device: &crate::training_core::BDevice,
+    ansatz: &dyn DirichletAnsatz,
+    affine_strain_pair: Option<(f64, f64)>,
 ) -> (f64, f64) {
     use crate::energy::compute_stress;
     use crate::differential_operator::production_strain as compute_strains;
-    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
+    use crate::fd_stencil::{norm_pts_to_tensor, FdConfig};
     use crate::network::fwd_embedded;
-    use crate::training_core::BInner;
+    use crate::training_core::{stencil_forward_with_ansatz, BInner};
     use burn::tensor::TensorData;
 
     let geometry = &spec.geometry;
@@ -2764,6 +2905,15 @@ pub fn probe_boundary_residuals(
     let (stress_ref, u_ref) = (scales.stress_ref, scales.u_ref);
     let px_pa = stress_ref;
     let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / geometry.half_w) as f32, (y / geometry.half_h) as f32] };
+    let add_affine = |exx: Tensor<BInner, 1>, eyy: Tensor<BInner, 1>, exy: Tensor<BInner, 1>| -> (Tensor<BInner, 1>, Tensor<BInner, 1>, Tensor<BInner, 1>) {
+        match affine_strain_pair {
+            Some((px, py)) => {
+                let (a_exx, a_eyy, a_exy) = affine_strain(px, py, &spec.material);
+                (exx.add_scalar(a_exx), eyy.add_scalar(a_eyy), exy.add_scalar(a_exy))
+            }
+            None => (exx, eyy, exy),
+        }
+    };
 
     let mut residuals: Vec<f32> = Vec::new();
 
@@ -2771,14 +2921,12 @@ pub fn probe_boundary_residuals(
     if !bnd_pts_phys.is_empty() {
         let n_bnd = bnd_pts_phys.len();
         let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
-        let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
-        let raw = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device);
-        let m = 5 * n_bnd;
-        let scaled = Tensor::cat(vec![
-            raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
-            raw.slice([0..m, 2..5]).mul_scalar(px_pa),
-        ], 1);
+        let (scaled, _embedding) = stencil_forward_with_ansatz::<BInner>(
+            model, ansatz, &bnd_norm, &fd, 1.0, u_ref as f64, px_pa, true,
+            embedding_for_model(model, geometry), None, device,
+        );
         let (exx, eyy, exy) = compute_strains::<BInner>(scaled, n_bnd, &fd);
+        let (exx, eyy, exy) = add_affine(exx, eyy, exy);
         let (sxx, syy, sxy) = compute_stress::<BInner>(exx, eyy, exy, &spec.material);
         let nx: Vec<f32> = bnd_pts_phys.iter().map(|p| p.nx as f32).collect();
         let ny: Vec<f32> = bnd_pts_phys.iter().map(|p| p.ny as f32).collect();
@@ -2796,16 +2944,38 @@ pub fn probe_boundary_residuals(
 
     // `named_point_sets` returns one ring per hole in `geometry.holes.iter()` order (zip,
     // same construction `UserDefinedProblem::new` itself relies on) - zip directly instead
-    // of re-deriving the correspondence from each set's name string.
+    // of re-deriving the correspondence from each set's name string. Direct-stress-column
+    // read (not FD-derived) - unaffected by `affine_strain_pair` (that mechanism only ever
+    // corrects FD-derived strain; a direct stress-column read has no strain step to correct),
+    // but the `u`/`v` columns DO need the ansatz's own transform for the Fixed-hole branch
+    // below, which is why `fwd_embedded` is still replaced with the ansatz-aware forward.
     for (hole, set) in geometry.holes.iter().zip(sampling.named_point_sets(&[]).into_iter()) {
         let n_h = set.points.len();
         if n_h == 0 { continue; }
         let ring_norm: Vec<[f32; 2]> = set.points.iter().map(|p| norm_pt(p.x, p.y)).collect();
         let raw = fwd_embedded::<BInner>(model, norm_pts_to_tensor::<BInner>(&ring_norm, device), geometry.coordinate_embedding(), device);
-        let scaled = Tensor::cat(vec![
-            raw.clone().slice([0..n_h, 0..2]).mul_scalar(u_ref as f64),
-            raw.slice([0..n_h, 2..5]).mul_scalar(px_pa),
-        ], 1);
+        let (dx_v, dy_v, add_x_v, add_y_v): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) = {
+            let mut dx_v = Vec::with_capacity(n_h);
+            let mut dy_v = Vec::with_capacity(n_h);
+            let mut add_x_v = Vec::with_capacity(n_h);
+            let mut add_y_v = Vec::with_capacity(n_h);
+            for p in &ring_norm {
+                let (dx, dy) = ansatz.eval(p[0], p[1], 1.0);
+                dx_v.push(dx);
+                dy_v.push(dy);
+                let (ax, ay) = ansatz.additive(p[0], p[1]);
+                add_x_v.push(ax);
+                add_y_v.push(ay);
+            }
+            (dx_v, dy_v, add_x_v, add_y_v)
+        };
+        let dx_t = Tensor::<BInner, 2>::from_data(TensorData::new(dx_v, vec![n_h, 1]), device);
+        let dy_t = Tensor::<BInner, 2>::from_data(TensorData::new(dy_v, vec![n_h, 1]), device);
+        let add_x_t = Tensor::<BInner, 2>::from_data(TensorData::new(add_x_v, vec![n_h, 1]), device);
+        let add_y_t = Tensor::<BInner, 2>::from_data(TensorData::new(add_y_v, vec![n_h, 1]), device);
+        let u_col = (raw.clone().slice([0..n_h, 0..1]) * dx_t + add_x_t).mul_scalar(u_ref as f64);
+        let v_col = (raw.clone().slice([0..n_h, 1..2]) * dy_t + add_y_t).mul_scalar(u_ref as f64);
+        let scaled = Tensor::cat(vec![u_col, v_col, raw.slice([0..n_h, 2..5]).mul_scalar(px_pa)], 1);
         match hole.bc {
             HoleBc::Free => {
                 let nx: Vec<f32> = set.points.iter().map(|p| p.nx as f32).collect();
@@ -2885,16 +3055,21 @@ pub fn stencil_quality_report(
 /// to zero - any nonzero net predicted force is a real, physically-meaningful inconsistency
 /// (the trained stress field failing to satisfy global force balance), normalized against the
 /// magnitude of one edge's own nominal load so the error is scale-free.
+/// Issue #78 real bug fix: `ansatz`/`affine_strain_pair` parameters - see
+/// `probe_boundary_residuals`'s own doc comment for the shared root cause and evidence; this
+/// function had the identical bare-`fwd_embedded` staleness for its own independent outer-
+/// boundary forward pass.
 pub fn probe_reaction_force(
     model: &crate::network::ElasticityNet<crate::training_core::BInner>,
     spec: &ProblemSpec,
     device: &crate::training_core::BDevice,
+    ansatz: &dyn DirichletAnsatz,
+    affine_strain_pair: Option<(f64, f64)>,
 ) -> pinn_core::messages::ReactionForce {
     use crate::energy::compute_stress;
     use crate::differential_operator::production_strain as compute_strains;
-    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
-    use crate::network::fwd_embedded;
-    use crate::training_core::BInner;
+    use crate::fd_stencil::FdConfig;
+    use crate::training_core::{stencil_forward_with_ansatz, BInner};
     use burn::tensor::TensorData;
 
     let geometry = &spec.geometry;
@@ -2923,14 +3098,17 @@ pub fn probe_reaction_force(
     let ds_y_normal = 2.0 * geometry.half_w / per_edge as f64; // top/bottom edges (ny = +-1)
 
     let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
-    let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
-    let raw = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device);
-    let m = 5 * n_bnd;
-    let scaled = Tensor::cat(vec![
-        raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
-        raw.slice([0..m, 2..5]).mul_scalar(px_pa),
-    ], 1);
-    let (exx, eyy, exy) = compute_strains::<BInner>(scaled, n_bnd, &fd);
+    let (scaled, _embedding) = stencil_forward_with_ansatz::<BInner>(
+        model, ansatz, &bnd_norm, &fd, 1.0, u_ref as f64, px_pa, true,
+        embedding_for_model(model, geometry), None, device,
+    );
+    let (mut exx, mut eyy, mut exy) = compute_strains::<BInner>(scaled, n_bnd, &fd);
+    if let Some((px, py)) = affine_strain_pair {
+        let (a_exx, a_eyy, a_exy) = affine_strain(px, py, &spec.material);
+        exx = exx.add_scalar(a_exx);
+        eyy = eyy.add_scalar(a_eyy);
+        exy = exy.add_scalar(a_exy);
+    }
     let (sxx, syy, sxy) = compute_stress::<BInner>(exx, eyy, exy, &spec.material);
     let nx: Vec<f32> = bnd_pts_phys.iter().map(|p| p.nx as f32).collect();
     let ny: Vec<f32> = bnd_pts_phys.iter().map(|p| p.ny as f32).collect();
@@ -2984,16 +3162,23 @@ pub struct LoadTransferReport {
     pub trivial_solution_warning: bool,
 }
 
+/// Issue #78 real bug fix: `ansatz`/`affine_strain_pair` parameters - see
+/// `probe_boundary_residuals`'s own doc comment for the shared root cause and evidence. This is
+/// the function whose stale reconstruction directly produced this session's own real, false
+/// "P2-09 trivial-solution warning: only 2.3% of load transferred" on a hard-constraint model
+/// that had actually trained well (its own correctly-reconstructed Kt read ~2.5, close to FEM's
+/// ~2.9-3.1, before this fix).
 pub fn probe_load_transfer(
     model: &crate::network::ElasticityNet<crate::training_core::BInner>,
     spec: &ProblemSpec,
     device: &crate::training_core::BDevice,
+    ansatz: &dyn DirichletAnsatz,
+    affine_strain_pair: Option<(f64, f64)>,
 ) -> LoadTransferReport {
     use crate::energy::compute_stress;
     use crate::differential_operator::production_strain as compute_strains;
-    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
-    use crate::network::fwd_embedded;
-    use crate::training_core::BInner;
+    use crate::fd_stencil::FdConfig;
+    use crate::training_core::{stencil_forward_with_ansatz, BInner};
     use burn::tensor::TensorData;
 
     let geometry = &spec.geometry;
@@ -3008,7 +3193,7 @@ pub fn probe_load_transfer(
     let prescribed_load_x = spec.load.px * 2.0 * geometry.half_h * geometry.thickness;
     let prescribed_load_y = spec.load.py * 2.0 * geometry.half_w * geometry.thickness;
 
-    let (traction_residual_rms, traction_residual_max) = probe_boundary_residuals(model, spec, device);
+    let (traction_residual_rms, traction_residual_max) = probe_boundary_residuals(model, spec, device, ansatz, affine_strain_pair);
 
     let bnd_pts_phys = sampling.sample_boundary(&placeholder, &spec.load, spec.training.n_boundary);
     if bnd_pts_phys.is_empty() {
@@ -3026,14 +3211,17 @@ pub fn probe_load_transfer(
     let ds_y_normal = 2.0 * geometry.half_w / per_edge as f64;
 
     let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
-    let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
-    let raw = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device);
-    let m = 5 * n_bnd;
-    let scaled = Tensor::cat(vec![
-        raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
-        raw.slice([0..m, 2..5]).mul_scalar(px_pa),
-    ], 1);
-    let (exx, eyy, exy) = compute_strains::<BInner>(scaled, n_bnd, &fd);
+    let (scaled, _embedding) = stencil_forward_with_ansatz::<BInner>(
+        model, ansatz, &bnd_norm, &fd, 1.0, u_ref as f64, px_pa, true,
+        embedding_for_model(model, geometry), None, device,
+    );
+    let (mut exx, mut eyy, mut exy) = compute_strains::<BInner>(scaled, n_bnd, &fd);
+    if let Some((px, py)) = affine_strain_pair {
+        let (a_exx, a_eyy, a_exy) = affine_strain(px, py, &spec.material);
+        exx = exx.add_scalar(a_exx);
+        eyy = eyy.add_scalar(a_eyy);
+        exy = exy.add_scalar(a_exy);
+    }
     let (sxx, syy, sxy) = compute_stress::<BInner>(exx, eyy, exy, &spec.material);
     let nx: Vec<f32> = bnd_pts_phys.iter().map(|p| p.nx as f32).collect();
     let ny: Vec<f32> = bnd_pts_phys.iter().map(|p| p.ny as f32).collect();
@@ -3164,10 +3352,13 @@ pub fn run_no_hole_benchmark(
         (sxx_rms as f64 / sigma_ref, syy_rms as f64 / sigma_ref, sxy_rms as f64 / sigma_ref)
     };
 
-    let (traction_rms, _traction_max) = probe_boundary_residuals(model, spec, device);
+    // `run_no_hole_benchmark` only ever runs against a no-hole geometry (asserted - see
+    // `run_no_hole_benchmark_panics_on_a_holed_geometry`) - `IdentityAnsatz`/no affine is the
+    // exact, correct reconstruction there, not a stopgap.
+    let (traction_rms, _traction_max) = probe_boundary_residuals(model, spec, device, &crate::pinlug_problem::IdentityAnsatz, None);
     let traction_rms_over_ref = traction_rms / sigma_ref;
 
-    let load_transfer = probe_load_transfer(model, spec, device);
+    let load_transfer = probe_load_transfer(model, spec, device, &crate::pinlug_problem::IdentityAnsatz, None);
 
     let mut failures = Vec::new();
     if !(sigma_xx_relative_error < SIGMA_XX_RELATIVE_ERROR_MAX) { failures.push("sigma_xx_relative_error"); }
@@ -6246,6 +6437,7 @@ mod tests {
         let term = HoleBcTerm {
             domain: USER_DOMAIN, point_set: "hole_0_fd", bc: HoleBc::Free, ref_stress2: 1.0,
             material: material.clone(), affine_target: Some((px, py)),
+            name: hole_bc_term_name(HoleBc::Free, 0),
         };
         let residual = term.compute(&[DomainForwardOutputs {
             domain: USER_DOMAIN, raw_out: &raw_out,
@@ -6326,17 +6518,112 @@ mod tests {
         assert!(ax != 0.0 || ay != 0.0, "hard-constraint additive correction must be nonzero away from the hole center");
     }
 
-    /// A geometry that doesn't qualify (`decomposition_applicable` false) must PANIC when the
-    /// hard constraint is requested, not silently ignore it - a real misconfiguration, not a
-    /// graceful fallback (matches this codebase's own "fail loudly" discipline elsewhere).
+    /// Issue #78: dropping `decomposition_applicable`'s centering restriction for the hard-
+    /// constraint gate is a real behavior change from the pre-#78 test above (which asserted
+    /// this exact off-center case PANICS) - an off-center single Free hole is now a genuine,
+    /// supported single-element `MultiHoleHardConstraint`, not a misconfiguration. Only a
+    /// geometry with NO eligible (`HoleBc::Free`) hole at all must still panic.
     #[test]
-    #[should_panic(expected = "hard-constraint ansatz requires one centered")]
-    fn single_domain_hard_constraint_panics_on_unsupported_geometry() {
+    fn single_domain_hard_constraint_accepts_an_off_center_hole() {
         let mut spec = single_hole_like_spec(1);
         spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
         spec.training.measure_aware_training = true;
         spec.geometry.holes[0].center = [0.01, 0.0]; // off-center - decomposition_applicable is false
+        let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec, true, 0.0);
+        assert!(problem.hard_constraint_active(), "off-center single Free hole must still wire in the hard constraint");
+        assert!(problem.loss_terms().iter().all(|t| t.name() != "hole_free"),
+            "off-center hard-constraint hole must NOT register the redundant soft hole_free term");
+    }
+
+    /// A geometry with no `HoleBc::Free` hole at all (every hole `Fixed`, or no holes) must
+    /// PANIC when the hard constraint is requested, not silently ignore it - a real
+    /// misconfiguration, not a graceful fallback (matches this codebase's own "fail loudly"
+    /// discipline elsewhere).
+    #[test]
+    #[should_panic(expected = "hard-constraint ansatz requires at least one Free hole")]
+    fn single_domain_hard_constraint_panics_when_no_free_hole_exists() {
+        let mut spec = single_hole_like_spec(1);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        spec.geometry.holes[0].bc = HoleBc::Fixed;
         let _ = UserDefinedProblem::new_with_hard_constraint_ansatz(spec, true, 0.0);
+    }
+
+    /// Issue #78 (multi-hole Kt), the load-bearing registration proof for N>1: on
+    /// `triple_hole_plate.toml`'s real shipped geometry (two off-center `Free` holes flanking
+    /// one `Fixed` hole), hard-constraint mode must suppress BOTH `Free` holes' soft `hole_free*`
+    /// terms while leaving the `Fixed` hole's own soft `hole_fixed` penalty completely
+    /// unaffected - proves the generalized `loss_terms()` gate is keyed on `HoleBc::Free`, not
+    /// on `decomposition_applicable`'s narrower single-centered-hole scope.
+    #[test]
+    fn multi_hole_hard_constraint_suppresses_every_free_holes_term_but_not_fixed() {
+        let mut spec = single_hole_like_spec(1);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        spec.geometry = UserGeometry {
+            half_w: 0.15, half_h: 0.06, thickness: 0.006,
+            holes: vec![
+                HoleSpec { center: [-0.06, 0.02], radius: 0.009, bc: HoleBc::Free },
+                HoleSpec { center: [0.0, -0.02], radius: 0.007, bc: HoleBc::Fixed },
+                HoleSpec { center: [0.06, 0.02], radius: 0.009, bc: HoleBc::Free },
+            ],
+        };
+
+        let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec, true, 0.0);
+        assert!(matches!(problem.ansatz, crate::kirsch_hole_correction::AnnulusAnsatz::MultiHoleHardConstraint(ref v) if v.len() == 2),
+            "two off-center Free holes must produce a 2-element MultiHoleHardConstraint");
+        let terms = problem.loss_terms();
+        assert!(terms.iter().all(|t| !t.name().starts_with("hole_free")),
+            "every Free hole's soft term must be suppressed under the multi-hole hard constraint");
+        assert!(terms.iter().any(|t| t.name() == "hole_fixed"),
+            "the Fixed hole's own soft penalty must be completely unaffected");
+    }
+
+    /// Issue #78: `UserSamplingStrategy`'s hole-biased sampling must generalize to bias EVERY
+    /// `HoleBc::Free` hole (not just a single centered one), splitting the total fraction evenly
+    /// - checked on `triple_hole_plate.toml`'s real geometry (two off-center Free holes, one
+    /// Fixed). Every biased point must land near ONE of the two Free holes (never the Fixed
+    /// one, which gets no bias budget), and both Free holes' own near-hole shares should be
+    /// comparable (evenly split, not all budget going to one hole).
+    #[test]
+    fn hole_bias_generalizes_to_every_free_hole_and_splits_the_budget_evenly() {
+        let geometry = UserGeometry {
+            half_w: 0.15, half_h: 0.06, thickness: 0.006,
+            holes: vec![
+                HoleSpec { center: [-0.06, 0.02], radius: 0.009, bc: HoleBc::Free },
+                HoleSpec { center: [0.0, -0.02], radius: 0.007, bc: HoleBc::Fixed },
+                HoleSpec { center: [0.06, 0.02], radius: 0.009, bc: HoleBc::Free },
+            ],
+        };
+        let placeholder = geometry.to_placeholder();
+        let n = 4096;
+        let sampler = UserSamplingStrategy::new(geometry.clone(), 1e-3).with_hole_bias(0.6);
+        let pts = sampler.sample_interior(&placeholder, n);
+        assert_eq!(pts.len(), n);
+
+        let near = |p: &[f64; 2], hole: &HoleSpec| {
+            let (dx, dy) = (p[0] - hole.center[0], p[1] - hole.center[1]);
+            (dx * dx + dy * dy).sqrt() <= HOLE_BIAS_RADIUS_MULTIPLIER * hole.radius
+        };
+        let hole0 = geometry.holes[0];
+        let hole1_fixed = geometry.holes[1];
+        let hole2 = geometry.holes[2];
+        let n0 = pts.iter().filter(|p| near(p, &hole0)).count();
+        let n2 = pts.iter().filter(|p| near(p, &hole2)).count();
+        let n1 = pts.iter().filter(|p| near(p, &hole1_fixed)).count();
+
+        let share0 = n0 as f64 / n as f64;
+        let share2 = n2 as f64 / n as f64;
+        assert!(share0 > 0.15 && share2 > 0.15,
+            "both Free holes must get a real, comparable share of the bias budget: share0={share0} share2={share2}");
+        assert!((share0 - share2).abs() < 0.1,
+            "the 0.6 budget must split roughly evenly across the two Free holes: share0={share0} share2={share2}");
+        // The Fixed hole gets no bias budget of its own, but its own exclusion-margin ring can
+        // still coincidentally overlap the near-hole-radius test above by chance from ordinary
+        // whole-plate draws - only assert it's not systematically over-represented like the two
+        // Free holes are.
+        assert!((n1 as f64 / n as f64) < share0.min(share2),
+            "the Fixed hole must not receive a Free-hole-sized share of the bias budget");
     }
 
     /// Issue #77 Phase 1: `hole_bias_fraction=0.0` (every pre-existing `UserSamplingStrategy`
@@ -6851,6 +7138,61 @@ mod tests {
         // two_hole_geometry's 2nd hole is HoleBc::Fixed - a real Dirichlet anchor already
         // exists, so the P2-07 gauge-fix must NOT be registered (would be redundant).
         assert!(!names.contains(&"translation_gauge"));
+    }
+
+    /// Issue #78 Stage 1.1 fix proof: two holes sharing a BC (mirrors `triple_hole_plate.
+    /// toml`'s real two-Free-hole shape) must produce two DISTINCT term names, not a collision
+    /// that would collapse in `training_core`'s `lam_by_name`/`raw_scalar_by_name`/`term_grad_
+    /// norms` `HashMap<&str, _>`s. Before this fix, both terms returned the literal constant
+    /// `"hole_free"` here - this test fails against the pre-fix code (both entries equal) and
+    /// passes against the fixed one.
+    #[test]
+    fn hole_bc_terms_get_distinct_names_when_two_holes_share_a_bc() {
+        let spec = ProblemSpec {
+            geometry: UserGeometry {
+                half_w: 0.1, half_h: 0.05, thickness: 0.005,
+                holes: vec![
+                    HoleSpec { center: [-0.03, 0.0], radius: 0.005, bc: HoleBc::Free },
+                    HoleSpec { center: [0.03, 0.0], radius: 0.005, bc: HoleBc::Free },
+                    HoleSpec { center: [0.0, 0.02], radius: 0.004, bc: HoleBc::Fixed },
+                ],
+            },
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(1e7),
+            network: Default::default(),
+            training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
+        };
+        let problem = UserDefinedProblem::new(spec);
+        let terms = problem.loss_terms();
+        let hole_names: Vec<&str> = terms.iter().map(|t| t.name()).filter(|n| n.starts_with("hole_")).collect();
+        assert_eq!(hole_names.len(), 3, "one term per hole: {hole_names:?}");
+        // The two Free holes must NOT share a name - this is the actual bug this fix closes.
+        let free_names: Vec<&&str> = hole_names.iter().filter(|n| n.starts_with("hole_free")).collect();
+        assert_eq!(free_names.len(), 2);
+        assert_ne!(free_names[0], free_names[1], "two Free holes must get distinct term names, not collide");
+        // First hole of its BC keeps the exact pre-#78 constant name - every existing
+        // single/mixed-BC spec's term names, base_weight lookups, and diagnostics stay
+        // byte-identical.
+        assert!(hole_names.contains(&"hole_free"), "first Free hole must keep the unsuffixed name");
+        assert!(hole_names.contains(&"hole_fixed"), "the lone Fixed hole must keep the unsuffixed name");
+        // Every hole term's name must still resolve through base_weight without panicking -
+        // the actual reader this fix had to keep working for suffixed names too.
+        for name in &hole_names {
+            let _ = problem.base_weight(name); // panics on an unrecognized name - the assertion IS not panicking
+        }
+    }
+
+    /// Issue #78 Stage 1.1: `hole_bc_term_name` itself - the pure naming rule, independent of
+    /// `loss_terms()`'s own wiring.
+    #[test]
+    fn hole_bc_term_name_suffixes_only_the_second_and_later_occurrence() {
+        assert_eq!(hole_bc_term_name(HoleBc::Free, 0), "hole_free");
+        assert_eq!(hole_bc_term_name(HoleBc::Free, 1), "hole_free_1");
+        assert_eq!(hole_bc_term_name(HoleBc::Free, 2), "hole_free_2");
+        assert_eq!(hole_bc_term_name(HoleBc::Fixed, 0), "hole_fixed");
+        assert_eq!(hole_bc_term_name(HoleBc::Fixed, 1), "hole_fixed_1");
     }
 
     /// Issue #61 P2-07: `translation_gauge` is registered exactly when the geometry is
@@ -8037,7 +8379,7 @@ mod tests {
             formulation: pinn_core::problem_spec::default_formulation(),
             architecture: Default::default(),
         };
-        let (rms, max) = probe_boundary_residuals(&model, &spec, &device);
+        let (rms, max) = probe_boundary_residuals(&model, &spec, &device, &crate::pinlug_problem::IdentityAnsatz, None);
         assert!(rms.is_finite() && rms >= 0.0, "rms must be finite and non-negative, got {rms}");
         assert!(max.is_finite() && max >= 0.0, "max must be finite and non-negative, got {max}");
         assert!(max >= rms - 1e-6, "max must be >= rms, got rms={rms} max={max}");
@@ -8060,7 +8402,7 @@ mod tests {
             formulation: pinn_core::problem_spec::default_formulation(),
             architecture: Default::default(),
         };
-        let (rms, max) = probe_boundary_residuals(&model, &spec, &device);
+        let (rms, max) = probe_boundary_residuals(&model, &spec, &device, &crate::pinlug_problem::IdentityAnsatz, None);
         assert!(rms.is_finite() && rms >= 0.0);
         assert!(max.is_finite() && max >= 0.0);
     }
@@ -8082,7 +8424,7 @@ mod tests {
             formulation: pinn_core::problem_spec::default_formulation(),
             architecture: Default::default(),
         };
-        let rf = probe_reaction_force(&model, &spec, &device);
+        let rf = probe_reaction_force(&model, &spec, &device, &crate::pinlug_problem::IdentityAnsatz, None);
         assert!(rf.net_fx.is_finite() && rf.net_fy.is_finite(), "net force must be finite, got fx={} fy={}", rf.net_fx, rf.net_fy);
         assert!(rf.equilibrium_error.is_finite() && rf.equilibrium_error >= 0.0);
         let expected_reference = (px * 2.0 * geometry.half_h * geometry.thickness).abs();
@@ -8145,7 +8487,7 @@ mod tests {
             formulation: pinn_core::problem_spec::default_formulation(),
             architecture: Default::default(),
         };
-        let rf = probe_reaction_force(&model, &spec, &device);
+        let rf = probe_reaction_force(&model, &spec, &device, &crate::pinlug_problem::IdentityAnsatz, None);
         assert!(rf.net_fx.is_finite() && rf.net_fy.is_finite());
         assert!(rf.equilibrium_error.is_finite() && rf.equilibrium_error >= 0.0);
     }
@@ -8165,7 +8507,7 @@ mod tests {
             formulation: pinn_core::problem_spec::default_formulation(),
             architecture: Default::default(),
         };
-        let rf = probe_reaction_force(&model, &spec, &device);
+        let rf = probe_reaction_force(&model, &spec, &device, &crate::pinlug_problem::IdentityAnsatz, None);
         assert!(rf.equilibrium_error.is_finite(), "equilibrium_error must stay finite at zero applied load, got {}", rf.equilibrium_error);
     }
 
@@ -8215,7 +8557,7 @@ mod tests {
             formulation: pinn_core::problem_spec::default_formulation(),
             architecture: Default::default(),
         };
-        let report = probe_load_transfer(&model, &spec, &device);
+        let report = probe_load_transfer(&model, &spec, &device, &crate::pinlug_problem::IdentityAnsatz, None);
         let expected_prescribed_x = px * 2.0 * spec.geometry.half_h * spec.geometry.thickness;
         assert!((report.prescribed_load_x - expected_prescribed_x).abs() / expected_prescribed_x.abs() < 1e-9);
         assert_eq!(report.prescribed_load_y, 0.0);
@@ -8239,7 +8581,7 @@ mod tests {
             formulation: pinn_core::problem_spec::default_formulation(),
             architecture: Default::default(),
         };
-        let report = probe_load_transfer(&model, &spec, &device);
+        let report = probe_load_transfer(&model, &spec, &device, &crate::pinlug_problem::IdentityAnsatz, None);
         assert_eq!(report.load_transfer_ratio, 1.0);
         assert!(!report.trivial_solution_warning);
     }
@@ -8257,7 +8599,7 @@ mod tests {
             formulation: pinn_core::problem_spec::default_formulation(),
             architecture: Default::default(),
         };
-        let report = probe_load_transfer(&model, &spec, &device);
+        let report = probe_load_transfer(&model, &spec, &device, &crate::pinlug_problem::IdentityAnsatz, None);
         assert!(report.load_transfer_ratio.is_finite());
         assert!(report.predicted_load_x.is_finite());
     }

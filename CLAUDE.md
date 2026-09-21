@@ -773,3 +773,199 @@ to assert exact `f32` equality on a hand-computed matmul+bias result — failing
 float rounding noise, not a logic bug. Now uses an epsilon-tolerant comparison. If a similarly
 CI-only-flaky test turns up again, check for exact `assert_eq!` on raw `f32`/`Vec<f32>` values
 first before assuming a real regression.
+
+## Issue #78 Stage 1: multi-hole hardening — machinery vs. accuracy, and why they're separate
+
+Full plan/progress: `docs/multi-hole-and-boundary-shape-epic.md`. Short version for anyone
+touching a multi-hole (N≥2 circular `HoleSpec`) spec on the default (non-`hard_constraint_
+ansatz`) `UserDefinedProblem` path:
+
+**Machinery is genuinely proven for N holes** — containment, signed distance, boundary
+normals/measures, valid-stencil, interior/boundary sampling (including narrow-ligament
+rejection via `UserSamplingStrategy::contains_for_collocation`'s per-hole union), AMR lock
+zones, one `HoleBcTerm` per hole, and per-hole Kt reporting in both headless and GUI default
+paths all loop over `holes.iter()` correctly. Real headless runs (both Wgpu and NdArray
+backends) on 2-hole and 3-hole configs complete cleanly — no panic, no NaN, finite per-hole Kt,
+sane equilibrium error.
+
+**Kt numerical accuracy has NO correction path for N≥2, and that's a structural fact, not an
+oversight to file a follow-up for.** Every accuracy mechanism this codebase built for the
+single-hole case is explicitly gated to exactly one centered `Free` hole:
+`decomposition_applicable` (`user_problem.rs`), `hole_bias_fraction`'s `holes.len()==1` guard,
+and `coordinate_embedding`'s `[hole] = self.holes.as_slice() else { return Raw }` pattern all
+fall back to the plain raw-coordinate model for N≠1. A multi-hole run therefore has strictly
+LESS accuracy machinery than the single-hole default case, which itself only reaches Kt≈1.0-1.5
+against a true ≈2.4-3.0 (see the PH4-4x sections above). **Do not assume the single-hole
+hard-constraint-ansatz fix "just needs generalizing" to N holes** — it's a real, separate,
+harder problem (the ansatz's closed-form correction and the sampling bias are both derived
+relative to ONE hole's own center/radius; a multi-hole generalization needs its own kinematic
+decomposition scheme, not a loop over the existing one) and is explicitly out of this epic's
+scope.
+
+**A real, previously-unfixed bug closed alongside this**: `HoleBcTerm::name()` used to return
+the CONSTANT `"hole_free"`/`"hole_fixed"` regardless of which hole a term belonged to. Two holes
+sharing a BC (`triple_hole_plate.toml`'s own two `Free` holes, a real shipped example) collided
+in `training_core.rs`'s `lam_by_name`/`raw_scalar_by_name`/`term_grad_norms` `HashMap<&str, _>`s
+— the second hole's entry silently overwrote the first, so both ended up weighted by whichever
+hole's SAW-adapted lambda was computed last. Both holes still received real gradients and
+contributed to the training objective throughout — this was a diagnostics/weighting-fidelity
+bug, not a dropped-physics one. Fixed via `hole_bc_term_name` (`user_problem.rs`): the first
+hole of a given BC keeps the exact pre-fix unsuffixed name (every single-hole or mixed-BC, e.g.
+one `Free` + one `Fixed`, spec's term names/diagnostics stay byte-identical); only the 2nd+ hole
+sharing that BC gets a numeric suffix (`"hole_free_1"`, `"hole_free_2"`, ...). `UserDefinedProblem::
+base_weight` matches by prefix (`starts_with("hole_free_")`) rather than needing a second exact
+arm per suffix.
+
+**Also new**: `UserGeometry::validate()` — a real, previously-nonexistent check (overlap and
+out-of-plate holes were silently accepted before this) wired into both `pinn-app`'s
+`--problem-spec` headless path and `pinn-gui`'s spec-Load button. Deliberately a pure geometric
+check (in-bounds, non-overlapping), NOT an FD-stencil-safety-margin check — `pinn-core` has no
+dependency on `pinn-solver`, where the real per-run margin formula (a function of
+`training.fd_h`) lives, so "too close for a numerically safe FD stencil at this run's specific
+`fd_h`" stays a real, narrower, still-open gap.
+
+**Also new**: hole placement by edge-referenced distance (`from_left`/`from_right`/`from_top`/
+`from_bottom` in `[[geometry.holes]]`, alongside the existing `center = [x, y]`) - pure
+TOML-input-layer sugar via a custom `Deserialize` impl on `UserGeometry`, zero solver/physics
+change. See `examples/problems/hole_by_edge_reference.toml`.
+
+## Issue #78 Stage 2: N-hole hard-constraint ansatz — a real Kt-accuracy fix, and two real bugs
+## found chasing it
+
+Stage 1 (above) closed with "multi-hole Kt accuracy has no correction path yet." This stage
+built one, following the multi-hole-fem-ground-truth-investigation's own approved plan
+(`docs/multi-hole-fem-ground-truth-investigation.md` — the authoritative record; this section
+is the short pointer). One-line summary: real, substantial improvement (trained Kt for every
+`HoleBc::Free` hole went from off by 6-600x to within 12-20% of real FEM ground truth), via one
+real methodology extension plus two real, previously-undiscovered bugs found investigating why
+the first attempt didn't work.
+
+**`AnnulusAnsatz::MultiHoleHardConstraint(Vec<HoleTractionFreeAnsatz>)`**
+(`kirsch_hole_correction.rs`) generalizes the single-hole `HardConstraint` ansatz to N `HoleBc::
+Free` holes, any position — `decomposition_applicable`'s centered/single-hole restriction was
+confirmed (by reading its own code) to be exactly what it always said: a deliberate scope
+narrowing, not a mathematical constraint. Product of envelopes (multiplicative suppression
+stays EXACTLY zero at every hole's own boundary for any N), sum of closed-form corrections
+(additive baseline is only APPROXIMATELY traction-free for N>1 — the same 0.1-4.4% interaction
+error the investigation's own Phase B measured, now also present in the trained field, not just
+the closed form). N=1 reduces byte-identically to the pre-existing path — proven, not assumed.
+`UserDefinedProblem::new_with_hard_constraint_ansatz` builds one `HoleTractionFreeAnsatz` per
+Free hole; `loss_terms()`'s existing single-hole `hole_free`-suppression gate generalizes to
+"any Free hole under an active hard constraint"; `UserSamplingStrategy`'s hole-biased sampling
+and `hole_bias_quadrature_weights` generalize to bias every Free hole, splitting the budget
+evenly (loud assertion, not silent mishandling, if bias disks would overlap).
+
+**Real bug #1, found because the first real N-hole training run collapsed to Kt≈0.004-0.014
+(trivial-solution collapse, not "just needs more steps"):** `UserDefinedProblem::loss_terms()`'s
+`affine_strain_pair` (the constant far-field background strain added to the network's own
+learning target under kinematic decomposition) was gated ONLY on `decomposition_applicable`
+(the single-centered-hole case) — never on the new N-hole `MultiHoleHardConstraint` case, even
+though this constant's own value is independent of hole count/position by construction. Every
+off-center/multi-hole hard-constraint spec therefore trained with the network having to learn
+the ENTIRE affine far-field background from scratch on top of refining the hole correction —
+precisely the gradient-competition failure mode issue #77's original decomposition fix existed
+to eliminate, silently reintroduced for exactly the geometry class this stage targets. Fixed by
+generalizing the gate to `decomposed || self.hard_constraint_active()` (`UserDefinedProblem::
+hard_constraint_active` made `pub(crate)` for this) — a strict OR, byte-identical for every
+pre-existing case (`decomposed=true` already implied `Some` before; the new case this adds is
+`decomposed=false, hard_constraint_active()=true`). Alone, this moved trained Kt from ≈0.004 to
+≈0.5 once the spec's own `formulation`/`measure_aware_training` were also corrected to match
+(see next paragraph).
+
+**A real methodology trap this session fell into and corrected**: the shipped
+`triple_hole_plate.toml`/`notched_plate.toml` examples have NO `[formulation]` override, so
+they use `default_formulation()` — the literal PRE-#77 Hybrid trajectory, which never got issue
+#77's own Kt fix at all. PH4-42's real verified L5 result used `formulation = "Variational"` +
+`training.measure_aware_training = true` explicitly. Real headless verification MUST use that
+same formulation on any hard-constraint spec — `variational_triple_hole_smoke.toml`/
+`variational_notched_smoke.toml` (already-shipped examples with the right formulation) are the
+correct base to build a hard-constraint verification config from, not the plain production
+examples.
+
+**Real bug #2, found because a P2-09 "trivial-solution" warning (load transfer ratio 0.02-0.07)
+persisted even after bug #1's fix, despite the model's own real Kt already reading correctly
+(~2.5) via a DIFFERENT, correctly-wired diagnostic function.** `probe_load_transfer`/
+`probe_reaction_force`/`probe_boundary_residuals` (`user_problem.rs`) had never been extended
+to accept an `ansatz`/`affine_strain_pair` parameter at all — unlike `probe_hole_boundary_
+profile_derived` (correctly fixed back in PH4-41), these three read the model via a bare
+`fwd_embedded` forward, completely bypassing any active `AnnulusAnsatz`/affine background, for
+ANY spec. This bug predates issue #78 entirely and would have affected the ORIGINAL single-hole
+L5 hard-constraint case too — never noticed because that case's real PH4-42 verification went
+through `run_user_problem_training_with_diagnostics`/`user_problem_l5_diagnostic` (correctly
+ansatz-threaded from the start), never `run_headless_user_problem`'s own printed CLI
+diagnostics. Fixed by threading `ansatz`/`affine_strain_pair` through all three functions
+(same `stencil_forward_with_ansatz`-based pattern as `probe_hole_boundary_profile_derived`) and
+updating every call site: the headless CLI diagnostic loop, the GUI-streaming vis-cadence block,
+the GUI checkpoint-save serving loop (all three now use the model's own real training-time
+`problem.ansatz(0)`), the GUI checkpoint-LOAD serving path (deliberately LEFT `IdentityAnsatz`-
+only — checkpoint metadata doesn't carry `ProblemSpec.architecture` yet, a real, disclosed,
+still-open gap, not silently glossed over), `run_no_hole_benchmark` (correctly stays
+`IdentityAnsatz`-only — no hole, no ansatz concept), and 8 pure-logic tests (`IdentityAnsatz,
+None` — every one already trained a plain `UserDefinedProblem::new(spec)`). This alone took
+the load transfer ratio from 0.02-0.07 (spurious "collapsed solution") to 1.00-1.01 (genuinely
+healthy) with ZERO change to the actual trained model weights — purely a diagnostic-
+reconstruction fix, proving the earlier false alarm was a measurement bug, not a training bug.
+
+**Real trained result** (both real shipped geometries, both bugs fixed, `formulation=
+"Variational"`, `measure_aware_training=true`, 3000 steps, `hole_bias_fraction=0.4`):
+`notched_plate.toml` (N=1 Free, off-center) hole0 Kt=2.694 (FEM=3.063, superposition=2.960);
+`triple_hole_plate.toml` (N=2 Free, off-center) hole0/hole2 Kt=2.507/2.507 (FEM=3.133/3.058,
+superposition=2.994/2.994); the Fixed middle hole read Kt=1.048, not directly comparable to the
+investigation's own Free/Free/Free FEM numbers (a pre-existing, disclosed caveat — the FEM tool
+has no Fixed-BC support). Load transfer ratio 1.00-1.01 and reaction-force equilibrium error
+~1% on every run — genuinely healthy, non-collapsed solutions.
+
+**Honestly NOT full PH4-42-level convergence (0.67-1.23%)** — 12-20% remaining error, for two
+disclosed reasons: off-center/multi-hole specs never get the single-hole path's OTHER accuracy
+machinery (log-polar embedding, `SequentialTwoStage`, still single-hole-gated by this stage's
+own deliberate scope), and the additive baseline itself carries Phase B's own measured N>1
+interaction residual into the trained field, not just the closed form.
+
+**The flat-loss-plateau observation above has since been fully investigated in a direct
+follow-up (same session) — real evidence, not left as an open flag.** Full detail lives in
+`docs/multi-hole-fem-ground-truth-investigation.md`'s own "Follow-up" section; short version:
+
+**A NEW real bug found and fixed while investigating the (separately real) BC-mismatch
+caveat**: `tools/multi_hole_reference.py`'s FEM ground-truth tool never supported `Fixed`
+holes at all — every prior FEM number in this stage (and Phase A/B before it) treated every
+hole as traction-free, while the real PINN specs have one genuinely `Fixed` hole each. Fixed by
+adding real Dirichlet (zero-displacement) BC support. Building and verifying that fix surfaced
+a SECOND, more serious, pre-existing bug in the SAME tool: its rigid-body-motion pin scheme
+(asymmetric by construction — full pin on the left edge, roller-only on the right) had always
+been silently wrong, invisible only because every all-`Free` geometry this tool ever shipped
+with made the pins carry zero reaction force regardless of asymmetric placement. The instant a
+`Fixed` hole (a real internal support with a genuinely nonzero reaction) was added, this broke
+physical mirror symmetry outright — two Free holes that MUST have identical Kt by symmetry
+(`triple_hole_plate.toml`'s own real geometry) came out ~30-50% different, confirmed real (not
+noise) via a geometry-mirroring cross-check. Fixed with a genuinely symmetric pin scheme;
+verified the fix is a pure bug fix with ZERO effect on every existing all-`Free` number (direct
+stress-field comparison, old vs. new pin choice, agrees to `~1.6e-10` relative precision). 6
+new regression tests. Real, BC-corrected FEM ground truth is now available and materially
+changes the comparison picture — see the investigation doc's own table.
+
+**The flat-loss plateau itself: definitively diagnosed via a new live per-step Kt diagnostic**
+(`user_runner.rs::run_headless_user_problem`, printed every checkpoint during training, not
+just at the end — a genuinely new, permanent capability). Real finding: Kt reaches its final
+value by ~step 300 and then GENUINELY does not move for the remaining ~2700 steps — the flat
+total_loss is real convergence, not a metric hiding continued progress, and not a training bug.
+Three independent hyperparameter experiments (hole_bias_fraction 0.4→1.0, hidden_dim 64→128,
+peak lr 1e-3→5e-3), each a major axis change, each reproduced the IDENTICAL converged Kt to
+3-4 significant figures — cleanly ruling out collocation density, network capacity, and
+optimizer step size as the cause. Working conclusion: the remaining accuracy gap is a
+structural/formulation limitation, not a tuning problem — the N-hole ansatz (this stage's own
+work) gives the network a strictly LARGER, less-constrained learning target than the original
+single-hole L5 case had, because L5's real 0.67-1.23% accuracy came from the ansatz AND
+kinematic decomposition TOGETHER, and only the ansatz half was generalized to N holes this
+stage. Full closure would mean generalizing kinematic decomposition itself to N holes too — a
+real, substantial, separately-scoped future task, deliberately not attempted in this pass. This
+is a DEFINITIVELY DIAGNOSED, disclosed open item (evidence in hand for what it is NOT), not a
+silently-accepted ceiling — matches this project's own "BLOCKED documented with evidence is not
+the same as complete" standard (Issue #63 Phase 4 close-out, above).
+
+Full regression suite after every change in this stage (`cargo test -p pinn-solver -p pinn-core
+--release -- --test-threads=1`): 546 passed, 1 failed — the same pre-existing, unrelated
+`compute_loss_for_lbfgs_panics_on_lams_missing_a_real_term_key` failure this project has
+tracked since before this stage began. Zero regressions from the ansatz generalization, either
+Rust-side diagnostic bug fix, the live-Kt diagnostic addition, or the FEM tool's own BC/pin
+fixes (Python-side, verified by its own separate 16-test suite, `tools/test_multi_hole_
+reference.py`).

@@ -73,19 +73,19 @@ pub fn show(ui: &mut Ui, state: &TrainingState) {
                 .enumerate()
                 .map(|(i, &v)| [i as f64 * 10.0, v.max(1e-12).log10() as f64])
                 .collect();
-            pui.line(Line::new(pts).name("Total").width(2.0).color(ACCENT_TOTAL));
+            pui.line(Line::new(pts).name("Total").width(2.0_f32).color(ACCENT_TOTAL));
 
             let pts_e: PlotPoints = state.energy_loss.iter()
                 .enumerate()
                 .map(|(i, &v)| [i as f64 * 10.0, v.max(1e-12).log10() as f64])
                 .collect();
-            pui.line(Line::new(pts_e).name("Energy").width(1.3).color(ACCENT_ENERGY));
+            pui.line(Line::new(pts_e).name("Energy").width(1.3_f32).color(ACCENT_ENERGY));
 
             let pts_n: PlotPoints = state.neumann_loss.iter()
                 .enumerate()
                 .map(|(i, &v)| [i as f64 * 10.0, v.max(1e-12).log10() as f64])
                 .collect();
-            pui.line(Line::new(pts_n).name("Boundary").width(1.3).color(ACCENT_BC));
+            pui.line(Line::new(pts_n).name("Boundary").width(1.3_f32).color(ACCENT_BC));
         });
 
     ui.separator();
@@ -101,7 +101,7 @@ pub fn show(ui: &mut Ui, state: &TrainingState) {
                 .enumerate()
                 .map(|(i, &v)| [i as f64 * 10.0, v.max(1e-12).log10() as f64])
                 .collect();
-            pui.line(Line::new(pts).name("LR").width(2.0).color(ACCENT_LR));
+            pui.line(Line::new(pts).name("LR").width(2.0_f32).color(ACCENT_LR));
         });
 
     ui.separator();
@@ -117,12 +117,12 @@ pub fn show(ui: &mut Ui, state: &TrainingState) {
                 .enumerate()
                 .map(|(i, &v)| [i as f64 * 10.0, v as f64])
                 .collect();
-            pui.line(Line::new(pts_e).name("λ_energy").width(1.5).color(ACCENT_ENERGY));
+            pui.line(Line::new(pts_e).name("λ_energy").width(1.5_f32).color(ACCENT_ENERGY));
 
             let pts_n: PlotPoints = state.lam_neumann.iter()
                 .enumerate()
                 .map(|(i, &v)| [i as f64 * 10.0, v as f64])
                 .collect();
-            pui.line(Line::new(pts_n).name("λ_neumann").width(1.5).color(ACCENT_BC));
+            pui.line(Line::new(pts_n).name("λ_neumann").width(1.5_f32).color(ACCENT_BC));
         });
 }

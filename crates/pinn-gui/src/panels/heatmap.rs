@@ -200,7 +200,7 @@ fn draw_overlays(
         let gx = x0 as f32 + i as f32 * grid_step_m;
         let top    = to_screen(gx, y1 as f32);
         let bottom = to_screen(gx, y0 as f32);
-        painter.line_segment([top, bottom], egui::Stroke::new(0.5, grid_col));
+        painter.line_segment([top, bottom], egui::Stroke::new(0.5_f32, grid_col));
     }
     // Horizontal grid lines
     let n_hlines = ((y1 as f32 - y0 as f32) / grid_step_m).floor() as i32;
@@ -208,11 +208,11 @@ fn draw_overlays(
         let gy = y0 as f32 + i as f32 * grid_step_m;
         let left  = to_screen(x0 as f32, gy);
         let right = to_screen(x1 as f32, gy);
-        painter.line_segment([left, right], egui::Stroke::new(0.5, grid_col));
+        painter.line_segment([left, right], egui::Stroke::new(0.5_f32, grid_col));
     }
 
     // ── Domain boundary (white border) ───────────────────────────────────
-    painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5_f32, egui::Color32::WHITE));
 
     // ── User-defined N-hole overlay ───────────────────────────────────────
     if let Some(holes) = user_holes {
@@ -226,7 +226,7 @@ fn draw_overlays(
                 HoleBc::Free  => egui::Color32::from_rgb(74, 222, 128),  // matches design ref
                 HoleBc::Fixed => egui::Color32::from_rgb(248, 113, 113),
             };
-            painter.circle_stroke(center, r_px, egui::Stroke::new(2.0, color));
+            painter.circle_stroke(center, r_px, egui::Stroke::new(2.0_f32, color));
         }
     }
 
@@ -241,7 +241,7 @@ fn draw_overlays(
         let r_px = (r_px_x + r_px_y) * 0.5;
 
         // Draw arc from 0° to 90° (QuarterSymm corner arc) or full circle
-        let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 220, 60));
+        let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 220, 60));
         let n_seg = 32;
         let angle_max = match config.geometry.symmetry {
             pinn_core::geometry::SymmetryMode::QuarterSymm => std::f32::consts::FRAC_PI_2,

@@ -325,8 +325,29 @@ mod tests {
         for name in ["notched_plate.toml", "single_hole_plate.toml", "triple_hole_plate.toml", "biaxial_steel_plate.toml"] {
             let path = examples_dir.join(name);
             let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
-            toml::from_str::<ProblemSpec>(&contents).unwrap_or_else(|e| panic!("failed to parse {path:?}: {e}"));
+            let spec: ProblemSpec = toml::from_str(&contents).unwrap_or_else(|e| panic!("failed to parse {path:?}: {e}"));
+            // Issue #78 Stage 1.2: every shipped multi-hole example must pass the new
+            // geometry-validation gate - a real regression guard that this session's own
+            // check doesn't reject the specs it's meant to keep working.
+            spec.geometry.validate().unwrap_or_else(|e| panic!("{path:?} failed geometry validation: {e}"));
         }
+    }
+
+    /// Issue #78 Stage 0: the shipped example demonstrating edge-referenced hole placement -
+    /// a real regression guard that the resolved center matches the documented closed form,
+    /// not just "the file parses".
+    #[test]
+    fn shipped_hole_by_edge_reference_example_resolves_the_expected_center() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/problems/hole_by_edge_reference.toml");
+        let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
+        let spec: ProblemSpec = toml::from_str(&contents).unwrap_or_else(|e| panic!("failed to parse {path:?}: {e}"));
+        assert_eq!(spec.geometry.holes.len(), 1);
+        let center = spec.geometry.holes[0].center;
+        let expected = [-spec.geometry.half_w + 0.06, -spec.geometry.half_h + 0.03];
+        assert!(
+            (center[0] - expected[0]).abs() < 1e-12 && (center[1] - expected[1]).abs() < 1e-12,
+            "expected center {expected:?}, got {center:?}"
+        );
     }
 
     /// Issue #77 PH4-45: the shipped example demonstrating `[architecture]` - a real regression

@@ -61,10 +61,16 @@ pub fn show(
             if ui.button("Load").clicked() {
                 match std::fs::read_to_string(user.spec_path.as_str()) {
                     Ok(contents) => match toml::from_str::<ProblemSpec>(&contents) {
-                        Ok(spec) => {
-                            *user.spec = Some(spec);
-                            *user.error = None;
-                        }
+                        // Issue #78 Stage 1.2: fail fast on a geometrically-nonsensical spec
+                        // (a hole outside the plate, two holes overlapping) at Load time,
+                        // before the user can click Start on it.
+                        Ok(spec) => match spec.geometry.validate() {
+                            Ok(()) => {
+                                *user.spec = Some(spec);
+                                *user.error = None;
+                            }
+                            Err(e) => *user.error = Some(format!("invalid geometry: {e}")),
+                        },
                         Err(e) => *user.error = Some(format!("parse error: {e}")),
                     },
                     Err(e) => *user.error = Some(format!("read error: {e}")),
