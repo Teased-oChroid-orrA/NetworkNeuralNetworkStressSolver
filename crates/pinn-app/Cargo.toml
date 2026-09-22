@@ -16,6 +16,9 @@ eframe      = { workspace = true }
 anyhow      = { workspace = true }
 rayon       = { workspace = true }
 toml        = { workspace = true }
+crossbeam-channel = { workspace = true }
+ratatui     = { workspace = true }
+crossterm   = { workspace = true }
 
 [features]
 ndarray-backend = ["pinn-solver/ndarray-backend"]

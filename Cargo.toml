@@ -38,6 +38,14 @@ rayon             = "1"
 # ProblemSpec (pinn-core::problem_spec) - a small, pure-Rust, zero-unsafe parser with no
 # further transitive dependencies of its own beyond serde (already a workspace dependency).
 toml              = "0.8"
+# pinn-app's `--tui` mode: a terminal dashboard for a run that has no display/window
+# compositor available (SSH, headless-adjacent environments) but still wants live loss/Kt/AMR
+# visibility beyond `--headless`'s plain scrolling `println!` log. `crossterm` is ratatui's own
+# default backend crate - pinned explicitly (not left to ratatui's own transitive default) since
+# `pinn-app`'s event loop calls `crossterm::event`/`terminal` directly for raw-mode setup and
+# input polling, not just through ratatui's `Terminal` wrapper.
+ratatui           = "0.29"
+crossterm         = "0.28"
 
 [profile.release]
 opt-level     = 3

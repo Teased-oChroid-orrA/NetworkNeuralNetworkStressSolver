@@ -6,6 +6,8 @@ use pinn_core::{
     HoleType,
 };
 
+mod tui;
+
 /// Read a KEY=VALUE env file; strip comments and blank lines.
 fn load_pinn_env(path: &Path) -> HashMap<String, String> {
     let text = match fs::read_to_string(path) {
@@ -213,6 +215,32 @@ fn parse_problem_spec_arg() -> Option<String> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // `--tui`/`-T`: a terminal dashboard, reached and dispatched FIRST, before either the
+    // `--problem-spec` early return or `--headless` below — both being other "no window" run
+    // modes, `--tui` wins if given alongside them (the strictly more capable request). Every
+    // path this check falls through to (`--headless`, `--problem-spec` without `--tui`, plain
+    // GUI) is completely unaffected — this function returns before any of that code runs.
+    let tui = env::args().any(|a| a == "--tui" || a == "-T");
+    if tui {
+        if let Some(spec_path) = parse_problem_spec_arg() {
+            let spec_str = std::fs::read_to_string(&spec_path)
+                .map_err(|e| anyhow::anyhow!("failed to read --problem-spec file '{spec_path}': {e}"))?;
+            let spec: pinn_core::problem_spec::ProblemSpec = toml::from_str(&spec_str)
+                .map_err(|e| anyhow::anyhow!("failed to parse --problem-spec TOML '{spec_path}': {e}"))?;
+            spec.geometry.validate().map_err(|e| anyhow::anyhow!("invalid geometry in '{spec_path}': {e}"))?;
+            return tui::run_tui_plate(spec);
+        }
+        let problem_kind = parse_problem_arg();
+        let env_path_str = env::var("PINN_ENV").unwrap_or_else(|_| "pinn.env".to_string());
+        let env_map = load_pinn_env(Path::new(&env_path_str));
+        let mut config = match problem_kind {
+            ProblemKind::Kirsch => SolverConfig::default_kirsch(),
+            ProblemKind::PinLug => SolverConfig::default_pinlug(),
+        };
+        apply_env(&mut config, &env_map, problem_kind == ProblemKind::PinLug);
+        return tui::run_tui_live(config, problem_kind);
+    }
+
     // User-defined-problem ingestion: checked BEFORE any Kirsch/pin-lug dispatch below, so
     // that dispatch (and pinn.env loading, which is irrelevant to a self-contained spec
     // file) is completely untouched when this flag is absent — the "default to the

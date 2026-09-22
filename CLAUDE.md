@@ -1155,3 +1155,48 @@ tight agreement (~1e-6 relative, `f32`-precision-limited) once the actual mismat
 19 new/updated unit tests. Full regression suite: 563 passed (+10 net new), same 1
 pre-existing unrelated failure (`compute_loss_for_lbfgs_panics_on_lams_missing_a_real_term_key`),
 zero regressions.
+
+## `--tui`/`-T`: a ratatui terminal dashboard for `pinn-app`
+
+A third live-training run mode alongside `--headless` (plain scrolling logs, no AMR wired for
+the plate path) and the default GUI (needs a display/window compositor): a terminal-only
+dashboard reached via `--tui`/`-T`, reusing the SAME training entry points the GUI already
+drives (`run_training`, `run_training_pinlug`, `pinn_solver::runner::run_training_user_problem`)
+over the identical `(Sender<TrainingMsg>, Receiver<ControlMsg>)` channel protocol `pinn-gui`'s
+own `start_solver`/`drain_channel` uses - zero solver-side change, Kirsch/pin-lug/every
+`[architecture]`-selectable User-Defined plate config all supported for free. Design doc:
+`docs/tui-mode-plan.md` (its own "Status" section has the full implementation record, including
+several real corrections a pre-implementation investigation found against its original design
+claims - `Done` is a blocking send, the plate path doesn't return on its own after `Done`,
+`TrainingMsg` has 10 variants, `PinLugTrainingUpdate.amr_sweep` is a `Vec` not an `Option`).
+
+`crates/pinn-app/src/tui/{mod,state,ui}.rs` - three files, one job each: `mod.rs` is the ONLY
+file that touches `crossterm` I/O (terminal lifecycle, panic hook, event loop); `state.rs` is
+pure data + `TuiState::apply`/`apply_pinlug`, zero `ratatui`/`crossterm` dependency, unit-
+testable with plain `TrainingUpdate`/`PinLugTrainingUpdate` literals; `ui.rs` is pure rendering,
+zero I/O. `main.rs`'s `--tui` check is dispatched FIRST (before the `--problem-spec` early
+return and the `--headless` check) - `--tui --problem-spec <path>` spawns `run_training_user_
+problem` (gets AMR, which `--problem-spec` alone does NOT - the channel-less `run_headless_
+user_problem` never wires it); `--tui` alone builds `config` exactly like the GUI branch and
+spawns `run_training`/`run_training_pinlug` per `--problem kirsch|pinlug`. Every pre-existing
+path (`--headless`, `--problem-spec` without `--tui`, plain GUI) is byte-for-byte unchanged -
+`--tui`'s check returns before any of that code runs.
+
+**A real, disclosed v1 gap found via this session's own binary smoke test, not a crash**: a
+handful of unconditional `println!` decision-maker tier-transition diagnostics in the SHARED
+`runner.rs`/`headless.rs` training code (correct and intended for `--headless`) write directly
+to the process's real stdout, bypassing the `TrainingMsg` channel - since the TUI's alternate
+screen occupies that same stdout, a tier transition firing mid-run visibly (transiently)
+corrupts the dashboard for one line before the next redraw overwrites it. A proper fix (OS-level
+stdout redirect, or plumbing a "quiet" sink through the shared training functions) was
+deliberately not attempted - it touches code this project has repeatedly flagged as risky to
+modify casually, for a cosmetic (not correctness/data-loss) issue. See `tui/mod.rs`'s own doc
+comment.
+
+Verified: `cargo build -p pinn-app` and `--features ndarray-backend` both clean; 12 new pure-
+logic unit tests, all passing; a real binary smoke run confirmed the process does not panic
+(this sandbox's shell apparently satisfies `enable_raw_mode()` even under `< /dev/null`
+redirection, so it entered a genuinely live training session rather than failing cleanly as
+first expected - which is how the stdout-corruption gap above was actually found). A real
+mouse/keyboard-driven interactive session was NOT performed - not possible from this sandbox,
+the same disclosed gap every other GUI-adjacent feature in this file already carries.
