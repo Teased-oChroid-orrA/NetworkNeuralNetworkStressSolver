@@ -150,7 +150,15 @@ impl AnnularPartition {
 /// `SingleHoleChart` keeps raw normalized coordinates and appends dimensionless local-hole
 /// chart and bounded-envelope features. `inv_radius` converts independently normalized x/y coordinates
 /// back to radius units, preserving circular physical geometry on non-square plates.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Issue #78: no longer `Copy` - `MultiHoleChart`'s own `Vec<HoleChartParams>` field (N holes,
+/// runtime-variable length) cannot be. Every pre-existing call site that relied on implicit
+/// `Copy` now needs an explicit `.clone()` (cheap - a small `Vec` of two-`[f32;2]`-pair
+/// structs, never on a per-step hot path) - the compiler enumerates every one of them
+/// exhaustively, the same discipline this codebase's own doc comments describe for every prior
+/// exhaustive-match migration (`HoleBcTerm::name()`'s `hole_bc_term_name`, `AnnulusAnsatz`'s
+/// own `MultiHoleHardConstraint` addition, etc.).
+#[derive(Debug, Clone, PartialEq)]
 pub enum CoordinateEmbedding {
     Raw,
     SingleHoleChart {
@@ -189,10 +197,44 @@ pub enum CoordinateEmbedding {
         inv_radius: [f32; 2],
         epsilon: f32,
     },
+    /// Issue #78: the N-hole generalization of `SingleHoleChart` - the same 7 hole-relative
+    /// features (`r, log_r, c2, s2, psi, psi*c2, psi*s2` - see `network::chart_embed`'s own doc
+    /// comment for the exact formula), computed independently for EVERY hole in this geometry
+    /// (not just `Free` ones - the network needs geometric awareness of a `Fixed` hole's own
+    /// local stress concentration too, via `interior_energy`/`equilibrium`/`hole_fixed`, none
+    /// of which are Free-only) and concatenated after the raw 3-column prefix. `holes.len()==1`
+    /// is deliberately NOT routed through this variant - `UserGeometry::coordinate_embedding`
+    /// keeps returning the exact pre-existing `SingleHoleChart` for that case, so every single-
+    /// hole spec's embedding, and every test/call site that pattern-matches `SingleHoleChart`
+    /// directly, stays byte-identical. This variant exists purely to close the gap `SingleHole
+    /// Chart`'s own doc comment already flagged ("Multi-hole enrichment is intentionally
+    /// deferred until it has an unambiguous benchmark") - the benchmark is this session's own
+    /// real finding: three independent hyperparameter experiments (collocation density,
+    /// network capacity, learning rate) each reproduced an IDENTICAL trained Kt for a real
+    /// multi-hole hard-constraint spec, ruling out optimization/data/capacity as the cause and
+    /// pointing at a representation-level gap instead - the only accuracy-relevant machinery
+    /// still gated to `holes.len()==1` after issue #78 Stage 2's own N-hole ansatz/affine work.
+    /// `n_fourier` always `0` here (no per-hole-Fourier call site exists yet, matching
+    /// `SingleHoleChart`'s own real, disclosed negative result for the single-hole case -
+    /// PH4-31 found it made the interior residual ~28x WORSE - so this is deliberately NOT
+    /// wired up for multi-hole either without new evidence).
+    MultiHoleChart {
+        holes: Vec<HoleChartParams>,
+        epsilon: f32,
+    },
+}
+
+/// Per-hole chart parameters for [`CoordinateEmbedding::MultiHoleChart`] - the same
+/// `center_norm`/`inv_radius` pair [`CoordinateEmbedding::SingleHoleChart`] carries for its one
+/// hole, one instance per hole in geometry order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HoleChartParams {
+    pub center_norm: [f32; 2],
+    pub inv_radius: [f32; 2],
 }
 
 impl CoordinateEmbedding {
-    pub const fn input_dim(self) -> usize {
+    pub fn input_dim(&self) -> usize {
         match self {
             Self::Raw => 3,
             // 10 base chart columns + 4 columns (sin/cos of qx, sin/cos of qy) per frequency
@@ -200,6 +242,9 @@ impl CoordinateEmbedding {
             Self::SingleHoleChart { n_fourier, .. } => 10 + 4 * n_fourier,
             // 3 raw prefix columns + (ξ, cosθ, sinθ).
             Self::LogPolar { .. } => 6,
+            // 3 raw prefix columns + 7 chart columns per hole (no Fourier - see this variant's
+            // own doc comment).
+            Self::MultiHoleChart { holes, .. } => 3 + 7 * holes.len(),
         }
     }
 }
@@ -414,9 +459,12 @@ impl UserGeometry {
         self.coordinate_embedding().input_dim()
     }
 
-    /// Geometry-owned input representation for #77. One hole gets a local radial/angular
-    /// chart with a bounded far-field envelope; no-hole and multi-hole problems remain raw-coordinate models.
-    /// Multi-hole enrichment is intentionally deferred until it has an unambiguous benchmark.
+    /// Geometry-owned input representation. One hole gets a local radial/angular chart with a
+    /// bounded far-field envelope (`SingleHoleChart`); N>1 holes get the same per-hole chart
+    /// features, one set per hole, concatenated (`MultiHoleChart` - issue #78, see that
+    /// variant's own doc comment for why the earlier "multi-hole enrichment is intentionally
+    /// deferred until it has an unambiguous benchmark" deferral is now resolved); no-hole
+    /// problems remain a raw-coordinate model.
     pub fn coordinate_embedding(&self) -> CoordinateEmbedding {
         self.coordinate_embedding_with_fourier(0)
     }
@@ -426,21 +474,41 @@ impl UserGeometry {
     /// `coordinate_embedding()` — for a no-hole/multi-hole geometry, which always returns
     /// `Raw` regardless of this argument). See `CoordinateEmbedding::SingleHoleChart::
     /// n_fourier`'s own doc comment.
+    ///
+    /// Issue #78: `n_fourier` only ever applies to the exact single-hole case
+    /// (`SingleHoleChart`) - `MultiHoleChart` (N>1 holes) never carries a Fourier band count
+    /// (see that variant's own doc comment for why: PH4-31's real negative result for the
+    /// single-hole case, no new evidence justifying it for N holes either).
     pub fn coordinate_embedding_with_fourier(&self, n_fourier: usize) -> CoordinateEmbedding {
-        let [hole] = self.holes.as_slice() else {
-            return CoordinateEmbedding::Raw;
-        };
-        let radius = hole.radius as f32;
-        CoordinateEmbedding::SingleHoleChart {
-            center_norm: [
-                (hole.center[0] / self.half_w) as f32,
-                (hole.center[1] / self.half_h) as f32,
-            ],
-            inv_radius: [(self.half_w as f32) / radius, (self.half_h as f32) / radius],
-            // Only protection at r=0. Valid plate points are outside r=a, so this cannot
-            // alter physical features at collocation or FD-stencil points.
-            epsilon: 1e-4,
-            n_fourier,
+        match self.holes.as_slice() {
+            [] => CoordinateEmbedding::Raw,
+            [hole] => {
+                let radius = hole.radius as f32;
+                CoordinateEmbedding::SingleHoleChart {
+                    center_norm: [
+                        (hole.center[0] / self.half_w) as f32,
+                        (hole.center[1] / self.half_h) as f32,
+                    ],
+                    inv_radius: [(self.half_w as f32) / radius, (self.half_h as f32) / radius],
+                    // Only protection at r=0. Valid plate points are outside r=a, so this
+                    // cannot alter physical features at collocation or FD-stencil points.
+                    epsilon: 1e-4,
+                    n_fourier,
+                }
+            }
+            holes => CoordinateEmbedding::MultiHoleChart {
+                holes: holes.iter().map(|hole| {
+                    let radius = hole.radius as f32;
+                    HoleChartParams {
+                        center_norm: [
+                            (hole.center[0] / self.half_w) as f32,
+                            (hole.center[1] / self.half_h) as f32,
+                        ],
+                        inv_radius: [(self.half_w as f32) / radius, (self.half_h as f32) / radius],
+                    }
+                }).collect(),
+                epsilon: 1e-4,
+            },
         }
     }
 
@@ -839,13 +907,24 @@ mod tests {
     }
 
     #[test]
-    fn coordinate_embedding_preserves_raw_no_hole_and_multi_hole_inputs() {
+    fn coordinate_embedding_preserves_raw_no_hole_and_generalizes_multi_hole_inputs() {
         let no_holes = UserGeometry { half_w: 1.0, half_h: 1.0, thickness: 0.1, holes: vec![] };
         assert_eq!(no_holes.coordinate_embedding(), CoordinateEmbedding::Raw);
         assert_eq!(no_holes.net_input_dim(), 3);
+        // Issue #78: multi-hole geometries used to fall back to `Raw` ("multi-hole enrichment
+        // is intentionally deferred until it has an unambiguous benchmark" - `SingleHoleChart`'s
+        // own now-resolved doc comment). They now get `MultiHoleChart`: the same 7 hole-
+        // relative features `SingleHoleChart` computes for one hole, computed independently for
+        // EACH hole and concatenated - `3 + 7*2 = 17` for this 2-hole fixture.
         let multi = two_hole_geometry();
-        assert_eq!(multi.coordinate_embedding(), CoordinateEmbedding::Raw);
-        assert_eq!(multi.net_input_dim(), 3);
+        assert_eq!(multi.coordinate_embedding(), CoordinateEmbedding::MultiHoleChart {
+            holes: vec![
+                HoleChartParams { center_norm: [-0.5, 0.0], inv_radius: [10.0, 10.0] },
+                HoleChartParams { center_norm: [0.5, 0.0], inv_radius: [10.0, 10.0] },
+            ],
+            epsilon: 1e-4,
+        });
+        assert_eq!(multi.net_input_dim(), 17);
     }
 
     #[test]

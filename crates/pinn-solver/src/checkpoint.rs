@@ -260,7 +260,7 @@ mod tests {
         let probe_pts: Vec<[f32; 2]> = vec![[0.1, 0.2], [-0.3, 0.4], [0.5, -0.1]];
         let probe_tensor = crate::fd_stencil::norm_pts_to_tensor::<BInner>(&probe_pts, &device);
         let before =
-            crate::network::fwd_embedded::<BInner>(&model, probe_tensor.clone(), embedding, &device)
+            crate::network::fwd_embedded::<BInner>(&model, probe_tensor.clone(), embedding.clone(), &device)
                 .into_data()
                 .to_vec::<f32>()
                 .unwrap();

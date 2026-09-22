@@ -357,3 +357,80 @@ substantial, scoped new engineering work, not attempted in this pass. Per this p
 "BLOCKED documented with evidence is not the same as complete" standard (see the Issue #63
 Phase 4 close-out section of `CLAUDE.md`): this is a definitively diagnosed, disclosed,
 open item, not a silently-accepted ceiling.
+
+## Second follow-up (same session): kinematic decomposition was already generalized; the coordinate embedding is the real remaining gate - closed, but did not move Kt
+
+Re-examining the "kinematic decomposition" claim above before acting on it (per this codebase's
+own evidence-before-implementation discipline) found it does NOT hold up: kinematic
+decomposition's only operative mechanism for the hard-constraint path is `affine_strain_pair`'s
+contribution to `PhysicalPotentialEnergyTerm`'s strain - and that gate was ALREADY generalized
+to N holes in the very first bug fix this session made (`decomposed || hard_constraint_
+active()`, in the "Follow-up" section above). The single-hole `decomposition_applicable`
+gate's OTHER effect (retargeting the soft `hole_free` term's own point-set/affine-target) is
+dead code under hard-constraint mode regardless of N (that term is unconditionally skipped).
+So there was nothing left to generalize under that name - the earlier framing to the user was
+imprecise, corrected here rather than silently re-doing already-complete work.
+
+**The real remaining single-hole-only accuracy machinery was `UserGeometry::coordinate_
+embedding()`** - `CoordinateEmbedding::SingleHoleChart` hands the network 7 explicit hole-
+relative features (`r, log_r, c2, s2, psi, psi*c2, psi*s2` - polar-like invariants computed
+relative to the hole's own center/radius) for a single-hole geometry; every multi-hole geometry
+fell back to bare `Raw` (3 raw coordinate columns, no geometric hole-awareness at all) -
+`SingleHoleChart`'s own doc comment already flagged this exact gap ("Multi-hole enrichment is
+intentionally deferred until it has an unambiguous benchmark"). This session's own real finding
+(three independent hyperparameter experiments reproducing an identical Kt) is that unambiguous
+benchmark. **Closed**: `CoordinateEmbedding::MultiHoleChart` (`pinn-core/src/user_geometry.rs`)
+computes the same 7 features independently for EVERY hole (not just `Free` ones - a `Fixed`
+hole's own local stress concentration needs geometric awareness too) and concatenates them
+(`3 + 7*N` total input width). `holes.len()==1` still returns the exact pre-existing
+`SingleHoleChart` unchanged - every single-hole spec's embedding, and every test/call site
+pattern-matching `SingleHoleChart` directly, stays byte-identical. `network::multi_chart_embed`
+is the N-hole forward-pass counterpart of `chart_embed`, proven to reduce byte-identically to
+it at N=1 and to compute each hole's own known-boundary-point values independently and
+correctly for N=2 (3 new tests). Because `CoordinateEmbedding` now holds a runtime-length
+`Vec<HoleChartParams>`, it can no longer be `Copy` (only `Clone`) - a real, disclosed,
+mechanical ripple through every call site that relied on that (the compiler's own exhaustive
+list), fixed with `.clone()` at each one (cheap - a small `Vec`, never on a per-step hot path).
+
+**A real, separate bug this exposed and fixed, unrelated to the embedding itself**:
+`probe_boundary_residuals`'s hole-ring loop used a bare `geometry.coordinate_embedding()`
+instead of the model-aware `embedding_for_model(model, geometry)` - harmless while every
+multi-hole geometry's "default" embedding was `Raw` (any model built for that geometry was
+also 3-wide, so the two coincidentally always agreed), but a real shape-mismatch panic the
+instant `coordinate_embedding()` started returning a wider `MultiHoleChart` for a geometry
+whose actual passed-in model was narrower (caught by `probe_load_transfer_handles_a_geometry_
+with_holes`, an existing test that happened to construct exactly this scenario). Fixed to match
+this file's own established `embedding_for_model` convention.
+
+**Real result: this genuinely closes a real architectural gap (the network now has explicit
+geometric awareness of every hole, not just one), but it did NOT move the trained Kt for
+`triple_hole_plate.toml`'s real geometry** - a live per-step Kt check showed the identical
+`hole0=2.507, hole2=2.507` (matching to 4 significant figures) with the wider, hole-aware
+embedding as without it. Combined with the earlier three negative experiments (collocation
+density, network capacity, learning rate), this is now **five independent structural/
+hyperparameter axes**, each cleanly falsified as the explanation for the remaining Kt gap:
+
+1. `hole_bias_fraction` 0.4 → 1.0 (2x near-hole collocation density per Free hole)
+2. `hidden_dim` 64 → 128 (2x network capacity)
+3. `training.lr` 1e-3 → 5e-3 (5x peak learning rate)
+4. `Raw` → `MultiHoleChart` coordinate embedding (explicit hole-relative geometric features)
+5. Extending `hole_bias_fraction`'s sampling bias to the `Fixed` hole too, not just `Free`
+   holes (tested as a throwaway experimental edit, reverted after showing no effect - the
+   `Fixed` hole getting zero extra near-hole collocation density was a real, plausible,
+   cheaply-testable hypothesis that turned out not to be the cause either)
+
+**Updated working conclusion.** Five clean falsifications of "the network can't represent/find
+the right answer" (data, capacity, optimizer, features, sampling) is strong evidence AGAINST a
+representation or optimization-search explanation and FOR a genuine, systematic property of the
+Π functional itself as currently formulated/discretized for this geometry - i.e., Kt≈2.507
+plausibly IS the true minimizer of the SAMPLED, measure-aware Monte-Carlo Π estimate this
+codebase computes, and the ~12-20% gap versus FEM reflects a genuine difference between what
+that estimator converges to and what a direct stiffness-matrix FEM solve computes for a
+multi-hole geometry specifically - not a training deficiency. **This is now a formulation-
+level question, not a hyperparameter-search one**, and pursuing it further needs a different
+kind of work: auditing the Π estimator's own mathematical correctness for N holes specifically
+(e.g., whether `hole_bias_quadrature_weights`'s area bookkeeping, or the FD stencil step size
+relative to the SMALLEST hole's own radius, introduces a systematic - not just noisy - bias
+for a multi-hole domain that a single-hole domain's own already-validated formulation doesn't
+have). Genuinely out of scope for further blind hyperparameter iteration; a real, scoped,
+disclosed open item for a future, more rigorous mathematical audit.

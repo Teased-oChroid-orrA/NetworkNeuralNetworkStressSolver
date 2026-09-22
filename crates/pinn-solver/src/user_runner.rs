@@ -256,7 +256,7 @@ fn run_annular_decomposition_training_inner(
             &config, &problem, &fd, &hole_fd,
             &annulus_data, &outer_data,
             scales.u_ref, scales.ref_energy, scales.ref_stress2, spec.geometry.n_fourier(),
-            annulus_embedding, diagnostic_steps.contains(&step) || grad_norm_probe_step, step,
+            annulus_embedding.clone(), diagnostic_steps.contains(&step) || grad_norm_probe_step, step,
         );
         // One-step lag: this step's own per-term losses aren't known until `step_physics_multi`
         // runs below, so (like every LR schedule) this reacts to the LAST observed reading.

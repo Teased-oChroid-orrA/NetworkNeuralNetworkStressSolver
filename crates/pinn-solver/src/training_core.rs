@@ -1448,7 +1448,7 @@ pub(crate) fn stencil_forward_with_ansatz<Bk: Backend<Device = BDevice>>(
     } else {
         panic!("unsupported domain input width {}; expected raw 3 or geometry-chart {}", model.input_dim(), coordinate_embedding.input_dim());
     };
-    let raw_net = fwd_embedded_masked::<Bk>(model, stencil, model_embedding, device, forward_mask);
+    let raw_net = fwd_embedded_masked::<Bk>(model, stencil, model_embedding.clone(), device, forward_mask);
     debug_assert_eq!(raw_net.dims()[0], m, "stencil row count must match 5*n_pts");
     let dx_t = Tensor::<Bk, 2>::from_data(TensorData::new(dx_v, vec![m, 1]), device);
     let dy_t = Tensor::<Bk, 2>::from_data(TensorData::new(dy_v, vec![m, 1]), device);
@@ -1492,7 +1492,7 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
     // comment on `MultiStepCtx`) is non-zero for the plate path specifically, when its
     // geometry has a hole (`UserGeometry::n_fourier`) - the pin-lug path stays at 0,
     // byte-identical to before this field existed.
-    let coordinate_embedding = ctx.coordinate_embedding;
+    let coordinate_embedding = ctx.coordinate_embedding.clone();
 
     let mut needed: Vec<(DomainId, &'static str)> = Vec::new();
     // (domain, point_set) pairs at least one active term needs the Hessian for - see
@@ -1576,7 +1576,7 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
         // behavior: same operations, same order, just no longer duplicated.
         let (raw, model_embedding) = stencil_forward_with_ansatz::<Bk>(
             model, ansatz, norm_pts, point_fd, ctx.k, u_ref_f64, px, is_mdem,
-            coordinate_embedding, forward_masks[model_idx], device,
+            coordinate_embedding.clone(), forward_masks[model_idx], device,
         );
         let raw_out = raw.clone().slice([0..n_pts, 0..raw.dims()[1]]);
         // Direct σ at the 4 FD-shifted positions - zero extra forward pass, just extracting

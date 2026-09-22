@@ -621,7 +621,7 @@ impl FrozenMultiStepCtx {
             dynamic_lam_non_tension_cap: ctx.dynamic_lam_non_tension_cap,
             constitutive_consistency_weight: ctx.constitutive_consistency_weight,
             n_fourier: ctx.n_fourier,
-            coordinate_embedding: ctx.coordinate_embedding,
+            coordinate_embedding: ctx.coordinate_embedding.clone(),
             phase2_active: ctx.phase2_active,
         }
     }
@@ -653,7 +653,7 @@ impl FrozenMultiStepCtx {
             dynamic_lam_non_tension_cap: self.dynamic_lam_non_tension_cap,
             constitutive_consistency_weight: self.constitutive_consistency_weight,
             n_fourier: self.n_fourier,
-            coordinate_embedding: self.coordinate_embedding,
+            coordinate_embedding: self.coordinate_embedding.clone(),
             // Not tracked by `FrozenMultiStepCtx` (same rationale as `step` above) - term-
             // gradient probing is a dedicated-diagnostic-only concern, never needed on the
             // L-BFGS/Converge path this reconstructs for.

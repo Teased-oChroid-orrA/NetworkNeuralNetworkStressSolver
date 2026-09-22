@@ -1016,6 +1016,31 @@ fn chart_embed<Bk: Backend>(
     Tensor::cat(cols, 1)
 }
 
+/// Issue #78: N-hole generalization of [`chart_embed`] - computes the SAME 7 hole-relative
+/// features independently for EVERY hole (own `center_norm`/`inv_radius`), concatenating all
+/// of them after the raw 3-column prefix (`3 + 7*N` total, matching `CoordinateEmbedding::
+/// MultiHoleChart::input_dim`'s own formula). Deliberately no Fourier terms here - see that
+/// variant's own doc comment for why. Reuses [`chart_embed`]'s exact per-hole math (calling it
+/// once per hole and dropping each call's own raw-prefix copy after the first) rather than
+/// duplicating the 7-feature formula a second time - one arithmetic implementation, N
+/// evaluations.
+fn multi_chart_embed<Bk: Backend>(
+    input: Tensor<Bk, 2>,
+    holes: &[pinn_core::user_geometry::HoleChartParams],
+    epsilon: f32,
+) -> Tensor<Bk, 2> {
+    let n = input.dims()[0];
+    let mut cols = vec![input.clone()];
+    for hole in holes {
+        // `chart_embed` returns `[input, r, log_r, c2, s2, psi, psi*c2, psi*s2]` (10 columns);
+        // only the 7 derived columns (everything after the raw-input prefix) are needed here -
+        // the raw prefix is added exactly once, above, not once per hole.
+        let per_hole = chart_embed::<Bk>(input.clone(), hole.center_norm, hole.inv_radius, epsilon, 0);
+        cols.push(per_hole.slice([0..n, 3..10]));
+    }
+    Tensor::cat(cols, 1)
+}
+
 /// Issue #77 Phase 3 architectural redesign: `(ξ, cosθ, sinθ)` — `ξ = ln(r)` in the SAME
 /// hole-relative normalized units `chart_embed`'s own `qx,qy` already use (`inv_radius` scales
 /// physical distance so `r=1` exactly at the hole boundary, making `ξ=0` there and `ξ<0`
@@ -1068,6 +1093,8 @@ pub fn fwd_embedded_masked<Bk: Backend>(
             chart_embed(input, center_norm, inv_radius, epsilon, n_fourier),
         CoordinateEmbedding::LogPolar { center_norm, inv_radius, epsilon } =>
             log_polar_embed(input, center_norm, inv_radius, epsilon),
+        CoordinateEmbedding::MultiHoleChart { ref holes, epsilon } =>
+            multi_chart_embed(input, holes, epsilon),
     };
     model.forward_with_coordinates_masked(embedded, coords, mask)
 }
@@ -1238,6 +1265,82 @@ mod tests {
         let expected = -std::f32::consts::PI;
         assert!((fd_deriv - expected).abs() / expected.abs() < 2e-3,
             "fd_deriv={fd_deriv} expected={expected}");
+    }
+
+    // ─── Issue #78: N-hole chart embedding (`multi_chart_embed`) ─────────────────────────
+
+    #[test]
+    fn multi_chart_embed_dimension_matches_coordinate_embedding_input_dim_formula() {
+        use crate::training_core::{BDevice, BInner};
+        use pinn_core::user_geometry::{CoordinateEmbedding, HoleChartParams};
+        let device = BDevice::default();
+        for n in [1usize, 2, 3, 5] {
+            let holes: Vec<HoleChartParams> = (0..n).map(|i| HoleChartParams {
+                center_norm: [0.1 * i as f32, -0.1 * i as f32], inv_radius: [20.0, 10.0],
+            }).collect();
+            let input = Tensor::<BInner, 2>::from_data(
+                TensorData::new(vec![0.30, -0.25, 0.0], vec![1, 3]), &device,
+            );
+            let dims = multi_chart_embed::<BInner>(input, &holes, 1e-4).dims();
+            let expected = CoordinateEmbedding::MultiHoleChart { holes: holes.clone(), epsilon: 1e-4 }.input_dim();
+            assert_eq!(dims, [1, expected], "n={n}: multi_chart_embed width must match CoordinateEmbedding::input_dim()'s own formula");
+        }
+    }
+
+    /// N=1 must reduce byte-identically to `chart_embed`'s own output - the same load-bearing
+    /// regression discipline this codebase used for `AnnulusAnsatz::MultiHoleHardConstraint`'s
+    /// own N=1 case (`kirsch_hole_correction.rs`).
+    #[test]
+    fn multi_chart_embed_reduces_to_chart_embed_when_n_equals_one() {
+        use crate::training_core::{BDevice, BInner};
+        use pinn_core::user_geometry::HoleChartParams;
+        let device = BDevice::default();
+        let input = Tensor::<BInner, 2>::from_data(
+            TensorData::new(vec![0.30, -0.25, 0.0, -0.1, 0.4, 0.0], vec![2, 3]), &device,
+        );
+        let single: Vec<f32> = chart_embed(input.clone(), [0.25, -0.25], [20.0, 10.0], 1e-4, 0)
+            .into_data().to_vec().unwrap();
+        let multi: Vec<f32> = multi_chart_embed::<BInner>(
+            input,
+            &[HoleChartParams { center_norm: [0.25, -0.25], inv_radius: [20.0, 10.0] }],
+            1e-4,
+        ).into_data().to_vec().unwrap();
+        assert_eq!(single, multi);
+    }
+
+    /// Real, per-hole correctness proof: for TWO holes, a point on hole A's own boundary must
+    /// show hole A's own 7-feature block at exactly the same known values
+    /// `chart_embed_preserves_raw_coordinates_and_encodes_known_boundary_point` already proves
+    /// for the single-hole case, while hole B's own block (evaluated at the SAME physical
+    /// point, relative to hole B's own different center/radius) is simply whatever that
+    /// hole's own chart formula gives there - not a boundary point for hole B, so no special
+    /// value is asserted for it beyond being finite and distinct from hole A's block.
+    #[test]
+    fn multi_chart_embed_encodes_each_holes_own_known_boundary_point_independently() {
+        use crate::training_core::{BDevice, BInner};
+        use pinn_core::user_geometry::HoleChartParams;
+        let device = BDevice::default();
+        // Point (0.30, -0.25) is exactly one physical hole-radius away from hole A's center
+        // (0.25, -0.25) at inv_radius=[20,10] - the same known boundary point the single-hole
+        // test above already establishes.
+        let input = Tensor::<BInner, 2>::from_data(
+            TensorData::new(vec![0.30, -0.25, 0.0], vec![1, 3]), &device,
+        );
+        let hole_a = HoleChartParams { center_norm: [0.25, -0.25], inv_radius: [20.0, 10.0] };
+        let hole_b = HoleChartParams { center_norm: [-0.4, 0.1], inv_radius: [15.0, 15.0] };
+        let values: Vec<f32> = multi_chart_embed::<BInner>(input, &[hole_a, hole_b], 1e-4)
+            .into_data().to_vec().unwrap();
+        // Layout: [raw x, raw y, raw z, hole_a's 7 columns, hole_b's 7 columns].
+        assert_eq!(&values[..3], &[0.30, -0.25, 0.0]);
+        let a = &values[3..10];
+        assert!((a[0] - 1.0).abs() < 1e-5, "hole A r={}", a[0]); // r
+        assert!(a[1].abs() < 1e-5, "hole A log_r={}", a[1]); // log_r
+        assert!((a[2] - 1.0).abs() < 1e-5, "hole A c2={}", a[2]);
+        assert!(a[3].abs() < 1e-5, "hole A s2={}", a[3]);
+        assert!((a[4] - 1.0).abs() < 1e-5, "hole A psi={}", a[4]);
+        let b = &values[10..17];
+        assert!(b.iter().all(|v| v.is_finite()), "hole B block must be finite: {b:?}");
+        assert_ne!(a, b, "hole A and hole B's own blocks must differ - this point is on A's boundary, not B's");
     }
 
     /// Issue #62 PH3-11: real, verified evidence that `Backend::seed` immediately before

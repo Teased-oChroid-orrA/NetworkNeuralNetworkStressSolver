@@ -2953,7 +2953,14 @@ pub fn probe_boundary_residuals(
         let n_h = set.points.len();
         if n_h == 0 { continue; }
         let ring_norm: Vec<[f32; 2]> = set.points.iter().map(|p| norm_pt(p.x, p.y)).collect();
-        let raw = fwd_embedded::<BInner>(model, norm_pts_to_tensor::<BInner>(&ring_norm, device), geometry.coordinate_embedding(), device);
+        // Issue #78: `embedding_for_model` (model-aware), not a bare `geometry.coordinate_
+        // embedding()` - the latter assumes the PASSED-IN model was built with the geometry's
+        // own "default" embedding, which stopped holding the instant `coordinate_embedding()`
+        // started returning `MultiHoleChart` for N>1 holes (a real shape-mismatch panic this
+        // exact call site hit against a `tiny_model_raw()`-style narrower test model, on a
+        // multi-hole geometry - the same model/geometry-embedding-mismatch class of bug
+        // `embedding_for_model` itself exists to prevent everywhere else in this file).
+        let raw = fwd_embedded::<BInner>(model, norm_pts_to_tensor::<BInner>(&ring_norm, device), embedding_for_model(model, geometry), device);
         let (dx_v, dy_v, add_x_v, add_y_v): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) = {
             let mut dx_v = Vec::with_capacity(n_h);
             let mut dy_v = Vec::with_capacity(n_h);

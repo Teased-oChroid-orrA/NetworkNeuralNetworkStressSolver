@@ -134,10 +134,21 @@ building that fix surfaced (2) a real, previously-invisible mirror-symmetry bug 
 tool's rigid-body-pin scheme (fixed, 6 new regression tests, proven zero-effect on every prior
 all-Free number). (3) The flat-loss-plateau this document's own earlier section flagged as
 unresolved is now definitively diagnosed (real convergence to a robust local optimum, not
-masked progress - proven via a new live per-step Kt diagnostic and three hyperparameter
-experiments that all reproduced the identical result) - not yet closed (would need kinematic
-decomposition generalized to N holes too, real future work). See the investigation doc's own
-"Follow-up" section for the full record.
+masked progress - proven via a new live per-step Kt diagnostic). See the investigation doc's
+own "Follow-up" section for the full record.
+
+**Second follow-up (same session): `CoordinateEmbedding::MultiHoleChart` closes a real,
+previously-open gap - the N-hole generalization of `SingleHoleChart`'s own hole-relative
+geometric features (every multi-hole geometry used to fall back to raw coordinates, zero
+geometric hole-awareness). A real bug in `probe_boundary_residuals` this exposed is also fixed.
+This did NOT move the trained Kt, joining three earlier hyperparameter experiments as a
+FIFTH independently falsified hypothesis (data density, capacity, learning rate, coordinate
+embedding, Fixed-hole sampling bias - all reproduce the identical converged Kt). Working
+conclusion, updated from "needs kinematic decomposition generalized to N holes" (which turned
+out to already be done): the remaining gap looks like a genuine property of the Π functional's
+own formulation for a multi-hole domain, not a training/representation deficiency - a
+formulation-level audit, not further hyperparameter search, is the real next step. See the
+investigation doc's own "Second follow-up" section for the full record.
 
 ## Future epic (not this one): arbitrary boundary shape, inner and outer
 
