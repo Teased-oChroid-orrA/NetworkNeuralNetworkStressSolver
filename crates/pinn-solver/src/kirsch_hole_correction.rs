@@ -194,8 +194,21 @@ pub struct HoleTractionFreeAnsatz {
     pub u_ref: f64,
     /// Issue #78 root-cause fix: see [`traction_free_envelope_scaled`]'s own doc comment for
     /// the full derivation. `1.0` = byte-identical to every pre-#78 caller (the exact original
-    /// `traction_free_envelope` saturation rate).
+    /// `traction_free_envelope` saturation rate). Meaningless (ignored, see `trainable` below)
+    /// when `trainable=true` - kept populated with the closed-form-derived value anyway so it
+    /// still serves as the INITIAL value a trainable model's own `hole_scales` `Param` is
+    /// seeded from.
     pub saturation_scale: f64,
+    /// Issue #78 item 3: when `true`, `eval()` returns `(1.0, 1.0)` (no host-computed envelope
+    /// at all) and `trainable_envelope_holes()` reports this hole so the CALLER
+    /// (`training_core::stencil_forward_with_ansatz`) computes the envelope itself, as a
+    /// differentiable tensor operation against the owning model's own `hole_scales: Vec<Param<
+    /// Tensor<B,1>>>` - gradient can then reach `saturation_scale` itself via backprop, unlike
+    /// the fixed/derived path above (host `f32` math, baked into a constant tensor, zero
+    /// autodiff connection). `false` (default) is byte-identical to every pre-#78-item-3
+    /// caller - this field did not exist before, every construction site sets it explicitly
+    /// (the compiler enumerates them), and `false` is a true no-op besides.
+    pub trainable: bool,
 }
 
 impl HoleTractionFreeAnsatz {
@@ -206,6 +219,12 @@ impl HoleTractionFreeAnsatz {
 
 impl pinn_core::problem::DirichletAnsatz for HoleTractionFreeAnsatz {
     fn eval(&self, xn: f32, yn: f32, _k: f32) -> (f32, f32) {
+        if self.trainable {
+            // The envelope is computed EXTERNALLY as a tensor op (see `trainable_envelope_
+            // holes` below) - (1.0, 1.0) here means "no suppression from this host path",
+            // the caller entirely replaces this contribution.
+            return (1.0, 1.0);
+        }
         let (x, y) = self.physical_xy(xn, yn);
         let phi = traction_free_envelope_scaled(x, y, self.hole_radius, self.saturation_scale) as f32;
         (phi, phi)
@@ -219,6 +238,14 @@ impl pinn_core::problem::DirichletAnsatz for HoleTractionFreeAnsatz {
         let same_hole = (hole_center[0] - self.hole_center[0]).abs() < 1e-12
             && (hole_center[1] - self.hole_center[1]).abs() < 1e-12;
         same_hole.then_some(self.saturation_scale)
+    }
+    fn trainable_envelope_holes(&self) -> Option<Vec<pinn_core::problem::TrainableEnvelopeHole>> {
+        self.trainable.then(|| vec![pinn_core::problem::TrainableEnvelopeHole {
+            hole_center: self.hole_center,
+            hole_radius: self.hole_radius,
+            half_w: self.half_w,
+            half_h: self.half_h,
+        }])
     }
 }
 
@@ -309,6 +336,21 @@ impl pinn_core::problem::DirichletAnsatz for AnnulusAnsatz {
             AnnulusAnsatz::HardConstraint(a) => a.saturation_scale_near(hole_center),
             AnnulusAnsatz::MultiHoleHardConstraint(holes) => {
                 holes.iter().find_map(|h| h.saturation_scale_near(hole_center))
+            }
+        }
+    }
+    fn trainable_envelope_holes(&self) -> Option<Vec<pinn_core::problem::TrainableEnvelopeHole>> {
+        match self {
+            AnnulusAnsatz::Identity => None,
+            AnnulusAnsatz::HardConstraint(a) => a.trainable_envelope_holes(),
+            AnnulusAnsatz::MultiHoleHardConstraint(holes) => {
+                // Every trainable hole contributes its own entry, in `holes`' own order - this
+                // order is load-bearing: the CALLER indexes the owning model's `hole_scales:
+                // Vec<Param<...>>` positionally against this same order (see `training_core::
+                // stencil_forward_with_ansatz`). Holes with `trainable=false` contribute
+                // nothing here (their envelope stays host-computed via `eval()`, unaffected).
+                let out: Vec<_> = holes.iter().filter_map(|h| h.trainable_envelope_holes()).flatten().collect();
+                (!out.is_empty()).then_some(out)
             }
         }
     }
@@ -519,8 +561,8 @@ mod tests {
         let h = 1e-7_f64;
 
         let holes = [
-            HoleTractionFreeAnsatz { hole_center: [-0.06, 0.02], hole_radius: a, half_w: 0.15, half_h: 0.06, px, py, e: E, nu: NU, u_ref: 1.0, saturation_scale: scale },
-            HoleTractionFreeAnsatz { hole_center: [0.06, 0.02], hole_radius: a, half_w: 0.15, half_h: 0.06, px, py, e: E, nu: NU, u_ref: 1.0, saturation_scale: scale },
+            HoleTractionFreeAnsatz { hole_center: [-0.06, 0.02], hole_radius: a, half_w: 0.15, half_h: 0.06, px, py, e: E, nu: NU, u_ref: 1.0, saturation_scale: scale, trainable: false },
+            HoleTractionFreeAnsatz { hole_center: [0.06, 0.02], hole_radius: a, half_w: 0.15, half_h: 0.06, px, py, e: E, nu: NU, u_ref: 1.0, saturation_scale: scale, trainable: false },
         ];
         let a_exx = (px - NU * py) / E;
         let a_eyy = (py - NU * px) / E;
@@ -577,7 +619,7 @@ mod tests {
         HoleTractionFreeAnsatz {
             hole_center: [0.0, 0.0], hole_radius: 0.005,
             half_w: 0.1, half_h: 0.1, px: 6.9e7, py: 2.0e7,
-            e: E, nu: NU, u_ref: 1e-3, saturation_scale: 1.0,
+            e: E, nu: NU, u_ref: 1e-3, saturation_scale: 1.0, trainable: false,
         }
     }
 
@@ -604,11 +646,11 @@ mod tests {
     fn multi_hole_envelope_is_exactly_zero_at_every_holes_own_boundary_for_two_holes() {
         let hole0 = HoleTractionFreeAnsatz {
             hole_center: [-0.03, 0.0], hole_radius: 0.01,
-            half_w: 0.1, half_h: 0.05, px: 6.9e7, py: 0.0, e: E, nu: NU, u_ref: 1e-3, saturation_scale: 1.0,
+            half_w: 0.1, half_h: 0.05, px: 6.9e7, py: 0.0, e: E, nu: NU, u_ref: 1e-3, saturation_scale: 1.0, trainable: false,
         };
         let hole1 = HoleTractionFreeAnsatz {
             hole_center: [0.03, 0.0], hole_radius: 0.008,
-            half_w: 0.1, half_h: 0.05, px: 6.9e7, py: 0.0, e: E, nu: NU, u_ref: 1e-3, saturation_scale: 1.0,
+            half_w: 0.1, half_h: 0.05, px: 6.9e7, py: 0.0, e: E, nu: NU, u_ref: 1e-3, saturation_scale: 1.0, trainable: false,
         };
         let ansatz = AnnulusAnsatz::MultiHoleHardConstraint(vec![hole0, hole1]);
         for theta in [0.0_f64, 0.9, 2.1, 3.4, 4.8] {

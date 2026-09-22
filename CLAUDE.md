@@ -1200,3 +1200,64 @@ redirection, so it entered a genuinely live training session rather than failing
 first expected - which is how the stdout-corruption gap above was actually found). A real
 mouse/keyboard-driven interactive session was NOT performed - not possible from this sandbox,
 the same disclosed gap every other GUI-adjacent feature in this file already carries.
+
+## Issue #78 item 3: genuinely trainable (gradient-descent) `saturation_scale`, opt-in
+
+`ArchitectureSpec.trainable_saturation_scale: bool` (`#[serde(default)]` false) makes each
+Free hole's own `HoleTractionFreeAnsatz.saturation_scale` a real `burn` `Param<Tensor<B,1>>`,
+gradient-trained alongside the network's own weights, instead of only ever the closed-form-
+derived fixed value (item 2). Only applies once `holes.len() > 1` (N=1's `saturation_scale=1.0`
+is exact by construction - nothing to learn there), and only when explicitly opted into.
+
+**The real, load-bearing engineering fact this design turns on**: the ansatz's envelope was
+previously computed ENTIRELY in host `f32` math (`traction_free_envelope_scaled`), baked into a
+constant tensor via `Tensor::from_data` before the network's forward pass even runs - zero
+autodiff connection, so gradient could never reach `saturation_scale` no matter how it was
+stored. Making it trainable required moving the envelope computation itself into TENSOR space:
+a new `training_core::trainable_envelope_hole_phi_tensor` recomputes `phi = 1-exp(-(scale*(r-a)
+/a)^2)` using burn tensor ops (`sub_scalar`/`mul_scalar`/`powf_scalar`/`sqrt`/`exp`) against the
+model's own `hole_scales: Vec<Param<Tensor<B,1>>>`, invoked from `stencil_forward_with_ansatz`
+only when `ansatz.trainable_envelope_holes()` (a new default-`None` `DirichletAnsatz` trait
+method) reports trainable holes - `eval()` for those holes returns `(1.0,1.0)` (no host
+suppression), and this tensor computation entirely replaces that contribution.
+
+**Real correctness proof before trusting any training run**: `trainable_envelope_hole_phi_
+tensor` matches the pure-host `traction_free_envelope_scaled` formula to `1e-4` at real
+geometry/scale values (`trainable_envelope_hole_phi_tensor_matches_host_traction_free_envelope_
+scaled_at_a_fixed_scale`), AND a real `.backward()` call through it gives the scale `Param` a
+nonzero gradient with the analytically-expected sign (`..._gradient_flows_to_scale_with_
+expected_sign`) - both new, passing unit tests, checked BEFORE any real GPU training run.
+
+**Ripple, compiler-enumerated, mechanical**: `ElasticityNet` gained `hole_scales` + `hole_
+scale_ids()`/`hole_scales()`/`with_hole_scales()` (~6 construction sites fixed);
+`DomainOptim` gained a 4th `hole_scale: GateOptim` field, reusing `GateOptim`'s own type (same
+small-scalar-Param optimizer role `gate` already has) rather than inventing a new optimizer type
+- wired through `step_physics_multi`'s own per-domain step (mirrors the `gate` step exactly,
+same LR treatment via `alpha_lr_mult`) and ~58 `DomainOptim` construction sites across the
+crate; `HoleTractionFreeAnsatz` gained `trainable: bool` (17 construction sites fixed). Every
+one of these is a genuine no-op (empty `Vec`, `trainable=false`) for every existing/default
+config - the SAME "empty means completely inert" precedent `gates`/`use_piratenet=false`
+already established, not a new pattern.
+
+**Real end-to-end verification**: N=1 (`issue_77_l5_hard_constraint.toml`) stayed byte-verified
+unchanged - `Kt=2.4443`, matches PH4-42's documented value exactly (the flag is a structural
+no-op there). N=3 (`triple_hole_plate.toml` geometry) with `trainable_saturation_scale=true`
+trained successfully end to end (3000 steps, no crash): hole0/hole2 Kt=2.893/2.994 - comparable
+to the fixed-derived path's own 2.884/3.032, healthy load transfer ratio (1.019), non-trivial
+displacement. **Decisive evidence the mechanism genuinely works, not just compiles**: a real
+900-step run's new diagnostic print (`[diag] trainable hole_scales[i]: seed=... final=...`)
+showed the learned scale moving from its derived seed (`30.0000`) to `30.2230`/`30.0567` - small
+but real, gradient-descent-driven movement in 900 steps, not frozen at the seed.
+
+Full regression suite: 565 passed (+2 net new), same 1 pre-existing unrelated failure
+(`compute_loss_for_lbfgs_panics_on_lams_missing_a_real_term_key`), zero regressions.
+
+**Honestly still open**: checkpoint save/load round-trip of a trained `hole_scales` is NOT
+independently verified (burn's own `#[derive(Module)]` should serialize `Param` fields
+automatically, same mechanism `gates` already relies on, but this specific field's round-trip
+was not exercised end to end this session). A resumed run currently RE-SEEDS `hole_scales` from
+the closed-form-derived value rather than continuing from a checkpoint's own trained value (see
+`runner.rs::run_user_problem_training_from`'s own comment) - a real, disclosed v1 limitation,
+not a crash. The observed scale movement (900 steps, ~0.2-0.7% relative) is small - whether a
+longer run or a different `alpha_lr_mult` would move it further is a real, untested question,
+not assumed either way.

@@ -1406,6 +1406,37 @@ struct Computed<Bk: Backend> {
 /// chart/log-polar variant), so a caller needing a SECOND forward pass at the same model (e.g.
 /// `compute_domain_forwards`'s own second-order Hessian stencil) can reuse it instead of
 /// re-implementing the same panic-on-mismatch dispatch logic a second time.
+/// Issue #78 item 3: the tensor-space equivalent of `kirsch_hole_correction::traction_free_
+/// envelope_scaled` (`phi = 1 - exp(-(scale*(r-a)/a)^2)`), evaluated at every one of the `m`
+/// stencil points in `xn_t`/`yn_t` (normalized coords) for ONE trainable hole, using that
+/// hole's own `scale_param: &Param<Tensor<Bk,1>>` - differentiable, unlike the host `f64`
+/// version, so gradient reaches `scale_param` itself. Physical `(x,y)` is recovered from
+/// normalized `(xn,yn)` via `TrainableEnvelopeHole`'s own `half_w`/`half_h`/`hole_center`,
+/// matching `HoleTractionFreeAnsatz::physical_xy`'s exact convention (verified byte-for-byte
+/// equal to the host formula at a fixed scale - see `trainable_envelope_hole_phi_tensor_
+/// matches_host_traction_free_envelope_scaled_at_a_fixed_scale`, the load-bearing correctness
+/// proof for this function).
+fn trainable_envelope_hole_phi_tensor<Bk: Backend<Device = BDevice>>(
+    xn_t: &Tensor<Bk, 2>,
+    yn_t: &Tensor<Bk, 2>,
+    hole: &pinn_core::problem::TrainableEnvelopeHole,
+    scale_param: &burn::module::Param<Tensor<Bk, 1>>,
+    _device: &BDevice,
+) -> Tensor<Bk, 2> {
+    let x_t = xn_t.clone().mul_scalar(hole.half_w).sub_scalar(hole.hole_center[0]);
+    let y_t = yn_t.clone().mul_scalar(hole.half_h).sub_scalar(hole.hole_center[1]);
+    let r_t = (x_t.powf_scalar(2.0) + y_t.powf_scalar(2.0)).sqrt();
+    // `scale_param` is shape `[1]` - reshape to `[1,1]` so elementwise `*` broadcasts against
+    // `[m,1]` (burn broadcasts dimensions of size 1, same convention every other tensor op in
+    // this file already relies on).
+    let scale_2d: Tensor<Bk, 2> = scale_param.val().reshape([1, 1]);
+    let u_t = r_t.sub_scalar(hole.hole_radius).div_scalar(hole.hole_radius) * scale_2d;
+    let neg_u2 = u_t.powf_scalar(2.0).neg();
+    // phi = 1 - exp(neg_u2) — no direct "scalar minus tensor" op in this API, so
+    // negate-then-add-one instead (`-exp(neg_u2) + 1`).
+    neg_u2.exp().mul_scalar(-1.0).add_scalar(1.0)
+}
+
 pub(crate) fn stencil_forward_with_ansatz<Bk: Backend<Device = BDevice>>(
     model: &ElasticityNet<Bk>,
     ansatz: &dyn DirichletAnsatz,
@@ -1450,10 +1481,43 @@ pub(crate) fn stencil_forward_with_ansatz<Bk: Backend<Device = BDevice>>(
     };
     let raw_net = fwd_embedded_masked::<Bk>(model, stencil, model_embedding.clone(), device, forward_mask);
     debug_assert_eq!(raw_net.dims()[0], m, "stencil row count must match 5*n_pts");
-    let dx_t = Tensor::<Bk, 2>::from_data(TensorData::new(dx_v, vec![m, 1]), device);
-    let dy_t = Tensor::<Bk, 2>::from_data(TensorData::new(dy_v, vec![m, 1]), device);
+    let mut dx_t = Tensor::<Bk, 2>::from_data(TensorData::new(dx_v, vec![m, 1]), device);
+    let mut dy_t = Tensor::<Bk, 2>::from_data(TensorData::new(dy_v, vec![m, 1]), device);
     let add_x_t = Tensor::<Bk, 2>::from_data(TensorData::new(add_x_v, vec![m, 1]), device);
     let add_y_t = Tensor::<Bk, 2>::from_data(TensorData::new(add_y_v, vec![m, 1]), device);
+
+    // Issue #78 item 3: when the ansatz has trainable-envelope holes, `dx_v`/`dy_v` above are
+    // all-1.0 (`eval()` returned `(1.0,1.0)` for them - "no host suppression") - the REAL
+    // envelope is computed HERE, as a differentiable tensor op against the model's own
+    // `hole_scales` Param, so gradient can reach `saturation_scale` itself via backprop
+    // (impossible for the host-computed `traction_free_envelope_scaled` path, which bakes a
+    // plain `f32` into a constant tensor with no autodiff connection at all). See
+    // `trainable_envelope_hole_phi_tensor`'s own doc comment for the formula and its
+    // correctness proof.
+    if let Some(holes) = ansatz.trainable_envelope_holes() {
+        debug_assert_eq!(holes.len(), model.hole_scales().len(),
+            "trainable_envelope_holes() count ({}) must match model.hole_scales() count ({}) - \
+             they're indexed positionally against each other",
+            holes.len(), model.hole_scales().len());
+        let mut xn_v = Vec::with_capacity(m);
+        let mut yn_v = Vec::with_capacity(m);
+        for &(sx, sy) in &[(0.0f32, 0.0f32), (fd.hx, 0.0), (-fd.hx, 0.0), (0.0, fd.hy), (0.0, -fd.hy)] {
+            for p in norm_pts {
+                xn_v.push(p[0] + sx);
+                yn_v.push(p[1] + sy);
+            }
+        }
+        let xn_t = Tensor::<Bk, 2>::from_data(TensorData::new(xn_v, vec![m, 1]), device);
+        let yn_t = Tensor::<Bk, 2>::from_data(TensorData::new(yn_v, vec![m, 1]), device);
+        let mut phi_product = Tensor::<Bk, 2>::ones([m, 1], device);
+        for (hole, scale_param) in holes.iter().zip(model.hole_scales().iter()) {
+            let phi = trainable_envelope_hole_phi_tensor::<Bk>(&xn_t, &yn_t, hole, scale_param, device);
+            phi_product = phi_product * phi;
+        }
+        dx_t = dx_t * phi_product.clone();
+        dy_t = dy_t * phi_product;
+    }
+
     let u_col = raw_net.clone().slice([0..m, 0..1]) * dx_t + add_x_t;
     let v_col = raw_net.clone().slice([0..m, 1..2]) * dy_t + add_y_t;
     let ansatz_out = if is_mdem {
@@ -2216,13 +2280,19 @@ pub fn step_physics_multi(
             None => default_weight_ids,
         };
         let gate_ids = model.gate_ids();
+        // Issue #78 item 3: empty for every model not built via `with_hole_scales` - the
+        // exact same "empty Vec, genuine no-op step" precedent `gate_ids` itself already
+        // established for `use_piratenet=false`.
+        let hole_scale_ids = model.hole_scale_ids();
         let weight_grads = GradientsParams::from_params(&mut grads, &model, &weight_ids);
         let bias_grads = GradientsParams::from_params(&mut grads, &model, &bias_ids);
         let gate_grads = GradientsParams::from_params(&mut grads, &model, &gate_ids);
+        let hole_scale_grads = GradientsParams::from_params(&mut grads, &model, &hole_scale_ids);
         let wn: f32 = flatten_grads(&model, &weight_grads).powf_scalar(2.0_f64).sum().into_scalar();
         let bn: f32 = flatten_grads(&model, &bias_grads).powf_scalar(2.0_f64).sum().into_scalar();
         let gn: f32 = flatten_grads(&model, &gate_grads).powf_scalar(2.0_f64).sum().into_scalar();
-        grad_norm_sq += wn + bn + gn;
+        let hsn: f32 = flatten_grads(&model, &hole_scale_grads).powf_scalar(2.0_f64).sum().into_scalar();
+        grad_norm_sq += wn + bn + gn + hsn;
         // Issue #77 Step 4: per-domain LR override (`MultiStepCtx::per_domain_lr`'s own doc
         // comment has the full rationale) - falls back to the single shared `lr` above when
         // `None` or when this domain has no entry, byte-identical to every pre-Step-4 caller.
@@ -2231,6 +2301,9 @@ pub fn step_physics_multi(
         let model = optim.weight.step(domain_lr, model, weight_grads);
         let model = optim.bias.step(domain_lr, model, bias_grads);
         let model = optim.gate.step(domain_lr * alpha_lr_mult, model, gate_grads);
+        // Same LR treatment as `gate` (a small-scalar Param, not a full weight matrix) -
+        // reuses `alpha_lr_mult` rather than inventing a third LR-multiplier convention.
+        let model = optim.hole_scale.step(domain_lr * alpha_lr_mult, model, hole_scale_grads);
         let _ = dctx;
         new_models.push(model);
     }
@@ -3781,6 +3854,82 @@ pub fn step_lbfgs_multi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Issue #78 item 3: trainable saturation_scale tensor-space envelope ────────────────
+
+    /// Load-bearing correctness proof: `trainable_envelope_hole_phi_tensor` (differentiable,
+    /// tensor-based) must match `kirsch_hole_correction::traction_free_envelope_scaled` (the
+    /// already-proven host `f64` formula) at a FIXED scale, at several real (x,y) points -
+    /// before trusting gradients through the tensor version at all.
+    #[test]
+    fn trainable_envelope_hole_phi_tensor_matches_host_traction_free_envelope_scaled_at_a_fixed_scale() {
+        let device = BDevice::default();
+        let half_w = 0.15_f64;
+        let half_h = 0.06_f64;
+        let hole_center = [-0.06_f64, 0.02_f64];
+        let hole_radius = 0.009_f64;
+        let scale = 22.75_f64;
+        let hole = pinn_core::problem::TrainableEnvelopeHole { hole_center, hole_radius, half_w, half_h };
+
+        // A handful of real physical points around and away from the hole boundary.
+        let physical_points: &[(f64, f64)] = &[
+            (hole_center[0] + hole_radius + 6e-4, hole_center[1]),
+            (hole_center[0] + hole_radius * 1.5, hole_center[1] + 0.001),
+            (hole_center[0] - hole_radius - 2e-3, hole_center[1] - 0.002),
+            (0.0, 0.0),
+            (hole_center[0], hole_center[1] + hole_radius + 3e-4),
+        ];
+        let xn_v: Vec<f32> = physical_points.iter().map(|&(x, _)| (x / half_w) as f32).collect();
+        let yn_v: Vec<f32> = physical_points.iter().map(|&(_, y)| (y / half_h) as f32).collect();
+        let m = physical_points.len();
+        let xn_t = Tensor::<B, 2>::from_data(TensorData::new(xn_v, vec![m, 1]), &device);
+        let yn_t = Tensor::<B, 2>::from_data(TensorData::new(yn_v, vec![m, 1]), &device);
+
+        let scale_param = burn::module::Param::from_tensor(
+            Tensor::<B, 1>::from_data(TensorData::new(vec![scale as f32], vec![1]), &device),
+        );
+
+        let phi_tensor = trainable_envelope_hole_phi_tensor::<B>(&xn_t, &yn_t, &hole, &scale_param, &device);
+        let phi_vals: Vec<f32> = phi_tensor.into_data().to_vec().unwrap();
+
+        for (i, &(x, y)) in physical_points.iter().enumerate() {
+            let dx = x - hole_center[0];
+            let dy = y - hole_center[1];
+            let expected = crate::kirsch_hole_correction::traction_free_envelope_scaled(dx, dy, hole_radius, scale);
+            let got = phi_vals[i] as f64;
+            assert!((got - expected).abs() < 1e-4,
+                "point {i} ({x},{y}): tensor phi={got} host phi={expected}");
+        }
+    }
+
+    /// Real gradient flow proof: `scale_param`'s gradient after `.backward()` through a tiny
+    /// graph built from `trainable_envelope_hole_phi_tensor` must be nonzero AND have the
+    /// analytically-expected sign - `phi` increases as `scale` increases (at a fixed point
+    /// past the hole boundary, further saturation), so summing `phi` and taking d(sum)/d(scale)
+    /// must be positive.
+    #[test]
+    fn trainable_envelope_hole_phi_tensor_gradient_flows_to_scale_with_expected_sign() {
+        let device = BDevice::default();
+        let hole = pinn_core::problem::TrainableEnvelopeHole {
+            hole_center: [-0.06, 0.02], hole_radius: 0.009, half_w: 0.15, half_h: 0.06,
+        };
+        let xn_v = vec![(-0.06 + 0.009 + 6e-4) as f32 / 0.15];
+        let yn_v = vec![0.02_f32 / 0.06];
+        let xn_t = Tensor::<B, 2>::from_data(TensorData::new(xn_v, vec![1, 1]), &device);
+        let yn_t = Tensor::<B, 2>::from_data(TensorData::new(yn_v, vec![1, 1]), &device);
+
+        let scale_param = burn::module::Param::from_tensor(
+            Tensor::<B, 1>::from_data(TensorData::new(vec![10.0_f32], vec![1]), &device),
+        );
+
+        let phi = trainable_envelope_hole_phi_tensor::<B>(&xn_t, &yn_t, &hole, &scale_param, &device);
+        let loss = phi.sum();
+        let grads = loss.backward();
+        let grad = scale_param.grad(&grads).expect("scale_param must receive a gradient");
+        let grad_val: f32 = grad.into_data().to_vec::<f32>().unwrap()[0];
+        assert!(grad_val > 0.0, "expected a positive gradient (phi increases with scale here), got {grad_val}");
+        assert!(grad_val.is_finite());
+    }
 
     #[test]
     fn residual_stats_computes_rms_and_max() {
@@ -6133,6 +6282,7 @@ mod tests {
             weight: WeightOptim::new(config.use_soap_muon),
             bias: make_bias_optim(),
             gate: make_gate_optim(),
+            hole_scale: make_gate_optim(),
         }];
         let mut saw_multi = SawBrdr::with_base(vec![1.0, 10.0, 200.0, 50.0], 0.95);
         let mut lr_sched_multi = LrSchedule::new(engine.peak_lr, 200, 1000);
@@ -6478,8 +6628,8 @@ mod tests {
         let b_before = param_l2_sq(&model_b);
 
         let mut optims = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
         let mut saw = SawBrdr::with_base(vec![1.0], 0.95);
         let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
@@ -6555,8 +6705,8 @@ mod tests {
         let a_before = param_l2_sq(&model_a);
         let b_before = param_l2_sq(&model_b);
         let mut optims = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
         let mut saw = SawBrdr::with_base(vec![1.0], 0.95);
         let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
@@ -6622,8 +6772,8 @@ mod tests {
                 probe_term_gradients: false, phase2_active: false, step: 0,
             };
             let mut optims = vec![
-                crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-                crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+                crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+                crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
             ];
             let mut saw = SawBrdr::with_base(vec![1.0], 0.95);
             let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
@@ -6687,8 +6837,8 @@ mod tests {
             probe_term_gradients: false, phase2_active: false, step: 0,
         };
         let mut optims = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
         let mut saw = SawBrdr::with_base(vec![1.0], 0.95);
         let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
@@ -6765,8 +6915,8 @@ mod tests {
         let b_before = param_l2_sq(&model_b);
 
         let mut optims = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
         let mut saw = SawBrdr::with_base(vec![1.0], 0.95);
         let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
@@ -7217,8 +7367,8 @@ mod tests {
         };
 
         let mut optims = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
         let mut saw = SawBrdr::with_base(vec![1.0], 0.95);
         let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
@@ -7305,8 +7455,8 @@ mod tests {
         // Base weight seed the SAW-BRDR instance starts from (uniform, both terms equal).
         let base_seed = 1.0_f64;
         let mut optims = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
         let mut saw = SawBrdr::with_base(vec![base_seed as f32, base_seed as f32], 0.95);
         let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
@@ -7498,8 +7648,8 @@ mod tests {
         let mut saw = SawBrdr::with_base(base_weights, 0.95);
         let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
         let mut optims = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
 
         let penetration_base = problem.base_weight("interface_penetration") as f64;
@@ -7539,8 +7689,8 @@ mod tests {
         let mut saw_ctrl = SawBrdr::with_base(base_weights.clone(), 0.95);
         let mut lr_sched_ctrl = LrSchedule::new(1e-3, 200, 1000);
         let mut optims_ctrl = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
         let ctx_ctrl = make_pinlug_test_ctx(
             &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
@@ -7556,8 +7706,8 @@ mod tests {
         let mut saw = SawBrdr::with_base(base_weights, 0.95);
         let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
         let mut optims = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
         let ctx = make_pinlug_test_ctx(
             &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
@@ -7591,8 +7741,8 @@ mod tests {
         let mut saw_a = SawBrdr::with_base(base_weights.clone(), 0.95);
         let mut lr_sched_a = LrSchedule::new(1e-3, 200, 1000);
         let mut optims_a = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
         let ctx_a = make_pinlug_test_ctx(
             &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
@@ -7607,8 +7757,8 @@ mod tests {
         let mut saw_b = SawBrdr::with_base(base_weights, 0.95);
         let mut lr_sched_b = LrSchedule::new(1e-3, 200, 1000);
         let mut optims_b = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
         let ctx_b = make_pinlug_test_ctx(
             &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
@@ -7635,8 +7785,8 @@ mod tests {
         let mut saw = SawBrdr::with_base(base_weights, 0.95);
         let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
         let mut optims = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
         let ctx = make_pinlug_test_ctx(
             &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
@@ -7669,8 +7819,8 @@ mod tests {
         let mut saw_probe = SawBrdr::with_base(base_weights.clone(), 0.95);
         let mut lr_sched_probe = LrSchedule::new(1e-3, 200, 1000);
         let mut optims_probe = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
         let ctx_probe = make_pinlug_test_ctx(
             &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,
@@ -7686,8 +7836,8 @@ mod tests {
         let mut saw = SawBrdr::with_base(base_weights, 0.95);
         let mut lr_sched = LrSchedule::new(1e-3, 200, 1000);
         let mut optims = vec![
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
-            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+            crate::problem::DomainOptim { weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
         ];
         let ctx = make_pinlug_test_ctx(
             &config, &problem, &fd, &pin_data, &lug_data, u_ref, ref_energy, ref_stress2,

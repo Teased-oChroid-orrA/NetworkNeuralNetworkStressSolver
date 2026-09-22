@@ -1013,11 +1013,13 @@ pub(crate) fn run_headless_pinlug_inner(
                 weight: WeightOptim::from_tier(use_soap_muon, &state.decision_maker.current_tier),
                 bias: make_bias_optim(),
                 gate: make_gate_optim(),
+                hole_scale: make_gate_optim(),
             },
             DomainOptim {
                 weight: WeightOptim::from_tier(use_soap_muon, &state.decision_maker.current_tier),
                 bias: make_bias_optim(),
                 gate: make_gate_optim(),
+                hole_scale: make_gate_optim(),
             },
         ];
         *state.lbfgs_opt = None;
@@ -1105,11 +1107,13 @@ pub(crate) fn run_headless_pinlug_inner(
             weight: WeightOptim::new(config.use_soap_muon),
             bias: make_bias_optim(),
             gate: make_gate_optim(),
+            hole_scale: make_gate_optim(),
         },
         DomainOptim {
             weight: WeightOptim::new(config.use_soap_muon),
             bias: make_bias_optim(),
             gate: make_gate_optim(),
+            hole_scale: make_gate_optim(),
         },
     ];
 
@@ -1447,11 +1451,13 @@ pub(crate) fn run_headless_pinlug_inner(
                             weight: WeightOptim::from_tier(config.use_soap_muon, &t.new_tier),
                             bias: make_bias_optim(),
                             gate: make_gate_optim(),
+                            hole_scale: make_gate_optim(),
                         },
                         DomainOptim {
                             weight: WeightOptim::from_tier(config.use_soap_muon, &t.new_tier),
                             bias: make_bias_optim(),
                             gate: make_gate_optim(),
+                            hole_scale: make_gate_optim(),
                         },
                     ];
                 }

@@ -258,6 +258,19 @@ pub struct ArchitectureSpec {
     pub coordinate_embedding: CoordinateEmbeddingSelection,
     #[serde(default = "default_training_procedure")]
     pub training_procedure: TrainingProcedure,
+    /// Issue #78 item 3: when `true` (and `hard_constraint_ansatz` is also `true`, N>1 Free
+    /// holes), each Free hole's own `saturation_scale` becomes a genuinely trainable `burn`
+    /// `Param` (gradient-descent-updated alongside the network's own weights), INITIALIZED
+    /// from the same closed-form-derived value the fixed path already computes
+    /// (`multi_hole_saturation_scale`/`target_phi_at_margin`) rather than starting from
+    /// scratch. `false` (default) is byte-identical to every pre-existing spec - this field
+    /// did not exist before item 3, and every code path that reads it treats absence as
+    /// "keep the closed-form-derived fixed value," never as an error. `N=1` (single Free hole)
+    /// ignores this flag entirely regardless of its value - that path's `saturation_scale=1.0`
+    /// is exact by construction (see `HoleTractionFreeAnsatz`'s own doc comment) and has no
+    /// meaningful "envelope steepness" left to learn.
+    #[serde(default)]
+    pub trainable_saturation_scale: bool,
 }
 
 /// The complete user-defined problem: geometry (rectangular plate + N holes), material,
@@ -495,7 +508,9 @@ mod tests {
                 hard_constraint_ansatz: true, hole_bias_fraction: 0.3,
                 coordinate_embedding: CoordinateEmbeddingSelection::LogPolar,
                 training_procedure: TrainingProcedure::SequentialTwoStage { stage_a_steps: 500, stage_b_steps: 2500 },
+                trainable_saturation_scale: false,
             },
+            ArchitectureSpec { hard_constraint_ansatz: true, trainable_saturation_scale: true, ..Default::default() },
         ] {
             spec.architecture = architecture;
             let toml_str = toml::to_string(&spec).expect("serialize");

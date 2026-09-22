@@ -120,6 +120,33 @@ pub trait DirichletAnsatz: Send + Sync {
     /// transition length (`kt_convergence_check`'s radial-probe margin, `pinn_solver::
     /// user_problem`) rather than a hardcoded multiplier of an unrelated margin.
     fn saturation_scale_near(&self, _hole_center: [f64; 2]) -> Option<f64> { None }
+
+    /// Issue #78 item 3: when this ansatz wants its multiplicative envelope computed
+    /// EXTERNALLY by the caller, as a differentiable tensor operation against a model-owned
+    /// trainable `Param` (rather than the host `f32` math `eval()` normally bakes into a
+    /// constant tensor with no autodiff connection), this returns one entry per such hole, IN
+    /// THE ORDER the owning model's own `hole_scales: Vec<Param<Tensor<B,1>>>` must be indexed
+    /// by (load-bearing - see `training_core::stencil_forward_with_ansatz`'s own doc comment).
+    /// `eval()` for every hole listed here MUST return `(1.0, 1.0)` (no host suppression) -
+    /// the caller entirely replaces that contribution. `None` (default) for every ansatz that
+    /// keeps its envelope host-computed - every pre-existing implementor is unaffected, same
+    /// precedent as `additive`/`saturation_scale_near` above.
+    fn trainable_envelope_holes(&self) -> Option<Vec<TrainableEnvelopeHole>> { None }
+}
+
+/// One hole's worth of geometry needed to compute its `traction_free_envelope_scaled`-style
+/// envelope as a tensor operation, external to the ansatz that owns it - see
+/// `DirichletAnsatz::trainable_envelope_holes`'s own doc comment. Physical units throughout,
+/// matching `HoleTractionFreeAnsatz::physical_xy`'s own convention exactly (this struct exists
+/// so `pinn-solver`'s tensor-space computation doesn't need `pinn-core` to depend on it, or
+/// vice versa - the same "pinn-core owns the SHAPE of any solver-computed value" rule
+/// `HoleBoundaryPoint`/`AmrSweepReport` already establish in `pinn-core::messages`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrainableEnvelopeHole {
+    pub hole_center: [f64; 2],
+    pub hole_radius: f64,
+    pub half_w: f64,
+    pub half_h: f64,
 }
 
 #[cfg(test)]

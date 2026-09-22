@@ -794,8 +794,8 @@ pub fn run_training_pinlug(
     let mut model_lug: ElasticityNet<B> = net_cfg(config.hidden_dim, config.n_hidden).init(&device);
 
     let mut optims = vec![
-        DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() },
-        DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() },
+        DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+        DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
     ];
 
     let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
@@ -878,8 +878,8 @@ pub fn run_training_pinlug(
                 model_pin = net_cfg(config.hidden_dim, config.n_hidden).init(&device);
                 model_lug = net_cfg(config.hidden_dim, config.n_hidden).init(&device);
                 optims = vec![
-                    DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() },
-                    DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() },
+                    DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
+                    DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() },
                 ];
                 let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
                 saw = SawBrdr::with_base(base_weights, 0.95);
@@ -1303,7 +1303,7 @@ fn run_training_annular_decomposition(
                     hole_center: hole.center, hole_radius: hole.radius,
                     half_w: geometry.half_w, half_h: geometry.half_h,
                     px, py, e: material.e as f64, nu: material.nu as f64,
-                    u_ref: scales.u_ref as f64, saturation_scale: 1.0,
+                    u_ref: scales.u_ref as f64, saturation_scale: 1.0, trainable: false,
                 },
             )
         } else {
@@ -1436,7 +1436,7 @@ fn run_training_annular_decomposition_sequential(
                     hole_center: hole.center, hole_radius: hole.radius,
                     half_w: geometry.half_w, half_h: geometry.half_h,
                     px, py, e: material.e as f64, nu: material.nu as f64,
-                    u_ref: scales.u_ref as f64, saturation_scale: 1.0,
+                    u_ref: scales.u_ref as f64, saturation_scale: 1.0, trainable: false,
                 },
             )
         } else {
@@ -1644,10 +1644,25 @@ fn run_user_problem_training_from(
     let mut config = SolverConfig::default_kirsch();
     config.load = spec.load;
 
+    // Issue #78 item 3: same seeding as `user_runner::run_headless_user_problem` - inert
+    // (empty seeds, no-op) unless `trainable_saturation_scale` genuinely applies. Runs here
+    // (not in the caller that constructs `model`) since this is the SHARED body for both a
+    // fresh run and a resumed one - a resumed run's own checkpoint-loaded `hole_scales` (if
+    // any) would be overwritten by this re-seed, a real, disclosed v1 limitation (see
+    // `ArchitectureSpec::trainable_saturation_scale`'s own doc comment area / `CLAUDE.md`),
+    // not a crash - checkpoint round-trip of a trained `hole_scales` isn't independently
+    // verified in this pass.
+    if spec.architecture.hard_constraint_ansatz && spec.architecture.trainable_saturation_scale {
+        let seeds = crate::user_problem::trainable_hole_scale_seeds(&spec);
+        if !seeds.is_empty() {
+            model = model.with_hole_scales(&seeds, &device);
+        }
+    }
     let mut optim = DomainOptim {
         weight: WeightOptim::new(config.use_soap_muon),
         bias: make_bias_optim(),
         gate: make_gate_optim(),
+        hole_scale: make_gate_optim(),
     };
 
     // Smart adaptive architecture (v1) - `arch_controller` stays `None` (a zero-cost, always-
@@ -3220,7 +3235,7 @@ mod tests {
             .with_input_dim(3).with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden)
             .with_output_dim(5);
         let mut model = net_cfg.init(&device);
-        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
         let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
         let mut saw = SawBrdr::with_base(base_weights, 0.95);
         let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
@@ -3301,7 +3316,7 @@ mod tests {
             .with_input_dim(3).with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden)
             .with_output_dim(5);
         let mut model = net_cfg.init(&device);
-        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
         let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
         let mut saw = SawBrdr::with_base(base_weights, 0.95);
         let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
@@ -3420,7 +3435,7 @@ mod tests {
             .with_input_dim(3).with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden)
             .with_output_dim(5);
         let mut model = net_cfg.init(&device);
-        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
         let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
         let mut saw = SawBrdr::with_base(base_weights, 0.95);
         let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
@@ -4172,7 +4187,7 @@ mod tests {
             .with_use_piratenet(spec.network.adaptive);
         B::seed(&device, spec.network.model_init_seed);
         let model = net_cfg.init(&device);
-        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
         let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
         let mut saw = SawBrdr::with_base(base_weights, 0.95);
         let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);

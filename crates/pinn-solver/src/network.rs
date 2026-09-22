@@ -42,6 +42,18 @@ pub struct ElasticityNet<B: Backend> {
     /// `omega_0` scale factor inside the SIREN activation. Sitzmann et al.'s own paper value
     /// (30.0) is the default; unused when `use_siren=false`.
     siren_omega_0: f64,
+    /// Issue #78 item 3: one learnable scalar per trainable-envelope hole (`AnnulusAnsatz::
+    /// MultiHoleHardConstraint`'s `HoleTractionFreeAnsatz.trainable=true` holes), gradient-
+    /// trained alongside `gates` above via its own `GateOptim` instance (see `training_core::
+    /// DomainOptim.hole_scale`) - empty for every model NOT built via `with_hole_scales`
+    /// (every existing caller, and any trainable_saturation_scale=false plate config), in
+    /// which case `training_core::stencil_forward_with_ansatz` never reads this field at all -
+    /// same "empty = completely inert" precedent `gates` itself already established for
+    /// `use_piratenet=false`. Indexed positionally against `DirichletAnsatz::trainable_
+    /// envelope_holes()`'s own output order (`kirsch_hole_correction.rs`'s own doc comment)
+    /// - NOT the same Vec as `gates` (a different role, a different count, would break
+    /// `gates[i]`'s existing per-hidden-layer indexing if merged).
+    hole_scales: Vec<Param<Tensor<B, 1>>>,
 }
 
 /// Pre-coordinate-residual record layout. Kept only to load existing checkpoints.
@@ -271,6 +283,38 @@ impl<B: Backend> ElasticityNet<B> {
         self.gates.iter().map(|g| g.id).collect()
     }
 
+    /// Issue #78 item 3: ParamIds of the trainable per-hole envelope-saturation scalars —
+    /// empty for every model not built via `with_hole_scales`. Mirrors `gate_ids`'s own
+    /// pattern exactly (a separate `Vec`/optimizer, not merged with `gates` - see this
+    /// field's own doc comment for why).
+    pub fn hole_scale_ids(&self) -> Vec<ParamId> {
+        self.hole_scales.iter().map(|s| s.id).collect()
+    }
+
+    /// Read-only access to the trainable hole-scale `Param`s themselves (not just their ids) -
+    /// `training_core::stencil_forward_with_ansatz` needs the live `Tensor<B,1>` values to
+    /// build the tensor-space envelope computation, not just something to pass to an
+    /// optimizer.
+    pub fn hole_scales(&self) -> &[Param<Tensor<B, 1>>] {
+        &self.hole_scales
+    }
+
+    /// Issue #78 item 3: seeds `hole_scales` with one trainable `Param` per entry in
+    /// `initial_values` (physical `saturation_scale` units - see `HoleTractionFreeAnsatz.
+    /// saturation_scale`'s own doc comment), in the SAME order `DirichletAnsatz::trainable_
+    /// envelope_holes()` will report them (load-bearing - the two are indexed together
+    /// positionally by the caller). Consuming builder (`self` by value), called once right
+    /// after `ElasticityNetConfig::init()` for a config that opts into `ArchitectureSpec::
+    /// trainable_saturation_scale` - every other caller never calls this, leaving `hole_scales`
+    /// empty (the default, fully inert state this field already had before this method
+    /// existed).
+    pub fn with_hole_scales(mut self, initial_values: &[f64], device: &B::Device) -> Self {
+        self.hole_scales = initial_values.iter()
+            .map(|&v| Param::from_tensor(Tensor::<B, 1>::from_data(TensorData::new(vec![v as f32], vec![1]), device)))
+            .collect();
+        self
+    }
+
     /// Test-only: force `gates[i]` to `value` — direct field assignment (`gates` has no
     /// production setter; training mutates it via the optimizer, never by direct
     /// assignment) so cross-module tests (e.g. `training_core`'s compute-skip tests) can
@@ -443,6 +487,7 @@ impl<B: Backend> ElasticityNet<B> {
             coordinate_skip: self.coordinate_skip.clone(),
             use_siren: self.use_siren,
             siren_omega_0: self.siren_omega_0,
+            hole_scales: self.hole_scales.clone(),
         }
     }
 
@@ -492,6 +537,7 @@ impl<B: Backend> ElasticityNet<B> {
             coordinate_skip: self.coordinate_skip.clone(),
             use_siren: self.use_siren,
             siren_omega_0: self.siren_omega_0,
+            hole_scales: self.hole_scales.clone(),
         }
     }
 
@@ -538,6 +584,7 @@ impl<B: Backend> ElasticityNet<B> {
             coordinate_skip: self.coordinate_skip.clone(),
             use_siren: self.use_siren,
             siren_omega_0: self.siren_omega_0,
+            hole_scales: self.hole_scales.clone(),
         }
     }
 
@@ -626,6 +673,7 @@ impl<B: Backend> ElasticityNet<B> {
             coordinate_skip: self.coordinate_skip.clone(),
             use_siren: self.use_siren,
             siren_omega_0: self.siren_omega_0,
+            hole_scales: self.hole_scales.clone(),
         }
     }
 }
@@ -854,6 +902,10 @@ impl ElasticityNetConfig {
             coordinate_skip,
             use_siren: self.use_siren,
             siren_omega_0: self.siren_omega_0,
+            // Fresh construction from `ElasticityNetConfig` (no prior `ElasticityNet` to carry
+            // this forward from - `self` here is the Config, which has no `hole_scales` field
+            // at all) - empty until/unless `with_hole_scales` (below) is called explicitly.
+            hole_scales: Vec::new(),
         }
     }
 
@@ -881,6 +933,9 @@ impl<B: Backend> ElasticityNet<B> {
             // evaluating) with tanh.
             use_siren: false,
             siren_omega_0: 30.0,
+            // Every legacy checkpoint predates issue #78 item 3 too - none was ever trained
+            // with a trainable hole-scale Param.
+            hole_scales: Vec::new(),
         }
     }
 }

@@ -209,6 +209,7 @@ fn run_annular_decomposition_training_inner(
     let mut models = vec![annulus_model, outer_model];
     let mut optims = (0..2).map(|_| DomainOptim {
         weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim(),
+        hole_scale: make_gate_optim(),
     }).collect::<Vec<_>>();
     let term_order: Vec<&'static str> = problem.loss_terms().iter().map(|t| t.name()).collect();
     // Kept separately from `saw.base_weights` (see `SawBrdr::base_weights`'s own doc comment):
@@ -711,7 +712,7 @@ pub fn run_annular_decomposition_training_sequential(
     // annular-decomposition comparison's own outer model does.
     B::seed(&device, spec.network.model_init_seed ^ 0xA77A_0001);
     let mut outer_model = raw_cfg.init(&device);
-    let mut outer_optim = DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() };
+    let mut outer_optim = DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
     let mut outer_saw = SawBrdr::with_base(outer_problem.loss_terms().iter().map(|t| outer_problem.base_weight(t.name())).collect(), 0.95);
     let mut outer_lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
     for step in 0..stage_a_steps {
@@ -749,7 +750,7 @@ pub fn run_annular_decomposition_training_sequential(
         .with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden).with_output_dim(5);
     B::seed(&device, spec.network.model_init_seed);
     let mut annulus_model = chart_cfg.init(&device);
-    let mut annulus_optim = DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() };
+    let mut annulus_optim = DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
     let mut annulus_saw = SawBrdr::with_base(annulus_problem.loss_terms().iter().map(|t| annulus_problem.base_weight(t.name())).collect(), 0.95);
     let mut annulus_lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
     let mut diagnostics = Vec::with_capacity(diagnostic_steps.len());
@@ -819,7 +820,7 @@ pub(crate) fn train_user_problem_for_benchmark(
         .with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden).with_output_dim(5);
     B::seed(device, spec.network.model_init_seed);
     let mut model = net_cfg.init(device);
-    let mut optim = DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() };
+    let mut optim = DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
     let mut saw = SawBrdr::with_base(problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect(), 0.95);
     let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
@@ -925,7 +926,7 @@ pub fn run_user_problem_training_with_diagnostics(
         .with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden).with_output_dim(5);
     B::seed(&device, spec.network.model_init_seed);
     let mut model = net_cfg.init(&device);
-    let mut optim = DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim() };
+    let mut optim = DomainOptim { weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
     let mut saw = SawBrdr::with_base(problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect(), 0.95);
     let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
@@ -1102,10 +1103,21 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
     // own comment.
     B::seed(&device, spec.network.model_init_seed);
     let mut model = net_cfg.init(&device);
+    // Issue #78 item 3: seed a trainable per-hole envelope scale from the same closed-form
+    // derivation the fixed path already uses - `trainable_hole_scale_seeds` returns an empty
+    // Vec (a genuine no-op) whenever `trainable_saturation_scale` doesn't apply (N≤1, or the
+    // flag is off), so this is inert for every existing spec.
+    if spec.architecture.hard_constraint_ansatz && spec.architecture.trainable_saturation_scale {
+        let seeds = crate::user_problem::trainable_hole_scale_seeds(&spec);
+        if !seeds.is_empty() {
+            model = model.with_hole_scales(&seeds, &device);
+        }
+    }
     let mut optim = DomainOptim {
         weight: WeightOptim::new(config.use_soap_muon),
         bias: make_bias_optim(),
         gate: make_gate_optim(),
+        hole_scale: make_gate_optim(),
     };
 
     let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
@@ -1274,6 +1286,17 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         .into_scalar();
 
     println!("  Done! final total_loss={last_total:.6e}  max|displacement|~{max_abs_disp:.3e} m");
+    // Issue #78 item 3: surface the trainable per-hole envelope scale's FINAL value (vs. its
+    // derived seed) - the one piece of real evidence "did gradient descent actually move this
+    // parameter" needs beyond a unit test. Empty (silent) for every model without trainable
+    // hole_scales (the default) - not a new diagnostic line cluttering every other run.
+    if !model.hole_scales().is_empty() {
+        let seeds = crate::user_problem::trainable_hole_scale_seeds(&spec);
+        for (i, (param, seed)) in model.hole_scales().iter().zip(seeds.iter()).enumerate() {
+            let final_val: f32 = param.val().into_data().to_vec::<f32>().unwrap()[0];
+            println!("  [diag] trainable hole_scales[{i}]: seed={seed:.4} final={final_val:.4}");
+        }
+    }
     if max_abs_disp < 1e-12 {
         println!("  [!] max|displacement| is suspiciously small — possible trivial-solution collapse.");
     } else {

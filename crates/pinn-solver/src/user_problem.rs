@@ -188,6 +188,24 @@ fn multi_hole_saturation_scale(hole_radius: f64, margin: f64, fd_step: f64) -> f
     (-(1.0 - target_phi).ln()).sqrt() / u
 }
 
+/// Issue #78 item 3: the closed-form-derived `saturation_scale` for every Free hole in `spec`,
+/// IN THE SAME ORDER `free_holes(spec)`/`new_with_hard_constraint_ansatz`'s own `holes.into_
+/// iter()` produces (load-bearing - a caller uses this to seed a trainable model's own
+/// `hole_scales: Vec<Param<Tensor<B,1>>>`, which is indexed positionally against the ansatz's
+/// `trainable_envelope_holes()` output, itself built from the same `free_holes` order).
+/// Returns an empty `Vec` when N≤1 (no seed needed - `trainable_saturation_scale` never
+/// applies there, see `ArchitectureSpec`'s own doc comment) - callers should treat an empty
+/// result as "nothing to seed," not an error.
+pub(crate) fn trainable_hole_scale_seeds(spec: &ProblemSpec) -> Vec<f64> {
+    let holes = free_holes(spec);
+    if holes.len() <= 1 {
+        return Vec::new();
+    }
+    let margin = ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+    let fd_step = physical_fd_step_m(spec.training.fd_h, &spec.geometry);
+    holes.into_iter().map(|hole| multi_hole_saturation_scale(hole.radius, margin, fd_step)).collect()
+}
+
 /// Issue #77 root-cause fix (kinematic decomposition): the closed-form uniform-tension
 /// strain `(eps_xx, eps_yy, eps_xy)` of `u_affine(x,y) = ((px-nu*py)/E)*x, ((py-nu*px)/E)*y`
 /// under Hooke's law inverse for plane stress (`sigma_xx=px, sigma_yy=py, sigma_xy=0`
@@ -1831,6 +1849,13 @@ impl UserDefinedProblem {
             let margin = ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
             let fd_step = physical_fd_step_m(spec.training.fd_h, &spec.geometry);
             let multi_hole = holes.len() > 1;
+            // Issue #78 item 3: `trainable_saturation_scale` only ever applies once N>1 (see
+            // `ArchitectureSpec.trainable_saturation_scale`'s own doc comment - N=1's
+            // `saturation_scale=1.0` is exact by construction, nothing to learn). The closed-
+            // form-derived value is STILL computed and stored either way - it's the SEED a
+            // trainable model's own `hole_scales` Param is initialized from (see
+            // `trainable_hole_scale_seeds`), never discarded.
+            let trainable = multi_hole && spec.architecture.trainable_saturation_scale;
             let sub_ansatzes = holes.into_iter().map(|hole| {
                 let saturation_scale = if multi_hole { multi_hole_saturation_scale(hole.radius, margin, fd_step) } else { 1.0 };
                 crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
@@ -1838,7 +1863,7 @@ impl UserDefinedProblem {
                     half_w: spec.geometry.half_w, half_h: spec.geometry.half_h,
                     px: spec.load.px, py: spec.load.py,
                     e: spec.material.e as f64, nu: spec.material.nu as f64,
-                    u_ref: scales.u_ref as f64, saturation_scale,
+                    u_ref: scales.u_ref as f64, saturation_scale, trainable,
                 }
             }).collect();
             problem.ansatz = crate::kirsch_hole_correction::AnnulusAnsatz::MultiHoleHardConstraint(sub_ansatzes);
@@ -2267,6 +2292,7 @@ impl AnnularDecompositionProblem {
                     nu: spec.material.nu as f64,
                     u_ref: scales.u_ref as f64,
                     saturation_scale: 1.0,
+                    trainable: false,
                 },
             )
         } else {
@@ -2674,7 +2700,7 @@ impl AnnulusStageProblem {
                     half_w: spec.geometry.half_w, half_h: spec.geometry.half_h,
                     px: spec.load.px, py: spec.load.py,
                     e: spec.material.e as f64, nu: spec.material.nu as f64,
-                    u_ref: scales.u_ref as f64, saturation_scale: 1.0,
+                    u_ref: scales.u_ref as f64, saturation_scale: 1.0, trainable: false,
                 },
             )
         } else {
@@ -8012,6 +8038,7 @@ mod tests {
         let model = net_cfg.init(&device);
         let mut optim = crate::problem::DomainOptim {
             weight: WeightOptim::new(false), bias: make_bias_optim(), gate: make_gate_optim(),
+            hole_scale: make_gate_optim(),
         };
         let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
         let mut saw = SawBrdr::with_base(base_weights, 0.95);
@@ -8415,6 +8442,7 @@ mod tests {
                 hole_center: hole.center, hole_radius: hole.radius,
                 half_w: geometry.half_w, half_h: geometry.half_h,
                 px, py, e: material.e as f64, nu: material.nu as f64, u_ref: u_ref as f64, saturation_scale: 1.0,
+                trainable: false,
             },
         );
         let via_identity = probe_hole_boundary_profile_derived(
@@ -8561,6 +8589,7 @@ mod tests {
         let ansatz = crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
             hole_center: [0.0, 0.0], hole_radius: 0.009, half_w: 0.15, half_h: 0.06,
             px: 6.9e7, py: 0.0, e: 71.7e9, nu: 0.33, u_ref: 1e-6, saturation_scale: 1.0,
+            trainable: false,
         };
         let margin = kt_convergence_radial_probe_margin(&ansatz, [0.0, 0.0], 0.009, margin_coarse);
         assert!((margin - margin_coarse * 1.5).abs() < 1e-15, "margin={margin}");
@@ -8580,6 +8609,7 @@ mod tests {
         let ansatz = crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
             hole_center: [0.0, 0.0], hole_radius, half_w: 0.15, half_h: 0.06,
             px: 6.9e7, py: 0.0, e: 71.7e9, nu: 0.33, u_ref: 1e-6, saturation_scale: 22.75,
+            trainable: false,
         };
         let margin = kt_convergence_radial_probe_margin(&ansatz, [0.0, 0.0], hole_radius, margin_coarse);
         assert!(margin > margin_coarse * 1.5, "expected margin > 1.5x margin_coarse, got {margin}");
@@ -8632,6 +8662,7 @@ mod tests {
             centers.iter().map(|&c| crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
                 hole_center: c, hole_radius: a, half_w, half_h,
                 px, py: 0.0, e: 71.7e9, nu: 0.33, u_ref: 1.0, saturation_scale: 30.0,
+                trainable: false,
             }).collect()
         );
         // A point on hole0's own boundary ring.
@@ -8673,10 +8704,12 @@ mod tests {
             crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
                 hole_center: [-0.06, 0.02], hole_radius: a, half_w: 0.15, half_h: 0.06,
                 px, py: 0.0, e: material.e as f64, nu: material.nu as f64, u_ref: 1.0, saturation_scale: scale,
+                trainable: false,
             },
             crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
                 hole_center: [0.06, 0.02], hole_radius: a, half_w: 0.15, half_h: 0.06,
                 px, py: 0.0, e: material.e as f64, nu: material.nu as f64, u_ref: 1.0, saturation_scale: scale,
+                trainable: false,
             },
         ]);
         let hole0 = geometry.holes[0];
@@ -8713,6 +8746,7 @@ mod tests {
         let ansatz = crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
             hole_center: hole.center, hole_radius: hole.radius, half_w: geometry.half_w, half_h: geometry.half_h,
             px: 1e7, py: 0.0, e: material.e as f64, nu: material.nu as f64, u_ref: 1.0, saturation_scale: 20.0,
+            trainable: false,
         };
         let report = kt_convergence_check(
             &model, &geometry, &hole, 32, &fd, 1.0, 1e7, &material, margin, 1e7, 0.5, &device,
@@ -8818,6 +8852,7 @@ mod tests {
                 hole_center: geometry.holes[0].center, hole_radius: geometry.holes[0].radius,
                 half_w: geometry.half_w, half_h: geometry.half_h,
                 px, py, e: material.e as f64, nu: material.nu as f64, u_ref: u_ref as f64, saturation_scale: 1.0,
+                trainable: false,
             },
         );
         let via_identity = evaluate_user_vis_grid(
@@ -9294,7 +9329,7 @@ mod tests {
             .with_output_dim(5);
         B::seed(&device, spec.network.model_init_seed);
         let mut model = net_cfg.init(&device);
-        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+        let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
         let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
         let mut saw = SawBrdr::with_base(base_weights, 0.95);
         let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
@@ -9419,7 +9454,7 @@ mod tests {
                 .with_output_dim(5);
             B::seed(device, spec.network.model_init_seed);
             let mut model = net_cfg.init(device);
-            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
             let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
             let mut saw = SawBrdr::with_base(base_weights, 0.95);
             let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
@@ -9513,7 +9548,7 @@ mod tests {
                 .with_output_dim(5);
             B::seed(device, spec.network.model_init_seed);
             let mut model = net_cfg.init(device);
-            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
             let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
             let mut saw = SawBrdr::with_base(base_weights, 0.95);
             let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
@@ -9622,7 +9657,7 @@ mod tests {
                 .with_output_dim(5);
             B::seed(device, spec.network.model_init_seed);
             let mut model = net_cfg.init(device);
-            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
             let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
             let mut saw = SawBrdr::with_base(base_weights, 0.95);
             let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
@@ -9778,7 +9813,7 @@ mod tests {
                 .with_output_dim(5);
             B::seed(device, spec.network.model_init_seed);
             let mut model = net_cfg.init(device);
-            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
             let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
             let mut saw = SawBrdr::with_base(base_weights, 0.95);
             let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
@@ -9937,7 +9972,7 @@ mod tests {
                 .with_output_dim(5);
             B::seed(device, spec.network.model_init_seed);
             let mut model = net_cfg.init(device);
-            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim() };
+            let mut optim = DomainOptim { weight: WeightOptim::new(true), bias: make_bias_optim(), gate: make_gate_optim(), hole_scale: make_gate_optim() };
             let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
             let mut saw = SawBrdr::with_base(base_weights, 0.95);
             let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);

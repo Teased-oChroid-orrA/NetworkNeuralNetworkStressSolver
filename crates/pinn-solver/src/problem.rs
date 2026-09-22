@@ -478,12 +478,18 @@ impl DomainStepData {
     }
 }
 
-/// Mutable per-domain optimizer triple (weight/bias/gate), analogous to the three
+/// Mutable per-domain optimizer quadruple (weight/bias/gate/hole_scale), analogous to the
 /// standalone optimizer arguments `step_physics` takes for its single (implicit) domain.
 pub struct DomainOptim {
     pub weight: WeightOptim,
     pub bias: BiasOptim,
     pub gate: GateOptim,
+    /// Issue #78 item 3: trains `ElasticityNet::hole_scales` - empty `Vec` (a genuine no-op
+    /// step, same precedent `gate` already established for `use_piratenet=false`) for every
+    /// model not built via `ElasticityNet::with_hole_scales`. Reuses `GateOptim`'s own type
+    /// (same small-scalar-Param optimizer role as `gate`) rather than introducing a distinct
+    /// optimizer type for a structurally identical job.
+    pub hole_scale: GateOptim,
 }
 
 /// Read-only per-domain data threaded through `step_physics_multi` — the multi-domain
