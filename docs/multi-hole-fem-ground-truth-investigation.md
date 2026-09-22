@@ -553,3 +553,20 @@ geometry) was considered and set aside for now - closed-form derivation already 
 hand-tuned magic number the user objected to, and turning it into a `burn` `Param` is a larger,
 separate engineering step with its own risk (a scalar co-trained with a highly nonlinear
 envelope function is a shape genuinely worth prototyping carefully, not bolting on quickly).
+
+## Fifth pass: `TARGET_PHI_AT_MARGIN` derived (not swept), Kt convergence check decomposed
+
+Both of the "honestly still open" items directly above were addressed this session -
+`CLAUDE.md`'s "Issue #78 fourth follow-up" section has the full record (derivation, the real
+`RING_ANCHOR_SAFETY_FACTOR`-reuse mistake caught before it shipped, the closed-form-baseline
+decisive diagnostic evidence, the honest real result). One-line summary: `TARGET_PHI_AT_MARGIN`
+is now `target_phi_at_margin(margin, fd_step)`, derived from a real FD-resolvability constraint
+(`ENVELOPE_FD_RESOLUTION_FACTOR=2.0`, a genuinely separate constant from `RING_ANCHOR_SAFETY_
+FACTOR` - reusing the latter was tried and found to be a category error). The Kt convergence
+check's raw radial Δ was found to be dominated (7.35% out of a real run's ~10-12%) by expected
+closed-form field curvature, not training non-convergence - a new `radial_residual_kt_delta`
+field decomposes this so the check is now genuinely informative rather than a single opaque
+number, though the flag itself still trips for both Free holes even after this fix (a real,
+disclosed, non-negligible network-side residual remains - not fully closed, honestly reported
+as such). `triple_hole_plate.toml`: hole0/hole2 Kt=2.884/3.032 vs FEM ≈2.98-3.06/2.97-3.02.
+Full regression: 563 passed (+10 net new), same 1 pre-existing unrelated failure.

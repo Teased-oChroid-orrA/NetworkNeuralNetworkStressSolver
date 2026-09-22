@@ -215,6 +215,11 @@ impl pinn_core::problem::DirichletAnsatz for HoleTractionFreeAnsatz {
         let (ux, uy) = kirsch_hole_displacement(x, y, self.hole_radius, self.e, self.nu, self.px, self.py);
         ((ux / self.u_ref) as f32, (uy / self.u_ref) as f32)
     }
+    fn saturation_scale_near(&self, hole_center: [f64; 2]) -> Option<f64> {
+        let same_hole = (hole_center[0] - self.hole_center[0]).abs() < 1e-12
+            && (hole_center[1] - self.hole_center[1]).abs() < 1e-12;
+        same_hole.then_some(self.saturation_scale)
+    }
 }
 
 /// The annulus domain's ansatz, selectable between the byte-identical default (`Identity`,
@@ -296,6 +301,15 @@ impl pinn_core::problem::DirichletAnsatz for AnnulusAnsatz {
             AnnulusAnsatz::Identity => (0.0, 0.0),
             AnnulusAnsatz::HardConstraint(a) => a.additive(xn, yn),
             AnnulusAnsatz::MultiHoleHardConstraint(holes) => multi_hole_additive(holes, xn, yn),
+        }
+    }
+    fn saturation_scale_near(&self, hole_center: [f64; 2]) -> Option<f64> {
+        match self {
+            AnnulusAnsatz::Identity => None,
+            AnnulusAnsatz::HardConstraint(a) => a.saturation_scale_near(hole_center),
+            AnnulusAnsatz::MultiHoleHardConstraint(holes) => {
+                holes.iter().find_map(|h| h.saturation_scale_near(hole_center))
+            }
         }
     }
 }
@@ -484,6 +498,80 @@ mod tests {
         assert!(phi_15 > phi_1 * 10.0, "a 15x saturation scale must give a real, order-of-magnitude larger phi at the same margin: phi_1={phi_1} phi_15={phi_15}");
     }
     const MULTI_HOLE_SATURATION_SCALE_FOR_TEST: f64 = 15.0;
+
+    /// Issue #78 second root-cause fix, diagnostic evidence: does the PURE closed-form
+    /// baseline (zero network contribution - `multi_hole_additive` + the affine background,
+    /// exactly the `total_field_is_traction_free_at_hole_boundary_numerically` test's own
+    /// method, extended to N=2 holes and two different radii) already vary meaningfully
+    /// between `kt_convergence_check`'s two radial probe points, independent of any network
+    /// training state at all? If so, the check's remaining "NOT converged" signal at the
+    /// derived scale is at least partly measuring REAL, expected physical/closed-form field
+    /// curvature, not a training-convergence problem the second probe's own radius selection
+    /// could ever fully eliminate - important, honest context for whatever this fix's real
+    /// end-to-end verification run shows.
+    #[test]
+    fn closed_form_only_kt_varies_meaningfully_between_the_two_radial_probe_points_at_real_scale() {
+        let a = 0.009_f64;
+        let px = 6.9e7_f64;
+        let py = 0.0_f64;
+        let margin_coarse = 6e-4_f64; // triple_hole_plate.toml's real ring_anchor_margin_m
+        let scale = 30.0_f64; // this geometry's real item-2-derived saturation_scale (~30)
+        let h = 1e-7_f64;
+
+        let holes = [
+            HoleTractionFreeAnsatz { hole_center: [-0.06, 0.02], hole_radius: a, half_w: 0.15, half_h: 0.06, px, py, e: E, nu: NU, u_ref: 1.0, saturation_scale: scale },
+            HoleTractionFreeAnsatz { hole_center: [0.06, 0.02], hole_radius: a, half_w: 0.15, half_h: 0.06, px, py, e: E, nu: NU, u_ref: 1.0, saturation_scale: scale },
+        ];
+        let a_exx = (px - NU * py) / E;
+        let a_eyy = (py - NU * px) / E;
+
+        // Closed-form-only total displacement at a GLOBAL point (x,y), relative to hole0's own
+        // center [-0.06, 0.02] (the hole this test measures Kt at) - superposition of both
+        // holes' own isolated closed forms plus the affine background, mirroring
+        // `multi_hole_additive` exactly (private in this module, so inlined here rather than
+        // exposed just for this test).
+        let total_u = |x: f64, y: f64| -> (f64, f64) {
+            let mut ux = a_exx * x;
+            let mut uy = a_eyy * y;
+            for hole in &holes {
+                let (hx, hy) = kirsch_hole_displacement(x - hole.hole_center[0], y - hole.hole_center[1], a, E, NU, px, py);
+                ux += hx;
+                uy += hy;
+            }
+            (ux, uy)
+        };
+        let kt_at_margin = |margin: f64| -> f64 {
+            let hole0_center = holes[0].hole_center;
+            let mut max_vm = 0.0_f64;
+            for i in 0..72 {
+                let theta = i as f64 * std::f64::consts::TAU / 72.0;
+                let x0 = hole0_center[0] + (a + margin) * theta.cos();
+                let y0 = hole0_center[1] + (a + margin) * theta.sin();
+                let (u_xp, v_xp) = total_u(x0 + h, y0);
+                let (u_xm, v_xm) = total_u(x0 - h, y0);
+                let (u_yp, v_yp) = total_u(x0, y0 + h);
+                let (u_ym, v_ym) = total_u(x0, y0 - h);
+                let exx = (u_xp - u_xm) / (2.0 * h);
+                let eyy = (v_yp - v_ym) / (2.0 * h);
+                let exy = 0.5 * ((u_yp - u_ym) / (2.0 * h) + (v_xp - v_xm) / (2.0 * h));
+                let sxx = E / (1.0 - NU * NU) * (exx + NU * eyy);
+                let syy = E / (1.0 - NU * NU) * (eyy + NU * exx);
+                let sxy = E / (2.0 * (1.0 + NU)) * (2.0 * exy);
+                let vm = (sxx * sxx - sxx * syy + syy * syy + 3.0 * sxy * sxy).sqrt();
+                if vm > max_vm { max_vm = vm; }
+            }
+            max_vm / px.abs()
+        };
+
+        let kt_1 = kt_at_margin(margin_coarse);
+        let kt_1_5 = kt_at_margin(margin_coarse * 1.5);
+        let closed_form_radial_change = (kt_1_5 - kt_1).abs() / kt_1.abs();
+        println!("closed-form-only Kt: margin={kt_1:.4} margin*1.5={kt_1_5:.4} relative_change={closed_form_radial_change:.4}");
+        // This assertion is intentionally weak (just proves the computation ran and produced a
+        // sane, finite, nonzero result) - the printed relative_change is the real evidence,
+        // inspected directly rather than gated on a pass/fail threshold that would obscure it.
+        assert!(closed_form_radial_change.is_finite() && kt_1 > 0.0 && kt_1_5 > 0.0);
+    }
 
     fn single_hole_ansatz() -> HoleTractionFreeAnsatz {
         HoleTractionFreeAnsatz {

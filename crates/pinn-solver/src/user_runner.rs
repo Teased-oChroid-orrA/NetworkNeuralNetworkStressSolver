@@ -1368,10 +1368,18 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
                 &model_val, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material,
                 hole_margin, nominal_stress, 0.1, &device, ansatz, affine,
             );
+            // Issue #78 second root-cause fix: surface the baseline-subtracted residual
+            // alongside the raw radial Δ - real evidence (this session's own diagnostic test)
+            // shows the raw radial Δ near a hole boundary is often DOMINATED by expected,
+            // closed-form field curvature, not training non-convergence. `residual_note` gives
+            // a human reader that context without silently redefining what "converged" means.
+            let residual_note = convergence.radial_residual_kt_delta
+                .map(|d| format!(", network-residual Δ={d:.3}"))
+                .unwrap_or_default();
             if convergence.converged {
-                println!("  [diag] hole {i}: Kt convergence OK (angular Δ={:.3}, radial Δ={:.3})", convergence.angular_relative_change, convergence.radial_relative_change);
+                println!("  [diag] hole {i}: Kt convergence OK (angular Δ={:.3}, radial Δ={:.3}{residual_note})", convergence.angular_relative_change, convergence.radial_relative_change);
             } else {
-                println!("  [!] hole {i}: Kt NOT converged (angular Δ={:.3}, radial Δ={:.3}) - Kt value may not be trustworthy yet", convergence.angular_relative_change, convergence.radial_relative_change);
+                println!("  [!] hole {i}: Kt NOT converged (angular Δ={:.3}, radial Δ={:.3}{residual_note}) - Kt value may not be trustworthy yet (radial Δ near a hole boundary is often dominated by expected closed-form field curvature, not training non-convergence - see network-residual Δ for the network's own contribution alone)", convergence.angular_relative_change, convergence.radial_relative_change);
             }
         }
 

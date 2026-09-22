@@ -109,6 +109,17 @@ pub trait DirichletAnsatz: Send + Sync {
     /// derivative, at the hole boundary specifically — the two methods work together, not
     /// independently, for that one ansatz.
     fn additive(&self, _xn: f32, _yn: f32) -> (f32, f32) { (0.0, 0.0) }
+
+    /// Issue #78 second root-cause fix: the multiplicative envelope's own `saturation_scale`
+    /// for the hole centered at `hole_center` (physical units, matching whatever this ansatz's
+    /// own construction used), if this ansatz applies a `traction_free_envelope_scaled`-style
+    /// suppression to that specific hole. `None` (default) for every ansatz with no such
+    /// envelope (e.g. `IdentityAnsatz`) or a hole this ansatz doesn't recognize — every
+    /// pre-existing implementor is unaffected by this addition, same precedent as `additive`
+    /// above. Used by diagnostics that need to reason about the envelope's own physical
+    /// transition length (`kt_convergence_check`'s radial-probe margin, `pinn_solver::
+    /// user_problem`) rather than a hardcoded multiplier of an unrelated margin.
+    fn saturation_scale_near(&self, _hole_center: [f64; 2]) -> Option<f64> { None }
 }
 
 #[cfg(test)]

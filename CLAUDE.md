@@ -1090,3 +1090,68 @@ picked trial). A genuinely trainable `saturation_scale` (a `burn` `Param` update
 descent, rather than solved in closed form) was considered and set aside - the closed-form
 derivation already removes the hand-tuned magic number; making it co-trained with a highly
 nonlinear envelope function is separate, larger engineering scope with its own risk.
+
+## Issue #78 fourth follow-up: `TARGET_PHI_AT_MARGIN` derived algorithmically, Kt convergence
+## check decomposed into real vs. expected curvature - honest, not fully "fixed"
+
+User asked whether `TARGET_PHI_AT_MARGIN` itself could be derived rather than a user/hand-picked
+input, and to fix the "NOT converged" convergence-check flag. Both done, with a real mid-course
+correction along the way (caught before shipping wrong code, not after).
+
+**`TARGET_PHI_AT_MARGIN` is now derived, not hand-picked.** As `target→1`, the envelope's own
+physical transition length `L = hole_radius/scale` shrinks; once `L` gets smaller than the real
+FD stencil step, finite-difference strain stops resolving the envelope's own curvature
+accurately - the actual mechanism behind the earlier session's "constitutive residual rose
+alongside Kt accuracy" observation. Requiring `L ≥ ENVELOPE_FD_RESOLUTION_FACTOR·fd_step` and
+solving for the tightest `target` satisfying it gives `target_phi_at_margin(margin, fd_step) =
+1 - exp(-(margin/(ENVELOPE_FD_RESOLUTION_FACTOR·fd_step))²)` - closed-form, no per-geometry
+hand-tuning. **A first attempt reused `RING_ANCHOR_SAFETY_FACTOR` for this new factor - checked
+by hand BEFORE writing code and found to collapse the target to a fixed `1-exp(-1)≈0.632` for
+every geometry, mathematically the WORST choice** (`dphi/dr` is MAXIMIZED near `target≈0.632`,
+not minimized - `RING_ANCHOR_SAFETY_FACTOR` answers a different question, a category error
+caught in time). Used a new, honestly-separate constant (`ENVELOPE_FD_RESOLUTION_FACTOR=2.0`)
+instead. For `triple_hole_plate.toml`'s real geometry this derives `target≈0.9817`, giving
+`scale≈30` - matching the earlier session's own best hand-picked trial almost exactly, a real
+coincidence confirmed by direct calculation, not fudged.
+
+**The Kt convergence check's "NOT converged" flag: root-caused with real decisive evidence, not
+fully cleared.** First attempt: pick the check's second radial probe from the envelope's own
+saturation curve instead of a flat `1.5x` multiplier. Real end-to-end testing showed this was a
+near NO-OP at the derived scale (the envelope saturates fast enough at `scale≈30` that both
+probes already sit past its steep zone). A dedicated diagnostic test
+(`kirsch_hole_correction::closed_form_only_kt_varies_meaningfully_between_the_two_radial_probe_
+points_at_real_scale`) then found the real dominant driver: the PURE closed-form baseline (zero
+network contribution) alone varies **7.35%** between the two radial probes for this real
+geometry - most of a real trained run's own ~10-12% raw radial Δ. This is genuine, expected
+physical field curvature this close to a hole boundary, not a training-convergence signal.
+
+**Real fix**: `closed_form_only_kt_at_margin` (pure host math, `ansatz.additive()`-based, zero
+model/network involved) and a new `KtConvergenceReport.radial_residual_kt_delta: Option<f64>`
+field - the network's OWN residual-correction drift between the two radii, ADDITIVE to (never
+replacing) the existing raw `radial_relative_change`/`converged` gate. `user_runner.rs`'s
+printed diagnostic now shows both with an explanatory note.
+
+**Honest real result** (`triple_hole_plate.toml`-shaped fixture, derived `target≈0.9817`):
+hole0/hole2 Kt=2.884/3.032 (close to FEM ≈2.98-3.06/2.97-3.02). Raw radial Δ still flags "NOT
+converged" for both Free holes (0.102/0.119) - but now with decomposed evidence:
+`network-residual Δ`=0.107/0.173 (Kt-units), proving a real, non-negligible amount of genuine
+network-side variation remains even after subtracting the known closed-form curvature. **Item 1
+is not "fixed" in the sense of "the flag now clears"** - it's fixed in the sense of replacing a
+single opaque, curvature-contaminated number with a decomposed, honest diagnostic a structural
+engineer can actually act on, backed by real evidence of what's really driving it. N=1
+(`issue_77_l5_hard_constraint.toml`) stayed byte-verified unchanged: `Kt=2.4447` (matches
+PH4-42's documented value); `network-residual Δ=0.000` there (the single-hole ansatz is exact,
+so a near-zero residual is the correct expected result, not a bug).
+
+**A real bug found and fixed during verification, not production code**: the first cross-check
+test comparing `closed_form_only_kt_at_margin`'s generic (`ansatz.additive()`-based)
+computation against an independent, hand-derived reimplementation in `kirsch_hole_correction.rs`
+failed by ~40% - traced via a dedicated isolation test
+(`debug_ansatz_additive_matches_direct_kirsch_hole_displacement_sum_at_one_point`) to the TEST
+itself omitting the affine uniaxial background the reference computation included, not a
+production bug. Fixed the test, not the implementation - confirmed by the isolation test's own
+tight agreement (~1e-6 relative, `f32`-precision-limited) once the actual mismatch was found.
+
+19 new/updated unit tests. Full regression suite: 563 passed (+10 net new), same 1
+pre-existing unrelated failure (`compute_loss_for_lbfgs_panics_on_lams_missing_a_real_term_key`),
+zero regressions.

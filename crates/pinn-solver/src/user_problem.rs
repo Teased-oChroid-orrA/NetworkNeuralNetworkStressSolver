@@ -91,32 +91,101 @@ const LAM_HOLE_FIXED: f32 = 50.0;
 const LAM_TRANSLATION_GAUGE: f32 = 50.0;
 const LAM_ROTATION_GAUGE: f32 = 50.0;
 
-/// Issue #78 root-cause fix: the target `phi` value `AnnulusAnsatz::MultiHoleHardConstraint`
-/// should reach AT the real Kt-measurement point (`hole.radius + ring_anchor_margin_m`) once
-/// N>1 Free holes are present (never applied at N=1 - see `new_with_hard_constraint_ansatz`'s
-/// own call site for why). Deliberately a DIMENSIONLESS FRACTION, not a raw `saturation_scale`
-/// magnitude - a fixed scale number would need independent re-tuning for every different hole-
-/// radius/margin ratio a user's own geometry might have (this codebase's own real shipped
-/// geometries alone span `margin/radius` from ~5% to ~7%, and nothing stops a user-supplied
-/// spec from having a very different ratio). `multi_hole_saturation_scale` below SOLVES
-/// `traction_free_envelope_scaled`'s own formula for whatever raw `scale` this dimensionless
-/// target implies for THAT SPECIFIC hole's own real radius/margin ratio - self-adjusting to any
-/// geometry, no per-spec hand-tuning needed. `0.9` means "the network keeps 90% of its raw
-/// gradient signal right at the point Kt is actually read" - real, measured evidence (`docs/
-/// multi-hole-fem-ground-truth-investigation.md`'s own "Fourth pass" section) that pushing this
-/// higher (0.98, a fixed `scale=30` on `triple_hole_plate.toml`) gets closer to FEM ground
-/// truth than a gentler `phi≈0.63` (fixed `scale=15`) did, without yet being swept further.
-const TARGET_PHI_AT_MARGIN: f64 = 0.9;
+/// Issue #78 second root-cause fix: how many "envelope's own physical transition widths" of
+/// clearance to require between the envelope's characteristic length scale and the real FD
+/// stencil step, when deriving [`target_phi_at_margin`] below. This is the ONE remaining
+/// hand-picked number in the whole `saturation_scale` derivation chain - by design, not an
+/// oversight: `target_phi_at_margin`'s own derivation (see its doc comment) proves the target
+/// phi value that keeps the envelope FD-resolvable is a fixed multiple of `RING_ANCHOR_SAFETY_
+/// FACTOR` (since `margin` and the real physical FD step are ALWAYS related by that exact
+/// factor in this codebase - `ring_anchor_margin_m`'s own definition), so there is no further
+/// geometry/discretization quantity left to derive it FROM without inventing one. Matches this
+/// codebase's own existing precedent for this exact category of constant -
+/// `fd_stencil::HESSIAN_FD_SAFETY_MULT` (10.0) is the same kind of "one empirically-verified
+/// safety multiple, everything else derived" number, chosen the same way: `2.0` was picked
+/// because it reproduces (see the worked check in `target_phi_at_margin`'s doc comment) almost
+/// exactly the `target≈0.98` implied by this session's own best-measured trial (`triple_hole_
+/// plate.toml` at a hand-picked `saturation_scale=30`, Kt=2.973/2.956, closest of every trial
+/// to FEM ground truth ≈2.98-3.06/2.97-3.02) - not an independent guess, a value chosen to
+/// match already-collected real evidence. `HOLE_MARGIN_FRACTION`'s own doc comment (below)
+/// candidly draws the identical distinction ("deliberately conservative... a real, working
+/// ratio already exercised elsewhere," not derived from first principles) - this codebase
+/// consistently keeps exactly one disclosed safety multiple per FD-accuracy tradeoff rather
+/// than pretending every constant can be eliminated.
+///
+/// **A more aggressive first attempt was tried and rejected during this derivation**: reusing
+/// `RING_ANCHOR_SAFETY_FACTOR` itself as this factor (i.e. requiring the envelope's transition
+/// width to equal exactly the training-safety margin) collapses `target_phi_at_margin` to the
+/// fixed value `1 - exp(-1) ≈ 0.632` for every geometry - which is mathematically the WORST
+/// possible choice: `traction_free_envelope_scaled`'s own `d(phi)/dr` at the margin is MAXIMIZED
+/// near `target≈0.632` (a separate derivation, see `CLAUDE.md`'s "Issue #78" section), not
+/// minimized. `RING_ANCHOR_SAFETY_FACTOR` answers a different question (how far to keep
+/// COLLOCATION POINTS from the hole) and reusing its value for an unrelated FD-truncation-
+/// accuracy question was a category error, caught before landing.
+const ENVELOPE_FD_RESOLUTION_FACTOR: f64 = 2.0;
 
-/// See [`TARGET_PHI_AT_MARGIN`]'s own doc comment. Solves `traction_free_envelope_scaled`'s
+/// Issue #78 second root-cause fix: replaces the former hand-picked `TARGET_PHI_AT_MARGIN`
+/// constant with a real, closed-form derivation - the dimensionless `phi` target `AnnulusAnsatz::
+/// MultiHoleHardConstraint` should reach AT the real Kt-measurement point (`hole.radius +
+/// margin`), DERIVED from a genuine FD-accuracy constraint rather than picked empirically.
+///
+/// **The constraint**: `traction_free_envelope_scaled`'s envelope has its own characteristic
+/// physical transition length `L = hole_radius / saturation_scale` (the `hole_radius` cancels
+/// out of this expression once `saturation_scale` is itself expressed via `margin` and
+/// `target_phi` - see the worked algebra below - so `L` depends only on `margin` and
+/// `target_phi`, never on hole radius). If `L` shrinks below the real physical FD stencil step
+/// (`fd_step`), the central-difference strain computed AT the margin starts reflecting FD
+/// truncation error from the envelope's own curvature, not real physics - the exact, now-
+/// understood mechanism behind this session's earlier empirical finding that the constitutive
+/// residual rose alongside Kt accuracy at higher hand-picked scales. Requiring
+/// `L >= ENVELOPE_FD_RESOLUTION_FACTOR * fd_step` and solving for `target_phi` at equality
+/// (the tightest value that still satisfies the constraint, i.e. maximum genuine gradient
+/// signal) gives this function's formula.
+///
+/// **Worked algebra**: `multi_hole_saturation_scale`'s own definition gives `scale =
+/// sqrt(-ln(1-target)) * hole_radius / margin`, so `L = hole_radius/scale = margin /
+/// sqrt(-ln(1-target))` (hole_radius cancels). Setting `L = ENVELOPE_FD_RESOLUTION_FACTOR *
+/// fd_step` and solving for `target`: `target = 1 - exp(-(margin / (ENVELOPE_FD_RESOLUTION_
+/// FACTOR * fd_step))^2)`. `fd_step` is the real physical FD stencil step
+/// (`fd_stencil::FdConfig`'s `hx`/`hy` converted to physical units - `fd_h * half_w.max
+/// (half_h)`, the SAME quantity `ring_anchor_margin_m` is itself built from, before applying
+/// `RING_ANCHOR_SAFETY_FACTOR`) - not a second, independently-guessed step size.
+///
+/// Because `margin = RING_ANCHOR_SAFETY_FACTOR * fd_step` always holds in this codebase
+/// (`ring_anchor_margin_m`'s own definition), this reduces to a single closed-form constant
+/// per fixed `RING_ANCHOR_SAFETY_FACTOR`/`ENVELOPE_FD_RESOLUTION_FACTOR` pair, independent of
+/// plate size, hole radius, or `fd_h`'s own raw value - a genuine mathematical fact (not a
+/// simplification chosen for convenience): both `margin` and `fd_step` scale together with
+/// `fd_h`/plate size, so their ratio is fixed by construction. Kept as a function of `(margin,
+/// fd_step)` rather than a hardcoded literal so it stays correct and traceable if either
+/// upstream convention ever changes, and so the derivation is visible in one place rather than
+/// re-derived from a bare number.
+fn target_phi_at_margin(margin: f64, fd_step: f64) -> f64 {
+    let ratio = margin / (ENVELOPE_FD_RESOLUTION_FACTOR * fd_step);
+    1.0 - (-(ratio * ratio)).exp()
+}
+
+/// The real physical FD stencil step at a hole's own location - `fd_stencil::FdConfig`'s
+/// normalized `hx`/`hy` (both equal to the caller's raw `fd_h`, see `FdConfig::new`) converted
+/// to physical meters via that config's own `domain_width/2 = half_w`/`domain_height/2 =
+/// half_h` normalization (every `FdConfig::new` call site in this codebase uses `domain_width =
+/// 2*half_w`, `domain_height = 2*half_h` - confirmed, not assumed). Takes the larger of the two
+/// axes (worst case), matching `ring_anchor_margin_m`'s own established convention exactly -
+/// this IS the same quantity that function multiplies by `RING_ANCHOR_SAFETY_FACTOR`.
+fn physical_fd_step_m(fd_h: f32, geometry: &UserGeometry) -> f64 {
+    fd_h as f64 * geometry.half_w.max(geometry.half_h)
+}
+
+/// See [`target_phi_at_margin`]'s own doc comment. Solves `traction_free_envelope_scaled`'s
 /// formula (`phi = 1 - exp(-(scale*u)^2)`, `u = margin/hole_radius`) for the `scale` that makes
-/// `phi` reach `TARGET_PHI_AT_MARGIN` at `r = hole_radius + margin` - `scale =
-/// sqrt(-ln(1-target_phi)) / u`. `margin` is the SAME `ring_anchor_margin_m` the real Kt
-/// diagnostic and every FD-safety exclusion already use - not a second, independently-guessed
-/// distance.
-fn multi_hole_saturation_scale(hole_radius: f64, margin: f64) -> f64 {
+/// `phi` reach the DERIVED `target_phi_at_margin(margin, fd_step)` at `r = hole_radius +
+/// margin` - `scale = sqrt(-ln(1-target_phi)) / u`. `margin` is the SAME `ring_anchor_margin_m`
+/// the real Kt diagnostic and every FD-safety exclusion already use - not a second,
+/// independently-guessed distance.
+fn multi_hole_saturation_scale(hole_radius: f64, margin: f64, fd_step: f64) -> f64 {
+    let target_phi = target_phi_at_margin(margin, fd_step);
     let u = margin / hole_radius;
-    (-(1.0 - TARGET_PHI_AT_MARGIN).ln()).sqrt() / u
+    (-(1.0 - target_phi).ln()).sqrt() / u
 }
 
 /// Issue #77 root-cause fix (kinematic decomposition): the closed-form uniform-tension
@@ -1755,13 +1824,15 @@ impl UserDefinedProblem {
             // spec through this exact constructor - INCLUDING PH4-42's own real, already-
             // verified L5 result (0.67-1.23% of FEM), which goes through this identical function
             // - completely untouched by this fix. Once `holes.len() > 1`, each hole gets its OWN
-            // DERIVED scale from `multi_hole_saturation_scale(hole.radius, margin)` - no hand-
-            // picked raw magnitude, self-adjusting to that hole's own radius/margin ratio (see
-            // `TARGET_PHI_AT_MARGIN`'s own doc comment).
+            // DERIVED scale from `multi_hole_saturation_scale(hole.radius, margin, fd_step)` - no
+            // hand-picked raw magnitude, self-adjusting to that hole's own radius/margin ratio AND
+            // (via `target_phi_at_margin`) to the real FD-resolvability constraint (see its own
+            // doc comment).
             let margin = ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+            let fd_step = physical_fd_step_m(spec.training.fd_h, &spec.geometry);
             let multi_hole = holes.len() > 1;
             let sub_ansatzes = holes.into_iter().map(|hole| {
-                let saturation_scale = if multi_hole { multi_hole_saturation_scale(hole.radius, margin) } else { 1.0 };
+                let saturation_scale = if multi_hole { multi_hole_saturation_scale(hole.radius, margin, fd_step) } else { 1.0 };
                 crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
                     hole_center: hole.center, hole_radius: hole.radius,
                     half_w: spec.geometry.half_w, half_h: spec.geometry.half_h,
@@ -4198,13 +4269,80 @@ pub fn stress_concentration_from_profile_generic(
     }
 }
 
+/// Issue #78 second root-cause fix (Kt convergence check): how saturated `phi` must be at the
+/// SECOND radial probe point (`kt_coarse_margin_1_5x` below) - deliberately close to 1
+/// ("essentially at asymptote"), so this probe sits safely past the envelope's own steep
+/// transition zone regardless of the training-time `saturation_scale` in use. Deliberately NOT
+/// the same target as `target_phi_at_margin`: that target answers a different question ("how
+/// much raw gradient signal survives at the real training margin"), and reusing its value here
+/// would put this probe at the exact SAME radius as the first probe (since that margin is, by
+/// construction, where `target_phi_at_margin`'s own target is reached) - collapsing the
+/// comparison to zero by definition rather than measuring anything. This is a genuinely
+/// separate, disclosed constant for a genuinely separate purpose.
+const ENVELOPE_MEASUREMENT_SATURATED_TARGET: f64 = 0.999;
+
+/// The margin (physical, `r - hole_radius`) at which `traction_free_envelope_scaled` reaches
+/// `target`, for a GIVEN `scale` - the inverse of `multi_hole_saturation_scale`'s own solve
+/// (that function solves for `scale` given a target margin and radius; this solves for the
+/// margin given a target and a scale, i.e. `margin = hole_radius * sqrt(-ln(1-target)) / scale`).
+fn envelope_margin_for_target(hole_radius: f64, scale: f64, target: f64) -> f64 {
+    hole_radius * (-(1.0 - target).ln()).sqrt() / scale
+}
+
+/// Extracted from `kt_convergence_check` so the second-radial-probe margin-selection logic
+/// (see `KtConvergenceReport`'s own doc comment) is independently unit-testable without a full
+/// model forward pass. `hole_center`/`hole_radius` identify the hole to `ansatz.saturation_
+/// scale_near`; `margin_coarse` is the first probe's own (already FD-safety-derived) margin.
+fn kt_convergence_radial_probe_margin(
+    ansatz: &dyn DirichletAnsatz,
+    hole_center: [f64; 2],
+    hole_radius: f64,
+    margin_coarse: f64,
+) -> f64 {
+    let margin_1_5x = margin_coarse * 1.5;
+    match ansatz.saturation_scale_near(hole_center) {
+        Some(scale) if scale.is_finite() && scale > 1.0 => {
+            envelope_margin_for_target(hole_radius, scale, ENVELOPE_MEASUREMENT_SATURATED_TARGET)
+                .max(margin_1_5x)
+        }
+        _ => margin_1_5x,
+    }
+}
+
 /// Issue #61 EPIC P2-10's own "angular/radial convergence support" - runs the SAME Kt QoI
 /// pipeline at a coarser and a finer angular resolution (same radial margin), and at the
-/// coarse resolution with a LARGER radial margin (1.5x - never smaller, so this never risks
-/// crossing into `valid_stencil`-unsafe territory near the hole boundary), reporting whether
-/// Kt is actually converging rather than drifting. Directly answers issue #61 §3's own concern
-/// (echoed for domain integrals in P2-11): a single point-count/margin choice proves nothing
-/// about convergence on its own.
+/// coarse resolution with a LARGER radial margin, reporting whether Kt is actually converging
+/// rather than drifting. Directly answers issue #61 §3's own concern (echoed for domain
+/// integrals in P2-11): a single point-count/margin choice proves nothing about convergence on
+/// its own.
+///
+/// **Issue #78 second root-cause fix**: the second radial probe's margin used to be a flat
+/// `margin_coarse * 1.5` - fine when `saturation_scale=1.0` (N=1, byte-identical to before this
+/// fix), but once `saturation_scale` grows for N>1 (issue #78's own root-cause fix), both
+/// `margin_coarse` and `margin_coarse*1.5` can land INSIDE the envelope's own steep transition
+/// zone, so `radial_relative_change` partly measures the ansatz's own known, deterministic
+/// curvature rather than genuine training non-convergence. Now: if `ansatz.saturation_scale_
+/// near(hole.center)` reports an active envelope, the second probe's margin is instead set to
+/// wherever `phi` reaches [`ENVELOPE_MEASUREMENT_SATURATED_TARGET`] for that hole's real scale
+/// (never smaller than the original `1.5x`, so this never risks crossing into `valid_stencil`-
+/// unsafe territory near the hole boundary) - guaranteeing both radial probes sit past the
+/// envelope's own steep region. Gated to `scale > 1.0` specifically (not merely "an envelope is
+/// active"): at `scale=1.0` (N=1, or any pre-#78 caller) the envelope saturates so slowly that
+/// solving for `phi=0.999` would land far outside any sensible probe radius, so at `scale=1.0`
+/// the ORIGINAL `1.5x` margin is used EXACTLY, not approximately - a true zero-regression
+/// guarantee for N=1 (verified - see `kt_convergence_check_radial_probe_is_byte_identical_at_
+/// unit_scale`).
+/// `radial_residual_kt_delta`: Issue #78 second root-cause fix - the ABSOLUTE (not relative -
+/// the residual can be near zero, making a ratio numerically unstable) change in the network's
+/// OWN Kt contribution (`kt_measured - closed_form_only_kt`) between the two radial probes.
+/// `None` when no closed-form baseline applies at all (`IdentityAnsatz` with no affine
+/// background - baseline is identically zero everywhere, so there is nothing to subtract and
+/// this residual would just equal the raw values, not a meaningful decomposition). This does
+/// NOT change `converged`'s own existing gate (kept exactly as before - backward compatible for
+/// every existing caller/threshold) - it's ADDITIVE diagnostic context surfacing how much of
+/// the raw `radial_relative_change` is real, expected closed-form field curvature versus the
+/// network's own still-changing correction, for a human reader to judge, not a new pass/fail
+/// rule silently redefining what "converged" means.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KtConvergenceReport {
     pub kt_coarse: f64,
@@ -4212,7 +4350,80 @@ pub struct KtConvergenceReport {
     pub kt_coarse_margin_1_5x: f64,
     pub angular_relative_change: f64,
     pub radial_relative_change: f64,
+    pub radial_residual_kt_delta: Option<f64>,
     pub converged: bool,
+}
+
+/// Issue #78 second root-cause fix, decisive supporting evidence: the Kt implied by ONLY the
+/// ansatz's own closed-form baseline (`additive()`, zero network contribution) at `r = hole.
+/// radius + margin` - generic over any `DirichletAnsatz` (`IdentityAnsatz`'s `additive()` is
+/// `(0,0)` everywhere, so with no affine background this returns `0.0`, a real "no baseline"
+/// signal, not a crash). Pure host math, no `model`/`device`/burn tensor involved at all - a
+/// genuinely independent computation from the trained-model path, deliberately so (this is
+/// meant to isolate what the CLOSED FORM ALONE predicts, uncontaminated by anything the model
+/// might be doing).
+///
+/// Exists because a real diagnostic test (`kirsch_hole_correction::closed_form_only_kt_
+/// varies_meaningfully_between_the_two_radial_probe_points_at_real_scale`) found the PURE
+/// closed-form baseline alone already accounts for a 7.35% Kt change between `margin_coarse`
+/// and `margin_coarse*1.5` for `triple_hole_plate.toml`'s real geometry at the item-2-derived
+/// scale - most of a real trained run's own observed ~11% raw radial Δ. `kt_convergence_check`'s
+/// raw comparison was always going to partly (mostly) reflect real, EXPECTED analytic field
+/// curvature this close to a hole boundary, not training non-convergence - no choice of SECOND
+/// probe radius alone (`kt_convergence_radial_probe_margin`, this fix's first attempt) can fully
+/// separate the two without this kind of baseline subtraction. `KtConvergenceReport.radial_
+/// residual_kt_delta` uses this to report the network's OWN residual-correction drift between
+/// the two radii, separately from the raw (baseline-contaminated) `radial_relative_change`.
+#[allow(clippy::too_many_arguments)]
+fn closed_form_only_kt_at_margin(
+    ansatz: &dyn DirichletAnsatz,
+    geometry: &UserGeometry,
+    hole: &HoleSpec,
+    margin: f64,
+    u_ref: f64,
+    material: &MaterialProps,
+    affine_strain_pair: Option<(f64, f64)>,
+    nominal_stress: f64,
+    n_theta: usize,
+) -> f64 {
+    let half_w = geometry.half_w;
+    let half_h = geometry.half_h;
+    let r = hole.radius + margin;
+    // Tiny physical FD step, independent of this codebase's own `fd_h` training convention -
+    // matches `kirsch_hole_correction.rs`'s own `total_field_is_traction_free_at_hole_
+    // boundary_numerically` precedent for this exact kind of closed-form-only check.
+    let h = 1e-7_f64;
+    let (a_exx, a_eyy, a_exy) = affine_strain_pair
+        .map(|(px, py)| affine_strain(px, py, material))
+        .unwrap_or((0.0, 0.0, 0.0));
+    let total_u = |x: f64, y: f64| -> (f64, f64) {
+        let xn = (x / half_w) as f32;
+        let yn = (y / half_h) as f32;
+        let (ax, ay) = ansatz.additive(xn, yn);
+        (a_exx * x + a_exy * y + ax as f64 * u_ref, a_exy * x + a_eyy * y + ay as f64 * u_ref)
+    };
+    let e = material.e as f64;
+    let nu = material.nu as f64;
+    let n = n_theta.max(1);
+    let mut max_vm = 0.0_f64;
+    for i in 0..n {
+        let theta = i as f64 * std::f64::consts::TAU / n as f64;
+        let x0 = hole.center[0] + r * theta.cos();
+        let y0 = hole.center[1] + r * theta.sin();
+        let (u_xp, v_xp) = total_u(x0 + h, y0);
+        let (u_xm, v_xm) = total_u(x0 - h, y0);
+        let (u_yp, v_yp) = total_u(x0, y0 + h);
+        let (u_ym, v_ym) = total_u(x0, y0 - h);
+        let exx = (u_xp - u_xm) / (2.0 * h);
+        let eyy = (v_yp - v_ym) / (2.0 * h);
+        let exy = 0.5 * ((u_yp - u_ym) / (2.0 * h) + (v_xp - v_xm) / (2.0 * h));
+        let sxx = e / (1.0 - nu * nu) * (exx + nu * eyy);
+        let syy = e / (1.0 - nu * nu) * (eyy + nu * exx);
+        let sxy = e / (2.0 * (1.0 + nu)) * (2.0 * exy);
+        let vm = (sxx * sxx - sxx * syy + syy * syy + 3.0 * sxy * sxy).sqrt();
+        if vm > max_vm { max_vm = vm; }
+    }
+    max_vm / nominal_stress.abs()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4241,7 +4452,12 @@ pub fn kt_convergence_check(
 
     let kt_coarse = kt_of(n_theta_coarse, margin_coarse);
     let kt_fine_angular = kt_of(n_theta_coarse * 2, margin_coarse);
-    let kt_coarse_margin_1_5x = kt_of(n_theta_coarse, margin_coarse * 1.5);
+
+    // Issue #78 second root-cause fix: pick the second radial probe's margin from the
+    // envelope's own saturation curve when an envelope is active, instead of a flat 1.5x -
+    // see `KtConvergenceReport`'s own doc comment for the full rationale.
+    let margin_radial_2 = kt_convergence_radial_probe_margin(ansatz, hole.center, hole.radius, margin_coarse);
+    let kt_coarse_margin_1_5x = kt_of(n_theta_coarse, margin_radial_2);
 
     let rel = |a: f64, b: f64| if b.abs() > 1e-30 { (a - b).abs() / b.abs() } else { (a - b).abs() };
     let angular_relative_change = rel(kt_fine_angular, kt_coarse);
@@ -4249,9 +4465,24 @@ pub fn kt_convergence_check(
     let converged = angular_relative_change.is_finite() && radial_relative_change.is_finite()
         && angular_relative_change < tolerance && radial_relative_change < tolerance;
 
+    // Issue #78 second root-cause fix: decompose the raw radial Δ into "expected closed-form
+    // curvature" vs. "the network's own residual still moving" - see `KtConvergenceReport`'s
+    // own doc comment. `None` when there's no real ansatz baseline to subtract (would just
+    // reproduce the raw values, not a meaningful decomposition).
+    let has_baseline = affine_strain_pair.is_some() || ansatz.saturation_scale_near(hole.center).is_some();
+    let radial_residual_kt_delta = has_baseline.then(|| {
+        let kt_baseline_1 = closed_form_only_kt_at_margin(
+            ansatz, geometry, hole, margin_coarse, u_ref as f64, material, affine_strain_pair, nominal_stress, n_theta_coarse,
+        );
+        let kt_baseline_2 = closed_form_only_kt_at_margin(
+            ansatz, geometry, hole, margin_radial_2, u_ref as f64, material, affine_strain_pair, nominal_stress, n_theta_coarse,
+        );
+        ((kt_coarse - kt_baseline_1) - (kt_coarse_margin_1_5x - kt_baseline_2)).abs()
+    });
+
     KtConvergenceReport {
         kt_coarse, kt_fine_angular, kt_coarse_margin_1_5x,
-        angular_relative_change, radial_relative_change, converged,
+        angular_relative_change, radial_relative_change, radial_residual_kt_delta, converged,
     }
 }
 
@@ -6629,6 +6860,57 @@ mod tests {
             "the Fixed hole's own soft penalty must be completely unaffected");
     }
 
+    /// Issue #78 second root-cause fix: `target_phi_at_margin` replaces the former hand-picked
+    /// `TARGET_PHI_AT_MARGIN=0.9` constant with a derivation from `margin`/`fd_step`/
+    /// `ENVELOPE_FD_RESOLUTION_FACTOR`. Because `margin = RING_ANCHOR_SAFETY_FACTOR * fd_step`
+    /// always holds via `ring_anchor_margin_m`/`physical_fd_step_m`'s own definitions, the real
+    /// call-site value collapses to a fixed constant - this test asserts that specific worked
+    /// value (`1 - exp(-(RING_ANCHOR_SAFETY_FACTOR / ENVELOPE_FD_RESOLUTION_FACTOR)^2)` =
+    /// `1 - exp(-4) ≈ 0.9817` at the real `4.0`/`2.0` values) so a future change to either
+    /// constant is caught here, not silently.
+    #[test]
+    fn target_phi_at_margin_matches_the_worked_closed_form_value_at_real_ring_anchor_ratio() {
+        let fd_step = 1.5e-4_f64;
+        let margin = RING_ANCHOR_SAFETY_FACTOR * fd_step;
+        let target = target_phi_at_margin(margin, fd_step);
+        let expected = 1.0 - (-(RING_ANCHOR_SAFETY_FACTOR / ENVELOPE_FD_RESOLUTION_FACTOR).powi(2)).exp();
+        assert!((target - expected).abs() < 1e-12, "target={target} expected={expected}");
+        assert!((target - 0.9816843).abs() < 1e-6, "worked value drifted: target={target}");
+    }
+
+    /// `physical_fd_step_m` must match the SAME `fd_h * half_w.max(half_h)` quantity
+    /// `ring_anchor_margin_m` builds its own margin from (before applying `RING_ANCHOR_SAFETY_
+    /// FACTOR`) - confirmed by construction here, not assumed, since a future change to either
+    /// function independently would silently break `target_phi_at_margin`'s own "margin =
+    /// RING_ANCHOR_SAFETY_FACTOR * fd_step always" premise.
+    #[test]
+    fn physical_fd_step_m_times_ring_anchor_safety_factor_equals_ring_anchor_margin_m() {
+        let geometry = UserGeometry {
+            half_w: 0.15, half_h: 0.06, thickness: 0.006,
+            holes: vec![HoleSpec { center: [0.0, 0.0], radius: 0.009, bc: HoleBc::Free }],
+        };
+        let fd_h = 1e-3_f32;
+        let fd_step = physical_fd_step_m(fd_h, &geometry);
+        let margin = ring_anchor_margin_m(fd_h, &geometry);
+        assert!((margin - RING_ANCHOR_SAFETY_FACTOR * fd_step).abs() < 1e-15,
+            "margin={margin} fd_step={fd_step}");
+    }
+
+    /// `multi_hole_saturation_scale`'s own derived scale must genuinely make `phi` reach the
+    /// DERIVED `target_phi_at_margin` value at `r = hole_radius + margin` - the same closed-loop
+    /// consistency proof the earlier (hand-picked-target) version of this derivation had.
+    #[test]
+    fn multi_hole_saturation_scale_derived_from_target_reaches_that_target_at_the_margin() {
+        let hole_radius = 0.009_f64;
+        let margin = 6e-4_f64;
+        let fd_step = 1.5e-4_f64;
+        let scale = multi_hole_saturation_scale(hole_radius, margin, fd_step);
+        let expected_target = target_phi_at_margin(margin, fd_step);
+        let r = hole_radius + margin;
+        let phi = crate::kirsch_hole_correction::traction_free_envelope_scaled(r, 0.0, hole_radius, scale);
+        assert!((phi - expected_target).abs() < 1e-9, "phi={phi} expected_target={expected_target}");
+    }
+
     /// Issue #78 root-cause fix: `new_with_hard_constraint_ansatz` must pick `saturation_scale`
     /// based on how many Free holes are actually eligible, NOT unconditionally - `1.0` at N=1
     /// (load-bearing for PH4-42's own real, already-verified L5 result, which is constructed
@@ -6662,7 +6944,8 @@ mod tests {
             ],
         };
         let margin = ring_anchor_margin_m(multi.training.fd_h, &multi.geometry);
-        let expected_scale = multi_hole_saturation_scale(0.009, margin);
+        let fd_step = physical_fd_step_m(multi.training.fd_h, &multi.geometry);
+        let expected_scale = multi_hole_saturation_scale(0.009, margin, fd_step);
         let multi_problem = UserDefinedProblem::new_with_hard_constraint_ansatz(multi, true, 0.0);
         match &multi_problem.ansatz {
             AnnulusAnsatz::MultiHoleHardConstraint(holes) => {
@@ -8253,6 +8536,59 @@ mod tests {
         assert!((sc_mean.kt - 2.0).abs() < 1e-9);
     }
 
+    /// `envelope_margin_for_target` must be the exact inverse of `multi_hole_saturation_scale`
+    /// (round-trip: derive a scale for a target margin, then solve back for the margin at that
+    /// same target, recover the original margin).
+    #[test]
+    fn envelope_margin_for_target_inverts_multi_hole_saturation_scale() {
+        let hole_radius = 0.009_f64;
+        let margin = 6e-4_f64;
+        let fd_step = 1.5e-4_f64;
+        let target = target_phi_at_margin(margin, fd_step);
+        let scale = multi_hole_saturation_scale(hole_radius, margin, fd_step);
+        let recovered_margin = envelope_margin_for_target(hole_radius, scale, target);
+        assert!((recovered_margin - margin).abs() < 1e-12,
+            "recovered={recovered_margin} expected={margin}");
+    }
+
+    /// Issue #78 second root-cause fix: at `scale=1.0` (N=1, or any pre-#78 ansatz), the
+    /// second radial probe's margin must be EXACTLY `margin_coarse * 1.5` - the original,
+    /// byte-identical formula - never the envelope-saturated one (which would be nonsensically
+    /// large at `scale=1.0`, see `KtConvergenceReport`'s own doc comment).
+    #[test]
+    fn kt_convergence_radial_probe_margin_is_exactly_1_5x_at_unit_scale() {
+        let margin_coarse = 6e-4_f64;
+        let ansatz = crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+            hole_center: [0.0, 0.0], hole_radius: 0.009, half_w: 0.15, half_h: 0.06,
+            px: 6.9e7, py: 0.0, e: 71.7e9, nu: 0.33, u_ref: 1e-6, saturation_scale: 1.0,
+        };
+        let margin = kt_convergence_radial_probe_margin(&ansatz, [0.0, 0.0], 0.009, margin_coarse);
+        assert!((margin - margin_coarse * 1.5).abs() < 1e-15, "margin={margin}");
+
+        // Also exactly 1.5x when the ansatz has no envelope at all (Identity/no match).
+        let margin_identity = kt_convergence_radial_probe_margin(&IdentityAnsatz, [0.0, 0.0], 0.009, margin_coarse);
+        assert!((margin_identity - margin_coarse * 1.5).abs() < 1e-15, "margin_identity={margin_identity}");
+    }
+
+    /// Once `saturation_scale > 1.0` (the real N>1 regime), the second radial probe must move
+    /// FARTHER out than the original `1.5x` margin - never smaller (FD-stencil safety), and
+    /// genuinely different (proving the fix actually engages, not a no-op).
+    #[test]
+    fn kt_convergence_radial_probe_margin_exceeds_1_5x_once_scale_exceeds_one() {
+        let margin_coarse = 6e-4_f64;
+        let hole_radius = 0.009_f64;
+        let ansatz = crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+            hole_center: [0.0, 0.0], hole_radius, half_w: 0.15, half_h: 0.06,
+            px: 6.9e7, py: 0.0, e: 71.7e9, nu: 0.33, u_ref: 1e-6, saturation_scale: 22.75,
+        };
+        let margin = kt_convergence_radial_probe_margin(&ansatz, [0.0, 0.0], hole_radius, margin_coarse);
+        assert!(margin > margin_coarse * 1.5, "expected margin > 1.5x margin_coarse, got {margin}");
+        // Sanity bound: this must still stay a small fraction of the hole's own radius, not
+        // blow up to plate scale - confirms `ENVELOPE_MEASUREMENT_SATURATED_TARGET`'s own
+        // choice stays physically sensible at a real derived scale.
+        assert!(margin < hole_radius, "margin={margin} should stay well under the hole radius at this scale");
+    }
+
     #[test]
     fn kt_convergence_check_runs_end_to_end_and_returns_finite_values() {
         let device = crate::training_core::BDevice::default();
@@ -8271,6 +8607,118 @@ mod tests {
         assert!(report.kt_coarse_margin_1_5x.is_finite(), "{report:?}");
         assert!(report.angular_relative_change.is_finite(), "{report:?}");
         assert!(report.radial_relative_change.is_finite(), "{report:?}");
+        // IdentityAnsatz + no affine background = no closed-form baseline to subtract at all.
+        assert_eq!(report.radial_residual_kt_delta, None, "{report:?}");
+    }
+
+    /// `closed_form_only_kt_at_margin`, computed generically via `ansatz.additive()`, must
+    /// numerically agree with `kirsch_hole_correction`'s own independent, hand-derived
+    /// reimplementation (`closed_form_only_kt_varies_meaningfully_between_the_two_radial_
+    /// probe_points_at_real_scale`) for the SAME geometry/scale/margins - two independently
+    /// written computations of the same real quantity agreeing is real evidence neither has a
+    /// transcription bug, not merely "it compiles."
+    /// Debug isolation: does `ansatz.additive(xn,yn)` (via `AnnulusAnsatz::MultiHoleHardConstraint`)
+    /// return the SAME physical displacement as directly calling `kirsch_hole_displacement`
+    /// per-hole and summing, at ONE specific point? Narrows whether a mismatch is in the ansatz
+    /// plumbing or in `closed_form_only_kt_at_margin`'s own FD/stress math.
+    #[test]
+    fn debug_ansatz_additive_matches_direct_kirsch_hole_displacement_sum_at_one_point() {
+        let a = 0.009_f64;
+        let px = 6.9e7_f64;
+        let half_w = 0.15_f64;
+        let half_h = 0.06_f64;
+        let centers = [[-0.06_f64, 0.02_f64], [0.06_f64, 0.02_f64]];
+        let ansatz = crate::kirsch_hole_correction::AnnulusAnsatz::MultiHoleHardConstraint(
+            centers.iter().map(|&c| crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+                hole_center: c, hole_radius: a, half_w, half_h,
+                px, py: 0.0, e: 71.7e9, nu: 0.33, u_ref: 1.0, saturation_scale: 30.0,
+            }).collect()
+        );
+        // A point on hole0's own boundary ring.
+        let x0 = centers[0][0] + (a + 6e-4) * 0.7_f64.cos();
+        let y0 = centers[0][1] + (a + 6e-4) * 0.7_f64.sin();
+        use pinn_core::problem::DirichletAnsatz;
+        let (ax, ay) = ansatz.additive((x0 / half_w) as f32, (y0 / half_h) as f32);
+
+        let mut ex = 0.0_f64;
+        let mut ey = 0.0_f64;
+        for &c in &centers {
+            let (hx, hy) = crate::kirsch_hole_correction::kirsch_hole_displacement(x0 - c[0], y0 - c[1], a, 71.7e9, 0.33, px, 0.0);
+            ex += hx;
+            ey += hy;
+        }
+        println!("ansatz.additive -> ({ax}, {ay})   direct sum -> ({ex}, {ey})");
+        // f32 precision (`additive`'s own return type), not f64 - a tight-but-realistic
+        // tolerance given the magnitudes involved here (~1e-5).
+        assert!((ax as f64 - ex).abs() < 1e-6 * ex.abs().max(1e-12), "ux mismatch: ansatz={ax} direct={ex}");
+        assert!((ay as f64 - ey).abs() < 1e-6 * ey.abs().max(1e-12), "uy mismatch: ansatz={ay} direct={ey}");
+    }
+
+    #[test]
+    fn closed_form_only_kt_at_margin_matches_the_independent_kirsch_hole_correction_reimplementation() {
+        let a = 0.009_f64;
+        let px = 6.9e7_f64;
+        let margin_coarse = 6e-4_f64;
+        let scale = 30.0_f64;
+        let geometry = UserGeometry {
+            half_w: 0.15, half_h: 0.06, thickness: 0.006,
+            holes: vec![
+                HoleSpec { center: [-0.06, 0.02], radius: a, bc: HoleBc::Free },
+                HoleSpec { center: [0.0, -0.02], radius: 0.007, bc: HoleBc::Fixed },
+                HoleSpec { center: [0.06, 0.02], radius: a, bc: HoleBc::Free },
+            ],
+        };
+        let material = MaterialProps { e: 71.7e9, nu: 0.33, density: 2810.0, ultimate_strength_pa: 503e6 };
+        let ansatz = crate::kirsch_hole_correction::AnnulusAnsatz::MultiHoleHardConstraint(vec![
+            crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+                hole_center: [-0.06, 0.02], hole_radius: a, half_w: 0.15, half_h: 0.06,
+                px, py: 0.0, e: material.e as f64, nu: material.nu as f64, u_ref: 1.0, saturation_scale: scale,
+            },
+            crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+                hole_center: [0.06, 0.02], hole_radius: a, half_w: 0.15, half_h: 0.06,
+                px, py: 0.0, e: material.e as f64, nu: material.nu as f64, u_ref: 1.0, saturation_scale: scale,
+            },
+        ]);
+        let hole0 = geometry.holes[0];
+        let nominal_stress = px;
+        // The independent reference test includes the affine uniaxial background
+        // (`a_exx*x + a_eyy*y`, `py=0.0`) - must pass the matching `Some((px, 0.0))` here, not
+        // `None`, or this cross-check compares two different physical fields.
+        let affine = Some((px, 0.0));
+        let kt_1 = closed_form_only_kt_at_margin(&ansatz, &geometry, &hole0, margin_coarse, 1.0, &material, affine, nominal_stress, 72);
+        let kt_1_5 = closed_form_only_kt_at_margin(&ansatz, &geometry, &hole0, margin_coarse * 1.5, 1.0, &material, affine, nominal_stress, 72);
+        // From the independent kirsch_hole_correction.rs test: margin=2.5075, margin*1.5=2.3231.
+        // 0.5% relative tolerance, not an exact match - this function round-trips the FD-
+        // perturbed point through `additive`'s `f32` (xn,yn) contract, while the reference
+        // test in `kirsch_hole_correction.rs` computes everything in pure `f64`; a small,
+        // expected precision difference between the two independent implementations, not a
+        // logic error (confirmed by `debug_ansatz_additive_matches_direct_kirsch_hole_
+        // displacement_sum_at_one_point`'s own tight single-point agreement).
+        assert!((kt_1 - 2.5075).abs() / 2.5075 < 5e-3, "kt_1={kt_1}, expected ~2.5075");
+        assert!((kt_1_5 - 2.3231).abs() / 2.3231 < 5e-3, "kt_1_5={kt_1_5}, expected ~2.3231");
+    }
+
+    /// End-to-end: `radial_residual_kt_delta` must be `Some` and finite for a real multi-hole
+    /// hard-constraint ansatz (a genuine baseline exists to subtract), unlike the `IdentityAnsatz`
+    /// case above.
+    #[test]
+    fn kt_convergence_check_reports_a_residual_when_a_real_baseline_ansatz_is_active() {
+        let device = crate::training_core::BDevice::default();
+        let geometry = two_hole_geometry();
+        let model = tiny_model(&geometry);
+        let fd = crate::fd_stencil::FdConfig::new(TEST_FD_H, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+        let material = MaterialProps::al7075_t6();
+        let hole = geometry.holes[0];
+        let margin = ring_anchor_margin_m(TEST_FD_H, &geometry);
+        let ansatz = crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+            hole_center: hole.center, hole_radius: hole.radius, half_w: geometry.half_w, half_h: geometry.half_h,
+            px: 1e7, py: 0.0, e: material.e as f64, nu: material.nu as f64, u_ref: 1.0, saturation_scale: 20.0,
+        };
+        let report = kt_convergence_check(
+            &model, &geometry, &hole, 32, &fd, 1.0, 1e7, &material, margin, 1e7, 0.5, &device,
+            &ansatz, None,
+        );
+        assert!(report.radial_residual_kt_delta.is_some_and(f64::is_finite), "{report:?}");
     }
 
     // ─── Phase 14 (Neural-Network-Wide Adaptive Collocation epic): spatial diagnostic fields ──
