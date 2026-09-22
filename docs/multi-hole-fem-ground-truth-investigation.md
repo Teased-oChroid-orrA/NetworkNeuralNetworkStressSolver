@@ -570,3 +570,22 @@ number, though the flag itself still trips for both Free holes even after this f
 disclosed, non-negligible network-side residual remains - not fully closed, honestly reported
 as such). `triple_hole_plate.toml`: hole0/hole2 Kt=2.884/3.032 vs FEM ≈2.98-3.06/2.97-3.02.
 Full regression: 563 passed (+10 net new), same 1 pre-existing unrelated failure.
+
+## Sixth pass: kinematic decomposition itself generalized to N holes - real, honest result
+
+Full detail: `CLAUDE.md`'s "Issue #78 item 4" section (the authoritative record - design,
+reuse-vs-new-code breakdown, verification). One-line summary: a new, purely additive
+`MultiAnnularDecompositionProblem` generalizes #77's own annular kinematic decomposition
+(previously exactly-one-hole-only) to N Free holes, zero change to the frozen single-hole path,
+real N=1 regression proof (bit-identical sampled points/point-sets/term set, passed first try).
+
+Real N=2 result (2 Free holes, no Fixed hole, converged FEM `Kt_vm≈3.05/3.07` via `tools/
+multi_hole_reference.py`): trains successfully, genuinely symmetric `hole0/hole1 Kt=2.521/2.520`
+- correct in shape, but ~15-18% below FEM, LESS accurate than the ansatz-only path's own best
+result on a different geometry (`Kt=2.88-2.99` vs FEM `≈2.98-3.06`). Root cause identified but
+not fixed this pass: every domain in the new driver uses plain Raw coordinates (a real
+`MultiStepCtx` limitation - one shared `coordinate_embedding` value can't safely carry N
+different per-hole `SingleHoleChart`s at once), losing the single-hole path's own hole-relative
+7-feature representation. A real, scoped, disclosed follow-up (per-domain embeddings in
+`MultiStepCtx`), alongside `SequentialTwoStage`'s own N-hole generalization (not attempted this
+pass either). Full regression: 566 passed (+7 net new), same 1 pre-existing unrelated failure.

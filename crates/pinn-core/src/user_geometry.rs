@@ -384,6 +384,45 @@ impl UserGeometry {
         }
         Some(AnnularPartition { center: hole.center, hole_radius: hole.radius, interface_radius })
     }
+
+    /// Issue #78 item 4: the N-hole generalization `annular_partition`'s own doc comment
+    /// flagged as deliberately deferred - one `AnnularPartition` per `HoleBc::Free` hole
+    /// (`Fixed` holes get no annulus domain at all; they stay in the outer domain via the
+    /// existing soft-penalty `hole_fixed` term, unaffected by this). `annular_partition`'s own
+    /// per-hole math (`interface_radius = 3·hole.radius`, centered on that hole) was ALREADY
+    /// hole-local, not plate-wide - this function just calls it once per Free hole and adds
+    /// the ONE thing genuinely missing for N>1: validating no two interface circles overlap
+    /// each other (a real, previously-nonexistent check - `UserGeometry::validate()` only ever
+    /// checked the HOLES themselves don't overlap, not their much-larger interface circles).
+    /// Returns `None` (loud, not silent) if ANY interface circle doesn't fit inside the plate
+    /// OR any two interface circles overlap - a caller must not silently fall back to a subset
+    /// of holes or an arbitrary ownership assignment for the overlapping region.
+    pub fn annular_partitions(&self) -> Option<Vec<AnnularPartition>> {
+        let free_holes: Vec<&HoleSpec> = self.holes.iter().filter(|h| h.bc == HoleBc::Free).collect();
+        if free_holes.is_empty() {
+            return None;
+        }
+        let mut partitions = Vec::with_capacity(free_holes.len());
+        for hole in &free_holes {
+            let interface_radius = ANNULAR_INTERFACE_RADIUS_FACTOR * hole.radius;
+            if interface_radius >= self.half_w.min(self.half_h) {
+                return None;
+            }
+            partitions.push(AnnularPartition { center: hole.center, hole_radius: hole.radius, interface_radius });
+        }
+        for i in 0..partitions.len() {
+            for j in (i + 1)..partitions.len() {
+                let (a, b) = (partitions[i], partitions[j]);
+                let dx = a.center[0] - b.center[0];
+                let dy = a.center[1] - b.center[1];
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist < a.interface_radius + b.interface_radius {
+                    return None;
+                }
+            }
+        }
+        Some(partitions)
+    }
     /// True if `(x, y)` is inside the plate's rectangular bound and outside every hole.
     pub fn contains(&self, x: f64, y: f64) -> bool {
         if x < -self.half_w || x > self.half_w || y < -self.half_h || y > self.half_h {
@@ -957,6 +996,65 @@ mod tests {
         assert!(partition.contains_outer(0.5, 0.0));
         assert!(!partition.contains_annulus(0.5, 0.0));
         assert!(!partition.contains_annulus(0.0, 0.0));
+    }
+
+    /// Issue #78 item 4: N=1 reduction - `annular_partitions` on a single-Free-hole geometry
+    /// must produce the SAME single `AnnularPartition` `annular_partition` (singular) does.
+    #[test]
+    fn annular_partitions_reduces_to_annular_partition_at_n_equals_one() {
+        let geometry = UserGeometry {
+            half_w: 1.0, half_h: 1.0, thickness: 0.1,
+            holes: vec![HoleSpec { center: [0.0, 0.0], radius: 0.1, bc: HoleBc::Free }],
+        };
+        let single = geometry.annular_partition().expect("single hole must partition");
+        let plural = geometry.annular_partitions().expect("single Free hole must partition");
+        assert_eq!(plural.len(), 1);
+        assert_eq!(plural[0], single);
+    }
+
+    /// Two well-separated Free holes must each get their own real, correctly-centered
+    /// partition - `Fixed` holes are excluded entirely (no partition for them).
+    #[test]
+    fn annular_partitions_returns_one_partition_per_free_hole_and_skips_fixed_holes() {
+        let geometry = UserGeometry {
+            half_w: 1.0, half_h: 1.0, thickness: 0.1,
+            holes: vec![
+                HoleSpec { center: [-0.5, 0.0], radius: 0.05, bc: HoleBc::Free },
+                HoleSpec { center: [0.0, 0.0], radius: 0.05, bc: HoleBc::Fixed },
+                HoleSpec { center: [0.5, 0.0], radius: 0.05, bc: HoleBc::Free },
+            ],
+        };
+        let partitions = geometry.annular_partitions().expect("two well-separated Free holes must partition");
+        assert_eq!(partitions.len(), 2, "exactly the two Free holes, Fixed excluded");
+        assert_eq!(partitions[0].center, [-0.5, 0.0]);
+        assert_eq!(partitions[1].center, [0.5, 0.0]);
+    }
+
+    /// Real overlap validation, previously nonexistent: two Free holes close enough that their
+    /// INTERFACE circles (not just the holes themselves) overlap must return `None`, loudly.
+    #[test]
+    fn annular_partitions_returns_none_when_interface_circles_overlap() {
+        // radius=0.1 => interface_radius=0.3 each; centers 0.5 apart => circles overlap
+        // (0.3+0.3=0.6 > 0.5) even though the holes themselves (0.1+0.1=0.2 < 0.5) do not.
+        let geometry = UserGeometry {
+            half_w: 2.0, half_h: 2.0, thickness: 0.1,
+            holes: vec![
+                HoleSpec { center: [-0.25, 0.0], radius: 0.1, bc: HoleBc::Free },
+                HoleSpec { center: [0.25, 0.0], radius: 0.1, bc: HoleBc::Free },
+            ],
+        };
+        assert!(geometry.validate().is_ok(), "the holes themselves must not overlap, only their interface circles");
+        assert!(geometry.annular_partitions().is_none(), "overlapping interface circles must be rejected, not silently assigned");
+    }
+
+    /// No Free holes at all (every hole Fixed, or no holes) - nothing to decompose.
+    #[test]
+    fn annular_partitions_returns_none_when_no_free_holes_exist() {
+        let geometry = UserGeometry {
+            half_w: 1.0, half_h: 1.0, thickness: 0.1,
+            holes: vec![HoleSpec { center: [0.0, 0.0], radius: 0.1, bc: HoleBc::Fixed }],
+        };
+        assert!(geometry.annular_partitions().is_none());
     }
 
     #[test]

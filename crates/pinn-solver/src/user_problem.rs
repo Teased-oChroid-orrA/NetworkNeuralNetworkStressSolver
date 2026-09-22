@@ -477,6 +477,120 @@ impl DomainSamplingStrategy for AnnularPartitionSampling {
     }
 }
 
+/// Issue #78 item 4: the OUTER domain's own sampling strategy for the N-hole generalization of
+/// #77's annular decomposition (`MultiAnnularDecompositionProblem`) - the multi-hole analogue
+/// of `AnnularPartitionSampling(is_annulus=false)`, generalized to exclude EVERY Free hole's own
+/// interface circle (not just one) and to expose N sets of interface points (one per hole,
+/// named via [`occurrence_suffixed_name`] so hole 0's own names stay byte-identical to the
+/// original single-hole path - load-bearing for the N=1 regression proof).
+///
+/// Each ANNULUS domain, by contrast, reuses [`AnnularPartitionSampling`] completely UNCHANGED
+/// (constructed with a synthetic single-hole [`UserGeometry`] for just that one hole) - only
+/// the shared OUTER domain genuinely needs new multi-hole-aware logic, since it's the only
+/// domain that must know about every hole at once.
+pub struct MultiAnnularOuterSampling {
+    /// The FULL, real N-hole geometry (every hole, Free and Fixed) - needed for `contains`/
+    /// the plate boundary, unlike each annulus domain's own synthetic single-hole view.
+    geometry: UserGeometry,
+    /// One entry per Free hole, in the SAME order `annulus_domain_ids`/`interfaces` use.
+    partitions: Vec<pinn_core::user_geometry::AnnularPartition>,
+    /// The partner `DomainId` for each Free hole's own annulus domain, same order as `partitions`.
+    annulus_domain_ids: Vec<DomainId>,
+    /// Shared across every hole (same `HOLE_RING_POINTS` angle set each - geometry-independent).
+    interface: std::sync::Arc<InterfaceParametrization>,
+    /// Same derivation as `AnnularPartitionSampling::interface_trace_offset` (plate-scaled via
+    /// `ring_anchor_margin_m`, not hole-scaled) - a single shared value is correct, not a
+    /// per-hole simplification, since the ORIGINAL single-hole field is plate-scaled too.
+    interface_trace_offset: f64,
+    interior_calls: std::sync::atomic::AtomicU64,
+}
+
+impl MultiAnnularOuterSampling {
+    pub fn new(
+        geometry: UserGeometry,
+        fd_h: f32,
+        partitions: Vec<pinn_core::user_geometry::AnnularPartition>,
+        annulus_domain_ids: Vec<DomainId>,
+        interface: std::sync::Arc<InterfaceParametrization>,
+    ) -> Self {
+        assert_eq!(partitions.len(), annulus_domain_ids.len(),
+            "one partition per annulus domain id - they're indexed together positionally");
+        let interface_trace_offset = 0.5 * ring_anchor_margin_m(fd_h, &geometry);
+        for p in &partitions {
+            assert!(interface_trace_offset > 0.0 && interface_trace_offset < p.interface_radius - p.hole_radius,
+                "#78 interface FD trace offset must fit inside every annulus");
+        }
+        Self { geometry, partitions, annulus_domain_ids, interface, interface_trace_offset, interior_calls: std::sync::atomic::AtomicU64::new(0) }
+    }
+}
+
+impl DomainSamplingStrategy for MultiAnnularOuterSampling {
+    fn sample_interior(&self, _geom: &GeometryConfig, n: usize) -> Vec<[f64; 2]> {
+        use pinn_core::LcgRng;
+        let call = self.interior_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut rng = LcgRng::new(SEED_INTERIOR ^ call.wrapping_mul(CALL_SEED_MIX));
+        let mut points = Vec::with_capacity(n);
+        let mut attempts = 0usize;
+        while points.len() < n && attempts < n * REJECTION_SAMPLE_ATTEMPTS_FACTOR {
+            attempts += 1;
+            let x = (rng.next_f64() * 2.0 - 1.0) * self.geometry.half_w;
+            let y = (rng.next_f64() * 2.0 - 1.0) * self.geometry.half_h;
+            if self.geometry.contains(x, y) && self.partitions.iter().all(|p| p.contains_outer(x, y)) {
+                points.push([x, y]);
+            }
+        }
+        points
+    }
+
+    fn sample_boundary(&self, _geom: &GeometryConfig, _load: &LoadConfig, n: usize) -> Vec<BoundaryPoint> {
+        // Identical to `AnnularPartitionSampling`'s own outer-boundary sampling - the plate's
+        // own outer edge doesn't depend on how many holes it has.
+        let per_edge = (n / 4).max(1);
+        let mut points = Vec::with_capacity(4 * per_edge);
+        for i in 0..per_edge {
+            let f = (i as f64 + 0.5) / per_edge as f64;
+            let x = -self.geometry.half_w + 2.0 * self.geometry.half_w * f;
+            let y = -self.geometry.half_h + 2.0 * self.geometry.half_h * f;
+            points.extend([
+                BoundaryPoint { x: self.geometry.half_w, y, nx: 1.0, ny: 0.0, tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannLoad },
+                BoundaryPoint { x: -self.geometry.half_w, y, nx: -1.0, ny: 0.0, tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannLoad },
+                BoundaryPoint { x, y: self.geometry.half_h, nx: 0.0, ny: 1.0, tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannLoad },
+                BoundaryPoint { x, y: -self.geometry.half_h, nx: 0.0, ny: -1.0, tx: 0.0, ty: 0.0, kind: BoundaryKind::NeumannLoad },
+            ]);
+        }
+        points
+    }
+
+    fn amr_lock_zone(&self, _geom: &GeometryConfig, _cell_center: [f64; 2]) -> bool { false }
+    fn sample_extra_ring(&self, _geom: &GeometryConfig, _n: usize) -> Vec<[f64; 2]> { Vec::new() }
+
+    fn named_point_sets(&self, _bnd: &[BoundaryPoint]) -> Vec<NamedPointSet> {
+        let mut sets = Vec::with_capacity(self.partitions.len() * 2);
+        for (i, (partition, &partner)) in self.partitions.iter().zip(self.annulus_domain_ids.iter()).enumerate() {
+            let interface_pts = self.interface.thetas.iter().map(|&theta| {
+                let radial = [theta.cos(), theta.sin()];
+                BoundaryPoint {
+                    x: partition.center[0] + partition.interface_radius * radial[0],
+                    y: partition.center[1] + partition.interface_radius * radial[1],
+                    nx: -radial[0], ny: -radial[1], tx: 0.0, ty: 0.0,
+                    kind: BoundaryKind::Interface { partner_domain: partner },
+                }
+            }).collect();
+            sets.push(NamedPointSet { name: occurrence_suffixed_name("interface", i), points: interface_pts });
+
+            let trace_radius = partition.interface_radius + self.interface_trace_offset;
+            let trace_pts = self.interface.thetas.iter().map(|&theta| BoundaryPoint {
+                x: partition.center[0] + trace_radius * theta.cos(),
+                y: partition.center[1] + trace_radius * theta.sin(),
+                nx: -theta.cos(), ny: -theta.sin(), tx: 0.0, ty: 0.0,
+                kind: BoundaryKind::Interface { partner_domain: partner },
+            }).collect();
+            sets.push(NamedPointSet { name: occurrence_suffixed_name("interface_outer_stress", i), points: trace_pts });
+        }
+        sets
+    }
+}
+
 /// Per-domain sampling strategy driven directly by a [`UserGeometry`] — ignores the
 /// `&GeometryConfig` parameter every [`DomainSamplingStrategy`] method takes (an
 /// established, precedented pattern — see `FakeInterfaceSampling` in
@@ -1492,6 +1606,22 @@ fn hole_bc_term_name(bc: HoleBc, occurrence: usize) -> &'static str {
     }
 }
 
+/// Issue #78 item 4: the SAME "first occurrence unsuffixed, 2nd+ suffixed" convention
+/// `hole_bc_term_name` established, generalized for any `base` name - used for the OUTER
+/// domain's own per-hole interface point-set names (`"interface"`/`"interface_outer_stress"`
+/// for the first Free hole, `"interface_1"`/`"interface_outer_stress_1"` for the second, ...).
+/// Load-bearing for the N=1 regression proof: at `occurrence=0` this is byte-identical to the
+/// literal `"interface"`/`"interface_outer_stress"` strings `AnnularPartitionSampling` itself
+/// already hardcodes, so a single-Free-hole `MultiAnnularOuterSampling` produces IDENTICAL
+/// point-set names to the original single-hole path.
+fn occurrence_suffixed_name(base: &'static str, occurrence: usize) -> &'static str {
+    if occurrence == 0 {
+        base
+    } else {
+        Box::leak(format!("{base}_{occurrence}").into_boxed_str())
+    }
+}
+
 /// One hole's boundary condition — `Free` mirrors `pinlug_problem::LugFreeEdgeTractionTerm`
 /// (`hole_traction_loss_direct` on direct mDEM stress columns, implicit zero target);
 /// `Fixed` mirrors `pinlug_problem::LugShankAnchorTerm` (`mean(u^2+v^2)` on direct mDEM
@@ -1590,6 +1720,77 @@ impl LossTerm for InterfaceTractionContinuityTerm {
         (tx.clone() * tx + ty.clone() * ty).mean().mul_scalar(self.inv_ref_stress2)
     }
 }
+/// Issue #78 item 4: the N-hole generalization of `InterfaceDisplacementContinuityTerm` - the
+/// ONLY reason a new struct is needed (not a parameter added to the existing one) is that the
+/// original hardcodes `point_sets() -> ["interface", "interface"]` (the SAME name on both
+/// sides, correct for exactly one annulus/outer pair). Once the outer domain is SHARED across
+/// N holes, each hole's own interface points need a per-hole-unique name on the outer side
+/// (`occurrence_suffixed_name`) while the annulus side stays unsuffixed "interface" (each
+/// annulus domain is independently scoped, never needs distinguishing). `right_point_set` is
+/// the only real addition; `compute()` is copied verbatim (byte-identical math).
+pub struct MultiInterfaceDisplacementContinuityTerm {
+    pub left: DomainId,
+    pub right: DomainId,
+    pub right_point_set: &'static str,
+    pub inv_u_ref_sq: f64,
+}
+impl LossTerm for MultiInterfaceDisplacementContinuityTerm {
+    fn name(&self) -> &'static str { "interface_displacement_continuity" }
+    fn domains(&self) -> Vec<DomainId> { vec![self.left, self.right] }
+    fn point_sets(&self) -> Vec<&'static str> { vec!["interface", self.right_point_set] }
+    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Interface) }
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
+    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        let left = inputs.iter().find(|d| d.domain == self.left).expect("interface displacement: left domain missing");
+        let right = inputs.iter().find(|d| d.domain == self.right).expect("interface displacement: right domain missing");
+        let n = left.raw_out.dims()[0];
+        assert_eq!(n, right.raw_out.dims()[0], "interface displacement: point sets must be aligned");
+        let du = left.raw_out.clone().slice([0..n, 0..1]) - right.raw_out.clone().slice([0..n, 0..1]);
+        let dv = left.raw_out.clone().slice([0..n, 1..2]) - right.raw_out.clone().slice([0..n, 1..2]);
+        (du.clone() * du + dv.clone() * dv).mean().mul_scalar(self.inv_u_ref_sq)
+    }
+}
+
+/// Issue #78 item 4: the N-hole generalization of `InterfaceTractionContinuityTerm` - see
+/// `MultiInterfaceDisplacementContinuityTerm`'s own doc comment for why a new struct (not a
+/// modified existing one) is the right shape. `right_point_set` replaces the hardcoded
+/// `"interface_outer_stress"` with a per-hole-suffixed name; the annulus side stays
+/// unsuffixed `"interface_annulus_stress"` (domain-scoped, needs no distinguishing).
+pub struct MultiInterfaceTractionContinuityTerm {
+    pub left: DomainId,
+    pub right: DomainId,
+    pub right_point_set: &'static str,
+    pub left_material: MaterialProps,
+    pub right_material: MaterialProps,
+    pub inv_ref_stress2: f64,
+}
+impl LossTerm for MultiInterfaceTractionContinuityTerm {
+    fn name(&self) -> &'static str { "interface_traction_continuity" }
+    fn domains(&self) -> Vec<DomainId> { vec![self.left, self.right] }
+    fn point_sets(&self) -> Vec<&'static str> { vec!["interface_annulus_stress", self.right_point_set] }
+    fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Bc }
+    fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Strong }
+    fn stress_source(&self) -> Option<crate::problem::StressSource> { Some(crate::problem::StressSource::Derived) }
+    fn boundary_kind(&self) -> Option<crate::problem::BoundaryOperatorKind> { Some(crate::problem::BoundaryOperatorKind::Interface) }
+    fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
+    fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::Constraint }
+    fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
+        let left = inputs.iter().find(|d| d.domain == self.left).expect("interface traction: left domain missing");
+        let right = inputs.iter().find(|d| d.domain == self.right).expect("interface traction: right domain missing");
+        let (lexx, leyy, lexy) = left.strains.clone().expect("interface traction: left strains missing");
+        let (rexx, reyy, rexy) = right.strains.clone().expect("interface traction: right strains missing");
+        let (lnx, lny) = left.normals.clone().expect("interface traction: left normals missing");
+        let (rnx, rny) = right.normals.clone().expect("interface traction: right normals missing");
+        let (lsxx, lsyy, lsxy) = crate::energy::compute_stress(lexx, leyy, lexy, &self.left_material);
+        let (rsxx, rsyy, rsxy) = crate::energy::compute_stress(rexx, reyy, rexy, &self.right_material);
+        let tx = lsxx * lnx.clone() + lsxy.clone() * lny.clone() + rsxx * rnx.clone() + rsxy.clone() * rny.clone();
+        let ty = lsxy * lnx + lsyy * lny + rsxy * rnx + rsyy * rny;
+        (tx.clone() * tx + ty.clone() * ty).mean().mul_scalar(self.inv_ref_stress2)
+    }
+}
+
 impl LossTerm for HoleBcTerm {
     fn name(&self) -> &'static str { self.name }
     fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
@@ -2329,6 +2530,19 @@ impl AnnularDecompositionProblem {
 /// outer contribution so loss ledgers can report both physical pieces. `step_physics_multi`
 /// pins both names to coefficient one, so SAW-BRDR cannot distort U_annulus + U_outer - W_ext.
 struct AnnularPotentialEnergyTerm {
+    /// Issue #78 item 4: which annulus domain this term integrates over - was hardcoded to
+    /// the single frozen `ANNULUS_DOMAIN` constant (correct when there's only ever one), now a
+    /// real field so `MultiAnnularDecompositionProblem` can construct one instance per Free
+    /// hole's own annulus domain. `AnnularDecompositionProblem`'s own N=1 construction sites
+    /// set this to `ANNULUS_DOMAIN` explicitly - byte-identical behavior, not a default.
+    domain: DomainId,
+    /// Issue #78 item 4: was hardcoded `"annulus_potential"` - a real field so N annulus
+    /// domains' own energy terms get DISTINCT names (`occurrence_suffixed_name`), avoiding the
+    /// exact SAME silent-`HashMap`-overwrite bug class `hole_bc_term_name` was already fixed
+    /// for (`HoleBcTerm`, issue #78 Stage 1) - unnamed/duplicate-named terms would silently
+    /// collide in `training_core.rs`'s `lam_by_name`/`term_grad_norms` bookkeeping. Every
+    /// N=1 construction site sets this to the literal `"annulus_potential"` - byte-identical.
+    name: &'static str,
     material: MaterialProps,
     domain_area: f64,
     thickness: f64,
@@ -2339,14 +2553,14 @@ struct AnnularPotentialEnergyTerm {
 }
 
 impl LossTerm for AnnularPotentialEnergyTerm {
-    fn name(&self) -> &'static str { "annulus_potential" }
-    fn domains(&self) -> Vec<DomainId> { vec![ANNULUS_DOMAIN] }
+    fn name(&self) -> &'static str { self.name }
+    fn domains(&self) -> Vec<DomainId> { vec![self.domain] }
     fn conflict_group(&self) -> ConflictGroup { ConflictGroup::Physics }
     fn formulation_kind(&self) -> crate::problem::FormulationKind { crate::problem::FormulationKind::Weak }
     fn derivative_order(&self) -> Option<crate::problem::DerivativeOrder> { Some(crate::problem::DerivativeOrder::First) }
     fn term_role(&self) -> crate::problem::TermRole { crate::problem::TermRole::PhysicalFunctional }
     fn compute(&self, inputs: &[DomainForwardOutputs<'_, B>]) -> Tensor<B, 1> {
-        let d = inputs.iter().find(|d| d.domain == ANNULUS_DOMAIN)
+        let d = inputs.iter().find(|d| d.domain == self.domain)
             .expect("annular physical potential: domain missing");
         let (mut exx, mut eyy, mut exy) = d.strains.clone().expect("annular physical potential: strains missing");
         if let Some((px, py)) = self.affine_strain {
@@ -2403,6 +2617,7 @@ impl BoundaryValueProblem for AnnularDecompositionProblem {
         let affine_strain_pair = if decomposed { Some((self.spec.load.px, self.spec.load.py)) } else { None };
         let mut terms: Vec<Box<dyn LossTerm>> = vec![
             Box::new(AnnularPotentialEnergyTerm {
+                domain: ANNULUS_DOMAIN, name: "annulus_potential",
                 material: self.spec.material.clone(), domain_area: annulus_area,
                 thickness: self.spec.geometry.thickness, ref_energy_absolute,
                 affine_strain: affine_strain_pair,
@@ -2470,6 +2685,238 @@ impl BoundaryValueProblem for AnnularDecompositionProblem {
             "hole_free" => self.hole_free_weight,
             "equilibrium" => LAM_EQUILIBRIUM_PLATE,
             other => panic!("AnnularDecompositionProblem::base_weight: unknown term '{other}'"),
+        }
+    }
+    fn phase1_steps(&self) -> usize { 0 }
+    fn convergence_metric(&self, _state: &[DomainState<B>]) -> Option<f64> { None }
+    fn convergence_target(&self) -> f64 { 0.0 }
+}
+
+/// Issue #78 item 4: the N-hole generalization of `AnnularDecompositionProblem` - N annulus
+/// domains (each single-hole-scoped exactly like `AnnularDecompositionProblem`'s own one,
+/// reusing `AnnularPartitionSampling`/`AnnulusAnsatz::HardConstraint` completely UNCHANGED via
+/// a synthetic single-hole `UserGeometry` per Free hole) sharing ONE outer domain/model
+/// (`MultiAnnularOuterSampling`, the one genuinely new sampling strategy this needs). This is
+/// the key architectural choice that keeps the blast radius small: log-polar embedding needs
+/// NO change at all (each annulus model stays relative to exactly one hole), and
+/// `AnnularDecompositionProblem` itself is completely untouched (a real, deliberate parallel
+/// struct, not a refactor of the frozen single-hole path - matching this codebase's own
+/// `step_physics`/`step_physics_multi` precedent for exactly this situation).
+///
+/// **Deliberately NOT wired into `TrainingProcedure::SequentialTwoStage`** - that path's own
+/// N-hole generalization (Stage A needs N `OuterInterfaceAnchorTerm`s, Stage B needs N annulus
+/// models trained as one `step_physics_multi` call) is real, separate, additional scope, not
+/// attempted in this pass - a genuine, disclosed follow-up, not silently glossed over. Only
+/// `TrainingProcedure::Joint` (the default) dispatches through this struct for N>1 Free holes.
+pub struct MultiAnnularDecompositionProblem {
+    spec: ProblemSpec,
+    domains: Vec<DomainSpec>,
+    /// One id per Free hole's own annulus domain, in the SAME order `annulus_samplings`/
+    /// `annulus_ansatzes`/`spec.geometry.holes.iter().filter(Free)` all use.
+    annulus_domain_ids: Vec<DomainId>,
+    outer_domain_id: DomainId,
+    annulus_samplings: Vec<AnnularPartitionSampling>,
+    outer_sampling: MultiAnnularOuterSampling,
+    outer_ansatz: IdentityAnsatz,
+    /// One ansatz per Free hole - `AnnulusAnsatz::HardConstraint` (built from a real, per-hole
+    /// `HoleTractionFreeAnsatz` - NOT `MultiHoleHardConstraint`, since these holes are
+    /// geometrically SEPARATE domains here, not sharing one model) or `Identity`, matching
+    /// `use_hard_constraint`.
+    annulus_ansatzes: Vec<crate::kirsch_hole_correction::AnnulusAnsatz>,
+    interface_weight: f32,
+}
+
+impl MultiAnnularDecompositionProblem {
+    /// The N-hole analogue of `AnnularDecompositionProblem::supports` - every hole must be
+    /// `Free` (a `Fixed` hole has no annulus-decomposition machinery - it stays in the outer
+    /// domain via the existing soft-penalty `hole_fixed` term, unaffected), and
+    /// `UserGeometry::annular_partitions` must succeed (every interface circle fits inside the
+    /// plate AND no two overlap - see that function's own doc comment).
+    pub fn supports(spec: &ProblemSpec) -> bool {
+        matches!(spec.formulation, pinn_core::problem_spec::FormulationSelection::Variational)
+            && spec.training.measure_aware_training
+            && !spec.geometry.holes.is_empty()
+            && spec.geometry.holes.iter().all(|h| h.bc == HoleBc::Free)
+            && spec.geometry.annular_partitions().is_some()
+    }
+
+    pub fn new(spec: ProblemSpec, use_hard_constraint: bool) -> Self {
+        assert!(Self::supports(&spec),
+            "multi-hole annular decomposition requires every hole Free, non-overlapping interface circles, Variational formulation, and measure-aware training");
+        let placeholder = spec.geometry.to_placeholder();
+        let free_holes: Vec<&HoleSpec> = spec.geometry.holes.iter().filter(|h| h.bc == HoleBc::Free).collect();
+        let n = free_holes.len();
+        let outer_domain_id = DomainId(9);
+        let annulus_domain_ids: Vec<DomainId> = (0..n).map(|i| DomainId(10 + i as u32)).collect();
+
+        let interface = phase2_interface_parametrization();
+        let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+
+        let mut domains = Vec::with_capacity(n + 1);
+        let mut annulus_samplings = Vec::with_capacity(n);
+        let mut annulus_ansatzes = Vec::with_capacity(n);
+        for (hole, &annulus_id) in free_holes.iter().zip(annulus_domain_ids.iter()) {
+            // Each annulus domain reuses `AnnularPartitionSampling`/`AnnulusAnsatz::
+            // HardConstraint` COMPLETELY UNCHANGED via a synthetic single-hole `UserGeometry`
+            // (same plate dimensions, exactly this one hole) - the existing, already-proven
+            // single-hole machinery never needs to know it's one of several.
+            let single_hole_geometry = UserGeometry {
+                half_w: spec.geometry.half_w, half_h: spec.geometry.half_h,
+                thickness: spec.geometry.thickness,
+                holes: vec![HoleSpec { center: hole.center, radius: hole.radius, bc: HoleBc::Free }],
+            };
+            annulus_samplings.push(AnnularPartitionSampling::new(
+                single_hole_geometry, spec.training.fd_h, true, outer_domain_id, interface.clone(),
+            ));
+            let ansatz = if use_hard_constraint {
+                crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(
+                    crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
+                        hole_center: hole.center, hole_radius: hole.radius,
+                        half_w: spec.geometry.half_w, half_h: spec.geometry.half_h,
+                        px: spec.load.px, py: spec.load.py,
+                        e: spec.material.e as f64, nu: spec.material.nu as f64,
+                        u_ref: scales.u_ref as f64, saturation_scale: 1.0, trainable: false,
+                    },
+                )
+            } else {
+                crate::kirsch_hole_correction::AnnulusAnsatz::Identity
+            };
+            annulus_ansatzes.push(ansatz);
+            domains.push(DomainSpec { id: annulus_id, geometry: placeholder.clone(), material: spec.material.clone(), output_dim: 5 });
+        }
+        domains.push(DomainSpec { id: outer_domain_id, geometry: placeholder, material: spec.material.clone(), output_dim: 5 });
+
+        let partitions = spec.geometry.annular_partitions().expect("validated by Self::supports above");
+        let outer_sampling = MultiAnnularOuterSampling::new(
+            spec.geometry.clone(), spec.training.fd_h, partitions, annulus_domain_ids.clone(), interface,
+        );
+
+        Self {
+            spec, domains, annulus_domain_ids, outer_domain_id,
+            annulus_samplings, outer_sampling, outer_ansatz: IdentityAnsatz,
+            annulus_ansatzes, interface_weight: 100.0,
+        }
+    }
+
+    fn hard_constraint_active(&self, i: usize) -> bool {
+        matches!(self.annulus_ansatzes[i], crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(_))
+    }
+}
+
+impl BoundaryValueProblem for MultiAnnularDecompositionProblem {
+    fn domains(&self) -> &[DomainSpec] { &self.domains }
+
+    fn sampling_strategy(&self, domain_idx: usize) -> &dyn DomainSamplingStrategy {
+        let id = self.domains[domain_idx].id;
+        if let Some(i) = self.annulus_domain_ids.iter().position(|&d| d == id) {
+            &self.annulus_samplings[i]
+        } else if id == self.outer_domain_id {
+            &self.outer_sampling
+        } else {
+            unreachable!("domain id {id:?} not owned by this problem")
+        }
+    }
+
+    fn ansatz(&self, domain_idx: usize) -> &dyn DirichletAnsatz {
+        let id = self.domains[domain_idx].id;
+        if let Some(i) = self.annulus_domain_ids.iter().position(|&d| d == id) {
+            &self.annulus_ansatzes[i]
+        } else if id == self.outer_domain_id {
+            &self.outer_ansatz
+        } else {
+            unreachable!("domain id {id:?} not owned by this problem")
+        }
+    }
+
+    fn loss_terms(&self) -> Vec<Box<dyn LossTerm>> {
+        let scales = crate::training_core::compute_reference_scales_for_plate(&self.spec);
+        let partitions = self.spec.geometry.annular_partitions().expect("validated by constructor");
+        let annulus_areas: Vec<f64> = partitions.iter()
+            .map(|p| std::f64::consts::PI * (p.interface_radius.powi(2) - p.hole_radius.powi(2)))
+            .collect();
+        let interface_area_total: f64 = partitions.iter().map(|p| std::f64::consts::PI * p.interface_radius.powi(2)).sum();
+        let outer_area = 4.0 * self.spec.geometry.half_w * self.spec.geometry.half_h - interface_area_total;
+        let total_area = annulus_areas.iter().sum::<f64>() + outer_area;
+        let ref_energy_absolute = scales.ref_energy as f64 * total_area * self.spec.geometry.thickness;
+        let per_edge = (self.spec.training.n_boundary / 4).max(1);
+        let mut ds_per_point = Vec::with_capacity(per_edge * 4);
+        for _ in 0..per_edge {
+            ds_per_point.push(2.0 * self.spec.geometry.half_h / per_edge as f64);
+            ds_per_point.push(2.0 * self.spec.geometry.half_h / per_edge as f64);
+            ds_per_point.push(2.0 * self.spec.geometry.half_w / per_edge as f64);
+            ds_per_point.push(2.0 * self.spec.geometry.half_w / per_edge as f64);
+        }
+
+        // Issue #78 item 4: the SAME affine-relief mechanism `AnnularDecompositionProblem`
+        // uses, generalized - the closed-form uniform-tension background is independent of
+        // hole count/position by construction (see `UserDefinedProblem::loss_terms()`'s own
+        // matching comment on this exact generalization for the single-domain path), so it
+        // applies unconditionally here (every hole is Free by `Self::supports`'s own gate).
+        let affine_strain_pair = Some((self.spec.load.px, self.spec.load.py));
+
+        let mut terms: Vec<Box<dyn LossTerm>> = vec![
+            Box::new(PhysicalPotentialEnergyTerm {
+                domain: self.outer_domain_id, material: self.spec.material.clone(),
+                px: self.spec.load.px, py: self.spec.load.py, measure_aware: true,
+                domain_area: outer_area, thickness: self.spec.geometry.thickness,
+                ref_energy: scales.ref_energy, ref_energy_absolute, interior_weights: None,
+                ds_per_point, affine_strain: affine_strain_pair,
+            }),
+            Box::new(TranslationGaugeTerm {
+                domain: self.outer_domain_id,
+                inv_u_ref_sq: 1.0 / (scales.u_ref as f64).powi(2).max(1e-30),
+            }),
+            Box::new(RotationGaugeTerm {
+                domain: self.outer_domain_id, half_w: self.spec.geometry.half_w, half_h: self.spec.geometry.half_h,
+            }),
+        ];
+
+        let free_holes: Vec<&HoleSpec> = self.spec.geometry.holes.iter().filter(|h| h.bc == HoleBc::Free).collect();
+        for (i, (&annulus_id, hole)) in self.annulus_domain_ids.iter().zip(free_holes.iter()).enumerate() {
+            terms.push(Box::new(AnnularPotentialEnergyTerm {
+                domain: annulus_id, name: occurrence_suffixed_name("annulus_potential", i),
+                material: self.spec.material.clone(), domain_area: annulus_areas[i],
+                thickness: self.spec.geometry.thickness, ref_energy_absolute,
+                affine_strain: affine_strain_pair,
+            }));
+            terms.push(Box::new(MultiInterfaceDisplacementContinuityTerm {
+                left: annulus_id, right: self.outer_domain_id,
+                right_point_set: occurrence_suffixed_name("interface", i),
+                inv_u_ref_sq: 1.0 / (scales.u_ref as f64).powi(2).max(1e-30),
+            }));
+            terms.push(Box::new(MultiInterfaceTractionContinuityTerm {
+                left: annulus_id, right: self.outer_domain_id,
+                right_point_set: occurrence_suffixed_name("interface_outer_stress", i),
+                left_material: self.spec.material.clone(), right_material: self.spec.material.clone(),
+                inv_ref_stress2: 1.0 / (scales.ref_stress2 as f64).max(1e-30),
+            }));
+            if !self.hard_constraint_active(i) {
+                terms.push(Box::new(HoleBcTerm {
+                    domain: annulus_id, point_set: "hole_0_fd", bc: HoleBc::Free,
+                    ref_stress2: scales.ref_stress2, material: self.spec.material.clone(),
+                    affine_target: affine_strain_pair,
+                    // Each annulus domain's own sampling always emits "hole_0"/"hole_0_fd"
+                    // (domain-scoped, built from a synthetic single-hole geometry) - but the
+                    // TERM's own name must still be unique across domains for SAW-BRDR
+                    // bookkeeping, same `hole_bc_term_name` convention every other multi-hole
+                    // BC term in this codebase already uses.
+                    name: hole_bc_term_name(HoleBc::Free, i),
+                }));
+            }
+            let _ = hole;
+        }
+        terms
+    }
+
+    fn base_weight(&self, term_name: &str) -> f32 {
+        match term_name {
+            "physical_potential" => LAM_PHYSICAL_POTENTIAL,
+            other if other == "annulus_potential" || other.starts_with("annulus_potential_") => LAM_PHYSICAL_POTENTIAL,
+            "interface_displacement_continuity" | "interface_traction_continuity" => self.interface_weight,
+            "translation_gauge" => LAM_TRANSLATION_GAUGE,
+            "rotation_gauge" => LAM_ROTATION_GAUGE,
+            other if other == "hole_free" || other.starts_with("hole_free_") => LAM_HOLE_FREE,
+            other => panic!("MultiAnnularDecompositionProblem::base_weight: unknown term '{other}'"),
         }
     }
     fn phase1_steps(&self) -> usize { 0 }
@@ -2740,6 +3187,7 @@ impl BoundaryValueProblem for AnnulusStageProblem {
         let affine_strain_pair = if decomposed { Some((self.spec.load.px, self.spec.load.py)) } else { None };
         let mut terms: Vec<Box<dyn LossTerm>> = vec![
             Box::new(AnnularPotentialEnergyTerm {
+                domain: ANNULUS_DOMAIN, name: "annulus_potential",
                 material: self.spec.material.clone(), domain_area: annulus_area,
                 thickness: self.spec.geometry.thickness, ref_energy_absolute,
                 affine_strain: affine_strain_pair,
@@ -4626,6 +5074,81 @@ mod tests {
         let terms = problem.loss_terms();
         assert!(terms.iter().any(|t| t.name() == "interface_displacement_continuity"));
         assert!(terms.iter().any(|t| t.name() == "interface_traction_continuity"));
+    }
+
+    /// Issue #78 item 4: the load-bearing N=1 regression proof - `MultiAnnularDecompositionProblem`
+    /// with exactly one Free hole must produce STRUCTURALLY IDENTICAL output to the frozen,
+    /// already-proven `AnnularDecompositionProblem` for the SAME spec: same domain count/output
+    /// widths, bit-identical sampled interior points (both reuse `AnnularPartitionSampling`'s
+    /// own seeding unchanged), bit-identical named interface/hole point sets, and the same set
+    /// of loss-term names with matching `base_weight`s. This is the single check that makes
+    /// trusting the new N-hole code for N=1 defensible - not just "it compiles."
+    #[test]
+    fn multi_annular_decomposition_matches_annular_decomposition_at_n_equals_one() {
+        let spec = ProblemSpec {
+            geometry: l5_geometry(), material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7), network: Default::default(),
+            training: pinn_core::problem_spec::TrainingSpec {
+                measure_aware_training: true, ..Default::default()
+            },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
+        };
+        let original = AnnularDecompositionProblem::new_with_hard_constraint_ansatz(spec.clone(), true);
+        let multi = MultiAnnularDecompositionProblem::new(spec, true);
+
+        // Same domain count and per-domain output width.
+        assert_eq!(original.domains().len(), multi.domains().len());
+        for (o, m) in original.domains().iter().zip(multi.domains().iter()) {
+            assert_eq!(o.output_dim, m.output_dim);
+        }
+
+        // Bit-identical sampled interior points, both domains, several calls (proves the RNG
+        // seed streams genuinely match, not just "both non-empty").
+        // Both samplers ignore this parameter entirely (they carry their own captured
+        // `UserGeometry`) - any real `GeometryConfig` works, matching the established
+        // `FakeInterfaceSampling` test precedent.
+        let placeholder = GeometryConfig::kirsch_plate_inches();
+        for domain_idx in 0..2 {
+            let orig_s = original.sampling_strategy(domain_idx);
+            let multi_s = multi.sampling_strategy(domain_idx);
+            for _ in 0..3 {
+                let o_pts = orig_s.sample_interior(&placeholder, 64);
+                let m_pts = multi_s.sample_interior(&placeholder, 64);
+                assert_eq!(o_pts.len(), m_pts.len(), "domain {domain_idx}: point count must match");
+                for (o, m) in o_pts.iter().zip(m_pts.iter()) {
+                    assert!((o[0] - m[0]).abs() < 1e-15 && (o[1] - m[1]).abs() < 1e-15,
+                        "domain {domain_idx}: sampled point mismatch: {o:?} vs {m:?}");
+                }
+            }
+        }
+
+        // Bit-identical named point sets (interface/hole rings) on both domains.
+        for domain_idx in 0..2 {
+            let o_sets = original.sampling_strategy(domain_idx).named_point_sets(&[]);
+            let m_sets = multi.sampling_strategy(domain_idx).named_point_sets(&[]);
+            let mut o_names: Vec<&str> = o_sets.iter().map(|s| s.name).collect();
+            let mut m_names: Vec<&str> = m_sets.iter().map(|s| s.name).collect();
+            o_names.sort(); m_names.sort();
+            assert_eq!(o_names, m_names, "domain {domain_idx}: named point-set names must match exactly");
+            for o_set in &o_sets {
+                let m_set = m_sets.iter().find(|s| s.name == o_set.name).unwrap();
+                assert_eq!(o_set.points.len(), m_set.points.len(), "point-set '{}' length mismatch", o_set.name);
+                for (o, m) in o_set.points.iter().zip(m_set.points.iter()) {
+                    assert!((o.x - m.x).abs() < 1e-12 && (o.y - m.y).abs() < 1e-12,
+                        "point-set '{}': point mismatch ({},{}) vs ({},{})", o_set.name, o.x, o.y, m.x, m.y);
+                }
+            }
+        }
+
+        // Same set of loss-term names, same base_weight per name.
+        let mut o_terms: Vec<&str> = original.loss_terms().iter().map(|t| t.name()).collect();
+        let mut m_terms: Vec<&str> = multi.loss_terms().iter().map(|t| t.name()).collect();
+        o_terms.sort(); m_terms.sort();
+        assert_eq!(o_terms, m_terms, "loss-term name set must match exactly at N=1");
+        for name in &o_terms {
+            assert_eq!(original.base_weight(name), multi.base_weight(name), "base_weight mismatch for '{name}'");
+        }
     }
 
     /// Issue #77 Phase 2 architectural redesign: `OuterStageProblem` is a genuine single-domain

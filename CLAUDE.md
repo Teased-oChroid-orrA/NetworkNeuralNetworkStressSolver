@@ -1261,3 +1261,67 @@ the closed-form-derived value rather than continuing from a checkpoint's own tra
 not a crash. The observed scale movement (900 steps, ~0.2-0.7% relative) is small - whether a
 longer run or a different `alpha_lr_mult` would move it further is a real, untested question,
 not assumed either way.
+
+## Issue #78 item 4: `AnnularDecompositionProblem` (kinematic decomposition) generalized to N
+## Free holes - `TrainingProcedure::Joint` only, one real accuracy tradeoff disclosed
+
+A new, purely ADDITIVE `MultiAnnularDecompositionProblem` (zero change to the frozen, PH4-42-
+verified single-hole `AnnularDecompositionProblem` - matching this codebase's own `step_physics`/
+`step_physics_multi` precedent for exactly this situation) generalizes #77's annular kinematic
+decomposition from exactly one Free hole to any N: N annulus domains (each single-hole-scoped
+exactly like the original, reusing `AnnularPartitionSampling`/`AnnulusAnsatz::HardConstraint`
+completely unchanged via a synthetic single-hole `UserGeometry` per hole) sharing ONE outer
+domain/model (`MultiAnnularOuterSampling`, the one genuinely new sampling strategy). Scoped to
+`TrainingProcedure::Joint` (the default) only - `SequentialTwoStage`'s own N-hole generalization
+is real, separate, additional scope, explicitly not attempted this pass, not silently glossed
+over.
+
+`pinn-core::UserGeometry::annular_partitions()` (plural) generalizes `annular_partition`'s own
+per-hole math (already hole-local, per that function's own doc comment) over every Free hole,
+adding a real, previously-nonexistent validation: no two holes' INTERFACE circles (not just the
+holes themselves) may overlap - 4 new tests, including one proving holes that pass `UserGeometry::
+validate()`'s own hole-overlap check can still correctly fail this stricter one.
+
+**Reuse over refactor, systematically**: `PhysicalPotentialEnergyTerm`/`TranslationGaugeTerm`/
+`RotationGaugeTerm`/`HoleBcTerm` are used completely unchanged (already `DomainId`-parameterized).
+`AnnularPotentialEnergyTerm` gained real `domain`/`name` fields (was hardcoded to the single
+`ANNULUS_DOMAIN` constant and a literal `"annulus_potential"` name - 2 existing construction
+sites updated, byte-identical). Two genuinely new term structs (`MultiInterfaceDisplacement
+ContinuityTerm`/`MultiInterfaceTractionContinuityTerm`, compute() bodies copied verbatim) were
+needed - not modifications to the originals - because those hardcode the SAME point-set name on
+both domain sides, and the shared outer domain needs a DIFFERENT name per hole
+(`occurrence_suffixed_name`, generalizing `hole_bc_term_name`'s own "first unsuffixed, 2nd+
+suffixed" convention - load-bearing for N=1 byte-identical naming).
+
+**Real, decisive N=1 regression proof**
+(`multi_annular_decomposition_matches_annular_decomposition_at_n_equals_one`): bit-identical
+sampled interior points (both domains, several calls - proves the RNG seed streams genuinely
+match, not just "both non-empty"), bit-identical named interface/hole point sets, and an
+identical loss-term name set with matching `base_weight`s, between the new N=1 path and the
+frozen original - passed first try. A real end-to-end headless run of a genuine N=1 Joint-
+dispatch spec (not `SingleDomain`-forced) confirmed the ORIGINAL `AnnularDecompositionProblem`
+path is still the one reached, giving `Kt=2.4416` (consistent with PH4-42's own verified range) -
+the new dispatch branch does not intercept it.
+
+**Real, honest N=2 end-to-end result**: a real headless run (2 Free holes, no Fixed hole, real
+FEM ground truth computed via `tools/multi_hole_reference.py` at a converged mesh:
+`Kt_vm≈3.05/3.07`) trained successfully through the new `[#78 multi-annular]` dispatch path (no
+crash, monotonically decreasing loss) to `hole0/hole1 Kt=2.521/2.520` - genuinely symmetric, as
+the geometry's own mirror symmetry predicts (a real positive sanity signal), but ~15-18% below
+FEM - LESS accurate than the item-1/2/3 ansatz-only path's own best result on a different
+(has-a-Fixed-hole) 2-hole geometry (`Kt=2.88-2.99` vs FEM `≈2.98-3.06`).
+
+**A real engineering constraint found and worked around, disclosed rather than hidden**:
+`MultiStepCtx.coordinate_embedding` is ONE shared value applied to every domain whose model
+input width matches it (`training_core::stencil_forward_with_ansatz`'s own model-input-width
+dispatch) - there is no per-domain embedding slot, so N different `SingleHoleChart` embeddings
+(each carrying a different hole center) cannot coexist safely in one training step. Every domain
+in the new driver therefore uses plain Raw (3-column) coordinates, including every annulus
+domain - unlike the single-hole path, which gets `SingleHoleChart`'s 7 hole-relative features
+"for free." This is the most likely explanation for the accuracy gap above (a real, testable
+hypothesis, NOT confirmed this pass) - plumbing genuine per-domain embeddings through
+`MultiStepCtx` would be the natural next step, a real, scoped, disclosed follow-up alongside
+`SequentialTwoStage`'s own N-hole generalization.
+
+Full regression suite: 566 passed (+7 net new), same 1 pre-existing unrelated failure
+(`compute_loss_for_lbfgs_panics_on_lams_missing_a_real_term_key`), zero regressions.

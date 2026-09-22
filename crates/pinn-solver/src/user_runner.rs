@@ -22,7 +22,8 @@ use crate::{
         plate_normalize_point as normalize_point, resample_plate_step_data, plate_multi_step_ctx,
         plate_multi_domain_step_ctx, resample_domain_step_data, AnnularDecompositionProblem,
         UserDefinedProblem, OuterStageProblem, AnnulusStageProblem, phase2_interface_parametrization,
-        ANNULUS_DOMAIN, OUTER_DOMAIN,
+        ANNULUS_DOMAIN, OUTER_DOMAIN, MultiAnnularDecompositionProblem,
+        kt_convergence_check, probe_hole_boundary_profile_derived, stress_concentration_from_profile,
     },
 };
 
@@ -305,6 +306,132 @@ fn run_annular_decomposition_training_inner(
     sync_device(&device);
     let mut models = models.into_iter();
     (models.next().expect("annulus model"), models.next().expect("outer model"), last_total)
+}
+
+/// Issue #78 item 4: the N-hole generalization of `run_annular_decomposition_training_inner` -
+/// N annulus domains (one per Free hole) sharing ONE outer domain, driven by the SAME
+/// `step_physics_multi` (already N-domain-generic - `MultiStepCtx.domains`/`optims`/`models`
+/// are already `Vec`s). Deliberately NARROWER in scope than the single-hole driver: no per-
+/// domain grad-norm rescale, no SIREN/Fourier/log-polar experimental knobs (all of those stay
+/// single-hole-scoped, real, disclosed deliberate scope cuts - not attempted here), and every
+/// domain (annulus AND outer) uses PLAIN RAW (3-column) coordinates, not `SingleHoleChart` -
+/// see the doc comment on `coordinate_embedding` usage below for why. `TrainingProcedure::
+/// SequentialTwoStage`'s own N-hole generalization is a SEPARATE, real, still-open follow-up,
+/// not wired to this function at all.
+pub fn run_multi_annular_decomposition_training(
+    spec: ProblemSpec,
+    device: BDevice,
+    use_hard_constraint: bool,
+    mut on_step: impl FnMut(usize, f32, f64, usize) -> bool,
+) -> (Vec<crate::network::ElasticityNet<B>>, f32) {
+    let problem = MultiAnnularDecompositionProblem::new(spec.clone(), use_hard_constraint);
+    crate::problem::validate_loss_terms(&problem);
+    let n_domains = problem.domains().len();
+
+    // Issue #78 item 4, a real, disclosed correctness constraint (not an oversight): `MultiStepCtx.
+    // coordinate_embedding` is ONE shared value applied to every domain whose model input width
+    // matches it (`training_core::stencil_forward_with_ansatz`'s own model-input-width dispatch) -
+    // there is no per-domain embedding slot. N different `SingleHoleChart` embeddings (each
+    // carrying a DIFFERENT hole center) cannot coexist in one shared field without one domain
+    // silently reading another's hole-relative geometry. Every domain here therefore uses plain
+    // Raw (3-column) coordinates - a real accuracy tradeoff (no hole-relative chart features for
+    // any annulus domain, unlike the single-hole path), not a hidden bug.
+    let net_cfg = ElasticityNetConfig::new().with_input_dim(3)
+        .with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden).with_output_dim(5);
+    let mut models = Vec::with_capacity(n_domains);
+    for i in 0..n_domains {
+        B::seed(&device, spec.network.model_init_seed ^ (0xA77A_0000u64 + i as u64));
+        models.push(net_cfg.init(&device));
+    }
+    let mut config = SolverConfig::default_kirsch();
+    config.load = spec.load;
+    let mut optims: Vec<DomainOptim> = (0..n_domains).map(|_| DomainOptim {
+        weight: WeightOptim::new(config.use_soap_muon), bias: make_bias_optim(), gate: make_gate_optim(),
+        hole_scale: make_gate_optim(),
+    }).collect();
+    let term_order: Vec<&'static str> = problem.loss_terms().iter().map(|t| t.name()).collect();
+    let base_weights: Vec<f32> = term_order.iter().map(|&n| problem.base_weight(n)).collect();
+    let mut saw = SawBrdr::with_base(base_weights, 0.95);
+    let mut lr_sched_shared = LrSchedule::new(spec.training.lr, 100, 500);
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+    let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+    let placeholder = spec.geometry.to_placeholder();
+    // Interior budget split evenly across annulus domains, remainder to the outer domain -
+    // mirrors `run_annular_decomposition_training_inner`'s own `n_annulus`/`n_outer` split
+    // generalized to N annuli instead of exactly one.
+    let n_annuli = n_domains - 1;
+    let n_per_annulus = (spec.training.n_interior / (2 * n_annuli.max(1))).max(256);
+    let n_outer = spec.training.n_interior.saturating_sub(n_per_annulus * n_annuli).max(256);
+    let mut last_total = f32::NAN;
+    for step in 0..spec.training.max_steps {
+        let mut domain_data = Vec::with_capacity(n_domains);
+        for i in 0..n_annuli {
+            domain_data.push(resample_domain_step_data(
+                problem.domains()[i].id, problem.sampling_strategy(i), &placeholder, &spec.load,
+                n_per_annulus, 0, spec.geometry.half_w, spec.geometry.half_h,
+            ));
+        }
+        domain_data.push(resample_domain_step_data(
+            problem.domains()[n_annuli].id, problem.sampling_strategy(n_annuli), &placeholder, &spec.load,
+            n_outer, spec.training.n_boundary, spec.geometry.half_w, spec.geometry.half_h,
+        ));
+        let domain_ctxs: Vec<crate::problem::DomainStepCtx> = domain_data.iter()
+            .map(|d| crate::problem::DomainStepCtx { data: d, u_ref: scales.u_ref, ref_energy: scales.ref_energy, ref_stress2: scales.ref_stress2 })
+            .collect();
+        let ctx = crate::problem::MultiStepCtx {
+            config: &config, problem: &problem, fd: &fd, hole_fd: &fd,
+            per_domain_lr: None, k: 1.0, domains: domain_ctxs,
+            dynamic_lam_h_cap: 50.0, dynamic_lam_d_cap: 50.0,
+            dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
+            constitutive_consistency_weight: 50.0,
+            n_fourier: 0, coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            probe_term_gradients: false, phase2_active: true, step,
+        };
+        let (new_models, out) = step_physics_multi(models, &mut optims, &ctx, &mut saw, &mut lr_sched_shared, &device, 0, 1.0, 1.0);
+        models = new_models;
+        last_total = out.total_scalar;
+        let n_points: usize = domain_data.iter().map(|d| d.int_norm.len()).sum();
+        if on_step(step, out.total_scalar, out.lr, n_points) {
+            break;
+        }
+    }
+    sync_device(&device);
+    (models, last_total)
+}
+
+/// Issue #78 item 4: real per-hole Kt for a trained `MultiAnnularDecompositionProblem` - each
+/// Free hole's own Kt is measured against ITS OWN annulus model and ansatz, exactly the same
+/// `kt_convergence_check`/`probe_hole_boundary_profile_derived` primitives the single-domain
+/// plate path already uses (nothing new to trust here, just a new call site).
+pub fn multi_annular_hole_kt_diagnostics(
+    problem: &MultiAnnularDecompositionProblem,
+    models: &[crate::network::ElasticityNet<crate::training_core::BInner>],
+    spec: &ProblemSpec,
+    device: &BDevice,
+) -> Vec<(usize, f64, bool)> {
+    use crate::training_core::compute_reference_scales_for_plate;
+    let scales = compute_reference_scales_for_plate(spec);
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+    let margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+    let nominal_stress = spec.load.px.abs();
+    let free_holes: Vec<&pinn_core::user_geometry::HoleSpec> = spec.geometry.holes.iter()
+        .filter(|h| h.bc == pinn_core::user_geometry::HoleBc::Free).collect();
+    let mut results = Vec::with_capacity(free_holes.len());
+    for (i, hole) in free_holes.iter().enumerate() {
+        let model = &models[i];
+        let ansatz = problem.ansatz(i);
+        let profile = probe_hole_boundary_profile_derived(
+            model, &spec.geometry, hole, 72, &fd, scales.u_ref, spec.load.px, &spec.material, margin, device,
+            ansatz, Some((spec.load.px, spec.load.py)),
+        );
+        let sc = stress_concentration_from_profile(&profile, nominal_stress);
+        let convergence = kt_convergence_check(
+            model, &spec.geometry, hole, 72, &fd, scales.u_ref, spec.load.px, &spec.material,
+            margin, nominal_stress, 0.1, device, ansatz, Some((spec.load.px, spec.load.py)),
+        );
+        results.push((i, sc.kt, convergence.converged));
+    }
+    results
 }
 
 /// Issue #77 PH4-45: production entry point exposing `use_hard_constraint`/`use_log_polar`
@@ -1043,6 +1170,38 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
             Some(kt) => println!("  [#77 annular] done final_total_loss={total:.6e} kt={kt:.9}"),
             None => println!("  [#77 annular] done final_total_loss={total:.6e}"),
         }
+        return total.is_finite();
+    }
+    // Issue #78 item 4: the N-hole generalization of the branch immediately above - reached
+    // only when `AnnularDecompositionProblem::supports` was false (N != 1, since that check
+    // already consumed the single-Free-hole case) but `MultiAnnularDecompositionProblem::
+    // supports` is true (every hole Free, non-overlapping interface circles). Deliberately
+    // scoped to `TrainingProcedure::Joint` only - `SequentialTwoStage`'s own N-hole
+    // generalization is a real, disclosed, separate follow-up, not wired here.
+    if !force_single_domain && MultiAnnularDecompositionProblem::supports(&spec) {
+        let device = BDevice::default();
+        let steps = spec.training.max_steps;
+        let use_hard_constraint = spec.architecture.hard_constraint_ansatz;
+        let n_holes = spec.geometry.holes.len();
+        println!("  [#78 multi-annular] {n_holes} Free hole(s), hard_constraint={use_hard_constraint}");
+        let spec_for_kt = spec.clone();
+        let (models, total) = run_multi_annular_decomposition_training(
+            spec, device.clone(), use_hard_constraint,
+            |step, loss, lr, n| {
+                if step % (steps / 10).max(1) == 0 || step + 1 == steps {
+                    println!("  [#78 multi-annular] step {step:>6} total_loss={loss:.6e} lr={lr:.3e} points={n}");
+                }
+                false
+            },
+        );
+        let problem = MultiAnnularDecompositionProblem::new(spec_for_kt.clone(), use_hard_constraint);
+        use burn::module::AutodiffModule;
+        let valid_models: Vec<crate::network::ElasticityNet<crate::training_core::BInner>> =
+            models.iter().map(|m| m.valid()).collect();
+        for (i, kt, converged) in multi_annular_hole_kt_diagnostics(&problem, &valid_models, &spec_for_kt, &device) {
+            println!("  [#78 multi-annular] hole {i}: Kt={kt:.4} convergence_check={}", if converged { "OK" } else { "NOT converged" });
+        }
+        println!("  [#78 multi-annular] done final_total_loss={total:.6e}");
         return total.is_finite();
     }
     let device = BDevice::default();
