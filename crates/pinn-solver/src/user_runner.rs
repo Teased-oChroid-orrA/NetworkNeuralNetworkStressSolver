@@ -1205,7 +1205,7 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         }
 
         if step % (spec.training.max_steps / 10).max(1) == 0 || step + 1 == spec.training.max_steps {
-            println!("  step {step:>6}   total_loss={:.6e}   lr={:.3e}", out.total_scalar, out.lr);
+            println!("  step {step:>6}   total_loss={:.6e}   lr={:.3e}   grad_norm={:.6e}", out.total_scalar, out.lr, out.grad_norm.unwrap_or(f32::NAN));
             if matches!(spec.formulation, pinn_core::problem_spec::FormulationSelection::Variational) {
                 let raw = out.raw_scalar_by_name.as_ref()
                     .and_then(|values| values.get("physical_potential")).copied()

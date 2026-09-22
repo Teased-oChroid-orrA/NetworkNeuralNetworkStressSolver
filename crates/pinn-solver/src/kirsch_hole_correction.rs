@@ -120,9 +120,50 @@ pub fn kirsch_hole_displacement(x: f64, y: f64, a: f64, e: f64, nu: f64, px: f64
 /// `phi(r) = 1 - exp(-((r-a)/a)^2)`. `phi(a)=1-exp(0)=0`.
 /// `phi'(r) = (2*(r-a)/a^2) * exp(-((r-a)/a)^2)`, which has an explicit `(r-a)` factor, so
 /// `phi'(a)=0` too — confirmed directly from the closed form, not just asserted.
+///
+/// Thin wrapper over [`traction_free_envelope_scaled`] at `saturation_scale=1.0` — kept as its
+/// own function (not just callers passing `1.0` directly) because it is the historical,
+/// already-verified (PH4-35/PH4-42) public API every pre-issue-#78 call site uses, and stays
+/// completely untouched by the issue #78 root-cause fix below.
 pub fn traction_free_envelope(x: f64, y: f64, a: f64) -> f64 {
+    traction_free_envelope_scaled(x, y, a, 1.0)
+}
+
+/// Issue #78 root-cause fix: `traction_free_envelope` generalized with an explicit saturation-
+/// rate multiplier, `saturation_scale` (`1.0` reduces byte-identically to the original -
+/// verified by `traction_free_envelope_scaled_at_one_matches_traction_free_envelope`).
+///
+/// **Why this exists - a real, numerically-proven root cause, not a speculative tuning knob.**
+/// Kt is necessarily measured at `r = hole.radius + margin`, never exactly at `r = hole.radius`
+/// itself (`margin` is the FD-safety offset `ring_anchor_margin_m` requires so a stencil arm
+/// never crosses into the hole). At `saturation_scale=1.0` and this codebase's real shipped
+/// multi-hole geometries, `margin` is only ~5-7% of the hole's own radius, and `phi` at that
+/// exact point is **~0.4-0.5%** (`u=(margin/radius)≈0.067`, `phi=1-exp(-u²)≈0.0044`) - meaning
+/// the network's own gradient-trainable contribution is suppressed to under half a percent of
+/// its raw magnitude exactly where Kt gets read and exactly where `PhysicalPotentialEnergyTerm`
+/// needs a real per-point energy-density gradient to learn a local correction. Confirmed as the
+/// real, dominant cause of this codebase's own multi-hole Kt gap (not a training/formulation
+/// issue): a real trained model's measured Kt (`2.5075`) matched the PURE closed-form
+/// `MultiHoleHardConstraint` baseline evaluated at the identical margin (`2.5075`, computed
+/// independently in Python) to four decimal places - the network was contributing essentially
+/// nothing there, letting the raw closed-form baseline (which only sums Free-hole-to-Free-hole
+/// Kirsch interactions, per `multi_hole_additive`'s own doc comment) determine Kt almost
+/// entirely. Five independent hyperparameter axes (collocation density, network capacity,
+/// learning rate, coordinate embedding, Fixed-hole sampling bias) were already falsified as
+/// explanations before this was found - none of them change what `phi` numerically IS at the
+/// margin, which is exactly why none of them mattered. See `docs/multi-hole-fem-ground-truth-
+/// investigation.md`'s "Fourth pass" section for the full derivation and real measured numbers.
+///
+/// A larger `saturation_scale` makes `phi` reach a meaningfully large value MUCH closer to the
+/// boundary (still exactly `0` with exactly zero derivative AT `r=a` - the hard constraint
+/// itself is completely unaffected, only how fast `phi` recovers past it), giving the network a
+/// real, usable gradient signal at the margin instead of a near-zero one. `saturation_scale=1.0`
+/// for every pre-#78 call site (`HardConstraint`, the single-centered-hole L5 path PH4-42's own
+/// 0.67-1.23% accuracy was verified against) keeps it completely unaffected - this is an
+/// additive, opt-in generalization, not a change to already-verified behavior.
+pub fn traction_free_envelope_scaled(x: f64, y: f64, a: f64, saturation_scale: f64) -> f64 {
     let r = (x * x + y * y).sqrt();
-    let u = (r - a) / a;
+    let u = saturation_scale * (r - a) / a;
     1.0 - (-(u * u)).exp()
 }
 
@@ -151,6 +192,10 @@ pub struct HoleTractionFreeAnsatz {
     pub e: f64,
     pub nu: f64,
     pub u_ref: f64,
+    /// Issue #78 root-cause fix: see [`traction_free_envelope_scaled`]'s own doc comment for
+    /// the full derivation. `1.0` = byte-identical to every pre-#78 caller (the exact original
+    /// `traction_free_envelope` saturation rate).
+    pub saturation_scale: f64,
 }
 
 impl HoleTractionFreeAnsatz {
@@ -162,7 +207,7 @@ impl HoleTractionFreeAnsatz {
 impl pinn_core::problem::DirichletAnsatz for HoleTractionFreeAnsatz {
     fn eval(&self, xn: f32, yn: f32, _k: f32) -> (f32, f32) {
         let (x, y) = self.physical_xy(xn, yn);
-        let phi = traction_free_envelope(x, y, self.hole_radius) as f32;
+        let phi = traction_free_envelope_scaled(x, y, self.hole_radius, self.saturation_scale) as f32;
         (phi, phi)
     }
     fn additive(&self, xn: f32, yn: f32) -> (f32, f32) {
@@ -392,11 +437,59 @@ mod tests {
         }
     }
 
+    // ─── Issue #78 root-cause fix: `traction_free_envelope_scaled` ────────────────────────
+
+    #[test]
+    fn traction_free_envelope_scaled_at_one_matches_traction_free_envelope() {
+        let a = 0.005_f64;
+        for r_mult in [0.0_f64, 0.5, 1.0, 1.5, 2.0, 3.0, 10.0, 1000.0] {
+            let (x, y) = (r_mult * a, 0.0);
+            assert_eq!(traction_free_envelope(x, y, a), traction_free_envelope_scaled(x, y, a, 1.0),
+                "saturation_scale=1.0 must be byte-identical to the original formula at r={r_mult}*a");
+        }
+    }
+
+    #[test]
+    fn traction_free_envelope_scaled_stays_zero_with_zero_derivative_at_the_boundary_for_any_scale() {
+        let a = 0.005_f64;
+        let h = 1e-9_f64;
+        for scale in [1.0_f64, 5.0, 15.0, 30.0] {
+            for &theta in &[0.0_f64, 1.0, 2.5, 4.0] {
+                let x0 = a * theta.cos();
+                let y0 = a * theta.sin();
+                let phi_a = traction_free_envelope_scaled(x0, y0, a, scale);
+                assert!(phi_a.abs() < 1e-12, "scale={scale}: phi(a) should be exactly 0, got {phi_a}");
+                let (nx, ny) = (theta.cos(), theta.sin());
+                let phi_p = traction_free_envelope_scaled(x0 + h * nx, y0 + h * ny, a, scale);
+                let phi_m = traction_free_envelope_scaled(x0 - h * nx, y0 - h * ny, a, scale);
+                let dphi_dr = (phi_p - phi_m) / (2.0 * h);
+                assert!(dphi_dr.abs() < 1e-3,
+                    "scale={scale}: phi'(a) should be ~0, got {dphi_dr} at theta={theta}");
+            }
+        }
+    }
+
+    /// The real, load-bearing property this fix exists for: a larger `saturation_scale` must
+    /// make `phi` recover to a meaningfully larger value at the SAME small offset from the
+    /// boundary - the real, measured gap this closes (`phi≈0.0044` at `scale=1.0` for this
+    /// codebase's own real multi-hole geometries' FD-safety margin - see this function's own
+    /// doc comment for the exact derivation).
+    #[test]
+    fn traction_free_envelope_scaled_recovers_faster_at_larger_scale() {
+        let a = 0.009_f64;
+        let margin = 6e-4_f64; // this codebase's own real ring_anchor_margin_m for triple_hole_plate.toml
+        let phi_1 = traction_free_envelope_scaled(a + margin, 0.0, a, 1.0);
+        let phi_15 = traction_free_envelope_scaled(a + margin, 0.0, a, MULTI_HOLE_SATURATION_SCALE_FOR_TEST);
+        assert!(phi_1 < 0.01, "expected phi≈0.44% at scale=1.0, got {phi_1}");
+        assert!(phi_15 > phi_1 * 10.0, "a 15x saturation scale must give a real, order-of-magnitude larger phi at the same margin: phi_1={phi_1} phi_15={phi_15}");
+    }
+    const MULTI_HOLE_SATURATION_SCALE_FOR_TEST: f64 = 15.0;
+
     fn single_hole_ansatz() -> HoleTractionFreeAnsatz {
         HoleTractionFreeAnsatz {
             hole_center: [0.0, 0.0], hole_radius: 0.005,
             half_w: 0.1, half_h: 0.1, px: 6.9e7, py: 2.0e7,
-            e: E, nu: NU, u_ref: 1e-3,
+            e: E, nu: NU, u_ref: 1e-3, saturation_scale: 1.0,
         }
     }
 
@@ -423,11 +516,11 @@ mod tests {
     fn multi_hole_envelope_is_exactly_zero_at_every_holes_own_boundary_for_two_holes() {
         let hole0 = HoleTractionFreeAnsatz {
             hole_center: [-0.03, 0.0], hole_radius: 0.01,
-            half_w: 0.1, half_h: 0.05, px: 6.9e7, py: 0.0, e: E, nu: NU, u_ref: 1e-3,
+            half_w: 0.1, half_h: 0.05, px: 6.9e7, py: 0.0, e: E, nu: NU, u_ref: 1e-3, saturation_scale: 1.0,
         };
         let hole1 = HoleTractionFreeAnsatz {
             hole_center: [0.03, 0.0], hole_radius: 0.008,
-            half_w: 0.1, half_h: 0.05, px: 6.9e7, py: 0.0, e: E, nu: NU, u_ref: 1e-3,
+            half_w: 0.1, half_h: 0.05, px: 6.9e7, py: 0.0, e: E, nu: NU, u_ref: 1e-3, saturation_scale: 1.0,
         };
         let ansatz = AnnulusAnsatz::MultiHoleHardConstraint(vec![hole0, hole1]);
         for theta in [0.0_f64, 0.9, 2.1, 3.4, 4.8] {

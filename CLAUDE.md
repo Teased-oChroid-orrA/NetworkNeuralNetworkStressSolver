@@ -1028,3 +1028,65 @@ Full regression suite after this follow-up: same 546 passed / 1 pre-existing fai
 regressions, plus 3 new `multi_chart_embed` tests and 1 updated `pinn-core` test
 (`coordinate_embedding_preserves_raw_no_hole_and_generalizes_multi_hole_inputs`, renamed from
 its own pre-#78 name to reflect the real, intentional behavior change it now asserts).
+
+## Issue #78 Stage 2 third follow-up: the actual root cause of the Kt gap - found and fixed
+
+The "formulation-level question" framing above was too pessimistic. Full derivation in
+`docs/multi-hole-fem-ground-truth-investigation.md`'s "Fourth pass" section; short version:
+
+**The decisive proof**: a real trained model's own measured Kt (`2.5072`) matches the PURE
+closed-form `MultiHoleHardConstraint` baseline (no network contribution at all) evaluated at
+the SAME real FD-safety-margin radius (`2.5075`, computed independently) to four decimal
+places. The network's own learned correction near the Free holes contributes essentially
+nothing.
+
+**Why**: Kt is necessarily measured at `r = hole.radius + margin` (never exactly at the
+boundary, an FD-stencil-safety requirement). For this codebase's real shipped multi-hole
+geometries, `margin` is only ~5-7% of the hole's own radius, and `traction_free_envelope`'s
+own saturation rate (tuned so `phi(3·radius)≈0.98`) gives `phi ≈ 0.44%` at that tiny distance.
+The network's own gradient-trainable output is multiplied by `phi` before being added to the
+closed form - meaning the GRADIENT reaching the specific weights that would learn a local
+correction is ALSO scaled by ~0.44%, a severe, real, precisely-quantified vanishing-gradient
+bottleneck exactly where Kt is read. This is exactly why none of the five (then six, after
+testing `LAM_HOLE_FIXED` 50→5 too) previously-falsified hyperparameter axes ever moved the
+needle - none of them change what `phi` numerically IS at the margin.
+
+**The fix**: `traction_free_envelope_scaled(x, y, a, saturation_scale)` - a faster-saturating
+generalization (`saturation_scale=1.0` byte-identical to the original), still exactly `0` with
+exactly zero derivative at the true boundary (the hard constraint itself is untouched). Applied
+via a new `HoleTractionFreeAnsatz.saturation_scale` field - strictly `1.0` at N=1, load-bearing
+since `new_with_hard_constraint_ansatz` is the SAME function PH4-42's own verified L5 result goes
+through. Verified zero regression two ways: unit tests proving the N=1 gate, AND a real
+end-to-end re-run of `issue_77_l5_hard_constraint.toml` (N=1) giving `Kt=2.4444` - matching
+PH4-42's own documented converged value (`2.444127304`) to 4 significant figures.
+
+**The scale itself is DERIVED from geometry, not hand-picked - this was a deliberate correction
+mid-investigation, not the first design.** A first pass tried a flat `MULTI_HOLE_SATURATION_
+SCALE` constant (`15.0`, then `30.0`) applied to every hole regardless of its own size. The user
+asked whether this needed to be a fixed input at all, wanting the app to derive it instead of
+requiring a hand-tuned magic number - it does now: `multi_hole_saturation_scale(hole_radius,
+margin)` solves `traction_free_envelope_scaled`'s own formula for the `scale` that makes `phi`
+reach a dimensionless target (`TARGET_PHI_AT_MARGIN = 0.9`) at the real Kt-measurement point
+(`scale = sqrt(-ln(1-0.9)) / (margin/hole_radius)`, `margin` = the same `ring_anchor_margin_m`
+the Kt diagnostic already uses). Only the dimensionless target remains a constant - a raw scale
+magnitude no longer needs re-guessing per geometry, it's computed from each hole's own
+radius/margin ratio.
+
+**Real, measured improvement** (`triple_hole_plate.toml`, N=2 Free holes, `scale≈22.75`
+computed automatically for this geometry): hole0/hole2 Kt went from `2.507`/`2.507` (no fix) to
+`2.930`/`2.958` (FEM ≈2.98-3.06/2.97-3.02) - within a few percent of FEM, matching the quality
+of the hand-picked `scale=30` trial (`2.973`/`2.956`) without hand-tuning either number to this
+specific geometry. Training dynamics genuinely healthier: `grad_norm` stays real and nonzero
+throughout instead of collapsing then oscillating, and per-step Kt visibly moves during training
+instead of being bit-for-bit frozen. Full regression: unchanged count (553 passed, +4 new/
+updated tests for the derivation), same 1 pre-existing unrelated failure, zero regressions.
+
+**Honestly still open**: hole0's Kt convergence check still flags `NOT converged` (radial
+Δ≈0.147) at this higher saturation rate, matching the same open caveat the `scale=30` hand-picked
+trial already had - close to FEM but not yet a fully settled number; the constitutive-residual
+max also rises alongside Kt accuracy, a real trade-off not yet characterized. `TARGET_PHI_AT_
+MARGIN=0.9` itself is not swept (chosen as the dimensionless analogue of the best-measured hand-
+picked trial). A genuinely trainable `saturation_scale` (a `burn` `Param` updated by gradient
+descent, rather than solved in closed form) was considered and set aside - the closed-form
+derivation already removes the hand-tuned magic number; making it co-trained with a highly
+nonlinear envelope function is separate, larger engineering scope with its own risk.

@@ -91,6 +91,34 @@ const LAM_HOLE_FIXED: f32 = 50.0;
 const LAM_TRANSLATION_GAUGE: f32 = 50.0;
 const LAM_ROTATION_GAUGE: f32 = 50.0;
 
+/// Issue #78 root-cause fix: the target `phi` value `AnnulusAnsatz::MultiHoleHardConstraint`
+/// should reach AT the real Kt-measurement point (`hole.radius + ring_anchor_margin_m`) once
+/// N>1 Free holes are present (never applied at N=1 - see `new_with_hard_constraint_ansatz`'s
+/// own call site for why). Deliberately a DIMENSIONLESS FRACTION, not a raw `saturation_scale`
+/// magnitude - a fixed scale number would need independent re-tuning for every different hole-
+/// radius/margin ratio a user's own geometry might have (this codebase's own real shipped
+/// geometries alone span `margin/radius` from ~5% to ~7%, and nothing stops a user-supplied
+/// spec from having a very different ratio). `multi_hole_saturation_scale` below SOLVES
+/// `traction_free_envelope_scaled`'s own formula for whatever raw `scale` this dimensionless
+/// target implies for THAT SPECIFIC hole's own real radius/margin ratio - self-adjusting to any
+/// geometry, no per-spec hand-tuning needed. `0.9` means "the network keeps 90% of its raw
+/// gradient signal right at the point Kt is actually read" - real, measured evidence (`docs/
+/// multi-hole-fem-ground-truth-investigation.md`'s own "Fourth pass" section) that pushing this
+/// higher (0.98, a fixed `scale=30` on `triple_hole_plate.toml`) gets closer to FEM ground
+/// truth than a gentler `phi≈0.63` (fixed `scale=15`) did, without yet being swept further.
+const TARGET_PHI_AT_MARGIN: f64 = 0.9;
+
+/// See [`TARGET_PHI_AT_MARGIN`]'s own doc comment. Solves `traction_free_envelope_scaled`'s
+/// formula (`phi = 1 - exp(-(scale*u)^2)`, `u = margin/hole_radius`) for the `scale` that makes
+/// `phi` reach `TARGET_PHI_AT_MARGIN` at `r = hole_radius + margin` - `scale =
+/// sqrt(-ln(1-target_phi)) / u`. `margin` is the SAME `ring_anchor_margin_m` the real Kt
+/// diagnostic and every FD-safety exclusion already use - not a second, independently-guessed
+/// distance.
+fn multi_hole_saturation_scale(hole_radius: f64, margin: f64) -> f64 {
+    let u = margin / hole_radius;
+    (-(1.0 - TARGET_PHI_AT_MARGIN).ln()).sqrt() / u
+}
+
 /// Issue #77 root-cause fix (kinematic decomposition): the closed-form uniform-tension
 /// strain `(eps_xx, eps_yy, eps_xy)` of `u_affine(x,y) = ((px-nu*py)/E)*x, ((py-nu*px)/E)*y`
 /// under Hooke's law inverse for plane stress (`sigma_xx=px, sigma_yy=py, sigma_xy=0`
@@ -1719,13 +1747,27 @@ impl UserDefinedProblem {
             assert!(!holes.is_empty(),
                 "hard-constraint ansatz requires at least one Free hole - see free_holes");
             let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+            // Issue #78 root-cause fix: `saturation_scale` - see `traction_free_envelope_
+            // scaled`'s own doc comment for the full derivation. STRICTLY `1.0` when exactly
+            // one Free hole is eligible (`holes.len() == 1`, load-bearing for byte-identical
+            // behavior with `AnnulusAnsatz::HardConstraint` - proven by `multi_hole_reduces_to_
+            // single_hole_hard_constraint_when_n_equals_one`), which keeps every single-hole
+            // spec through this exact constructor - INCLUDING PH4-42's own real, already-
+            // verified L5 result (0.67-1.23% of FEM), which goes through this identical function
+            // - completely untouched by this fix. Once `holes.len() > 1`, each hole gets its OWN
+            // DERIVED scale from `multi_hole_saturation_scale(hole.radius, margin)` - no hand-
+            // picked raw magnitude, self-adjusting to that hole's own radius/margin ratio (see
+            // `TARGET_PHI_AT_MARGIN`'s own doc comment).
+            let margin = ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+            let multi_hole = holes.len() > 1;
             let sub_ansatzes = holes.into_iter().map(|hole| {
+                let saturation_scale = if multi_hole { multi_hole_saturation_scale(hole.radius, margin) } else { 1.0 };
                 crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
                     hole_center: hole.center, hole_radius: hole.radius,
                     half_w: spec.geometry.half_w, half_h: spec.geometry.half_h,
                     px: spec.load.px, py: spec.load.py,
                     e: spec.material.e as f64, nu: spec.material.nu as f64,
-                    u_ref: scales.u_ref as f64,
+                    u_ref: scales.u_ref as f64, saturation_scale,
                 }
             }).collect();
             problem.ansatz = crate::kirsch_hole_correction::AnnulusAnsatz::MultiHoleHardConstraint(sub_ansatzes);
@@ -2153,6 +2195,7 @@ impl AnnularDecompositionProblem {
                     e: spec.material.e as f64,
                     nu: spec.material.nu as f64,
                     u_ref: scales.u_ref as f64,
+                    saturation_scale: 1.0,
                 },
             )
         } else {
@@ -2560,7 +2603,7 @@ impl AnnulusStageProblem {
                     half_w: spec.geometry.half_w, half_h: spec.geometry.half_h,
                     px: spec.load.px, py: spec.load.py,
                     e: spec.material.e as f64, nu: spec.material.nu as f64,
-                    u_ref: scales.u_ref as f64,
+                    u_ref: scales.u_ref as f64, saturation_scale: 1.0,
                 },
             )
         } else {
@@ -6586,6 +6629,56 @@ mod tests {
             "the Fixed hole's own soft penalty must be completely unaffected");
     }
 
+    /// Issue #78 root-cause fix: `new_with_hard_constraint_ansatz` must pick `saturation_scale`
+    /// based on how many Free holes are actually eligible, NOT unconditionally - `1.0` at N=1
+    /// (load-bearing for PH4-42's own real, already-verified L5 result, which is constructed
+    /// through this exact function), the geometry-DERIVED `multi_hole_saturation_scale` (see its
+    /// own doc comment) only once N>1 - never a flat hand-picked constant.
+    #[test]
+    fn new_with_hard_constraint_ansatz_only_raises_saturation_scale_when_multiple_free_holes_exist() {
+        use crate::kirsch_hole_correction::AnnulusAnsatz;
+
+        let mut single = single_hole_like_spec(1);
+        single.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        single.training.measure_aware_training = true;
+        let single_problem = UserDefinedProblem::new_with_hard_constraint_ansatz(single, true, 0.0);
+        match &single_problem.ansatz {
+            AnnulusAnsatz::MultiHoleHardConstraint(holes) => {
+                assert_eq!(holes.len(), 1);
+                assert_eq!(holes[0].saturation_scale, 1.0, "N=1 must stay at the original saturation rate - byte-identical to HardConstraint");
+            }
+            _ => panic!("expected MultiHoleHardConstraint"),
+        }
+
+        let mut multi = single_hole_like_spec(1);
+        multi.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        multi.training.measure_aware_training = true;
+        multi.geometry = UserGeometry {
+            half_w: 0.15, half_h: 0.06, thickness: 0.006,
+            holes: vec![
+                HoleSpec { center: [-0.06, 0.02], radius: 0.009, bc: HoleBc::Free },
+                HoleSpec { center: [0.0, -0.02], radius: 0.007, bc: HoleBc::Fixed },
+                HoleSpec { center: [0.06, 0.02], radius: 0.009, bc: HoleBc::Free },
+            ],
+        };
+        let margin = ring_anchor_margin_m(multi.training.fd_h, &multi.geometry);
+        let expected_scale = multi_hole_saturation_scale(0.009, margin);
+        let multi_problem = UserDefinedProblem::new_with_hard_constraint_ansatz(multi, true, 0.0);
+        match &multi_problem.ansatz {
+            AnnulusAnsatz::MultiHoleHardConstraint(holes) => {
+                assert_eq!(holes.len(), 2);
+                for hole in holes {
+                    assert!((hole.saturation_scale - expected_scale).abs() < 1e-9,
+                        "N>1 must use the geometry-derived saturation rate for every Free hole (got {}, expected {})",
+                        hole.saturation_scale, expected_scale);
+                    assert!(hole.saturation_scale > 1.0,
+                        "the derived scale must genuinely raise phi at the margin above the N=1 rate");
+                }
+            }
+            _ => panic!("expected MultiHoleHardConstraint"),
+        }
+    }
+
     /// Issue #78: `UserSamplingStrategy`'s hole-biased sampling must generalize to bias EVERY
     /// `HoleBc::Free` hole (not just a single centered one), splitting the total fraction evenly
     /// - checked on `triple_hole_plate.toml`'s real geometry (two off-center Free holes, one
@@ -6737,6 +6830,65 @@ mod tests {
         let device = crate::training_core::BDevice::default();
         let (_model, loss) = crate::user_runner::train_user_problem_for_benchmark(&problem, spec, &device);
         assert!(loss.is_finite(), "single-domain hard-constraint + hole-bias must train to a finite loss, got {loss}");
+    }
+
+    /// Issue #78 root-cause investigation (Step 1, decisive diagnostic): does `traction_free_
+    /// envelope`'s value AT the real Kt-measurement point (`hole.radius + ring_anchor_margin_m`,
+    /// the tiny FD-safety margin, NOT a large offset) suppress the trained network's own
+    /// contribution to near-zero - meaning Kt reads almost purely the closed-form baseline
+    /// regardless of what the network has learned? Real, precise, numerically confirmed lead
+    /// (`docs/multi-hole-fem-ground-truth-investigation.md`'s own "Third pass" section): for
+    /// `triple_hole_plate.toml`'s real geometry, `phi ≈ 0.44%` at that exact margin (vs. `phi >
+    /// 0.97` by `3*radius`) - a genuine, severe local vanishing-gradient bottleneck for the
+    /// specific weights that would need to shape the field there, independent of every
+    /// hyperparameter axis already falsified (none of those change what phi IS at that radius).
+    /// This test measures Kt via the SAME trained model at the real margin AND at several
+    /// larger radii (where phi has actually saturated), on the SAME real geometry, to confirm
+    /// or refute this mechanism directly before any production fix is attempted.
+    #[test]
+    #[ignore]
+    fn issue_78_kt_varies_with_probe_radius_matching_envelope_saturation_not_yet_a_fix() {
+        let mut spec = single_hole_like_spec(600);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        spec.training.n_interior = 4096;
+        spec.training.n_boundary = 3072;
+        spec.training.amr_enabled = true;
+        spec.geometry = UserGeometry {
+            half_w: 0.15, half_h: 0.06, thickness: 0.006,
+            holes: vec![
+                HoleSpec { center: [-0.06, 0.02], radius: 0.009, bc: HoleBc::Free },
+                HoleSpec { center: [0.0, -0.02], radius: 0.007, bc: HoleBc::Fixed },
+                HoleSpec { center: [0.06, 0.02], radius: 0.009, bc: HoleBc::Free },
+            ],
+        };
+        spec.network = pinn_core::problem_spec::NetworkSpec { hidden_dim: 64, n_hidden: 8, ..Default::default() };
+
+        let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec.clone(), true, 0.4);
+        let device = crate::training_core::BDevice::default();
+        let (model, loss) = crate::user_runner::train_user_problem_for_benchmark(&problem, spec.clone(), &device);
+        assert!(loss.is_finite());
+
+        let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+        let fd = crate::fd_stencil::FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+        let nominal_stress = spec.load.px.abs();
+        let real_margin = ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+
+        for &hole_idx in &[0usize, 2] {
+            let hole = &spec.geometry.holes[hole_idx];
+            println!("=== hole {hole_idx} (radius={}) ===", hole.radius);
+            println!("  real FD-safety margin={real_margin:.6e} m ({:.4}% of radius)", 100.0 * real_margin / hole.radius);
+            for margin_mult in [1.0_f64, 5.0, 20.0, 50.0, 100.0, 300.0] {
+                let margin = real_margin * margin_mult;
+                let phi = crate::kirsch_hole_correction::traction_free_envelope(hole.radius + margin, 0.0, hole.radius);
+                let profile = probe_hole_boundary_profile_derived(
+                    &model, &spec.geometry, hole, 72, &fd, scales.u_ref, spec.load.px, &spec.material,
+                    margin, &device, problem.ansatz(0), (decomposition_applicable(&spec) || problem.hard_constraint_active()).then_some((spec.load.px, spec.load.py)),
+                );
+                let sc = stress_concentration_from_profile(&profile, nominal_stress);
+                println!("  margin_mult={margin_mult:>6.1}  margin={margin:.6e} m  phi={phi:.6}  Kt_vm={:.4}", sc.kt);
+            }
+        }
     }
 
     /// Same registration proof for `AnnularDecompositionProblem`, plus the point-set-consumption
@@ -7979,7 +8131,7 @@ mod tests {
             crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
                 hole_center: hole.center, hole_radius: hole.radius,
                 half_w: geometry.half_w, half_h: geometry.half_h,
-                px, py, e: material.e as f64, nu: material.nu as f64, u_ref: u_ref as f64,
+                px, py, e: material.e as f64, nu: material.nu as f64, u_ref: u_ref as f64, saturation_scale: 1.0,
             },
         );
         let via_identity = probe_hole_boundary_profile_derived(
@@ -8217,7 +8369,7 @@ mod tests {
             crate::kirsch_hole_correction::HoleTractionFreeAnsatz {
                 hole_center: geometry.holes[0].center, hole_radius: geometry.holes[0].radius,
                 half_w: geometry.half_w, half_h: geometry.half_h,
-                px, py, e: material.e as f64, nu: material.nu as f64, u_ref: u_ref as f64,
+                px, py, e: material.e as f64, nu: material.nu as f64, u_ref: u_ref as f64, saturation_scale: 1.0,
             },
         );
         let via_identity = evaluate_user_vis_grid(

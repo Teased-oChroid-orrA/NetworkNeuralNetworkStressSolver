@@ -1303,7 +1303,7 @@ fn run_training_annular_decomposition(
                     hole_center: hole.center, hole_radius: hole.radius,
                     half_w: geometry.half_w, half_h: geometry.half_h,
                     px, py, e: material.e as f64, nu: material.nu as f64,
-                    u_ref: scales.u_ref as f64,
+                    u_ref: scales.u_ref as f64, saturation_scale: 1.0,
                 },
             )
         } else {
@@ -1436,7 +1436,7 @@ fn run_training_annular_decomposition_sequential(
                     hole_center: hole.center, hole_radius: hole.radius,
                     half_w: geometry.half_w, half_h: geometry.half_h,
                     px, py, e: material.e as f64, nu: material.nu as f64,
-                    u_ref: scales.u_ref as f64,
+                    u_ref: scales.u_ref as f64, saturation_scale: 1.0,
                 },
             )
         } else {
