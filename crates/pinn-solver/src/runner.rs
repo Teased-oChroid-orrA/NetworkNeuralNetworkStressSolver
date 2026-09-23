@@ -926,6 +926,7 @@ pub fn run_training_pinlug(
                 constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                 n_fourier: 0,
                 coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+                domain_coordinate_embeddings: None,
                 probe_term_gradients: false,
                 phase2_active: false,
                 step,
@@ -961,6 +962,7 @@ pub fn run_training_pinlug(
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                         n_fourier: 0,
                         coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+                        domain_coordinate_embeddings: None,
                         probe_term_gradients: false,
                         phase2_active: false, step,
                     };
@@ -1006,6 +1008,7 @@ pub fn run_training_pinlug(
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                         n_fourier: 0,
                         coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+                        domain_coordinate_embeddings: None,
                         probe_term_gradients: false,
                         phase2_active: false, step,
                     };
@@ -1053,6 +1056,7 @@ pub fn run_training_pinlug(
             constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
             coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            domain_coordinate_embeddings: None,
             probe_term_gradients: false,
             phase2_active: false,
             step,
@@ -1647,12 +1651,20 @@ fn run_user_problem_training_from(
     // Issue #78 item 3: same seeding as `user_runner::run_headless_user_problem` - inert
     // (empty seeds, no-op) unless `trainable_saturation_scale` genuinely applies. Runs here
     // (not in the caller that constructs `model`) since this is the SHARED body for both a
-    // fresh run and a resumed one - a resumed run's own checkpoint-loaded `hole_scales` (if
-    // any) would be overwritten by this re-seed, a real, disclosed v1 limitation (see
-    // `ArchitectureSpec::trainable_saturation_scale`'s own doc comment area / `CLAUDE.md`),
-    // not a crash - checkpoint round-trip of a trained `hole_scales` isn't independently
-    // verified in this pass.
-    if spec.architecture.hard_constraint_ansatz && spec.architecture.trainable_saturation_scale {
+    // fresh run and a resumed one. Gated on `model.hole_scale_ids().is_empty()`: a FRESH model
+    // (`run_training_user_problem`) always starts with an empty `hole_scales` Vec (see
+    // `ElasticityNetConfig::init`), so this seeds it exactly as before. A RESUMED model
+    // (`run_training_user_problem_resume`, via `load_checkpoint_for_training`) already carries
+    // its own checkpoint-loaded, gradient-trained `hole_scales` (burn's `#[derive(Module)]`
+    // record walk serializes/deserializes `Param<Tensor<B,1>>` fields structurally, the same
+    // mechanism `gates` already relies on - no special-casing needed for the round-trip
+    // itself, confirmed by `checkpoint::tests::trainable_hole_scales_round_trip_through_save_
+    // and_load_for_training`) - re-seeding it here would silently discard that training
+    // progress back to the closed-form seed, the real bug this gate fixes.
+    if spec.architecture.hard_constraint_ansatz
+        && spec.architecture.trainable_saturation_scale
+        && model.hole_scale_ids().is_empty()
+    {
         let seeds = crate::user_problem::trainable_hole_scale_seeds(&spec);
         if !seeds.is_empty() {
             model = model.with_hole_scales(&seeds, &device);
@@ -1872,6 +1884,7 @@ fn run_user_problem_training_from(
                 constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                 n_fourier: spec.geometry.n_fourier(),
                 coordinate_embedding: spec.geometry.coordinate_embedding(),
+                domain_coordinate_embeddings: None,
                 probe_term_gradients: false,
                 phase2_active: true,
                 step,
@@ -1943,6 +1956,7 @@ fn run_user_problem_training_from(
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                         n_fourier: spec.geometry.n_fourier(),
                         coordinate_embedding: spec.geometry.coordinate_embedding(),
+                        domain_coordinate_embeddings: None,
                         probe_term_gradients: false,
                         phase2_active: true, step,
                     };
@@ -2435,6 +2449,7 @@ fn run_user_problem_training_from(
                     saved_at_unix,
                     provenance,
                     report: Some(report),
+                    hole_scale_count: 0,
                 };
                 let result = crate::checkpoint::save_checkpoint(model_val, &meta, &path)
                     .map(|p| p.display().to_string());
@@ -2631,6 +2646,7 @@ pub fn serve_loaded_plate_checkpoint(
                     saved_at_unix,
                     provenance,
                     report: Some(report),
+                    hole_scale_count: 0,
                 };
                 let result = crate::checkpoint::save_checkpoint(model.clone(), &meta, &path)
                     .map(|p| p.display().to_string());
@@ -3274,6 +3290,7 @@ mod tests {
                 constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
                 n_fourier: 0,
                 coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+                domain_coordinate_embeddings: None,
                 probe_term_gradients: false,
                 phase2_active: true, step,
             };
@@ -3358,6 +3375,7 @@ mod tests {
                 constitutive_consistency_weight: 50.0,
                 n_fourier: 0,
                 coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+                domain_coordinate_embeddings: None,
                 probe_term_gradients: probe_now,
                 phase2_active: true, step,
             };
@@ -3477,6 +3495,7 @@ mod tests {
                 constitutive_consistency_weight: 50.0,
                 n_fourier: 0,
                 coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+                domain_coordinate_embeddings: None,
                 probe_term_gradients: probe_now,
                 phase2_active: true, step,
             };

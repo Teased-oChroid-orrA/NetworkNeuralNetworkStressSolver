@@ -943,6 +943,7 @@ fn serve_parametric_inference(
                     // integral`), so claiming an `integration_mode`/`sampling_mode` for it here
                     // would misrepresent behavior this path doesn't actually have.
                     report: None,
+            hole_scale_count: 0,
                 };
                 let result = crate::checkpoint::save_checkpoint(model.clone(), &meta, &path)
                     .map(|p| p.display().to_string());

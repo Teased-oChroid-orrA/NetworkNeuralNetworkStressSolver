@@ -328,18 +328,18 @@ pub fn run_multi_annular_decomposition_training(
     crate::problem::validate_loss_terms(&problem);
     let n_domains = problem.domains().len();
 
-    // Issue #78 item 4, a real, disclosed correctness constraint (not an oversight): `MultiStepCtx.
-    // coordinate_embedding` is ONE shared value applied to every domain whose model input width
-    // matches it (`training_core::stencil_forward_with_ansatz`'s own model-input-width dispatch) -
-    // there is no per-domain embedding slot. N different `SingleHoleChart` embeddings (each
-    // carrying a DIFFERENT hole center) cannot coexist in one shared field without one domain
-    // silently reading another's hole-relative geometry. Every domain here therefore uses plain
-    // Raw (3-column) coordinates - a real accuracy tradeoff (no hole-relative chart features for
-    // any annulus domain, unlike the single-hole path), not a hidden bug.
-    let net_cfg = ElasticityNetConfig::new().with_input_dim(3)
-        .with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden).with_output_dim(5);
+    // Issue #78 item 4 follow-up: `MultiStepCtx.domain_coordinate_embeddings` (an ADDITIVE
+    // per-domain override - see its own doc comment) closes the real, previously-disclosed
+    // limitation this comment used to describe ("every domain here uses plain Raw - a real
+    // accuracy tradeoff"). Each annulus domain now gets its OWN `SingleHoleChart`, matching the
+    // input width its own model is built with below; the outer domain stays Raw, matching the
+    // original single-hole `AnnularDecompositionProblem`'s own convention.
+    let domain_embeddings = problem.domain_coordinate_embeddings();
+    debug_assert_eq!(domain_embeddings.len(), n_domains, "one embedding per domain, same order as problem.domains()");
     let mut models = Vec::with_capacity(n_domains);
-    for i in 0..n_domains {
+    for (i, embedding) in domain_embeddings.iter().enumerate() {
+        let net_cfg = ElasticityNetConfig::new().with_input_dim(embedding.input_dim())
+            .with_hidden_dim(spec.network.hidden_dim).with_n_hidden(spec.network.n_hidden).with_output_dim(5);
         B::seed(&device, spec.network.model_init_seed ^ (0xA77A_0000u64 + i as u64));
         models.push(net_cfg.init(&device));
     }
@@ -385,6 +385,7 @@ pub fn run_multi_annular_decomposition_training(
             dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
             constitutive_consistency_weight: 50.0,
             n_fourier: 0, coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            domain_coordinate_embeddings: Some(domain_embeddings.clone()),
             probe_term_gradients: false, phase2_active: true, step,
         };
         let (new_models, out) = step_physics_multi(models, &mut optims, &ctx, &mut saw, &mut lr_sched_shared, &device, 0, 1.0, 1.0);
@@ -420,13 +421,22 @@ pub fn multi_annular_hole_kt_diagnostics(
     for (i, hole) in free_holes.iter().enumerate() {
         let model = &models[i];
         let ansatz = problem.ansatz(i);
+        // Issue #78 item 4 follow-up: probe through the SAME synthetic single-hole geometry
+        // this model was trained relative to (`problem.free_hole_geometry(i)`), not the full
+        // N-hole `spec.geometry` - that model's own `input_dim` (10, `SingleHoleChart`) only
+        // matches the embedding a single-hole geometry derives; the full geometry's own
+        // `coordinate_embedding()` is `MultiHoleChart` for N>1, a different width entirely,
+        // which previously made `embedding_for_model` panic ("matches no known embedding") the
+        // instant a real N=2+ run reached its post-training Kt diagnostic - a real bug, not a
+        // hypothetical, caught by this session's own real end-to-end run.
+        let hole_geometry = problem.free_hole_geometry(i);
         let profile = probe_hole_boundary_profile_derived(
-            model, &spec.geometry, hole, 72, &fd, scales.u_ref, spec.load.px, &spec.material, margin, device,
+            model, &hole_geometry, hole, 72, &fd, scales.u_ref, spec.load.px, &spec.material, margin, device,
             ansatz, Some((spec.load.px, spec.load.py)),
         );
         let sc = stress_concentration_from_profile(&profile, nominal_stress);
         let convergence = kt_convergence_check(
-            model, &spec.geometry, hole, 72, &fd, scales.u_ref, spec.load.px, &spec.material,
+            model, &hole_geometry, hole, 72, &fd, scales.u_ref, spec.load.px, &spec.material,
             margin, nominal_stress, 0.1, device, ansatz, Some((spec.load.px, spec.load.py)),
         );
         results.push((i, sc.kt, convergence.converged));

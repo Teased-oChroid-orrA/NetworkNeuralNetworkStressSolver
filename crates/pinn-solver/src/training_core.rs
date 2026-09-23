@@ -1638,9 +1638,19 @@ fn compute_domain_forwards<Bk: Backend<Device = BDevice>>(
         // also used by the (fixed) Kt/stress diagnostic probe. See that function's own doc
         // comment for why this extraction exists and what bug it closes. Byte-identical
         // behavior: same operations, same order, just no longer duplicated.
+        //
+        // Issue #78 item 4 follow-up: `ctx.domain_coordinate_embeddings` (indexed by the SAME
+        // `model_idx` position as `models`/`ctx.domains`) overrides the shared `coordinate_
+        // embedding` above for this one domain when present - see `MultiStepCtx::domain_
+        // coordinate_embeddings`'s own doc comment. `None` (every caller except `run_multi_
+        // annular_decomposition_training`) falls back to the shared value exactly as before.
+        let this_domain_embedding = ctx.domain_coordinate_embeddings.as_ref()
+            .and_then(|v| v.get(model_idx))
+            .cloned()
+            .unwrap_or_else(|| coordinate_embedding.clone());
         let (raw, model_embedding) = stencil_forward_with_ansatz::<Bk>(
             model, ansatz, norm_pts, point_fd, ctx.k, u_ref_f64, px, is_mdem,
-            coordinate_embedding.clone(), forward_masks[model_idx], device,
+            this_domain_embedding, forward_masks[model_idx], device,
         );
         let raw_out = raw.clone().slice([0..n_pts, 0..raw.dims()[1]]);
         // Direct σ at the 4 FD-shifted positions - zero extra forward pass, just extracting
@@ -6316,6 +6326,7 @@ mod tests {
                 constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
                 n_fourier: 0,
                 coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+                domain_coordinate_embeddings: None,
                 probe_term_gradients: false,
                 phase2_active: false,
                 step,
@@ -6619,6 +6630,7 @@ mod tests {
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
             coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            domain_coordinate_embeddings: None,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -6697,6 +6709,7 @@ mod tests {
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
             coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            domain_coordinate_embeddings: None,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -6769,6 +6782,7 @@ mod tests {
                 dynamic_lam_penetration_cap: 500.0, dynamic_lam_non_tension_cap: 100.0,
                 constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
                 n_fourier: 0, coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+                domain_coordinate_embeddings: None,
                 probe_term_gradients: false, phase2_active: false, step: 0,
             };
             let mut optims = vec![
@@ -6834,6 +6848,7 @@ mod tests {
             dynamic_lam_penetration_cap: 500.0, dynamic_lam_non_tension_cap: 100.0,
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0, coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            domain_coordinate_embeddings: None,
             probe_term_gradients: false, phase2_active: false, step: 0,
         };
         let mut optims = vec![
@@ -6906,6 +6921,7 @@ mod tests {
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
             coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            domain_coordinate_embeddings: None,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -7026,6 +7042,7 @@ mod tests {
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
             coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            domain_coordinate_embeddings: None,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -7168,6 +7185,7 @@ mod tests {
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
             coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            domain_coordinate_embeddings: None,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -7221,6 +7239,7 @@ mod tests {
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
             coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            domain_coordinate_embeddings: None,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -7361,6 +7380,7 @@ mod tests {
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
             coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            domain_coordinate_embeddings: None,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -7447,6 +7467,7 @@ mod tests {
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
             coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            domain_coordinate_embeddings: None,
             probe_term_gradients: false,
             phase2_active: false,
             step: 0,
@@ -7584,6 +7605,7 @@ mod tests {
             constitutive_consistency_weight: LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
             coordinate_embedding: pinn_core::user_geometry::CoordinateEmbedding::Raw,
+            domain_coordinate_embeddings: None,
             probe_term_gradients: false,
             phase2_active,
             step: 0,

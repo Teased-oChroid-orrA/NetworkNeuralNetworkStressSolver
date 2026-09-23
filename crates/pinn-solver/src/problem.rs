@@ -563,8 +563,19 @@ pub struct MultiStepCtx<'a> {
     /// single-domain; every other caller keeps this `0`, byte-identical to before this field
     /// existed.
     pub n_fourier: usize,
-    /// User-geometry coordinate representation. Legacy callers use `Raw`.
+    /// User-geometry coordinate representation. Legacy callers use `Raw`. Shared across every
+    /// domain UNLESS `domain_coordinate_embeddings` (below) overrides it per-domain.
     pub coordinate_embedding: CoordinateEmbedding,
+    /// Issue #78 item 4 follow-up: per-domain override of `coordinate_embedding` above, indexed
+    /// positionally against `domains` (same order convention `per_domain_lr` already
+    /// established). `None` (every caller before this field existed, and every caller that
+    /// doesn't need it) = every domain uses the single shared `coordinate_embedding` exactly as
+    /// before - byte-identical. `Some(v)` = domain at position `i` uses `v[i]` instead (only
+    /// consumed by `compute_domain_forwards`). Exists because a single shared value cannot
+    /// represent N different `SingleHoleChart` embeddings (each carrying a DIFFERENT hole
+    /// center) at once - `MultiAnnularDecompositionProblem::domain_coordinate_embeddings` is
+    /// the one real producer of a `Some` value today.
+    pub domain_coordinate_embeddings: Option<Vec<CoordinateEmbedding>>,
     /// Diagnostic-only, opt-in (default `false` everywhere except dedicated diagnostics): when
     /// true, `step_physics_multi` computes each active term's OWN gradient L2 norm (an extra
     /// `.backward()` pass per term) and populates `StepOutput.term_grad_norms`. Real cost (N
@@ -660,6 +671,11 @@ impl FrozenMultiStepCtx {
             constitutive_consistency_weight: self.constitutive_consistency_weight,
             n_fourier: self.n_fourier,
             coordinate_embedding: self.coordinate_embedding.clone(),
+            // Not tracked by `FrozenMultiStepCtx` - the L-BFGS/Converge-tier path this
+            // reconstructs for is never reached by a problem that needs a per-domain override
+            // (see `MultiStepCtx::domain_coordinate_embeddings`'s own doc comment); `None` is
+            // the exact behavior every field this frozen snapshot already carries reduces to.
+            domain_coordinate_embeddings: None,
             // Not tracked by `FrozenMultiStepCtx` (same rationale as `step` above) - term-
             // gradient probing is a dedicated-diagnostic-only concern, never needed on the
             // L-BFGS/Converge path this reconstructs for.
@@ -810,6 +826,7 @@ mod tests {
             constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
             n_fourier: 0,
             coordinate_embedding: CoordinateEmbedding::Raw,
+            domain_coordinate_embeddings: None,
             probe_term_gradients: false,
             phase2_active: true,
             step: 0,

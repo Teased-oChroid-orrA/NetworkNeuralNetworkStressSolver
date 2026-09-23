@@ -1227,6 +1227,12 @@ pub fn plate_multi_step_ctx<'a>(
         constitutive_consistency_weight: 50.0,
         n_fourier,
         coordinate_embedding,
+        // Only `run_multi_annular_decomposition_training`'s own inline `MultiStepCtx` literal
+        // ever needs a per-domain override (N different hole-relative charts) - neither of
+        // this file's two shared single/two-domain builders is used by that N-hole path, so
+        // `None` (the shared `coordinate_embedding` above, applied to every domain) is always
+        // correct here.
+        domain_coordinate_embeddings: None,
         probe_term_gradients,
         phase2_active: true,
         step,
@@ -1271,6 +1277,7 @@ pub fn plate_multi_domain_step_ctx<'a>(
         constitutive_consistency_weight: 50.0,
         n_fourier,
         coordinate_embedding,
+        domain_coordinate_embeddings: None,
         probe_term_gradients,
         phase2_active: true,
         step,
@@ -2726,6 +2733,20 @@ pub struct MultiAnnularDecompositionProblem {
     interface_weight: f32,
 }
 
+/// Shared by `MultiAnnularDecompositionProblem::new` (builds each annulus domain's sampling/
+/// ansatz), `domain_coordinate_embeddings` (derives each annulus model's own input width), and
+/// `multi_annular_hole_kt_diagnostics` (must probe each trained model through the SAME geometry
+/// it was trained relative to, or `embedding_for_model` panics on a width it doesn't recognize -
+/// a real bug this factoring-out fixes, see that diagnostic function's own doc comment). A
+/// single source of truth for "what geometry does hole i's own annulus model see" - three
+/// independently-written copies previously risked silently diverging.
+fn single_hole_geometry_for(full: &UserGeometry, hole: &HoleSpec) -> UserGeometry {
+    UserGeometry {
+        half_w: full.half_w, half_h: full.half_h, thickness: full.thickness,
+        holes: vec![HoleSpec { center: hole.center, radius: hole.radius, bc: HoleBc::Free }],
+    }
+}
+
 impl MultiAnnularDecompositionProblem {
     /// The N-hole analogue of `AnnularDecompositionProblem::supports` - every hole must be
     /// `Free` (a `Fixed` hole has no annulus-decomposition machinery - it stays in the outer
@@ -2760,11 +2781,7 @@ impl MultiAnnularDecompositionProblem {
             // HardConstraint` COMPLETELY UNCHANGED via a synthetic single-hole `UserGeometry`
             // (same plate dimensions, exactly this one hole) - the existing, already-proven
             // single-hole machinery never needs to know it's one of several.
-            let single_hole_geometry = UserGeometry {
-                half_w: spec.geometry.half_w, half_h: spec.geometry.half_h,
-                thickness: spec.geometry.thickness,
-                holes: vec![HoleSpec { center: hole.center, radius: hole.radius, bc: HoleBc::Free }],
-            };
+            let single_hole_geometry = single_hole_geometry_for(&spec.geometry, hole);
             annulus_samplings.push(AnnularPartitionSampling::new(
                 single_hole_geometry, spec.training.fd_h, true, outer_domain_id, interface.clone(),
             ));
@@ -2800,6 +2817,44 @@ impl MultiAnnularDecompositionProblem {
 
     fn hard_constraint_active(&self, i: usize) -> bool {
         matches!(self.annulus_ansatzes[i], crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(_))
+    }
+
+    /// Issue #78 item 4 follow-up: closes the `MultiStepCtx.coordinate_embedding`-is-one-
+    /// shared-value gap this problem's own doc comment (and `run_multi_annular_decomposition_
+    /// training`'s) previously disclosed as a real, unfixed accuracy limitation. One
+    /// `CoordinateEmbedding` per domain, in `self.domains()` order (annulus domains first, then
+    /// the outer domain) - each annulus domain gets a genuine `SingleHoleChart` relative to ITS
+    /// OWN hole, recomputed from the SAME synthetic single-hole `UserGeometry` shape `new()`
+    /// already builds that hole's sampling/ansatz from above (never a second, potentially-
+    /// diverging geometry - if `new()`'s own construction ever changes, this must change with
+    /// it). The outer domain stays `Raw`, matching the original single-hole
+    /// `AnnularDecompositionProblem`'s own convention (annulus gets chart features, outer
+    /// doesn't - the outer domain represents only a small residual correction post-kinematic-
+    /// decomposition, the same rationale that keeps it plain-tanh there too). The caller MUST
+    /// build each annulus model with the matching `input_dim()` and populate `MultiStepCtx::
+    /// domain_coordinate_embeddings` with this Vec, in this exact order, or `compute_domain_
+    /// forwards` panics on a width mismatch (loud, not silent - see that function's own
+    /// model-input-width dispatch).
+    pub fn domain_coordinate_embeddings(&self) -> Vec<pinn_core::user_geometry::CoordinateEmbedding> {
+        let free_holes: Vec<&HoleSpec> = self.spec.geometry.holes.iter().filter(|h| h.bc == HoleBc::Free).collect();
+        let mut out = Vec::with_capacity(self.domains.len());
+        for hole in &free_holes {
+            out.push(single_hole_geometry_for(&self.spec.geometry, hole).coordinate_embedding());
+        }
+        out.push(pinn_core::user_geometry::CoordinateEmbedding::Raw);
+        out
+    }
+
+    /// Issue #78 item 4 follow-up: the exact synthetic single-hole `UserGeometry` free-hole `i`'s
+    /// own annulus model was trained relative to (same one `new()`/`domain_coordinate_
+    /// embeddings()` use internally). Diagnostics that probe that model directly (`multi_
+    /// annular_hole_kt_diagnostics`) MUST pass this, not `spec.geometry` (the full N-hole
+    /// geometry) - `embedding_for_model` derives its embedding from whatever `UserGeometry` it's
+    /// given, and the full geometry's own `coordinate_embedding()` is `MultiHoleChart` (a
+    /// DIFFERENT width) for N>1, which the annulus model was never built with.
+    pub fn free_hole_geometry(&self, i: usize) -> UserGeometry {
+        let free_holes: Vec<&HoleSpec> = self.spec.geometry.holes.iter().filter(|h| h.bc == HoleBc::Free).collect();
+        single_hole_geometry_for(&self.spec.geometry, free_holes[i])
     }
 }
 
@@ -4936,8 +4991,6 @@ pub fn kt_convergence_check(
     let rel = |a: f64, b: f64| if b.abs() > 1e-30 { (a - b).abs() / b.abs() } else { (a - b).abs() };
     let angular_relative_change = rel(kt_fine_angular, kt_coarse);
     let radial_relative_change = rel(kt_coarse_margin_1_5x, kt_coarse);
-    let converged = angular_relative_change.is_finite() && radial_relative_change.is_finite()
-        && angular_relative_change < tolerance && radial_relative_change < tolerance;
 
     // Issue #78 second root-cause fix: decompose the raw radial Δ into "expected closed-form
     // curvature" vs. "the network's own residual still moving" - see `KtConvergenceReport`'s
@@ -4953,6 +5006,25 @@ pub fn kt_convergence_check(
         );
         ((kt_coarse - kt_baseline_1) - (kt_coarse_margin_1_5x - kt_baseline_2)).abs()
     });
+
+    // Issue #78 item 1 (final fix): the radial half of `converged` now gates on the DECOMPOSED
+    // residual (relative to `kt_coarse`, the same units/scale `tolerance` already means for the
+    // angular check) whenever a baseline exists, instead of the raw, curvature-contaminated
+    // `radial_relative_change` - the raw number was proven (see this function's own doc comment
+    // and `closed_form_only_kt_varies_meaningfully_between_the_two_radial_probe_points_at_real_
+    // scale`) to be dominated by real, EXPECTED closed-form field curvature that has nothing to
+    // do with training convergence, so gating pass/fail on it was measuring the wrong thing. No
+    // baseline (`IdentityAnsatz`, no affine background - e.g. the no-hole variational benchmark)
+    // falls back to the ORIGINAL raw check exactly as before - zero regression for that case,
+    // since there's no known curvature to subtract there in the first place.
+    let radial_ok = match radial_residual_kt_delta {
+        Some(residual) => {
+            let residual_relative = if kt_coarse.abs() > 1e-30 { residual / kt_coarse.abs() } else { residual };
+            residual_relative.is_finite() && residual_relative < tolerance
+        }
+        None => radial_relative_change.is_finite() && radial_relative_change < tolerance,
+    };
+    let converged = angular_relative_change.is_finite() && angular_relative_change < tolerance && radial_ok;
 
     KtConvergenceReport {
         kt_coarse, kt_fine_angular, kt_coarse_margin_1_5x,
@@ -5149,6 +5221,51 @@ mod tests {
         for name in &o_terms {
             assert_eq!(original.base_weight(name), multi.base_weight(name), "base_weight mismatch for '{name}'");
         }
+    }
+
+    /// Issue #78 item 4 follow-up: `domain_coordinate_embeddings` closes the real, previously-
+    /// disclosed "every domain uses plain Raw" limitation - one `SingleHoleChart` per annulus
+    /// domain, each carrying its OWN hole's center (not a shared/first-hole value silently
+    /// reused for every domain, the exact failure mode this test exists to rule out), Raw for
+    /// the shared outer domain, in `self.domains()` order.
+    #[test]
+    fn multi_annular_domain_coordinate_embeddings_are_genuinely_per_hole() {
+        let spec = ProblemSpec {
+            geometry: UserGeometry {
+                half_w: 0.15, half_h: 0.06, thickness: 0.005,
+                holes: vec![
+                    HoleSpec { center: [-0.06, 0.0], radius: 0.009, bc: HoleBc::Free },
+                    HoleSpec { center: [0.06, 0.0], radius: 0.009, bc: HoleBc::Free },
+                ],
+            },
+            material: MaterialProps::al7075_t6(),
+            load: LoadConfig::uniaxial_x(6.9e7), network: Default::default(),
+            training: pinn_core::problem_spec::TrainingSpec { measure_aware_training: true, ..Default::default() },
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
+        };
+        let problem = MultiAnnularDecompositionProblem::new(spec, true);
+        let embeddings = problem.domain_coordinate_embeddings();
+        assert_eq!(embeddings.len(), 3, "2 annulus domains + 1 outer domain");
+
+        let center_of = |e: &pinn_core::user_geometry::CoordinateEmbedding| match e {
+            pinn_core::user_geometry::CoordinateEmbedding::SingleHoleChart { center_norm, .. } => *center_norm,
+            other => panic!("expected SingleHoleChart for an annulus domain, got {other:?}"),
+        };
+        let c0 = center_of(&embeddings[0]);
+        let c1 = center_of(&embeddings[1]);
+        assert!((c0[0] - c1[0]).abs() > 0.1, "the two annulus domains must NOT share the same hole center: {c0:?} vs {c1:?}");
+        assert!(c0[0] < 0.0, "hole 0 is at x=-0.06, its own chart center must reflect that (negative x)");
+        assert!(c1[0] > 0.0, "hole 1 is at x=+0.06, its own chart center must reflect that (positive x)");
+        assert_eq!(embeddings[2], pinn_core::user_geometry::CoordinateEmbedding::Raw, "the shared outer domain must stay Raw");
+
+        // Real, decisive proof this isn't just correct in isolation but actually reaches the
+        // model: `run_multi_annular_decomposition_training` must build each annulus model with
+        // THIS embedding's own input width (10 for SingleHoleChart, n_fourier=0), not the
+        // uniform Raw(3) every domain used before this fix.
+        assert_eq!(embeddings[0].input_dim(), 10);
+        assert_eq!(embeddings[1].input_dim(), 10);
+        assert_eq!(embeddings[2].input_dim(), 3);
     }
 
     /// Issue #77 Phase 2 architectural redesign: `OuterStageProblem` is a genuine single-domain
@@ -8612,6 +8729,7 @@ mod tests {
             constitutive_consistency_weight: 50.0,
             n_fourier: spec.geometry.n_fourier(),
             coordinate_embedding: spec.geometry.coordinate_embedding(),
+            domain_coordinate_embeddings: None,
             probe_term_gradients: true,
             phase2_active: true,
             step: 0,
@@ -9892,6 +10010,7 @@ mod tests {
                 constitutive_consistency_weight: 50.0,
                 n_fourier: spec.geometry.n_fourier(),
                 coordinate_embedding: spec.geometry.coordinate_embedding(),
+                domain_coordinate_embeddings: None,
                 probe_term_gradients: false,
                 phase2_active: true, step,
             };
@@ -10211,7 +10330,8 @@ mod tests {
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
-                        n_fourier: spec.geometry.n_fourier(), coordinate_embedding: spec.geometry.coordinate_embedding(), probe_term_gradients: false,
+                        n_fourier: spec.geometry.n_fourier(), coordinate_embedding: spec.geometry.coordinate_embedding(),
+                        domain_coordinate_embeddings: None, probe_term_gradients: false,
                         phase2_active: true, step,
                     };
                     if let Some(residuals) = probe_interior_energy_residuals(&probe_ctx, &[&model], device).remove(&USER_DOMAIN) {
@@ -10234,7 +10354,8 @@ mod tests {
                                 dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                                 dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                                 constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
-                                n_fourier: spec.geometry.n_fourier(), coordinate_embedding: spec.geometry.coordinate_embedding(), probe_term_gradients: false,
+                                n_fourier: spec.geometry.n_fourier(), coordinate_embedding: spec.geometry.coordinate_embedding(),
+                                domain_coordinate_embeddings: None, probe_term_gradients: false,
                                 phase2_active: true, step,
                             };
                             let after_residuals = probe_interior_energy_residuals(&after_ctx, &[&model], device)
@@ -10371,7 +10492,8 @@ mod tests {
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
-                        n_fourier: spec.geometry.n_fourier(), coordinate_embedding: spec.geometry.coordinate_embedding(), probe_term_gradients: false,
+                        n_fourier: spec.geometry.n_fourier(), coordinate_embedding: spec.geometry.coordinate_embedding(),
+                        domain_coordinate_embeddings: None, probe_term_gradients: false,
                         phase2_active: true, step,
                     };
                     if let Some(residuals) = probe_interior_energy_residuals(&probe_ctx, &[&model], device).remove(&USER_DOMAIN) {
@@ -10527,7 +10649,8 @@ mod tests {
                         dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
                         dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
                         constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
-                        n_fourier: spec.geometry.n_fourier(), coordinate_embedding: spec.geometry.coordinate_embedding(), probe_term_gradients: false,
+                        n_fourier: spec.geometry.n_fourier(), coordinate_embedding: spec.geometry.coordinate_embedding(),
+                        domain_coordinate_embeddings: None, probe_term_gradients: false,
                         phase2_active: true, step,
                     };
                     if let Some(residuals) = probe_interior_energy_residuals(&probe_ctx, &[&model], device).remove(&USER_DOMAIN) {

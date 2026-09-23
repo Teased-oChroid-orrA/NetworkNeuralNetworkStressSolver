@@ -65,6 +65,19 @@ pub struct CheckpointMeta {
     /// already has.
     #[serde(default)]
     pub report: Option<crate::provenance::AuthoritativeReport>,
+    /// Issue #78 item 3: the number of trainable envelope-saturation scalars
+    /// (`ElasticityNet::hole_scale_ids().len()`) the SAVED model actually had. `#[serde(default)]`
+    /// (`0`) for a checkpoint saved before this field existed - an honest "this model had no
+    /// trainable hole_scales" for every pre-existing checkpoint, which is also exactly correct
+    /// (the field didn't exist yet, so it was always empty). Required on load: burn's
+    /// `#[derive(Module)]` record walk maps a `Vec<Param<_>>` field positionally against the
+    /// freshly-`init()`'d destination module's OWN Vec length, not the record's - a destination
+    /// built via the ordinary `ElasticityNetConfig::init()` (always `hole_scales: Vec::new()`)
+    /// silently fails to receive a saved model's real trained scales, the exact bug this field
+    /// exists to close (see `net_cfg_for_meta`'s caller in `load_checkpoint`/`load_checkpoint_
+    /// for_training` below).
+    #[serde(default)]
+    pub hole_scale_count: usize,
 }
 
 fn recorder() -> NamedMpkGzFileRecorder<HalfPrecisionSettings> {
@@ -89,11 +102,13 @@ pub fn save_checkpoint(
     weights_path: &Path,
 ) -> Result<PathBuf, String> {
     let input_dim = model.input_dim();
+    let hole_scale_count = model.hole_scale_ids().len();
     model
         .save_file(weights_path, &recorder())
         .map_err(|e| format!("failed to write model weights: {e}"))?;
     let mut meta = meta.clone();
     meta.input_dim = Some(input_dim);
+    meta.hole_scale_count = hole_scale_count;
     let json = serde_json::to_string_pretty(&meta)
         .map_err(|e| format!("failed to serialize checkpoint metadata: {e}"))?;
     std::fs::write(meta_path(weights_path), json)
@@ -160,7 +175,12 @@ pub fn load_checkpoint(
 ) -> Result<(ElasticityNet<BInner>, CheckpointMeta), String> {
     let meta = parse_meta(weights_path)?;
     let net_cfg = net_cfg_for_meta(&meta);
-    let fresh: ElasticityNet<BInner> = net_cfg.init(device);
+    // Placeholder seed values (`0.0`) - shape only. `load_file` below overwrites every one of
+    // these with the record's real trained values; a model with the WRONG `hole_scales` length
+    // silently fails to receive them at all (see `CheckpointMeta::hole_scale_count`'s own doc
+    // comment on why the length must match before the record load happens).
+    let fresh: ElasticityNet<BInner> = net_cfg.init(device)
+        .with_hole_scales(&vec![0.0; meta.hole_scale_count], device);
     let model = match fresh.load_file(weights_path, &recorder(), device) {
         Ok(model) => model,
         Err(current_error) => {
@@ -184,7 +204,10 @@ pub fn load_checkpoint_for_training(
 ) -> Result<(ElasticityNet<B>, CheckpointMeta), String> {
     let meta = parse_meta(weights_path)?;
     let net_cfg = net_cfg_for_meta(&meta);
-    let fresh: ElasticityNet<B> = net_cfg.init(device);
+    // See `load_checkpoint`'s identical placeholder-shape comment above - same requirement,
+    // same fix, only the backend type parameter differs.
+    let fresh: ElasticityNet<B> = net_cfg.init(device)
+        .with_hole_scales(&vec![0.0; meta.hole_scale_count], device);
     let model = match fresh.load_file(weights_path, &recorder(), device) {
         Ok(model) => model,
         Err(current_error) => {
@@ -272,6 +295,7 @@ mod tests {
             input_dim: None,
             provenance: Default::default(),
             report: None,
+            hole_scale_count: 0,
         };
         let weights_path = tmp_path("roundtrip");
         let written = save_checkpoint(model, &meta, &weights_path).expect("save must succeed");
@@ -348,6 +372,7 @@ mod tests {
             input_dim: None,
             provenance: Default::default(),
             report: None,
+            hole_scale_count: 0,
         };
         let weights_path = tmp_path("parametric");
         let written = save_checkpoint(model, &meta, &weights_path).expect("save must succeed");
@@ -382,6 +407,68 @@ mod tests {
         let _ = std::fs::remove_file(meta_path(&weights_path));
     }
 
+    /// Issue #78 item 3's own disclosed gap, closed: proves a checkpoint's trainable, gradient-
+    /// descended `hole_scales` genuinely round-trip through save/load - not just structurally
+    /// (same count) but NUMERICALLY (real trained values survive, not zeroed/reset). Before
+    /// `CheckpointMeta::hole_scale_count` existed, `load_checkpoint_for_training` always
+    /// reconstructed a fresh model via the ordinary `ElasticityNetConfig::init()` path
+    /// (`hole_scales: Vec::new()`) before calling `load_file` - burn's `#[derive(Module)]`
+    /// record walk maps a `Vec<Param<_>>` positionally against the DESTINATION's own Vec length,
+    /// not the record's, so a 0-length destination silently failed to receive a real 2-element
+    /// saved `hole_scales` - exactly the bug this test exists to catch a regression of.
+    #[test]
+    fn trainable_hole_scales_round_trip_through_save_and_load_for_training() {
+        let device = BDevice::default();
+        let mut spec = tiny_plate_spec();
+        spec.geometry.holes.push(HoleSpec { center: [0.05, 0.0], radius: 0.01, bc: HoleBc::Free });
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(3)
+            .with_hidden_dim(8)
+            .with_n_hidden(2)
+            .with_output_dim(5);
+        let seeded = [22.75_f64, 30.12_f64];
+        let model: ElasticityNet<BInner> = net_cfg.init(&device).with_hole_scales(&seeded, &device);
+        assert_eq!(model.hole_scale_ids().len(), 2, "sanity: freshly-seeded model must carry 2 trainable scales");
+
+        let meta = CheckpointMeta {
+            spec: CheckpointSpec::Plate(spec),
+            steps_completed: 900,
+            final_loss: 1.0,
+            saved_at_unix: 0,
+            input_dim: None,
+            provenance: Default::default(),
+            report: None,
+            hole_scale_count: 0, // overwritten by save_checkpoint from the real model, like input_dim
+        };
+        let weights_path = tmp_path("trainable_hole_scales");
+        let written = save_checkpoint(model, &meta, &weights_path).expect("save must succeed");
+
+        let (loaded, loaded_meta) =
+            load_checkpoint_for_training(&weights_path, &device).expect("load_checkpoint_for_training must succeed");
+        assert_eq!(loaded_meta.hole_scale_count, 2, "saved count must be captured from the real model, not left at the literal's placeholder 0");
+        assert_eq!(loaded.hole_scale_ids().len(), 2, "loaded model must reconstruct the SAME Vec length as the saved record before load_file runs, or the record silently fails to populate it");
+
+        for (i, (param, &expected)) in loaded.hole_scales().iter().zip(seeded.iter()).enumerate() {
+            let actual: f32 = param.val().into_data().to_vec::<f32>().unwrap()[0];
+            // Half-precision (HalfPrecisionSettings) round-trip is lossy - loose but decisive:
+            // proves the REAL trained value survived, not that it silently reset to 0.0 (which
+            // this tolerance would immediately catch for both seeds, neither near zero).
+            assert!(
+                (actual as f64 - expected).abs() < 0.05,
+                "hole_scales[{i}] did not round-trip: expected~{expected}, got {actual}"
+            );
+        }
+
+        // Also confirm `load_checkpoint` (the inference-only sibling) round-trips the same way -
+        // both loaders share the identical `net_cfg_for_meta` + placeholder-shape fix.
+        let (loaded_inference, _) =
+            load_checkpoint(&weights_path, &device).expect("load_checkpoint must also succeed");
+        assert_eq!(loaded_inference.hole_scale_ids().len(), 2);
+
+        let _ = std::fs::remove_file(&written);
+        let _ = std::fs::remove_file(meta_path(&weights_path));
+    }
+
     #[test]
     fn legacy_record_loads_with_zero_coordinate_skip() {
         let device = BDevice::default();
@@ -409,6 +496,7 @@ mod tests {
             input_dim: None,
             provenance: Default::default(),
             report: None,
+            hole_scale_count: 0,
         };
         let weights_path = tmp_path("legacy_fallback");
         legacy
