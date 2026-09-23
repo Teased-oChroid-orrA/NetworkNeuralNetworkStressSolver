@@ -7,22 +7,27 @@
 //! mode, alternate screen, panic hook, the event loop). `state.rs` is pure data; `ui.rs` is
 //! pure rendering - neither touches a terminal or a channel.
 //!
-//! **Known, disclosed v1 gap, found during this session's own smoke test**: a small number of
-//! unconditional `println!` calls in the shared `runner.rs`/`headless.rs` decision-maker
-//! tier-transition diagnostics (`"[DM@{step}] ... -> ..."`, correct and intended for
-//! `--headless`) write directly to the process's real stdout, bypassing the `TrainingMsg`
-//! channel entirely - since this TUI's alternate screen occupies that SAME stdout, a tier
-//! transition firing mid-run will visibly corrupt the rendered dashboard for one line before
-//! the next redraw overwrites it. A real OS-level stdout redirect (or plumbing a "quiet" sink
-//! through the shared training functions) would fix this properly but touches code this
-//! project has repeatedly, explicitly flagged as risky to modify casually (the frozen/shared
-//! training-loop paths) - deliberately NOT attempted in this pass. Cosmetic only (one
-//! transient garbled line, not a crash, not lost training state, not incorrect physics) - a
-//! real, scoped follow-up, not silently glossed over.
+//! **Stray-`println!` corruption, found during this session's own smoke test, now fixed via an
+//! OS-level stdout redirect (Unix only)**: a small number of unconditional `println!` calls in
+//! the shared `runner.rs`/`headless.rs` decision-maker tier-transition diagnostics
+//! (`"[DM@{step}] ... -> ..."`, correct and intended for `--headless`) write directly to the
+//! process's real stdout (fd 1), bypassing the `TrainingMsg` channel entirely. Rather than touch
+//! that shared, repeatedly-flagged-as-risky-to-modify training-loop code, `StdoutGuard::install`
+//! `dup()`s the real terminal fd aside for ratatui's OWN rendering to write through, then
+//! `dup2()`s fd 1 onto `/dev/null` for the duration of the alternate screen - any `println!`/
+//! `print!` anywhere in the process (this training thread included) is silently swallowed,
+//! while the TUI's own frames (written through the duped fd, never through `std::io::stdout()`)
+//! render normally. `Drop` restores fd 1 to the real terminal. On non-Unix targets this guard is
+//! a no-op (`stdout()` is used directly, same as before) - the corruption is Unix-fixed, Windows
+//! keeps the pre-existing, disclosed cosmetic gap.
 
+mod setup;
 mod state;
 mod ui;
 
+pub use setup::{run_setup_menu, SetupChoice};
+
+use std::io::Write;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, unbounded, TryRecvError};
@@ -40,33 +45,109 @@ use state::TuiState;
 /// `drain_channel`), so this never blocks waiting for a message that may not come this tick.
 const TICK: Duration = Duration::from_millis(120);
 
-/// Sets up raw mode + alternate screen, installs the mandatory panic hook (ratatui's own
-/// guidance: a mid-run panic must not leave the user's shell in raw mode / on the alternate
-/// screen), runs `body`, then restores the terminal unconditionally (even if `body` returned an
-/// error) before propagating that error.
+#[cfg(unix)]
+mod stdout_guard {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::os::unix::io::{FromRawFd, RawFd};
+
+    fn check(fd: RawFd) -> std::io::Result<RawFd> {
+        if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(fd) }
+    }
+
+    /// Redirects the process's real fd 1 to `/dev/null` and hands back a `File` (a separate
+    /// `dup()` of the ORIGINAL terminal fd) for the TUI's own rendering to write through
+    /// instead. `Drop` restores fd 1 to the real terminal.
+    pub struct StdoutGuard {
+        real_fd: RawFd,
+    }
+
+    impl StdoutGuard {
+        pub fn install() -> std::io::Result<(Self, File)> {
+            unsafe {
+                let real_fd = check(libc::dup(1))?;
+                let devnull = CString::new("/dev/null").unwrap();
+                let devnull_fd = check(libc::open(devnull.as_ptr(), libc::O_WRONLY))?;
+                let dup_result = libc::dup2(devnull_fd, 1);
+                libc::close(devnull_fd);
+                check(dup_result)?;
+                // A second dup of real_fd so the File this returns owns an independent
+                // descriptor - StdoutGuard's own Drop closes `real_fd` separately on restore.
+                let render_fd = check(libc::dup(real_fd))?;
+                Ok((StdoutGuard { real_fd }, File::from_raw_fd(render_fd)))
+            }
+        }
+    }
+
+    impl Drop for StdoutGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::dup2(self.real_fd, 1);
+                libc::close(self.real_fd);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+type TerminalOut = std::fs::File;
+#[cfg(not(unix))]
+type TerminalOut = std::io::Stdout;
+
+#[cfg(unix)]
+fn open_terminal_out() -> anyhow::Result<(Option<stdout_guard::StdoutGuard>, TerminalOut)> {
+    let (guard, file) = stdout_guard::StdoutGuard::install()
+        .map_err(|e| anyhow::anyhow!("failed to redirect stdout for --tui ({e}) - falling back is not attempted, this is a hard error so the cause is never silently swallowed"))?;
+    Ok((Some(guard), file))
+}
+#[cfg(not(unix))]
+fn open_terminal_out() -> anyhow::Result<(Option<()>, TerminalOut)> {
+    Ok((None, std::io::stdout()))
+}
+
+/// Sets up raw mode + alternate screen (writing through a fd that is NEVER the process's real
+/// stdout - see `StdoutGuard` above), installs the mandatory panic hook (ratatui's own guidance:
+/// a mid-run panic must not leave the user's shell in raw mode / on the alternate screen), runs
+/// `body`, then restores the terminal unconditionally (even if `body` returned an error) before
+/// propagating that error.
 fn with_terminal<F>(body: F) -> anyhow::Result<()>
 where
-    F: FnOnce(&mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>) -> anyhow::Result<()>,
+    F: FnOnce(&mut ratatui::Terminal<ratatui::backend::CrosstermBackend<TerminalOut>>) -> anyhow::Result<()>,
 {
     enable_raw_mode().map_err(|e| anyhow::anyhow!("--tui requires an interactive terminal (enable_raw_mode failed: {e})"))?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(|e| anyhow::anyhow!("failed to enter alternate screen: {e}"))?;
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let (_guard, mut out) = open_terminal_out()?;
+    execute!(out, EnterAlternateScreen).map_err(|e| anyhow::anyhow!("failed to enter alternate screen: {e}"))?;
+    let backend = ratatui::backend::CrosstermBackend::new(out);
     let mut terminal = ratatui::Terminal::new(backend).map_err(|e| anyhow::anyhow!("failed to construct terminal: {e}"))?;
 
+    // The panic hook only needs to leave the alternate screen / disable raw mode - it must not
+    // try to write through `_guard`'s (possibly already-dropped-by-then) fd, so it opens its own
+    // short-lived handle on whatever the real terminal currently is. On Unix that's `/dev/tty`
+    // (fd 1 may still be redirected to `/dev/null` at panic time); elsewhere, `stdout()`.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        #[cfg(unix)]
+        {
+            if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+                let _ = execute!(tty, LeaveAlternateScreen);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        }
         default_hook(info);
     }));
 
     let result = body(&mut terminal);
 
     let _ = disable_raw_mode();
-    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.backend_mut().flush();
     // Restore the default panic hook so a LATER, unrelated panic (after this function returns)
-    // isn't attributed to a terminal state this function no longer owns.
+    // isn't attributed to a terminal state this function no longer owns. `_guard` (if Unix)
+    // drops here too, restoring the process's real fd 1 before this function returns.
     let _ = std::panic::take_hook();
 
     result
@@ -90,7 +171,7 @@ fn quit_requested() -> anyhow::Result<bool> {
 /// `tx.send` on that same channel elsewhere; a TUI that stopped polling could hang the solver
 /// thread), apply it into `TuiState`, redraw, and watch for quit/completion.
 fn event_loop(
-    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<TerminalOut>>,
     rx: crossbeam_channel::Receiver<TrainingMsg>,
     tx_ctrl: crossbeam_channel::Sender<ControlMsg>,
     mut state: TuiState,

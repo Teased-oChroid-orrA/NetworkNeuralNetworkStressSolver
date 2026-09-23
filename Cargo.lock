@@ -4933,6 +4933,7 @@ dependencies = [
  "crossterm",
  "eframe",
  "egui",
+ "libc",
  "pinn-core",
  "pinn-gui",
  "pinn-solver",

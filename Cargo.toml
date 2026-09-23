@@ -46,6 +46,13 @@ toml              = "0.8"
 # input polling, not just through ratatui's `Terminal` wrapper.
 ratatui           = "0.29"
 crossterm         = "0.28"
+# `--tui`'s stdout redirect (see pinn-app/src/tui/mod.rs's `StdoutGuard`): a handful of
+# unconditional `println!` decision-maker diagnostics live in the frozen, shared
+# runner.rs/headless.rs training loop and cannot safely be touched here - redirecting the
+# process's real stdout fd to /dev/null for the duration of the alternate screen (Unix only,
+# via dup/dup2) is the OS-level fix this project's own docs already named as the correct one.
+# Already resolved transitively via crossterm/mio - this adds no new supply-chain surface.
+libc              = "0.2"
 
 [profile.release]
 opt-level     = 3

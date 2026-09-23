@@ -230,7 +230,22 @@ fn main() -> anyhow::Result<()> {
             spec.geometry.validate().map_err(|e| anyhow::anyhow!("invalid geometry in '{spec_path}': {e}"))?;
             return tui::run_tui_plate(spec);
         }
-        let problem_kind = parse_problem_arg();
+        let problem_explicit = env::args().any(|a| a == "--problem");
+        let problem_kind = if problem_explicit {
+            Some(parse_problem_arg())
+        } else {
+            // Neither `--problem` nor `--problem-spec` was given - ask interactively instead of
+            // silently defaulting to Kirsch, so `--tui` alone is a genuinely self-contained
+            // entry point (problem selection AND, for User-Defined, spec loading both happen
+            // inside the TUI itself).
+            match tui::run_setup_menu()? {
+                None => return Ok(()),
+                Some(tui::SetupChoice::Kirsch) => Some(ProblemKind::Kirsch),
+                Some(tui::SetupChoice::PinLug) => Some(ProblemKind::PinLug),
+                Some(tui::SetupChoice::Plate(spec)) => return tui::run_tui_plate(spec),
+            }
+        };
+        let problem_kind = problem_kind.expect("set to Some on every non-early-return path above");
         let env_path_str = env::var("PINN_ENV").unwrap_or_else(|_| "pinn.env".to_string());
         let env_map = load_pinn_env(Path::new(&env_path_str));
         let mut config = match problem_kind {
