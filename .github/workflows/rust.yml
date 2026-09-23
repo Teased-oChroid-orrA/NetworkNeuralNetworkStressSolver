@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# Cancel a still-running CI run on main the instant a newer push supersedes it — each job
+# here runs ~55-65 min; without this, several pushes to main in quick succession queue up
+# and burn that wall-clock N times over instead of once for the latest commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
