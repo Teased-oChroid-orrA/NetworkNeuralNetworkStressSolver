@@ -404,6 +404,25 @@ pub struct StepOutput {
     pub gradient_conflict_report: Option<GradientConflictReport>,
 }
 
+impl StepOutput {
+    /// Transport the existing loss ledger; no tensor operations or independent physics.
+    pub fn objective_telemetry(&self) -> Option<pinn_core::messages::ObjectiveTelemetry> {
+        use pinn_core::messages::{LossContribution, ObjectiveTelemetry};
+        let (raw, weights) = (self.raw_scalar_by_name.as_ref()?, self.lam_by_name.as_ref()?);
+        for name in raw.keys() { required_loss_weight(weights, name); }
+        let ledger = build_loss_ledger(raw, weights, self.term_grad_norms.as_ref(), None, None);
+        let mut terms: Vec<_> = ledger.into_iter().map(|row| LossContribution {
+            name: row.name.to_owned(), normalized_raw: row.raw as f64,
+            effective_weight: row.lambda, weighted: row.weighted,
+        }).collect();
+        terms.sort_by(|a, b| a.name.cmp(&b.name));
+        let sum: f64 = terms.iter().map(|term| term.weighted).sum();
+        Some(ObjectiveTelemetry { terms, total: self.total_scalar as f64,
+            reconstruction_error: self.total_scalar as f64 - sum,
+            optimizer_tier: self.optimizer_tier, grad_norm_before_optimizer: self.grad_norm })
+    }
+}
+
 /// A term's gradient contributes less than 1% of the total gradient magnitude across all
 /// active terms - flagged as functionally inert (bugSource-New's own investigation found
 /// `equilibrium` at 5-6 orders of magnitude below this before it was fixed; this threshold is
@@ -3154,6 +3173,15 @@ impl LbfgsCtxScalars {
 /// placeholder GPU tensors, purely to read `.name()`/`.phase2_only()`; `.compute()` is never
 /// called on these instances — real values come from `term_tensor`'s separately-built structs)
 /// on every inner iteration was wasted, repeated work (Issue #36).
+fn required_loss_weight(lams: &HashMap<&'static str, f64>, name: &str) -> f64 {
+    let weight = *lams.get(name).unwrap_or_else(|| {
+        panic!("L-BFGS: missing effective weight for active loss term '{name}'")
+    });
+    assert!(weight.is_finite() && weight >= 0.0,
+        "L-BFGS: invalid effective weight {weight} for active loss term '{name}'");
+    weight
+}
+
 fn lbfgs_term_names(problem: &dyn BoundaryValueProblem) -> Vec<(&'static str, bool)> {
     problem.loss_terms().into_iter()
         .filter(|t| t.name() != "constitutive_consistency")
@@ -3172,9 +3200,8 @@ fn lbfgs_term_names(problem: &dyn BoundaryValueProblem) -> Vec<(&'static str, bo
 ///
 /// Called by the L-BFGS closure at each inner line-search iteration.
 /// SAW is NOT updated here — `lams` is the snapshot from Converge tier entry, keyed by each
-/// term's own `LossTerm::name()`. A `debug_assert!` at the top of the body fails fast (debug
-/// builds only) if any active term's name has no matching `lams` key — see that assertion's
-/// own comment.
+/// term's own `LossTerm::name()`. Missing or invalid active weights fail closed in
+/// both debug and release builds before any tensor work.
 fn compute_loss_for_lbfgs(
     model: &ElasticityNet<B>,
     ctx: &LbfgsCtxScalars,
@@ -3182,24 +3209,13 @@ fn compute_loss_for_lbfgs(
     lams: &HashMap<&'static str, f64>,
     device: &BDevice,
 ) -> (Tensor<B, 1>, f32) {
-    // Fail fast (debug builds only — compiled out entirely in release, same as every other
-    // `debug_assert!`) if `lams` is missing an entry for a real, active loss term. Contrast
-    // with `term_tensor`'s match arms below, which already panic loudly on an unrecognized
-    // NAME; this catches the inverse mistake — a recognized name with no matching WEIGHT.
-    // `lams`'s keys are hand-typed independently at the two Converge-tier-entry `HashMap`
-    // literals in `headless.rs`/`runner.rs`, with no compile-time link to `LossTerm::name()`'s
-    // actual return values — `lams.get(name).unwrap_or(&0.0)` below would otherwise silently
-    // zero-weight a renamed term for the entire Converge tier with no panic, warning, or
-    // failing test pointing at the cause. Checked against `term_names` (ALL non-constitutive
-    // terms, not just the phase2-gated active subset) — same set the pre-hoist inline
-    // `problem.loss_terms()` filter checked.
-    debug_assert!(
-        term_names.iter().all(|&(n, _)| lams.contains_key(n)),
-        "compute_loss_for_lbfgs: `lams` has no entry for active loss term '{}' — a \
-         `LossTerm::name()` was likely renamed without updating the `HashMap` literal built at \
-         Converge-tier entry (see headless.rs/runner.rs)",
-        term_names.iter().find(|&&(n, _)| !lams.contains_key(n)).map(|&(n, _)| n).unwrap_or("<unknown>"),
-    );
+    // Validate before any tensor work. Production must never optimize a different
+    // objective merely because a term was omitted from the weight snapshot.
+    for &(name, phase2_only) in term_names {
+        if ctx.phase2_active || !phase2_only {
+            required_loss_weight(lams, name);
+        }
+    }
 
     let n_int     = ctx.int_norm.len();
     let n_fourier = ctx.engine.n_fourier;
@@ -3513,7 +3529,7 @@ fn compute_loss_for_lbfgs(
     let mut total: Option<Tensor<B, 1>> = None;
     let mut total_scalar = 0.0_f32;
     for name in active_names {
-        let raw_lam = *lams.get(name).unwrap_or(&0.0);
+        let raw_lam = required_loss_weight(lams, name);
         // `dynamic_lam_h_cap`/`dynamic_lam_d_cap` still clamp inside the L-BFGS objective,
         // exactly as before — only the lookup mechanism (HashMap vs. dedicated struct field)
         // changed.
@@ -3788,6 +3804,10 @@ fn compute_loss_for_lbfgs_multi(
     use crate::problem::DomainForwardOutputs as DFO;
     use pinn_core::problem::DomainId;
 
+    for term in active_terms {
+        required_loss_weight(lams, term.name());
+    }
+
     let ctx = frozen_ctx.as_multi_step_ctx(problem);
 
     let model_refs: Vec<&ElasticityNet<B>> = vec![&models.pin, &models.lug];
@@ -3811,7 +3831,7 @@ fn compute_loss_for_lbfgs_multi(
     let mut total: Option<Tensor<B, 1>> = None;
     let mut total_scalar = 0.0_f32;
     for term in active_terms {
-        let lam = *lams.get(term.name()).unwrap_or(&0.0);
+        let lam = required_loss_weight(lams, term.name());
         let inputs: Vec<DFO<'_, B>> = term.domains().iter().zip(term.point_sets().iter())
             .filter_map(|(&id, &ps)| forwards.get(&(id, ps)).map(|f| DFO {
                 domain: f.domain, raw_out: f.raw_out,
@@ -3871,6 +3891,19 @@ mod tests {
     /// tensor-based) must match `kirsch_hole_correction::traction_free_envelope_scaled` (the
     /// already-proven host `f64` formula) at a FIXED scale, at several real (x,y) points -
     /// before trusting gradients through the tensor version at all.
+    #[test]
+    fn required_weights_reject_missing_dynamic_terms_and_invalid_values() {
+        let mut weights = HashMap::from([("hole_free_0", 2.0)]);
+        assert_eq!(required_loss_weight(&weights, "hole_free_0"), 2.0);
+        assert!(std::panic::catch_unwind(|| required_loss_weight(&weights, "hole_free_1")).is_err());
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            weights.insert("hole_free_0", invalid);
+            assert!(std::panic::catch_unwind(|| required_loss_weight(&weights, "hole_free_0")).is_err());
+        }
+        weights.insert("hole_free_0", 0.0); // Explicitly disabled is distinct from missing.
+        assert_eq!(required_loss_weight(&weights, "hole_free_0"), 0.0);
+    }
+
     #[test]
     fn trainable_envelope_hole_phi_tensor_matches_host_traction_free_envelope_scaled_at_a_fixed_scale() {
         let device = BDevice::default();

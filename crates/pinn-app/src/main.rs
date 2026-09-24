@@ -9,13 +9,14 @@ use pinn_core::{
 mod tui;
 
 /// Read a KEY=VALUE env file; strip comments and blank lines.
-fn load_pinn_env(path: &Path) -> HashMap<String, String> {
+fn load_pinn_env(path: &Path) -> anyhow::Result<HashMap<String, String>> {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
-        Err(_) => return HashMap::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && env::var_os("PINN_ENV").is_none() => return Ok(HashMap::new()),
+        Err(e) => anyhow::bail!("cannot read configuration {}: {e}", path.display()),
     };
     let mut map = HashMap::new();
-    for line in text.lines() {
+    for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         // Strip inline comments before parsing
         let line = if let Some(pos) = line.find('#') { &line[..pos] } else { line };
@@ -24,15 +25,17 @@ fn load_pinn_env(path: &Path) -> HashMap<String, String> {
         if let Some((k, v)) = line.split_once('=') {
             let key = k.trim().to_string();
             let val = v.trim().to_string();
-            if !key.is_empty() {
-                map.insert(key, val);
-            }
+            anyhow::ensure!(!key.is_empty() && !val.is_empty(), "{}:{}: expected KEY=VALUE", path.display(), index + 1);
+            anyhow::ensure!(!map.contains_key(&key), "{}:{}: duplicate key {key}", path.display(), index + 1);
+            map.insert(key, val);
+        } else {
+            anyhow::bail!("{}:{}: expected KEY=VALUE", path.display(), index + 1);
         }
     }
-    map
+    Ok(map)
 }
 
-/// Apply parsed env map to config in-place. Unknown keys are silently ignored.
+/// Apply a validated env map. Invalid and unknown values are configuration errors.
 ///
 /// `skip_problem_specific`: when `true`, the material/load/geometry overrides below are NOT
 /// applied. `pinn.env`'s MATERIAL_E_MSI/MATERIAL_NU/LOAD_*/GEOM_*/HOLE_RADIUS_IN keys are
@@ -40,7 +43,8 @@ fn load_pinn_env(path: &Path) -> HashMap<String, String> {
 /// overwrite `SolverConfig::default_pinlug()`'s fixed 4340-steel material with those Kirsch
 /// defaults otherwise — pass `true` for `ProblemKind::PinLug`, whose material/geometry/load are
 /// part of the problem definition, not user-tunable via this shared env file in this slice.
-fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>, skip_problem_specific: bool) {
+fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>, skip_problem_specific: bool) -> anyhow::Result<()> {
+    validate_env(env)?;
     macro_rules! parse_usize {
         ($key:expr, $field:expr) => {
             if let Some(v) = env.get($key) {
@@ -152,7 +156,7 @@ fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>, skip_problem
     parse_bool!("DIAGNOSTICS_ENABLED", cfg.diagnostics.enabled);
 
     if skip_problem_specific {
-        return;
+        return Ok(());
     }
 
     // Material (US Customary → SI)
@@ -181,48 +185,97 @@ fn apply_env(cfg: &mut SolverConfig, env: &HashMap<String, String>, skip_problem
             cfg.geometry.hole = HoleType::Circular { radius: n * IN_TO_M };
         }
     }
+    anyhow::ensure!(cfg.geometry.half_w.is_finite() && cfg.geometry.half_h.is_finite() && cfg.material.e.is_finite() && cfg.load.px.is_finite() && cfg.load.py.is_finite(), "physical values overflow after SI conversion");
+    if let HoleType::Circular { radius } = cfg.geometry.hole {
+        anyhow::ensure!(radius.is_finite() && radius < cfg.geometry.half_w.min(cfg.geometry.half_h), "hole radius must be smaller than both plate half-dimensions");
+    }
+    Ok(())
 }
 
-/// Parse `--problem kirsch|pinlug` from argv (defaults to `kirsch` — the existing,
-/// unaffected behavior — if the flag is absent or has an unrecognized value).
-fn parse_problem_arg() -> ProblemKind {
-    let args: Vec<String> = env::args().collect();
-    for i in 0..args.len() {
-        if args[i] == "--problem" {
-            if let Some(v) = args.get(i + 1) {
-                return match v.as_str() {
-                    "pinlug" => ProblemKind::PinLug,
-                    _ => ProblemKind::Kirsch,
-                };
+/// Validate before applying values so a malformed override never silently keeps a default.
+fn validate_env(values: &HashMap<String, String>) -> anyhow::Result<()> {
+    for (key, value) in values {
+        let valid = match key.as_str() {
+            "N_INTERIOR" | "N_BOUNDARY" | "MAX_STEPS" | "HIDDEN_DIM" | "N_HIDDEN"
+            | "DM_CHECK_INTERVAL" | "DM_MIN_DWELL_STEPS" | "DM_LBFGS_MAX_ITER"
+            | "STIFF_CHECK_INTERVAL" => value.parse::<usize>().is_ok_and(|n| n > 0),
+            "VIS_GRID_NX" | "VIS_GRID_NY" => value.parse::<usize>().is_ok_and(|n| n >= 2),
+            "USE_SOAP_MUON" | "USE_PIRATENET" | "USE_PIRATENET_COMPUTE_SKIP"
+            | "DM_ENABLED" | "DM_USE_EXACT_COSINE" | "STIFF_ENABLED" | "DIAGNOSTICS_ENABLED"
+                => matches!(value.to_ascii_lowercase().as_str(), "true" | "false" | "1" | "0" | "yes" | "no"),
+            "EXEC_MODE" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "serial"),
+            "EXEC_PROFILE" => matches!(value.to_ascii_lowercase().as_str(), "eco" | "balanced" | "performance" | "maximum"),
+            "MATERIAL_NU" => value.parse::<f64>().is_ok_and(|n| n.is_finite() && n > -1.0 && n < 0.5),
+            "LOAD_PX_KSI" | "LOAD_PY_KSI" => value.parse::<f64>().is_ok_and(|n| n.is_finite() && (n * KSI_TO_PA).is_finite()),
+            "MATERIAL_E_MSI" | "GEOM_HALF_W_IN" | "GEOM_HALF_H_IN" | "HOLE_RADIUS_IN"
+                => value.parse::<f64>().is_ok_and(|n| n.is_finite() && n > 0.0),
+            "DM_CONFLICT_THRESHOLD" | "DM_ALIGNMENT_THRESHOLD" | "DM_CONVERGE_COSINE_MIN"
+                => value.parse::<f32>().is_ok_and(|n| n.is_finite() && (-1.0..=1.0).contains(&n)),
+            "STIFF_EMA_BETA" => value.parse::<f32>().is_ok_and(|n| n.is_finite() && (0.0..1.0).contains(&n)),
+            "FD_H" => value.parse::<f32>().is_ok_and(|n| n.is_finite() && n > 0.0 && n < 1.0),
+            "DM_CONVERGE_GRAD_THRESHOLD" | "STIFF_GATE_AWAKE_EPSILON"
+            | "STIFF_PHYSICS_BOOST_GAIN" | "STIFF_ALPHA_ACCEL_GAIN"
+                => value.parse::<f32>().is_ok_and(|n| n.is_finite() && n >= 0.0),
+            _ => anyhow::bail!("unknown configuration key '{key}'"),
+        };
+        anyhow::ensure!(valid, "invalid configuration value for '{key}': '{value}'");
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct Arguments {
+    problem: Option<ProblemKind>,
+    spec: Option<String>,
+    tui: bool,
+    headless: bool,
+    help: bool,
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> anyhow::Result<Arguments> {
+    let mut parsed = Arguments::default();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--tui" | "-T" => parsed.tui = true,
+            "--headless" | "-H" => parsed.headless = true,
+            "--help" | "-h" => parsed.help = true,
+            "--problem" | "--problem-spec" => {
+                let value = args.next().filter(|s| !s.starts_with('-'))
+                    .ok_or_else(|| anyhow::anyhow!("{arg} requires a value"))?;
+                if arg == "--problem" {
+                    anyhow::ensure!(parsed.problem.is_none(), "duplicate --problem");
+                    parsed.problem = Some(match value.as_str() {
+                        "kirsch" => ProblemKind::Kirsch,
+                        "pinlug" => ProblemKind::PinLug,
+                        _ => anyhow::bail!("unknown problem '{value}'; expected kirsch or pinlug"),
+                    });
+                } else {
+                    anyhow::ensure!(parsed.spec.is_none(), "duplicate --problem-spec");
+                    parsed.spec = Some(value);
+                }
             }
+            _ => anyhow::bail!("unknown argument '{arg}'"),
         }
     }
-    ProblemKind::Kirsch
-}
-
-/// Parse `--problem-spec <path>` from argv — a user-defined-problem TOML file (see
-/// `pinn_core::problem_spec::ProblemSpec`). `None` if absent, the existing, unaffected
-/// default behavior (falls through to `parse_problem_arg`'s hardcoded Kirsch/pin-lug
-/// dispatch).
-fn parse_problem_spec_arg() -> Option<String> {
-    let args: Vec<String> = env::args().collect();
-    for i in 0..args.len() {
-        if args[i] == "--problem-spec" {
-            return args.get(i + 1).cloned();
-        }
-    }
-    None
+    anyhow::ensure!(parsed.problem.is_none() || parsed.spec.is_none(), "--problem and --problem-spec are mutually exclusive");
+    Ok(parsed)
 }
 
 fn main() -> anyhow::Result<()> {
+    let args = parse_args(env::args().skip(1))?;
+    if args.help {
+        println!("stress-solver [--tui|-T | --headless|-H] [--problem kirsch|pinlug | --problem-spec PATH]\nPINN_ENV selects a strict KEY=VALUE configuration file for built-in problems.");
+        return Ok(());
+    }
     // `--tui`/`-T`: a terminal dashboard, reached and dispatched FIRST, before either the
     // `--problem-spec` early return or `--headless` below — both being other "no window" run
     // modes, `--tui` wins if given alongside them (the strictly more capable request). Every
     // path this check falls through to (`--headless`, `--problem-spec` without `--tui`, plain
     // GUI) is completely unaffected — this function returns before any of that code runs.
-    let tui = env::args().any(|a| a == "--tui" || a == "-T");
+    let tui = args.tui;
     if tui {
-        if let Some(spec_path) = parse_problem_spec_arg() {
+        if let Some(spec_path) = args.spec.as_ref() {
             let spec_str = std::fs::read_to_string(&spec_path)
                 .map_err(|e| anyhow::anyhow!("failed to read --problem-spec file '{spec_path}': {e}"))?;
             let spec: pinn_core::problem_spec::ProblemSpec = toml::from_str(&spec_str)
@@ -230,9 +283,9 @@ fn main() -> anyhow::Result<()> {
             spec.geometry.validate().map_err(|e| anyhow::anyhow!("invalid geometry in '{spec_path}': {e}"))?;
             return tui::run_tui_plate(spec);
         }
-        let problem_explicit = env::args().any(|a| a == "--problem");
+        let problem_explicit = args.problem.is_some();
         let problem_kind = if problem_explicit {
-            Some(parse_problem_arg())
+            args.problem
         } else {
             // Neither `--problem` nor `--problem-spec` was given - ask interactively instead of
             // silently defaulting to Kirsch, so `--tui` alone is a genuinely self-contained
@@ -247,12 +300,12 @@ fn main() -> anyhow::Result<()> {
         };
         let problem_kind = problem_kind.expect("set to Some on every non-early-return path above");
         let env_path_str = env::var("PINN_ENV").unwrap_or_else(|_| "pinn.env".to_string());
-        let env_map = load_pinn_env(Path::new(&env_path_str));
+        let env_map = load_pinn_env(Path::new(&env_path_str))?;
         let mut config = match problem_kind {
             ProblemKind::Kirsch => SolverConfig::default_kirsch(),
             ProblemKind::PinLug => SolverConfig::default_pinlug(),
         };
-        apply_env(&mut config, &env_map, problem_kind == ProblemKind::PinLug);
+        apply_env(&mut config, &env_map, problem_kind == ProblemKind::PinLug)?;
         return tui::run_tui_live(config, problem_kind);
     }
 
@@ -260,7 +313,7 @@ fn main() -> anyhow::Result<()> {
     // that dispatch (and pinn.env loading, which is irrelevant to a self-contained spec
     // file) is completely untouched when this flag is absent — the "default to the
     // already-defined hardcoded problems" behavior this feature was required to preserve.
-    if let Some(spec_path) = parse_problem_spec_arg() {
+    if let Some(spec_path) = args.spec.as_ref() {
         let spec_str = std::fs::read_to_string(&spec_path)
             .map_err(|e| anyhow::anyhow!("failed to read --problem-spec file '{spec_path}': {e}"))?;
         let spec: pinn_core::problem_spec::ProblemSpec = toml::from_str(&spec_str)
@@ -278,14 +331,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     let env_path_str = env::var("PINN_ENV").unwrap_or_else(|_| "pinn.env".to_string());
-    let env_map = load_pinn_env(Path::new(&env_path_str));
+    let env_map = load_pinn_env(Path::new(&env_path_str))?;
 
-    let problem_kind = parse_problem_arg();
+    let problem_kind = args.problem.unwrap_or(ProblemKind::Kirsch);
     let mut config = match problem_kind {
         ProblemKind::Kirsch => SolverConfig::default_kirsch(),
         ProblemKind::PinLug => SolverConfig::default_pinlug(),
     };
-    apply_env(&mut config, &env_map, problem_kind == ProblemKind::PinLug);
+    apply_env(&mut config, &env_map, problem_kind == ProblemKind::PinLug)?;
 
     // Hardware-adaptive-execution epic, Phase 4. `apply_performance_profile` (the Eco
     // n_interior/n_boundary reduction) is NOT called here - Kirsch's `run_headless_inner` runs
@@ -307,7 +360,7 @@ fn main() -> anyhow::Result<()> {
         eprintln!("[pinn.env] loaded {} key(s) from {env_path_str}",  env_map.len());
     }
 
-    let headless = env::args().any(|a| a == "--headless" || a == "-H");
+    let headless = args.headless;
 
     if headless {
         let ok = match problem_kind {
@@ -355,20 +408,18 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("EXEC_MODE".to_string(), "serial".to_string());
         env.insert("EXEC_PROFILE".to_string(), "performance".to_string());
-        apply_env(&mut cfg, &env, false);
+        apply_env(&mut cfg, &env, false).unwrap();
         assert_eq!(cfg.execution.mode, pinn_core::messages::ExecutionMode::Serial);
         assert_eq!(cfg.execution.profile, pinn_core::messages::PerformanceProfile::Performance);
     }
 
     #[test]
-    fn apply_env_ignores_unrecognized_exec_mode_and_exec_profile_values() {
+    fn apply_env_rejects_unrecognized_exec_mode_and_exec_profile_values() {
         let mut cfg = SolverConfig::default_kirsch();
         let mut env = HashMap::new();
         env.insert("EXEC_MODE".to_string(), "quantum".to_string());
         env.insert("EXEC_PROFILE".to_string(), "ludicrous".to_string());
-        apply_env(&mut cfg, &env, false);
-        // Unrecognized values leave the (default) config untouched, matching this file's
-        // existing "unknown keys are silently ignored" convention.
+        assert!(apply_env(&mut cfg, &env, false).is_err());
         assert_eq!(cfg.execution.mode, pinn_core::messages::ExecutionMode::Auto);
         assert_eq!(cfg.execution.profile, pinn_core::messages::PerformanceProfile::Balanced);
     }
@@ -380,7 +431,7 @@ mod tests {
         let mut cfg = SolverConfig::default_pinlug();
         let mut env = HashMap::new();
         env.insert("EXEC_MODE".to_string(), "serial".to_string());
-        apply_env(&mut cfg, &env, true);
+        apply_env(&mut cfg, &env, true).unwrap();
         assert_eq!(cfg.execution.mode, pinn_core::messages::ExecutionMode::Serial);
     }
 
@@ -390,7 +441,33 @@ mod tests {
         assert!(!cfg.diagnostics.enabled, "must default to disabled");
         let mut env = HashMap::new();
         env.insert("DIAGNOSTICS_ENABLED".to_string(), "true".to_string());
-        apply_env(&mut cfg, &env, false);
+        apply_env(&mut cfg, &env, false).unwrap();
         assert!(cfg.diagnostics.enabled);
     }
+    #[test]
+    fn malformed_configuration_is_rejected_before_mutation() {
+        for (key, value) in [("MATERIAL_E_MSI", "abc"), ("FD_H", "NaN"),
+            ("MAX_STEPS", "0"), ("MATERIAL_NU", "0.5"), ("DM_ENABLED", "maybe"),
+            ("LOAD_PX_KSI", "inf"), ("MAX_STEP", "10")] {
+            let mut cfg = SolverConfig::default_kirsch();
+            let original = cfg.max_steps;
+            let values = HashMap::from([(key.to_owned(), value.to_owned())]);
+            assert!(apply_env(&mut cfg, &values, false).is_err(), "{key}");
+            assert_eq!(cfg.max_steps, original);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_typos_missing_values_and_conflicting_problem_sources() {
+        for args in [vec!["--problem", "pinlgu"], vec!["--problem-spec"],
+            vec!["--problem", "--headless"], vec!["--unknown"],
+            vec!["--problem", "kirsch", "--problem-spec", "p.toml"]] {
+            assert!(parse_args(args.into_iter().map(str::to_owned)).is_err());
+        }
+        let parsed = parse_args(["--headless", "--problem", "pinlug"].map(str::to_owned)).unwrap();
+        assert!(parsed.headless);
+        assert_eq!(parsed.problem, Some(ProblemKind::PinLug));
+        assert!(parse_args(Vec::<String>::new()).unwrap().problem.is_none());
+    }
+
 }

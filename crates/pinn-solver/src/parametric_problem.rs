@@ -600,6 +600,7 @@ fn energy_balance_stats<Bk: Backend>(
     fd: &FdConfig,
     e_n: f32, nu_n: f32, p_n: f32,
     material: &MaterialProps,
+    prescribed_px: f64,
     area: f64,
     thickness: f64,
     device: &Bk::Device,
@@ -638,24 +639,15 @@ fn energy_balance_stats<Bk: Backend>(
             bnd_raw.clone().slice([0..m_bnd, 0..2]).mul_scalar(scales.u_ref as f64),
             bnd_raw.slice([0..m_bnd, 2..5]).mul_scalar(scales.stress_scale),
         ], 1);
-        let (exx, eyy, exy) = compute_strains::<Bk>(bnd_scaled.clone(), n_bnd, fd);
-        let (sxx, syy, sxy) = compute_stress::<Bk>(exx, eyy, exy, material);
         let bnd_nx: Vec<f32> = points.boundary.iter().map(|p| p.nx as f32).collect();
-        let bnd_ny: Vec<f32> = points.boundary.iter().map(|p| p.ny as f32).collect();
-        let nx_t = Tensor::<Bk, 1>::from_data(TensorData::new(bnd_nx.clone(), vec![n_bnd]), device);
-        let ny_t = Tensor::<Bk, 1>::from_data(TensorData::new(bnd_ny.clone(), vec![n_bnd]), device);
-        let tx_pred = (sxx.clone() * nx_t.clone() + sxy.clone() * ny_t.clone())
-            .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
-        let ty_pred = (sxy * nx_t + syy * ny_t)
-            .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
         let u_vals: Vec<f32> = bnd_scaled.clone().slice([0..n_bnd, 0..1]).reshape([n_bnd])
-            .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
-        let v_vals: Vec<f32> = bnd_scaled.slice([0..n_bnd, 1..2]).reshape([n_bnd])
             .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
         let mut work = 0.0f64;
         for i in 0..n_bnd {
             let ds = if bnd_nx[i].abs() > 0.5 { ds_x_normal } else { ds_y_normal };
-            work += (tx_pred[i] as f64 * u_vals[i] as f64 + ty_pred[i] as f64 * v_vals[i] as f64) * ds * thickness;
+            // EnergyBalance is defined from prescribed load potential, not model-predicted
+            // boundary traction. Parametric loading is uniaxial x, so tbar = px * n_x.
+            work += prescribed_px * bnd_nx[i] as f64 * u_vals[i] as f64 * ds * thickness;
         }
         0.5 * work
     };
@@ -824,7 +816,7 @@ pub fn run_training_parametric(spec: ParametricProblemSpec, tx: Sender<TrainingM
             let vis = evaluate_parametric_vis_grid(&model_val, &spec.geometry, [64, 64], &scales, e_n, nu_n, p_n, &material, &fd, &int_norm, &device);
             let analyses = hole_analyses_at(&model_val, &spec.geometry, &fd, &scales, e_n, nu_n, p_n, px, &device);
             let rf = reaction_force_stats(&model_val, &points, &scales, &fd, e_n, nu_n, p_n, &material, px, spec.geometry.thickness, &device);
-            let eb = energy_balance_stats(&model_val, &points, &scales, &fd, e_n, nu_n, p_n, &material, area, spec.geometry.thickness, &device);
+            let eb = energy_balance_stats(&model_val, &points, &scales, &fd, e_n, nu_n, p_n, &material, px, area, spec.geometry.thickness, &device);
             let ns = crate::network::network_snapshot(&model_val);
 
             // Smart adaptive architecture - see `runner::run_training_user_problem`'s
@@ -913,7 +905,7 @@ fn serve_parametric_inference(
                 let hole_analyses = hole_analyses_at(&model, &spec.geometry, fd, scales, e_n, nu_n, p_n, px, device);
                 let (bc_residual_rms, bc_residual_max) = bc_residual_stats(&model, points, scales, fd, e_n, nu_n, p_n, &material, px, device);
                 let reaction_force = reaction_force_stats(&model, points, scales, fd, e_n, nu_n, p_n, &material, px, spec.geometry.thickness, device);
-                let energy_balance = energy_balance_stats(&model, points, scales, fd, e_n, nu_n, p_n, &material, area, spec.geometry.thickness, device);
+                let energy_balance = energy_balance_stats(&model, points, scales, fd, e_n, nu_n, p_n, &material, px, area, spec.geometry.thickness, device);
                 let reservoir_slice: Vec<[f32; 3]> = param_reservoir.iter().copied().collect();
                 let nearest_sample_distance = pinn_core::param_distance::nearest_neighbor_distance([e_n, nu_n, p_n], &reservoir_slice) as f64;
                 let typical_sample_spacing = pinn_core::param_distance::median_nn_spacing(&reservoir_slice) as f64;

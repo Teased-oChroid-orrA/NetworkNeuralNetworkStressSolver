@@ -69,15 +69,22 @@ pub struct ReactionForce {
 /// physical energy in joules (`enhancement.md` Phase 10's own explicit warning: "do not label
 /// a quantity 'energy error' if it is merely the training loss"). `internal_energy` here is a
 /// genuine Monte-Carlo domain integral of the per-point strain energy density over the
-/// plate's real area×thickness; `external_work` is a genuine `∮ t·u ds` integral over the
-/// loaded boundary. For a converged linear-elastic solution under pure traction loading (no
-/// body force), the work-energy theorem requires these to be equal — `energy_balance_error`
+/// plate's real area×thickness. For historical serialized compatibility, `external_work`
+/// stores the proportional-loading work `0.5 * ∮ t·u ds`, NOT the full load potential
+/// W_ext used in Pi. Use `load_potential_work()` when reconstructing Pi. At equilibrium
+/// under linear elastic pure traction loading, U and this half-work are equal — `energy_balance_error`
 /// is how far apart they are, normalized by `external_work`'s own magnitude.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EnergyBalance {
     pub internal_energy: f64,
     pub external_work: f64,
     pub energy_balance_error: f64,
+}
+
+impl EnergyBalance {
+    /// Full prescribed-load potential work, distinguished from proportional-loading work.
+    pub fn load_potential_work(&self) -> f64 { 2.0 * self.external_work }
+    pub fn physical_potential(&self) -> f64 { self.internal_energy - self.load_potential_work() }
 }
 
 /// Issue #62 PH3-02 ("persist the hard benchmark result"): transport-side mirror of
@@ -485,7 +492,28 @@ pub struct GradientConflictSummary {
     pub most_conflicting: Option<(&'static str, &'static str, f32)>,
 }
 
+/// Solver-produced objective decomposition. Values are normalized optimizer terms,
+/// not joules. Signed terms are retained without clamping or absolute-value transforms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LossContribution {
+    pub name: String,
+    pub normalized_raw: f64,
+    pub effective_weight: f64,
+    pub weighted: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectiveTelemetry {
+    pub terms: Vec<LossContribution>,
+    pub total: f64,
+    /// Rounding/reconstruction difference, not another physical loss term.
+    pub reconstruction_error: f64,
+    pub optimizer_tier: u8,
+    pub grad_norm_before_optimizer: Option<f32>,
+}
+
 pub struct TrainingUpdate {
+    pub objective: Option<ObjectiveTelemetry>,
     pub step: usize,
     pub total_loss:   f32,
     pub energy_loss:  f32,

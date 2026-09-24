@@ -301,6 +301,7 @@ fn handle_control_messages(stop_rx: &Receiver<ControlMsg>) -> ControlAction {
         // Nothing to export on the single-domain Kirsch path this function drives — a no-op
         // that just proceeds with the current step, same as no control message at all.
         Ok(ControlMsg::ExportContactPressure) => ControlAction::Continue,
+        Err(crossbeam_channel::TryRecvError::Disconnected) => ControlAction::StopImmediately,
         _ => ControlAction::Continue,
     }
 }
@@ -583,6 +584,7 @@ pub fn run_training(
             }
 
             let update = TrainingUpdate {
+            objective: None,
                 step,
                 total_loss:   out.total_scalar,
                 energy_loss:  out.e_scalar,
@@ -1330,6 +1332,7 @@ fn run_training_annular_decomposition(
                 None => (None, None),
             };
             let update = TrainingUpdate {
+            objective: None,
                 step, total_loss, energy_loss: total_loss, neumann_loss: 0.0, lr: lr as f32,
                 lam_energy: 1.0, lam_neumann: 0.0, n_colloc, kt_estimate, vis,
                 amr_sweep: None, hole_analyses: Vec::new(), grad_norm: None,
@@ -1464,6 +1467,7 @@ fn run_training_annular_decomposition_sequential(
                 None => (None, None),
             };
             let update = TrainingUpdate {
+            objective: None,
                 step: global_step, total_loss, energy_loss: total_loss, neumann_loss: 0.0,
                 lr: 0.0, lam_energy: 1.0, lam_neumann: 0.0, n_colloc: 0, kt_estimate, vis,
                 amr_sweep: None, hole_analyses: Vec::new(), grad_norm: None,
@@ -2244,6 +2248,7 @@ fn run_user_problem_training_from(
                 .map(|(&name, &weight)| (name.to_string(), weight))
                 .collect());
         }
+        let objective = out.objective_telemetry();
         let energy_loss = out.e_scalar;
         let neumann_loss = out.total_scalar - energy_loss;
         // `training_core::GradientShareReport` -> `pinn_core::messages::GradientShareSummary` -
@@ -2346,6 +2351,7 @@ fn run_user_problem_training_from(
             None
         };
         let update = TrainingUpdate {
+            objective,
             step,
             total_loss: out.total_scalar,
             energy_loss,
@@ -2376,7 +2382,14 @@ fn run_user_problem_training_from(
             ad_fd_strain_diagnostic,
             convergence_evidence,
         };
-        let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
+        // The final update owns convergence and physical-acceptance evidence. A bounded UI
+        // channel may legitimately drop intermediate chart samples, but it must not drop the
+        // terminal evidence immediately before `Done`.
+        if auto_stopped || update.convergence_evidence.is_some() {
+            let _ = tx.send(TrainingMsg::Update(Box::new(update)));
+        } else {
+            let _ = tx.try_send(TrainingMsg::Update(Box::new(update)));
+        }
         if auto_stopped {
             break;
         }
@@ -2583,6 +2596,7 @@ pub fn serve_loaded_plate_checkpoint(
     let no_hole_benchmark = no_hole_benchmark_summary(&model, &spec, &device, &l0_result);
 
     let update = TrainingUpdate {
+            objective: None,
         step: 0, total_loss: 0.0, energy_loss: 0.0, neumann_loss: 0.0, lr: 0.0,
         lam_energy: 0.0, lam_neumann: 0.0, n_colloc: 0, kt_estimate: None,
         vis: Some(vis), amr_sweep: None, hole_analyses,
@@ -2691,6 +2705,7 @@ fn handle_control_messages_pinlug(stop_rx: &Receiver<ControlMsg>) -> PinLugContr
         },
         Ok(ControlMsg::WarmStart { config, .. }) => PinLugControlAction::WarmStart { config },
         Ok(ControlMsg::ExportContactPressure) => PinLugControlAction::ExportContactPressure,
+        Err(crossbeam_channel::TryRecvError::Disconnected) => PinLugControlAction::StopImmediately,
         _ => PinLugControlAction::Continue,
     }
 }
@@ -5842,6 +5857,16 @@ mod tests {
         tx.send(ControlMsg::ExportContactPressure).unwrap();
         let action = handle_control_messages(&rx);
         assert!(matches!(action, ControlAction::Continue));
+    }
+
+    #[test]
+    fn pinlug_control_disconnect_stops_worker_immediately() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        drop(tx);
+        assert!(matches!(
+            handle_control_messages_pinlug(&rx),
+            PinLugControlAction::StopImmediately
+        ));
     }
 
     #[test]
