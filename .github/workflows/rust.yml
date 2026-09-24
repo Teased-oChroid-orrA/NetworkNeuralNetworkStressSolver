@@ -59,11 +59,20 @@ jobs:
       env:
         RUST_BACKTRACE: 1
 
+    # Cheap, deterministic physics gates. These validate the analytical variational
+    # functional, geometric integration, and a non-square affine field independently of the
+    # learned network. Real trained L4/L5 gates run in physics-validation.yml.
+    - name: Physics acceptance (analytical L0/L3 and affine-field fixtures)
+      run: |
+        cargo test -p pinn-solver verification_ladder::tests:: -- --test-threads=1
+        cargo test -p pinn-solver measure_integral::tests:: -- --test-threads=1
+        cargo test -p pinn-solver no_hole_field_validation_accepts_affine_on_a_non_square_plate -- --test-threads=1
+
     # A/B benchmark half (Wgpu side) for issue #58's AC3 — bounded step count so this stays
     # fast. MAX_STEPS is read from a pinn.env-format FILE (main.rs's load_pinn_env), not a
     # process env var — a plain `MAX_STEPS=1200` shell env has no effect and silently runs
     # the full un-capped step count (confirmed the hard way locally before writing this).
-    - name: Headless bench (Wgpu)
+    - name: Runtime smoke only (Wgpu; not a physics-accuracy gate)
       run: |
         echo "MAX_STEPS=1200" > pinn.env
         cargo run -p pinn-app --release --features eframe/x11,eframe/wayland -- --headless | tee wgpu-bench.log
@@ -100,7 +109,7 @@ jobs:
 
     # A/B benchmark half (NdArray side) for issue #58's AC3 — same MAX_STEPS, same
     # collocation/network config as the Wgpu job's bench step, only the backend differs.
-    - name: Headless bench (NdArray)
+    - name: Runtime smoke only (NdArray; not a physics-accuracy gate)
       run: |
         echo "MAX_STEPS=1200" > pinn.env
         cargo run -p pinn-app --release --features eframe/x11,eframe/wayland,ndarray-backend -- --headless | tee ndarray-bench.log

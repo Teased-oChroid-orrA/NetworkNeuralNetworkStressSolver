@@ -1,0 +1,23 @@
+name: Long Physics Validation
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "17 6 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ndarray-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: No-hole Variational L4 acceptance
+        run: cargo test -p pinn-solver --release --features ndarray-backend issue_64_resampling_fix_passes_l4_and_independent_field_validation -- --ignored --test-threads=1
+      - name: Single-hole hard-constraint L5 acceptance
+        run: cargo test -p pinn-solver --release --features ndarray-backend user_problem::issue_77_l5_tests::issue_77_l5_single_domain_hard_constraint_converges_to_fem_reference -- --ignored --exact --test-threads=1

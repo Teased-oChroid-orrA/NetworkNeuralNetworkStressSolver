@@ -11261,4 +11261,61 @@ mod issue_77_l5_tests {
         assert!(kt.is_finite() && error <= 0.05,
             "#77 L5 failed: Kt={kt:.9}, FEM={FEM_KT:.9}, error={:.3}%", 100.0 * error);
     }
+
+    /// Machine-enforced acceptance for the shipped PH4-42 hard-constraint specification.
+    /// L5 remains conditional on an independently trained no-hole companion passing L4.
+    #[test]
+    #[ignore]
+    fn issue_77_l5_single_domain_hard_constraint_converges_to_fem_reference() {
+        const FEM_KT: f64 = 2.460_638_516;
+        let text = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/problems/issue_77_l5_hard_constraint.toml"
+        ));
+        let hole: ProblemSpec = toml::from_str(text).expect("shipped hard-constraint L5 spec must parse");
+        assert!(hole.architecture.hard_constraint_ansatz);
+        assert!(matches!(
+            hole.architecture.training_procedure,
+            pinn_core::problem_spec::TrainingProcedure::SingleDomain
+        ));
+
+        let device = crate::training_core::BDevice::default();
+        let mut no_hole = hole.clone();
+        no_hole.geometry.holes.clear();
+        no_hole.architecture = Default::default();
+        let companion_model =
+            crate::user_runner::train_single_user_problem_for_benchmark(no_hole.clone(), &device);
+        let companion = run_no_hole_benchmark(&companion_model, &no_hole, &device);
+        assert!(companion.passed, "L5 companion no-hole gate failed: {companion:?}");
+
+        let final_step = hole.training.max_steps - 1;
+        let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(
+            hole.clone(),
+            true,
+            hole.architecture.hole_bias_fraction,
+        );
+        let (_model, loss, diagnostics) =
+            crate::user_runner::run_user_problem_training_with_diagnostics(
+                problem,
+                hole,
+                device,
+                &[final_step],
+                |_step, _loss, _lr, _points| false,
+            );
+        assert!(loss.is_finite(), "hard-constraint L5 loss must remain finite");
+        let kt = diagnostics
+            .last()
+            .expect("hard-constraint L5 final diagnostic missing")
+            .kt_derived_fd_vm;
+        let error = (kt - FEM_KT).abs() / FEM_KT;
+        println!(
+            "[L5 #77 hard constraint] Kt={kt:.9} FEM={FEM_KT:.9} error={:.3}%",
+            100.0 * error
+        );
+        assert!(
+            kt.is_finite() && error <= 0.05,
+            "#77 hard-constraint L5 failed: Kt={kt:.9}, FEM={FEM_KT:.9}, error={:.3}%",
+            100.0 * error
+        );
+    }
 }
