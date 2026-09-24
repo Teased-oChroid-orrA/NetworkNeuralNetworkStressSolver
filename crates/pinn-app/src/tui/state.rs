@@ -39,6 +39,20 @@ pub enum RunStatus {
 /// carrying that dependency for fields never read).
 #[derive(Debug, Clone, Default)]
 pub struct TuiState {
+    pub tab: usize,
+    pub scroll: u16,
+    pub warnings_only: bool,
+    pub run_summary: String,
+    pub control_status: String,
+    pub logs: Vec<String>,
+    pub objective: Option<pinn_core::messages::ObjectiveTelemetry>,
+    pub energy_balance: Option<pinn_core::messages::EnergyBalance>,
+    pub reaction_force: Option<pinn_core::messages::ReactionForce>,
+    pub boundary_residual: Option<(usize, f64, f64)>,
+    pub gradient_shares: Option<pinn_core::messages::GradientShareSummary>,
+    pub convergence: Option<pinn_core::messages::ConvergenceEvidenceSummary>,
+    pub sources: Vec<(&'static str, &'static str)>,
+    pub history_steps: Vec<usize>,
     pub status: Option<RunStatus>,
     pub error_msg: Option<String>,
     pub step: usize,
@@ -76,7 +90,9 @@ impl TuiState {
     /// picking one exclusively - but for `TuiKtSource` (this dashboard's own single headline
     /// number) `kt_estimate` is the more authoritative of the two when both exist.
     pub fn apply(&mut self, u: &TrainingUpdate) {
-        self.status = Some(RunStatus::Running);
+        if self.status != Some(RunStatus::Error) {
+            self.status = Some(RunStatus::Running);
+        }
         self.step = u.step;
         self.total_loss = u.total_loss;
         self.energy_loss = u.energy_loss;
@@ -86,7 +102,20 @@ impl TuiState {
         self.lam_neumann = u.lam_neumann;
         self.n_colloc = u.n_colloc;
         self.grad_norm = u.grad_norm;
-        self.total_loss_history.push(u.total_loss);
+        self.push_history(u.step, u.total_loss);
+        if !u.total_loss.is_finite() || u.grad_norm.is_some_and(|g| !g.is_finite()) {
+            self.log("ERROR non-finite loss or gradient reported by solver".into());
+            self.set_error("non-finite loss or gradient reported by solver".into());
+        }
+
+        self.objective = u.objective.clone();
+        if let Some(energy) = u.energy_balance { self.energy_balance = Some(energy); }
+        if let Some(force) = u.reaction_force { self.reaction_force = Some(force); }
+        if u.vis.is_some() { self.boundary_residual = Some((u.step, u.bc_residual_rms, u.bc_residual_max)); }
+        if let Some(shares) = &u.gradient_share_report { self.gradient_shares = Some(shares.clone()); }
+        if let Some(evidence) = &u.convergence_evidence { self.convergence = Some(evidence.clone()); }
+        if !u.stress_source_report.is_empty() { self.sources = u.stress_source_report.clone(); }
+        if !u.hole_analyses.is_empty() { self.hole_analyses = u.hole_analyses.clone(); }
 
         if let Some(kt) = u.kt_estimate {
             self.kt_source = TuiKtSource::KtEstimate;
@@ -108,7 +137,9 @@ impl TuiState {
     /// entries, one per domain) instead of `TrainingUpdate`'s `Option`, no `hole_analyses`/
     /// `architecture_event` field exists on this type at all.
     pub fn apply_pinlug(&mut self, u: &PinLugTrainingUpdate) {
-        self.status = Some(RunStatus::Running);
+        if self.status != Some(RunStatus::Error) {
+            self.status = Some(RunStatus::Running);
+        }
         self.step = u.step;
         self.total_loss = u.total_loss;
         self.energy_loss = u.energy_loss;
@@ -118,7 +149,11 @@ impl TuiState {
         self.lam_neumann = u.lam_neumann;
         self.n_colloc = u.n_colloc;
         self.grad_norm = u.grad_norm;
-        self.total_loss_history.push(u.total_loss);
+        self.push_history(u.step, u.total_loss);
+        if !u.total_loss.is_finite() || u.grad_norm.is_some_and(|g| !g.is_finite()) {
+            self.log("ERROR non-finite loss or gradient reported by solver".into());
+            self.set_error("non-finite loss or gradient reported by solver".into());
+        }
 
         self.kt_source = TuiKtSource::ConvergenceMetric;
         self.convergence_metric = u.convergence_metric;
@@ -127,8 +162,29 @@ impl TuiState {
         }
     }
 
+    fn push_history(&mut self, step: usize, loss: f32) {
+        const HISTORY_LIMIT: usize = 1024;
+        if self.history_steps.last().is_some_and(|&last| step < last) {
+            self.history_steps.clear();
+            self.total_loss_history.clear();
+        }
+        if self.history_steps.len() == HISTORY_LIMIT {
+            self.history_steps.remove(0);
+            self.total_loss_history.remove(0);
+        }
+        self.history_steps.push(step);
+        self.total_loss_history.push(loss);
+    }
+
+    pub fn log(&mut self, message: String) {
+        if self.logs.len() == 256 { self.logs.remove(0); }
+        self.logs.push(message);
+    }
+
     pub fn set_done(&mut self) {
-        self.status = Some(RunStatus::Done);
+        if self.status != Some(RunStatus::Error) {
+            self.status = Some(RunStatus::Done);
+        }
     }
 
     pub fn set_error(&mut self, msg: String) {
@@ -144,6 +200,7 @@ mod tests {
 
     fn base_update() -> TrainingUpdate {
         TrainingUpdate {
+            objective: None,
             step: 10,
             total_loss: 1.5,
             energy_loss: 1.0,
@@ -318,5 +375,38 @@ mod tests {
         state2.set_error("boom".to_string());
         assert_eq!(state2.status, Some(RunStatus::Error));
         assert_eq!(state2.error_msg.as_deref(), Some("boom"));
+        state2.set_done();
+        assert_eq!(state2.status, Some(RunStatus::Error), "Done must not hide a prior error");
     }
+
+    #[test]
+    fn non_finite_updates_fail_closed_for_plate_and_pinlug() {
+        let mut plate = base_update();
+        plate.total_loss = f32::NAN;
+        let mut state = TuiState::new(100);
+        state.apply(&plate);
+        state.set_done();
+        assert_eq!(state.status, Some(RunStatus::Error));
+
+        let mut pinlug = base_pinlug_update();
+        pinlug.grad_norm = Some(f32::INFINITY);
+        let mut state = TuiState::new(100);
+        state.apply_pinlug(&pinlug);
+        state.set_done();
+        assert_eq!(state.status, Some(RunStatus::Error));
+    }
+    #[test]
+    fn signed_history_is_bounded_and_keeps_actual_step_numbers() {
+        let mut state = TuiState::new(2000);
+        for step in 0..1500 { state.push_history(step * 10, -(step as f32)); }
+        assert_eq!(state.total_loss_history.len(), 1024);
+        assert_eq!(state.history_steps[0], 4760);
+        assert_eq!(*state.total_loss_history.last().unwrap(), -1499.0);
+        state.push_history(0, -2.0);
+        assert_eq!(state.history_steps, vec![0]);
+        assert_eq!(state.total_loss_history, vec![-2.0]);
+        for _ in 0..300 { state.log("WARN example".into()); }
+        assert_eq!(state.logs.len(), 256);
+    }
+
 }

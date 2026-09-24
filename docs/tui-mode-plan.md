@@ -1,5 +1,11 @@
 # Ratatui TUI mode for pinn-app
 
+> Status update (2026-09-23): the original dashboard has been superseded on
+> `feature/pinn-numerics-tui-audit-20260923` by the engineering console described in
+> `NUMERICAL_AND_TUI_RECONCILIATION_2026-09-23.md`. It consumes authoritative solver telemetry,
+> preserves signed objectives, bounds history/channels, persists per-run diagnostics, and uses
+> RAII terminal/worker cleanup. This file remains the original design record.
+
 ## Context
 
 `pinn-app` currently has exactly two run modes: `--headless` (plain scrolling `println!` logs,
