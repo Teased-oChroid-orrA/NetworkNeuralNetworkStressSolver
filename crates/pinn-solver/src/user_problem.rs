@@ -231,6 +231,29 @@ fn affine_strain(px: f64, py: f64, material: &MaterialProps) -> (f64, f64, f64) 
     ((px - nu * py) / e, (py - nu * px) / e, 0.0)
 }
 
+fn affine_outer_work_normalized(spec: &ProblemSpec, measure_aware: bool, ref_energy: f32, ref_energy_absolute: f64) -> f64 {
+    let (exx, eyy, _) = affine_strain(spec.load.px, spec.load.py, &spec.material);
+    if measure_aware {
+        let outer_area = 4.0 * spec.geometry.half_w * spec.geometry.half_h;
+        outer_area * spec.geometry.thickness * (spec.load.px * exx + spec.load.py * eyy)
+            / ref_energy_absolute
+    } else {
+        (spec.load.px * exx * spec.geometry.half_w + spec.load.py * eyy * spec.geometry.half_h)
+            / (2.0 * ref_energy as f64)
+    }
+}
+
+fn fixed_hole_affine_offsets(hole: &HoleSpec, px: f64, py: f64, material: &MaterialProps) -> Vec<[f32; 2]> {
+    let (exx, eyy, exy) = affine_strain(px, py, material);
+    (0..HOLE_RING_POINTS).map(|i| {
+        // Match UserSamplingStrategy::named_point_sets' exact point order.
+        let theta = 2.0 * std::f64::consts::PI * i as f64 / HOLE_RING_POINTS as f64;
+        let x = hole.center[0] + hole.radius * theta.cos();
+        let y = hole.center[1] + hole.radius * theta.sin();
+        [(exx * x + exy * y) as f32, (exy * x + eyy * y) as f32]
+    }).collect()
+}
+
 /// Kinematic decomposition (issue #77 fix) is scoped to exactly the case where
 /// `u_affine` has a clean closed form and the hole's own natural BC needs an explicit,
 /// correctly-targeted residual: one centered, traction-free hole. Off, unconditionally,
@@ -1506,6 +1529,8 @@ struct PhysicalPotentialEnergyTerm {
     /// must be added before computing `U` (see that function's doc comment: the cross term is
     /// physically required, not optional). `None` everywhere else — byte-identical fallback.
     affine_strain: Option<(f64, f64)>,
+    /// Constant load work of the affine displacement superposed on the network correction.
+    affine_work_normalized: f64,
 }
 
 impl LossTerm for PhysicalPotentialEnergyTerm {
@@ -1563,7 +1588,7 @@ impl LossTerm for PhysicalPotentialEnergyTerm {
         } else {
             work_density.mean().mul_scalar(1.0 / self.ref_energy as f64)
         };
-        u - w_ext
+        u - w_ext.add_scalar(self.affine_work_normalized)
     }
 }
 impl LossTerm for ExternalWorkTerm {
@@ -1638,6 +1663,12 @@ struct HoleBcTerm {
     point_set: &'static str,
     bc: HoleBc,
     ref_stress2: f32,
+    /// Make Fixed-hole displacement admissibility dimensionless, like interface and gauge
+    /// constraints. Unscaled meter-squared values were inert beside normalized Pi.
+    inv_u_ref_sq: f64,
+    /// Physical affine displacement at each Fixed-hole point, in sampler order. The network
+    /// represents only the correction when affine completion is active.
+    fixed_affine_offsets: Option<Vec<[f32; 2]>>,
     material: MaterialProps,
     /// Issue #77 fix: `Some((px,py))` when kinematic decomposition is active for a `Free`
     /// hole. The network represents `u_hole`, so the true traction-free condition on the
@@ -1872,9 +1903,17 @@ impl LossTerm for HoleBcTerm {
                 hole_traction_loss_direct(sxx, syy, sxy, nx, ny).mul_scalar(1.0 / self.ref_stress2 as f64)
             }
             HoleBc::Fixed => {
-                let u = d.raw_out.clone().slice([0..n, 0..1]).reshape([n]);
-                let v = d.raw_out.clone().slice([0..n, 1..2]).reshape([n]);
-                (u.clone() * u + v.clone() * v).mean()
+                let mut u = d.raw_out.clone().slice([0..n, 0..1]).reshape([n]);
+                let mut v = d.raw_out.clone().slice([0..n, 1..2]).reshape([n]);
+                if let Some(offsets) = &self.fixed_affine_offsets {
+                    assert_eq!(offsets.len(), n, "fixed-hole affine points must match sampled ring");
+                    let us = offsets.iter().map(|p| p[0]).collect::<Vec<_>>();
+                    let vs = offsets.iter().map(|p| p[1]).collect::<Vec<_>>();
+                    let device = d.raw_out.device();
+                    u = u + Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(us, vec![n]), &device);
+                    v = v + Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(vs, vec![n]), &device);
+                }
+                (u.clone() * u + v.clone() * v).mean().mul_scalar(self.inv_u_ref_sq)
             }
         }
     }
@@ -2241,6 +2280,9 @@ impl BoundaryValueProblem for UserDefinedProblem {
                 measure_aware, domain_area, thickness, ref_energy, ref_energy_absolute,
                 interior_weights: interior_weights.clone(), ds_per_point: ds_per_point.clone(),
                 affine_strain: affine_strain_pair,
+                affine_work_normalized: if affine_active {
+                    affine_outer_work_normalized(&self.spec, measure_aware, ref_energy, ref_energy_absolute)
+                } else { 0.0 },
             }));
         }
         if active_base.contains("interior_energy") {
@@ -2298,6 +2340,10 @@ impl BoundaryValueProblem for UserDefinedProblem {
                 };
                 terms.push(Box::new(HoleBcTerm {
                     domain: USER_DOMAIN, point_set, bc: hole.bc, ref_stress2,
+                    inv_u_ref_sq: 1.0 / (scales.u_ref as f64).powi(2).max(1e-30),
+                    fixed_affine_offsets: if hole.bc == HoleBc::Fixed && affine_active {
+                        Some(fixed_hole_affine_offsets(hole, self.spec.load.px, self.spec.load.py, &self.spec.material))
+                    } else { None },
                     material: self.spec.material.clone(), affine_target,
                     name: hole_bc_term_name(hole.bc, occurrence),
                 }));
@@ -2635,6 +2681,9 @@ impl BoundaryValueProblem for AnnularDecompositionProblem {
                 domain_area: outer_area, thickness: self.spec.geometry.thickness,
                 ref_energy: scales.ref_energy, ref_energy_absolute, interior_weights: None,
                 ds_per_point, affine_strain: affine_strain_pair,
+                affine_work_normalized: if affine_strain_pair.is_some() {
+                    affine_outer_work_normalized(&self.spec, true, scales.ref_energy, ref_energy_absolute)
+                } else { 0.0 },
             }),
             Box::new(InterfaceDisplacementContinuityTerm {
                 left: ANNULUS_DOMAIN, right: OUTER_DOMAIN,
@@ -2661,7 +2710,10 @@ impl BoundaryValueProblem for AnnularDecompositionProblem {
         if decomposed && !self.hard_constraint_active() {
             terms.push(Box::new(HoleBcTerm {
                 domain: ANNULUS_DOMAIN, point_set: "hole_0_fd", bc: HoleBc::Free,
-                ref_stress2: scales.ref_stress2, material: self.spec.material.clone(),
+                ref_stress2: scales.ref_stress2,
+                inv_u_ref_sq: 1.0 / (scales.u_ref as f64).powi(2).max(1e-30),
+                fixed_affine_offsets: None,
+                material: self.spec.material.clone(),
                 affine_target: affine_strain_pair,
                 // Single-hole-only scope (`decomposition_applicable` requires exactly one
                 // centered Free hole) - always the first (and only) hole of its BC.
@@ -2916,6 +2968,7 @@ impl BoundaryValueProblem for MultiAnnularDecompositionProblem {
                 domain_area: outer_area, thickness: self.spec.geometry.thickness,
                 ref_energy: scales.ref_energy, ref_energy_absolute, interior_weights: None,
                 ds_per_point, affine_strain: affine_strain_pair,
+                affine_work_normalized: affine_outer_work_normalized(&self.spec, true, scales.ref_energy, ref_energy_absolute),
             }),
             Box::new(TranslationGaugeTerm {
                 domain: self.outer_domain_id,
@@ -2948,7 +3001,10 @@ impl BoundaryValueProblem for MultiAnnularDecompositionProblem {
             if !self.hard_constraint_active(i) {
                 terms.push(Box::new(HoleBcTerm {
                     domain: annulus_id, point_set: "hole_0_fd", bc: HoleBc::Free,
-                    ref_stress2: scales.ref_stress2, material: self.spec.material.clone(),
+                    ref_stress2: scales.ref_stress2,
+                    inv_u_ref_sq: 1.0 / (scales.u_ref as f64).powi(2).max(1e-30),
+                    fixed_affine_offsets: None,
+                    material: self.spec.material.clone(),
                     affine_target: affine_strain_pair,
                     // Each annulus domain's own sampling always emits "hole_0"/"hole_0_fd"
                     // (domain-scoped, built from a synthetic single-hole geometry) - but the
@@ -3145,6 +3201,9 @@ impl BoundaryValueProblem for OuterStageProblem {
                 domain_area: outer_area, thickness: self.spec.geometry.thickness,
                 ref_energy: scales.ref_energy, ref_energy_absolute, interior_weights: None,
                 ds_per_point, affine_strain: affine_strain_pair,
+                affine_work_normalized: if affine_strain_pair.is_some() {
+                    affine_outer_work_normalized(&self.spec, true, scales.ref_energy, ref_energy_absolute)
+                } else { 0.0 },
             }),
             Box::new(OuterInterfaceAnchorTerm {
                 domain: OUTER_DOMAIN, target_u, target_v,
@@ -3257,7 +3316,10 @@ impl BoundaryValueProblem for AnnulusStageProblem {
         if decomposed && !self.hard_constraint_active() {
             terms.push(Box::new(HoleBcTerm {
                 domain: ANNULUS_DOMAIN, point_set: "hole_0_fd", bc: HoleBc::Free,
-                ref_stress2: scales.ref_stress2, material: self.spec.material.clone(),
+                ref_stress2: scales.ref_stress2,
+                inv_u_ref_sq: 1.0 / (scales.u_ref as f64).powi(2).max(1e-30),
+                fixed_affine_offsets: None,
+                material: self.spec.material.clone(),
                 affine_target: affine_strain_pair,
                 // Single-hole-only scope, same rationale as `AnnularDecompositionProblem`'s
                 // own identical construction site.
@@ -4604,9 +4666,9 @@ pub fn probe_hole_boundary_profile_derived(
         // for inspection, not itself differentiated further).
         let (mut ux, mut uy) = (uv_vals[i * 2], uv_vals[i * 2 + 1]);
         if let Some((a_exx, a_eyy, a_exy, _px, _py)) = affine_uv {
-            let (dx, dy) = (x - hole.center[0], y - hole.center[1]);
-            ux += (a_exx * dx + a_exy * dy) as f32;
-            uy += (a_exy * dx + a_eyy * dy) as f32;
+            // Match the global-origin affine field used by training and the Fixed-hole target.
+            ux += (a_exx * x + a_exy * y) as f32;
+            uy += (a_exy * x + a_eyy * y) as f32;
         }
         HoleBoundaryPoint {
             theta_deg: thetas[i], x, y, ux, uy,
@@ -7153,7 +7215,7 @@ mod tests {
             domain: USER_DOMAIN,
             material: material.clone(), px, py: 0.0, measure_aware: true, domain_area,
             thickness, ref_energy: 1.0, ref_energy_absolute, interior_weights: None,
-            ds_per_point: vec![1.0, 1.0], affine_strain: None,
+            ds_per_point: vec![1.0, 1.0], affine_strain: None, affine_work_normalized: 0.0,
         };
         assert_eq!(term.domains(), vec![USER_DOMAIN, USER_DOMAIN]);
         assert_eq!(term.point_sets(), vec!["interior", "outer_boundary"]);
@@ -7212,7 +7274,7 @@ mod tests {
                 domain_area: area, thickness, ref_energy: 1.0, ref_energy_absolute: 1.0,
                 interior_weights: None,
                 ds_per_point: vec![2.0 * half_h, 2.0 * half_h, 2.0 * half_w, 2.0 * half_w],
-                affine_strain: None,
+                affine_strain: None, affine_work_normalized: 0.0,
             }.compute(&[
                 DomainForwardOutputs { domain: USER_DOMAIN, raw_out: &interior_out,
                     strains: Some((exx, eyy, exy)), normals: None, shifted_stress: None, hessian: None },
@@ -7233,6 +7295,23 @@ mod tests {
     }
 
     #[test]
+    fn affine_outer_work_is_twice_strain_energy_for_exact_no_hole_field() {
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.1, half_h: 0.05, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(), training: Default::default(),
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
+        };
+        let (exx, eyy, _) = affine_strain(spec.load.px, spec.load.py, &spec.material);
+        let volume = 4.0 * spec.geometry.half_w * spec.geometry.half_h * spec.geometry.thickness;
+        let exact_internal = 0.5 * volume * (spec.load.px * exx + spec.load.py * eyy);
+        let work = affine_outer_work_normalized(&spec, true, 1.0, 1.0);
+        assert!((work - 2.0 * exact_internal).abs() / work < 1e-12);
+    }
+
+    #[test]
     fn physical_potential_live_measure_aware_weights_remove_nonuniform_interior_bias() {
         use burn::tensor::TensorData;
         let device: crate::training_core::BDevice = Default::default();
@@ -7250,6 +7329,7 @@ mod tests {
             material: material.clone(), px: 0.0, py: 0.0, measure_aware: true,
             domain_area: 1.0, thickness: 1.0, ref_energy: 1.0, ref_energy_absolute: 1.0,
             interior_weights: weights, ds_per_point: vec![0.25; 4], affine_strain: None,
+            affine_work_normalized: 0.0,
         };
         let weighted = make_term(Some(weights.clone())).compute(&[
             DomainForwardOutputs { domain: USER_DOMAIN, raw_out: &interior_out,
@@ -7383,6 +7463,8 @@ mod tests {
 
         let term = HoleBcTerm {
             domain: USER_DOMAIN, point_set: "hole_0_fd", bc: HoleBc::Free, ref_stress2: 1.0,
+            inv_u_ref_sq: 1.0,
+            fixed_affine_offsets: None,
             material: material.clone(), affine_target: Some((px, py)),
             name: hole_bc_term_name(HoleBc::Free, 0),
         };
@@ -7400,6 +7482,28 @@ mod tests {
             "residual={residual:.6e} expected={expected:.6e} - decomposed hole term must target \
              -sigma_affine.n, not zero");
         assert!(residual > 0.0, "a nonzero target must produce nonzero residual for sigma_hole=0");
+    }
+
+    #[test]
+    fn fixed_hole_penalty_uses_reference_displacement_scale() {
+        let device: crate::training_core::BDevice = Default::default();
+        let u_ref = 2e-5_f64;
+        let raw_out = Tensor::<B, 2>::from_data(
+            burn::tensor::TensorData::new(vec![u_ref as f32, 0.0, 0.0, 0.0, 0.0], vec![1, 5]),
+            &device,
+        );
+        let term = HoleBcTerm {
+            domain: USER_DOMAIN, point_set: "hole_0", bc: HoleBc::Fixed,
+            ref_stress2: 1.0, inv_u_ref_sq: 1.0 / u_ref.powi(2),
+            fixed_affine_offsets: Some(vec![[u_ref as f32, 0.0]]),
+            material: MaterialProps::al7075_t6(), affine_target: None,
+            name: hole_bc_term_name(HoleBc::Fixed, 0),
+        };
+        let value = term.compute(&[DomainForwardOutputs {
+            domain: USER_DOMAIN, raw_out: &raw_out, strains: None, normals: None,
+            shifted_stress: None, hessian: None,
+        }]).into_data().to_vec::<f32>().unwrap()[0];
+        assert!((value - 4.0).abs() < 1e-5, "network plus affine reference displacements must give penalty four, got {value}");
     }
 
     /// End-to-end registration proof: for the L5-shaped spec, `UserDefinedProblem::loss_terms()`
@@ -9019,7 +9123,7 @@ mod tests {
             .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
             .init(&device);
         let geometry = UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] };
-        let hole = HoleSpec { center: [0.0, 0.0], radius: 0.02, bc: HoleBc::Free };
+        let hole = HoleSpec { center: [-0.03, 0.01], radius: 0.02, bc: HoleBc::Free };
         let fd = crate::fd_stencil::FdConfig::new(1e-3, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
         let material = MaterialProps::al7075_t6();
         let margin = 0.003;
@@ -9035,6 +9139,10 @@ mod tests {
         assert!(a_exx != 0.0 && a_eyy != 0.0, "test fixture must use a genuinely nonzero affine strain, got ({a_exx}, {a_eyy})");
 
         for (w, wo) in with_affine.iter().zip(&without_affine) {
+            assert!(((w.ux - wo.ux) as f64 - (a_exx * w.x + a_exy * w.y)).abs() < 1e-6,
+                "reported displacement must use the same global affine origin as training");
+            assert!(((w.uy - wo.uy) as f64 - (a_exy * w.x + a_eyy * w.y)).abs() < 1e-6,
+                "reported displacement must use the same global affine origin as training");
             assert!((w.eps_xx as f64 - wo.eps_xx as f64 - a_exx).abs() < 1e-6 * a_exx.abs().max(1.0),
                 "eps_xx must shift by exactly a_exx={a_exx:e}: with={} without={}", w.eps_xx, wo.eps_xx);
             assert!((w.eps_yy as f64 - wo.eps_yy as f64 - a_eyy).abs() < 1e-6 * a_eyy.abs().max(1.0),
