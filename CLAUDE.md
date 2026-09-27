@@ -2015,3 +2015,17 @@ mismatch is real but small: model drift and/or quadrature bias accumulated over 
 more likely dominant contributors, and should be investigated next (e.g. probing at multiple
 points across a real multi-hundred-step trial, not just one step, to see whether the gap grows
 with training duration in a way pure quadrature noise would not).
+
+**The doc's OTHER suggested next target (Fixed-hole mirror-asymmetry/angular-shape via per-hole
+embedding or increased near-Fixed-hole collocation density) was deliberately deferred, not
+attempted, this pass.** `hole_bias_quadrature_weights`/`UserSamplingStrategy::with_hole_bias`
+only ever bias `HoleBc::Free` holes today - issue #78's own earlier "fifth experiment" (extending
+that sampling bias to a Fixed hole too, for the unrelated multi-Free-hole Kt question) was tried
+and fully reverted, so no Fixed-hole-biasing infrastructure survives in the current tree to reuse.
+Building it correctly (matching the existing Free-hole implementation's careful overlap/area
+accounting, not a rushed approximation of it) plus a real multi-hundred-step trial and profile-
+shape analysis is a real, separately-scoped unit of work - attempting a hasty version of it
+risked introducing a real numerical bug into research infrastructure for no decisive evidence
+gained. Left open for a dedicated future pass, same standard this file already applies elsewhere
+("BLOCKED documented with evidence is not the same as complete" - this is "not yet started,
+correctly scoped," a different, honest category from that).
