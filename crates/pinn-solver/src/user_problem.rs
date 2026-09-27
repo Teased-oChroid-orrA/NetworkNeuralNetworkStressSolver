@@ -825,30 +825,44 @@ pub(crate) fn hole_bias_quadrature_weights(
         .map(|p| [p[0] as f64 * geometry.half_w, p[1] as f64 * geometry.half_h])
         .collect();
     let bias_r2: Vec<f64> = free.iter().map(|h| (HOLE_BIAS_RADIUS_MULTIPLIER * h.radius).powi(2)).collect();
-    let in_bias = |p: &[f64; 2]| -> bool {
-        free.iter().zip(&bias_r2).any(|(hole, &r2)| {
+    // Which Free hole's own bias disk (if any) a point falls in - at most one, since the
+    // overlap assert above rules out two disks ever sharing a point. `sample_interior` draws
+    // an EQUAL point count per hole (`hole_bias_fraction / bias_holes.len()`), regardless of
+    // that hole's own disk area - so for Free holes of DIFFERENT radii, the resulting local
+    // density genuinely differs per hole (a smaller disk with the same point count is denser).
+    // Pooling every biased point into one combined area/count (as this function once did)
+    // silently assumed uniform density across the whole union of disks, which is only
+    // correct when every Free hole shares the same radius - invisible in every existing test
+    // geometry (`two_hole_geometry`, `triple_hole_plate.toml`) because their Free holes happen
+    // to be equal-sized. Must be computed PER HOLE to match the sampler's real stratification.
+    let hole_of_point: Vec<Option<usize>> = points.iter().map(|p| {
+        free.iter().zip(&bias_r2).position(|(hole, &r2)| {
             let (dx, dy) = (p[0] - hole.center[0], p[1] - hole.center[1]);
             dx * dx + dy * dy <= r2
         })
-    };
-    let n_biased = points.iter().filter(|p| in_bias(p)).count();
-    let n_remaining = points.len() - n_biased;
+    }).collect();
+    let mut n_biased_per_hole = vec![0usize; free.len()];
+    for idx in hole_of_point.iter().flatten() {
+        n_biased_per_hole[*idx] += 1;
+    }
+    let n_biased_total: usize = n_biased_per_hole.iter().sum();
+    let n_remaining = points.len() - n_biased_total;
     // Physical area each stratum represents - the SAME areas `sample_interior`'s own uniform-
     // in-r^2 draw (biased strata) and whole-plate-minus-those-disks draw (remainder) are meant
     // to cover, independent of how many points actually landed in each this particular call.
     let all_hole_area: f64 = geometry.holes.iter().map(|h| std::f64::consts::PI * h.radius * h.radius).sum();
-    let bias_area: f64 = free.iter().zip(&bias_r2).map(|(h, &r2)| {
+    let bias_area_per_hole: Vec<f64> = free.iter().zip(&bias_r2).map(|(h, &r2)| {
         (std::f64::consts::PI * r2 - std::f64::consts::PI * h.radius * h.radius).max(0.0)
-    }).sum();
+    }).collect();
+    let bias_area_total: f64 = bias_area_per_hole.iter().sum();
     let plate_area = 4.0 * geometry.half_w * geometry.half_h - all_hole_area;
-    let remaining_area = (plate_area - bias_area).max(0.0);
-    let samples: Vec<pinn_core::amr::DensitySample> = points.iter().map(|&p| {
-        let leaf_area = if in_bias(&p) {
-            if n_biased > 0 { bias_area / n_biased as f64 } else { 0.0 }
-        } else if n_remaining > 0 {
-            remaining_area / n_remaining as f64
-        } else {
-            0.0
+    let remaining_area = (plate_area - bias_area_total).max(0.0);
+    let samples: Vec<pinn_core::amr::DensitySample> = points.iter().zip(&hole_of_point).map(|(&p, &hole_idx)| {
+        let leaf_area = match hole_idx {
+            Some(i) if n_biased_per_hole[i] > 0 => bias_area_per_hole[i] / n_biased_per_hole[i] as f64,
+            Some(_) => 0.0,
+            None if n_remaining > 0 => remaining_area / n_remaining as f64,
+            None => 0.0,
         };
         pinn_core::amr::DensitySample { point: p, leaf_area }
     }).collect();
@@ -8190,6 +8204,88 @@ mod tests {
                      the fix closes) - got rel_err={unweighted_rel_err}, expected a real, large error");
             }
         }
+    }
+
+    /// Issue #78 follow-up: `hole_bias_quadrature_weights` must compute leaf area PER Free
+    /// hole, not pooled across every biased point - `sample_interior` draws an EQUAL point
+    /// count per hole regardless of that hole's own bias-disk area, so two Free holes of
+    /// DIFFERENT radii have genuinely different local density in their own disks. A pooled
+    /// formula (bias_area_total/n_biased_total for every biased point, this function's own
+    /// pre-fix behavior) silently assumes uniform density across the whole union of disks -
+    /// invisible in every other test geometry in this file because their Free holes happen to
+    /// share one radius. This test uses two Free holes of DIFFERENT radii specifically to
+    /// exercise the case the old pooled formula got wrong.
+    #[test]
+    fn hole_bias_quadrature_weights_is_correct_for_free_holes_of_different_radii() {
+        let geometry = UserGeometry {
+            half_w: 0.15, half_h: 0.06, thickness: 0.005,
+            holes: vec![
+                HoleSpec { center: [-0.05, 0.0], radius: 0.005, bc: HoleBc::Free },
+                HoleSpec { center: [0.05, 0.0], radius: 0.012, bc: HoleBc::Free },
+            ],
+        };
+        let placeholder = geometry.to_placeholder();
+        let n = 8192;
+        let fraction = 0.5;
+        let (a, b) = (geometry.half_w, geometry.half_h);
+        let hole_integral: f64 = geometry.holes.iter()
+            .map(|h| std::f64::consts::PI * h.radius.powi(4) / 2.0)
+            .sum();
+        let square_integral = (4.0 * a * b / 3.0) * (a * a + b * b);
+        let exact = square_integral - hole_integral;
+        let hole_area: f64 = geometry.holes.iter().map(|h| std::f64::consts::PI * h.radius * h.radius).sum();
+        let plate_area = 4.0 * a * b - hole_area;
+
+        let sampler = UserSamplingStrategy::new(geometry.clone(), 1e-3).with_hole_bias(fraction);
+        let pts = sampler.sample_interior(&placeholder, n);
+        let pts_norm: Vec<[f32; 2]> = pts.iter().map(|p| [(p[0] / a) as f32, (p[1] / b) as f32]).collect();
+        let weights = hole_bias_quadrature_weights(&pts_norm, &geometry, fraction);
+
+        let mean_w = weights.iter().sum::<f64>() / weights.len() as f64;
+        assert!((mean_w - 1.0).abs() < 1e-6, "compensation weights must average to 1.0, got {mean_w}");
+
+        let f = |p: &[f64; 2]| p[0] * p[0] + p[1] * p[1];
+        let weighted_mean: f64 = pts.iter().zip(&weights).map(|(p, &w)| f(p) * w).sum::<f64>() / pts.len() as f64;
+        let weighted_estimate = weighted_mean * plate_area;
+        let rel_err = (weighted_estimate - exact).abs() / exact.abs();
+        assert!(rel_err < 0.08,
+            "per-hole weighting must recover the true integral for unequal-radius Free holes: \
+             estimate={weighted_estimate:e} exact={exact:e} rel_err={rel_err}");
+
+        // Decisive regression proof: reconstruct the OLD pooled formula by hand and show it
+        // gives a measurably different (wrong) answer for these unequal-radius holes - if this
+        // ever stops being true, the fix has regressed back to the pooled behavior.
+        let bias_r2: Vec<f64> = geometry.holes.iter().map(|h| (3.0 * h.radius).powi(2)).collect();
+        let in_bias = |p: &[f64; 2]| -> bool {
+            geometry.holes.iter().zip(&bias_r2).any(|(hole, &r2)| {
+                let (dx, dy) = (p[0] - hole.center[0], p[1] - hole.center[1]);
+                dx * dx + dy * dy <= r2
+            })
+        };
+        let n_biased = pts.iter().filter(|p| in_bias(p)).count();
+        let n_remaining = pts.len() - n_biased;
+        let bias_area_total: f64 = geometry.holes.iter().zip(&bias_r2).map(|(h, &r2)| {
+            (std::f64::consts::PI * r2 - std::f64::consts::PI * h.radius * h.radius).max(0.0)
+        }).sum();
+        let remaining_area = (plate_area - bias_area_total).max(0.0);
+        let pooled_weights: Vec<f64> = {
+            let samples: Vec<pinn_core::amr::DensitySample> = pts.iter().map(|&p| {
+                let leaf_area = if in_bias(&p) {
+                    if n_biased > 0 { bias_area_total / n_biased as f64 } else { 0.0 }
+                } else if n_remaining > 0 {
+                    remaining_area / n_remaining as f64
+                } else { 0.0 };
+                pinn_core::amr::DensitySample { point: p, leaf_area }
+            }).collect();
+            pinn_core::amr::compensation_weights(&samples)
+        };
+        let pooled_mean: f64 = pts.iter().zip(&pooled_weights).map(|(p, &w)| f(p) * w).sum::<f64>() / pts.len() as f64;
+        let pooled_estimate = pooled_mean * plate_area;
+        let pooled_rel_err = (pooled_estimate - exact).abs() / exact.abs();
+        assert!(pooled_rel_err > rel_err + 0.002,
+            "the old pooled formula should be measurably WORSE than the per-hole fix for \
+             unequal-radius holes - pooled_rel_err={pooled_rel_err} vs fixed_rel_err={rel_err}; \
+             if these are close, the two formulas may have converged and this test needs revisiting");
     }
 
     /// Issue #77 Phase 1: real, tiny end-to-end training run proving the combined path
