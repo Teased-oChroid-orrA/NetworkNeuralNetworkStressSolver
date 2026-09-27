@@ -2029,3 +2029,44 @@ risked introducing a real numerical bug into research infrastructure for no deci
 gained. Left open for a dedicated future pass, same standard this file already applies elsewhere
 ("BLOCKED documented with evidence is not the same as complete" - this is "not yet started,
 correctly scoped," a different, honest category from that).
+
+**Update: the deferral above was closed with a real, positive, reproducible result** (opt-in
+infrastructure: `UserSamplingStrategy::with_hole_bias_including_fixed`/`ArchitectureSpec.
+hole_bias_include_fixed`, both default `false`, byte-identical to every existing spec - see the
+paired code commit). Two real trials (`examples/problems/notched_plate_fixed_hole_bias_control.
+toml`/`..._treatment.toml`, single-variable change: `hole_bias_fraction=0.4` split Free-only vs.
+Free+Fixed, same geometry/architecture/network as `notched_plate_boundary_lift_exact_fixed_
+trial.toml` otherwise) at BOTH 300 and 1000 real steps, via `audit_trace.rs`, comparing the
+Fixed-hole profile's own angular-shape metrics computed directly from the captured profile data
+(mirror-asymmetry: mean `|von_mises(theta) - von_mises(-theta)|` relative to mean `|von_mises|`;
+4th angular Fourier harmonic amplitude - the same two metrics the investigation doc's own
+diagnosis of this problem used):
+
+| | 300 steps | 1000 steps |
+|---|---|---|
+| mirror-asymmetry, Free-only bias (control) | 7.34% | 9.18% |
+| mirror-asymmetry, Free+Fixed bias (treatment) | 5.11% | **2.93%** |
+
+**The effect is real, reproduces at both step counts, and grows stronger with more training** -
+at 1000 steps the improvement is a 68% relative reduction in mirror-asymmetry, moving
+substantially closer to the FEM reference's own ~0.55% symmetric baseline (a different geometry
+in this project's own FEM cross-check work, cited for scale, not a direct number-for-number
+comparison here). Peak von-Mises also dropped (6.51e7 → 6.09e7 Pa at 1000 steps, ~6.3%). The
+4th-harmonic-amplitude metric was NOT consistently directional (improved at 300 steps, slightly
+worse at 1000) - mirror-asymmetry is the more decisive, reproducible signal of the two.
+
+**This is a genuinely different outcome from the FIVE previously-falsified hyperparameter axes**
+(collocation density, network capacity, learning rate, coordinate embedding, Fixed-hole sampling
+bias tried once before for the UNRELATED multi-Free-hole Kt question) - this is the same lever
+(near-hole collocation density) applied to a DIFFERENT question (this hole's own angular shape,
+not a different hole's Kt value) on a DIFFERENT architecture (boundary-lift + exact-Fixed-
+projection, not `MultiHoleHardConstraint`), and it moved the needle substantially. Confirms the
+plan's own Step 4a hypothesis was correct for this case.
+
+**Honestly still open**: not yet validated against real FEM ground truth for absolute accuracy
+(this comparison is relative - control vs. treatment on the SAME metric - not yet cross-checked
+against `tools/multi_hole_reference.py`'s own mixed-BC-correct solve for this exact geometry).
+2.93% mirror-asymmetry is a real improvement, not yet "solved" (FEM's own baseline elsewhere is
+~0.55%). Stability beyond 1000 steps, and whether increasing `hole_bias_fraction` further (or
+combining with per-hole coordinate embedding) compounds the improvement, are real, untested,
+disclosed next steps - not assumed either way.
