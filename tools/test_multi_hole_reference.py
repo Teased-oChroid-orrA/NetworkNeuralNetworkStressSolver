@@ -19,9 +19,77 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import numpy as np
 
 from multi_hole_reference import mesh, solve, validate_holes
+from compare_plate_trace import physical_acceptance, profile_metrics, reference_quality
 
 
 class MultiHoleReferenceTests(unittest.TestCase):
+    def test_physical_acceptance_needs_separate_force_energy_boundary_and_profile_gates(self):
+        spec = {"geometry": {"half_w": 0.1, "half_h": 0.05,
+                             "holes": [{"bc": "Free"}, {"bc": "Fixed"}]},
+                "material": {"e": 71.7e9}, "load": {"px": 69e6},
+                "training": {"fd_h": 1e-3}}
+        point = {key: 1.0 for key in ("x", "y", "ux", "uy", "sxx", "syy", "sxy", "von_mises")}
+        update = {"holes": [{"profile": [point], "refinement_converged": True,
+                             "angular_change": 0.01, "radial_change": 0.01} for _ in range(2)],
+                  "energy_balance": {"energy_balance_error": 0.01},
+                  "reaction_force": {"equilibrium_error": 0.01},
+                  "physical_boundary_residuals": {
+                      "outer_traction_pa": {"rms": 0.0},
+                      "free_hole_traction_pa": [[0, {"rms": 0.0}]],
+                      "fixed_hole_displacement_m": [[1, {"rms": 0.0}]],
+                  }}
+        hole = {"recovered": {"peak_relative_error": 0.01,
+                              "rms_error_over_reference_rms": 0.01},
+                "stress_components": {key: {"rms_error_over_reference_rms": 0.01}
+                                      for key in ("sxx", "syy", "sxy")},
+                "offset_traction_rms_difference_over_load": 0.01}
+        comparison = {"reference_quality": {"failures": [], "passed": True},
+                      "levels": [{"holes": [hole, hole]}], "training_stationarity": [0.01, 0.01],
+                      "energy_vs_fem_relative_error": 0.01}
+        companion = {"passed": True, "l0_passed": True, "operational_status": "PASS"}
+        summary = {"completed": True, "worker_ok": True, "nonfinite": False}
+        self.assertTrue(physical_acceptance(spec, update, comparison, companion, summary)["passed"])
+        update["energy_balance"]["energy_balance_error"] = 0.04
+        update["physical_boundary_residuals"]["fixed_hole_displacement_m"][0][1]["rms"] = 1e-6
+        verdict = physical_acceptance(spec, update, comparison, companion, summary)
+        self.assertFalse(verdict["passed"])
+        self.assertTrue(any("energy" in reason for reason in verdict["failures"]))
+        self.assertTrue(any("Fixed" in reason for reason in verdict["failures"]))
+
+    def test_reference_quality_requires_three_levels_and_estimator_agreement(self):
+        good = {mode: {"fem_profile_change_over_current_rms": 0.01}
+                for mode in ("fd", "element", "recovered")}
+        good["fd_vs_recovered_rms_over_recovered_rms"] = 0.01
+        good["reference_components"] = {
+            name: {"fem_profile_change_over_current_rms": 0.01,
+                   "fd_vs_recovered_rms_over_recovered_rms": 0.01}
+            for name in ("sxx", "syy", "sxy")
+        }
+        level = {"holes": [good]}
+        self.assertFalse(reference_quality([level, level])["passed"])
+        self.assertTrue(reference_quality([level, level, level])["passed"])
+        bad = {"holes": [{**good, "fd_vs_recovered_rms_over_recovered_rms": 0.08}]}
+        self.assertFalse(reference_quality([level, level, bad])["passed"])
+        bad_component = {"holes": [{**good, "reference_components": {
+            **good["reference_components"], "syy": {
+                "fem_profile_change_over_current_rms": 0.01,
+                "fd_vs_recovered_rms_over_recovered_rms": 0.053,
+            },
+        }}]}
+        verdict = reference_quality([level, level, bad_component])
+        self.assertFalse(verdict["passed"])
+        self.assertTrue(any("syy" in reason for reason in verdict["failures"]))
+
+    def test_profile_metrics_rejects_misalignment_and_detects_shape_error(self):
+        with self.assertRaises(ValueError):
+            profile_metrics([1.0, 2.0], [1.0])
+        exact = profile_metrics([1.0, 2.0, 3.0], [1.0, 2.0, 3.0])
+        self.assertEqual(exact["peak_relative_error"], 0.0)
+        self.assertEqual(exact["rms_error_over_reference_rms"], 0.0)
+        shifted = profile_metrics([1.0, 2.0, 3.0], [3.0, 1.0, 2.0])
+        self.assertEqual(shifted["peak_relative_error"], 0.0)
+        self.assertGreater(shifted["rms_error_over_reference_rms"], 0.0)
+
     def test_validate_holes_rejects_overlap(self):
         with self.assertRaises(ValueError):
             validate_holes(0.1, 0.1, [(-0.01, 0.0, 0.02), (0.01, 0.0, 0.02)])
@@ -56,6 +124,7 @@ class MultiHoleReferenceTests(unittest.TestCase):
         holes = [(-0.03, 0.0, 0.01), (0.03, 0.0, 0.008)]
         solution = solve(0.10, 0.05, holes, 71.7e9, 0.33, 69e6, 20, 3, 1.4)
         self.assertLess(solution.relative_work_error, 1e-9)
+        self.assertGreater(solution.strain_energy_per_thickness, 0.0)
 
     def test_solve_two_holes_kt_lands_in_a_physically_sane_range(self):
         # Not a converged-value assertion (see this file's own module doc comment) - just a
@@ -71,6 +140,20 @@ class MultiHoleReferenceTests(unittest.TestCase):
             result = solution.profile(i, fd_step=(fd_h * 0.10, fd_h * 0.05), radius=probe_r)
             self.assertGreater(result["kt_vm"], 1.0, f"hole {i}: Kt must exceed 1.0")
             self.assertLess(result["kt_vm"], 4.0, f"hole {i}: Kt implausibly far above the isolated-hole Kirsch value")
+
+    def test_full_profile_matches_summary_and_uses_requested_offset(self):
+        holes = [(-0.03, 0.0, 0.01), (0.03, 0.0, 0.008)]
+        solution = solve(0.10, 0.05, holes, 71.7e9, 0.33, 69e6, 24, 3, 1.0,
+                         bcs=["free", "fixed"])
+        radius = holes[0][2] + 0.0004
+        fd_step = (0.0001, 0.00005)
+        field = solution.profile_field(0, n_angles=72, fd_step=fd_step, radius=radius)
+        summary = solution.profile(0, n_angles=72, fd_step=fd_step, radius=radius)
+        self.assertEqual(len(field["theta_deg"]), 72)
+        np.testing.assert_allclose(np.hypot(field["x"] - holes[0][0], field["y"] - holes[0][1]), radius)
+        self.assertAlmostEqual(summary["kt_vm"], field["von_mises"].max() / solution.traction)
+        self.assertAlmostEqual(summary["kt_hoop"], field["hoop"].max() / solution.traction)
+        self.assertTrue(np.all(np.isfinite(field["traction"])))
 
     def test_solve_rejects_a_single_hole_too_close_to_the_edge(self):
         with self.assertRaises(ValueError):
@@ -109,6 +192,14 @@ class MultiHoleReferenceTests(unittest.TestCase):
         self.assertGreater(len(on_boundary), 0, "must find real mesh nodes on the fixed hole's boundary")
         boundary_disp = solution.displacement[on_boundary]
         np.testing.assert_allclose(boundary_disp, 0.0, atol=1e-15)
+
+    def test_fixed_hole_does_not_add_outer_pin_boundary_conditions(self):
+        holes = [(-0.03, 0.0, 0.01), (0.03, 0.0, 0.008)]
+        solution = solve(0.10, 0.05, holes, 71.7e9, 0.33, 69e6, 24, 3, 1.0,
+                         bcs=["free", "fixed"])
+        bottom_mid = np.argmin(np.sum((solution.nodes - [0.0, -0.05]) ** 2, axis=1))
+        self.assertGreater(abs(solution.displacement[bottom_mid, 0]), 1e-6,
+                           "Fixed hole anchors the plate; outer x pin would impose an extra BC")
 
     def test_solve_fixed_hole_changes_the_free_holes_own_stress_field(self):
         # A fixed hole is a real, coupled elasticity boundary condition - it must measurably

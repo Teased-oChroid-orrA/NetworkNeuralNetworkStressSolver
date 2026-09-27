@@ -24,14 +24,10 @@ GROUND-TRUTH tool than a hand-rolled one would be - the entire point of this fil
 independent check, so its own correctness risk has to be lower than what it's checking, not
 merely "no new pip installs."
 
-No symmetry to exploit means two real differences from `finite_plate_reference.py`: traction
-must be applied on BOTH the left and right edges (there marks only the right edge, relying on
-the reflection embedded in its own quarter-plate BCs to cover the left), and rigid-body motion
-(2 translations + 1 rotation, vs. that tool's 2 symmetry-fixed translations only) needs explicit
-pinning - this file pins ux=uy=0 at the midpoint of the left edge and uy=0 at the midpoint of
-the right edge (a standard statically-determinate "pin + roller" tension-specimen support),
-chosen on the OUTER boundary, far from every hole, so it cannot contaminate a near-hole Kt
-reading.
+No symmetry to exploit means traction must be applied on BOTH left and right edges. For an
+all-Free geometry, three symmetric outer constraints remove rigid-body modes. If any hole is
+Fixed, that hole already removes those modes; adding outer constraints would change the
+physical boundary-value problem and invalidate comparison with the PINN.
 """
 import argparse
 import json
@@ -98,6 +94,7 @@ class MultiHoleSolution:
     triangles: np.ndarray
     displacement: np.ndarray
     stress: np.ndarray
+    recovered_stress: np.ndarray
     constitutive: np.ndarray
     traction: float
     holes: list
@@ -115,8 +112,9 @@ class MultiHoleSolution:
     iterations: int
     relative_residual: float
     relative_work_error: float
+    strain_energy_per_thickness: float
 
-    def sample(self, points):
+    def sample(self, points, recovered=False):
         """Piecewise-linear displacement and element stress at arbitrary physical points, via
         the SAME Delaunay object's own point-location (`find_simplex`) - no bespoke candidate
         search needed, unlike `finite_plate_reference.py`'s polar-structured-mesh version."""
@@ -139,7 +137,7 @@ class MultiHoleSolution:
             w2 = (edge1[0] * diff[1] - edge1[1] * diff[0]) / det
             weights = np.array([1 - w1 - w2, w1, w2])
             uv = weights @ self.displacement[tri]
-            stress = self.stress[kept_idx]
+            stress = weights @ self.recovered_stress[tri] if recovered else self.stress[kept_idx]
             displacements.append(uv)
             stresses.append(stress)
         return np.asarray(displacements), np.asarray(stresses)
@@ -151,14 +149,27 @@ class MultiHoleSolution:
         CALLER must pass a `radius` with enough margin for the stencil to clear the hole on
         every side (mirrors `finite_plate_reference.py`'s own `probe_radius = radius +
         4*fd_h*max(half_w,half_h)` convention exactly - see `main()`'s own call site)."""
+        field = self.profile_field(hole_index, n_angles=n_angles, fd_step=fd_step, radius=radius)
+        return {"kt_hoop": float(field["hoop"].max() / self.traction),
+                "kt_vm": float(field["von_mises"].max() / self.traction)}
+
+    def profile_field(self, hole_index, n_angles=360, fd_step=None, radius=None, stress_mode="fd"):
+        """Full, angle-aligned physical field for comparison with a PINN ring probe.
+
+        Stress uses the same optional central displacement FD stencil as ``profile``.
+        Traction is reported at the requested radius; it is not a boundary-condition
+        residual when ``radius`` is offset from the actual hole boundary.
+        """
         cx, cy, hole_r = self.holes[hole_index]
         r = hole_r if radius is None else radius
         if fd_step is not None and r <= hole_r:
             raise ValueError(f"hole {hole_index}: an FD profile needs radius > the hole's own radius ({hole_r}) for stencil clearance, got {r}")
         theta = np.arange(n_angles) * 2 * math.pi / n_angles
         points = np.stack((cx + r * np.cos(theta), cy + r * np.sin(theta)), axis=1)
-        _, stress = self.sample(points)
-        if fd_step is not None:
+        if stress_mode not in ("fd", "element", "recovered"):
+            raise ValueError("stress_mode must be fd, element, or recovered")
+        displacement, stress = self.sample(points, recovered=stress_mode == "recovered")
+        if fd_step is not None and stress_mode == "fd":
             hx, hy = fd_step
             xp, _ = self.sample(points + [hx, 0])
             xm, _ = self.sample(points - [hx, 0])
@@ -170,7 +181,12 @@ class MultiHoleSolution:
         sx, sy, shear = stress.T
         hoop = sx * np.sin(theta) ** 2 - 2 * shear * np.sin(theta) * np.cos(theta) + sy * np.cos(theta) ** 2
         vm = np.sqrt(sx * sx - sx * sy + sy * sy + 3 * shear * shear)
-        return {"kt_hoop": float(hoop.max() / self.traction), "kt_vm": float(vm.max() / self.traction)}
+        tx = sx * np.cos(theta) + shear * np.sin(theta)
+        ty = shear * np.cos(theta) + sy * np.sin(theta)
+        return {"theta_deg": np.rad2deg(theta), "x": points[:, 0], "y": points[:, 1],
+                "ux": displacement[:, 0], "uy": displacement[:, 1],
+                "sxx": sx, "syy": sy, "sxy": shear, "hoop": hoop,
+                "von_mises": vm, "traction": np.hypot(tx, ty)}
 
 
 def solve(half_w, half_h, holes, young, nu, traction, n_theta, n_ring_layers, bg_spacing_factor=1.0, bcs=None):
@@ -244,18 +260,22 @@ def solve(half_w, half_h, holes, young, nu, traction, n_theta, n_ring_layers, bg
     # choice that doesn't privilege a side). Together removes exactly the 3 rigid-body DOFs
     # (2 translation + 1 rotation) the old scheme did, just via a symmetric set instead of an
     # asymmetric one.
-    left_edge = np.flatnonzero(np.abs(nodes[:, 0] + half_w) < 1e-9 * half_w)
-    right_edge = np.flatnonzero(np.abs(nodes[:, 0] - half_w) < 1e-9 * half_w)
-    bottom_edge = np.flatnonzero(np.abs(nodes[:, 1] + half_h) < 1e-9 * half_h)
-    if len(bottom_edge) == 0:
-        raise ValueError("no mesh nodes found on the bottom edge to anchor x-translation")
-    pin_left = left_edge[np.argmin(np.abs(nodes[left_edge, 1]))]
-    pin_right = right_edge[np.argmin(np.abs(nodes[right_edge, 1]))]
-    pin_bottom = bottom_edge[np.argmin(np.abs(nodes[bottom_edge, 0]))]
     free = np.ones(len(force), dtype=bool)
-    free[2 * pin_left + 1] = False
-    free[2 * pin_right + 1] = False
-    free[2 * pin_bottom] = False
+    # A Fixed hole already removes all three rigid-body modes. Extra outer pins would impose
+    # boundary conditions absent from the PINN problem and change the stress field. Retain
+    # the established symmetric gauge only for all-Free geometries.
+    if "fixed" not in bcs:
+        left_edge = np.flatnonzero(np.abs(nodes[:, 0] + half_w) < 1e-9 * half_w)
+        right_edge = np.flatnonzero(np.abs(nodes[:, 0] - half_w) < 1e-9 * half_w)
+        bottom_edge = np.flatnonzero(np.abs(nodes[:, 1] + half_h) < 1e-9 * half_h)
+        if len(bottom_edge) == 0:
+            raise ValueError("no mesh nodes found on the bottom edge to anchor x-translation")
+        pin_left = left_edge[np.argmin(np.abs(nodes[left_edge, 1]))]
+        pin_right = right_edge[np.argmin(np.abs(nodes[right_edge, 1]))]
+        pin_bottom = bottom_edge[np.argmin(np.abs(nodes[bottom_edge, 0]))]
+        free[2 * pin_left + 1] = False
+        free[2 * pin_right + 1] = False
+        free[2 * pin_bottom] = False
 
     # `bc == "fixed"`: zero-displacement Dirichlet constraint at every mesh node exactly on
     # that hole's own boundary ring (`_mesh_with_delaunay` always places the first ring layer
@@ -276,6 +296,17 @@ def solve(half_w, half_h, holes, young, nu, traction, n_theta, n_ring_layers, bg
     displacement, reaction, iterations, residual = element_pcg(stiffness, dofs, force, free)
     strains = np.einsum("eij,ej->ei", B, displacement[dofs])
     stress = strains @ D.T
+    # Area-weighted nodal patch recovery makes stress continuous across CST element edges.
+    # Retain raw element and displacement-FD stress as independent checks: recovery is an
+    # estimator, not permission to hide mesh or stencil disagreement.
+    recovered_stress = np.zeros((len(nodes), 3))
+    nodal_area = np.zeros(len(nodes))
+    for corner in range(3):
+        np.add.at(recovered_stress, triangles[:, corner], stress * areas[:, None])
+        np.add.at(nodal_area, triangles[:, corner], areas)
+    if np.any(nodal_area <= 0):
+        raise RuntimeError("FEM mesh contains a node with no stress-bearing element")
+    recovered_stress /= nodal_area[:, None]
     twice_energy = float(np.sum(areas * np.einsum("ei,ei->e", strains, stress)))
     work = float(displacement @ force)
     work_error = abs(twice_energy - work) / abs(work)
@@ -284,8 +315,9 @@ def solve(half_w, half_h, holes, young, nu, traction, n_theta, n_ring_layers, bg
     if np.linalg.norm(balance) / ref_force > 1e-6 or work_error > 1e-6:
         raise RuntimeError("FEM reaction balance or strain-energy identity failed")
 
-    return MultiHoleSolution(nodes, triangles, displacement.reshape(-1, 2), stress, D, traction,
-                              holes, bcs, delaunay, simplex_to_kept, iterations, residual, work_error)
+    return MultiHoleSolution(nodes, triangles, displacement.reshape(-1, 2), stress, recovered_stress, D, traction,
+                              holes, bcs, delaunay, simplex_to_kept, iterations, residual, work_error,
+                              0.5 * twice_energy)
 
 
 def _mesh_with_delaunay(half_w, half_h, holes, n_theta, n_ring_layers, bg_spacing_factor):
