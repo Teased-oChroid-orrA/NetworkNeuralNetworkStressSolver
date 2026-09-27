@@ -81,9 +81,30 @@ fn main() -> anyhow::Result<()> {
                     "legacy_neumann_channel":u.neumann_loss,"grad_norm":u.grad_norm,"lr":u.lr,"n_colloc":u.n_colloc,
                     "objective":u.objective,"energy_balance":u.energy_balance,"reaction_force":u.reaction_force,
                     "bc_rms":if u.vis.is_some(){Some(u.bc_residual_rms)}else{None},
+                    "physical_boundary_residuals":u.physical_boundary_residuals,
+                    "no_hole_benchmark":u.no_hole_benchmark.as_ref().map(|b| serde_json::json!({
+                        "passed":b.passed,"l0_passed":b.l0_passed,
+                        "operational_status":b.operational_status,"failure_reasons":b.failure_reasons,
+                        "sigma_xx_relative_error":b.sigma_xx_relative_error,
+                        "sigma_yy_over_ref":b.sigma_yy_over_reference,
+                        "sigma_xy_over_ref":b.sigma_xy_over_reference,
+                        "traction_rms_over_ref":b.traction_rms_over_reference,
+                        "load_transfer_ratio":b.load_transfer_ratio,
+                    })),
                     "gradient_shares":u.gradient_share_report.as_ref().map(|g| &g.shares),
                     "gradient_conflicts":u.gradient_conflict_report.as_ref().map(|g| &g.pairs),
-                    "holes":u.hole_analyses.iter().map(|h| serde_json::json!({"index":h.hole_index,"kt":h.concentration.kt})).collect::<Vec<_>>() });
+                    "holes":u.hole_analyses.iter().map(|h| serde_json::json!({
+                        "index":h.hole_index,"kt":h.concentration.kt,
+                        "peak_angle_deg":h.concentration.max_theta_deg,
+                        "angular_change":h.concentration.angular_refinement_relative_change,
+                        "radial_change":h.concentration.radial_offset_refinement_relative_change,
+                        "refinement_converged":h.concentration.refinement_converged,
+                        "profile":h.profile.iter().map(|p| serde_json::json!({
+                            "theta_deg":p.theta_deg,"x":p.x,"y":p.y,"ux":p.ux,"uy":p.uy,
+                            "sxx":p.sxx,"syy":p.syy,"sxy":p.sxy,
+                            "von_mises":p.von_mises,
+                        })).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>() });
                 serde_json::to_writer(&mut stream, &row)?;
                 writeln!(stream)?;
             }

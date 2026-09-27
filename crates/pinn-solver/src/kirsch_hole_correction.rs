@@ -167,6 +167,14 @@ pub fn traction_free_envelope_scaled(x: f64, y: f64, a: f64, saturation_scale: f
     1.0 - (-(u * u)).exp()
 }
 
+/// Weight for subtracting the unmodified field's trace on a Fixed circle.
+/// Zero slope at the circle leaves its radial strain controlled by the field,
+/// independently of the value subtracted to enforce zero displacement.
+pub(crate) fn fixed_trace_projection_weight(distance: f64, width: f64) -> f64 {
+    let t = (distance / width).clamp(0.0, 1.0);
+    1.0 - 3.0 * t * t + 2.0 * t * t * t
+}
+
 /// [`pinn_core::problem::DirichletAnsatz`] for the annulus domain's hard-constraint mode:
 /// `eval` returns [`traction_free_envelope`] (same value for both u,v columns — a single
 /// scalar suppression, not independently tuned per axis) as the multiplicative scale on the
@@ -256,6 +264,11 @@ impl pinn_core::problem::DirichletAnsatz for HoleTractionFreeAnsatz {
 pub enum AnnulusAnsatz {
     Identity,
     HardConstraint(HoleTractionFreeAnsatz),
+    /// Single circular Free boundary with learned displacement trace. The shared
+    /// solver forward operator supplies the traction-compatible radial derivative.
+    BoundaryLift { hole: HoleTractionFreeAnsatz, fixed: Option<pinn_core::problem::FixedHoleProjection> },
+    /// Exact circular Fixed trace projection without a Free-hole lift.
+    FixedProjection(pinn_core::problem::FixedHoleProjection),
     /// Issue #78 (multi-hole Kt): N≥1 Free holes, each contributing its own isolated-hole
     /// closed form — see [`multi_hole_eval`]/[`multi_hole_additive`]'s own doc comments for
     /// the combination rule and the real, disclosed accuracy consequence of N>1 (the
@@ -320,6 +333,8 @@ impl pinn_core::problem::DirichletAnsatz for AnnulusAnsatz {
         match self {
             AnnulusAnsatz::Identity => (1.0, 1.0),
             AnnulusAnsatz::HardConstraint(a) => a.eval(xn, yn, k),
+            AnnulusAnsatz::BoundaryLift { hole, .. } => hole.eval(xn, yn, k),
+            AnnulusAnsatz::FixedProjection(_) => (1.0, 1.0),
             AnnulusAnsatz::MultiHoleHardConstraint(holes) => multi_hole_eval(holes, xn, yn, k),
         }
     }
@@ -327,6 +342,8 @@ impl pinn_core::problem::DirichletAnsatz for AnnulusAnsatz {
         match self {
             AnnulusAnsatz::Identity => (0.0, 0.0),
             AnnulusAnsatz::HardConstraint(a) => a.additive(xn, yn),
+            AnnulusAnsatz::BoundaryLift { hole, .. } => hole.additive(xn, yn),
+            AnnulusAnsatz::FixedProjection(_) => (0.0, 0.0),
             AnnulusAnsatz::MultiHoleHardConstraint(holes) => multi_hole_additive(holes, xn, yn),
         }
     }
@@ -334,6 +351,8 @@ impl pinn_core::problem::DirichletAnsatz for AnnulusAnsatz {
         match self {
             AnnulusAnsatz::Identity => None,
             AnnulusAnsatz::HardConstraint(a) => a.saturation_scale_near(hole_center),
+            AnnulusAnsatz::BoundaryLift { hole, .. } => hole.saturation_scale_near(hole_center),
+            AnnulusAnsatz::FixedProjection(_) => None,
             AnnulusAnsatz::MultiHoleHardConstraint(holes) => {
                 holes.iter().find_map(|h| h.saturation_scale_near(hole_center))
             }
@@ -343,6 +362,7 @@ impl pinn_core::problem::DirichletAnsatz for AnnulusAnsatz {
         match self {
             AnnulusAnsatz::Identity => None,
             AnnulusAnsatz::HardConstraint(a) => a.trainable_envelope_holes(),
+            AnnulusAnsatz::BoundaryLift { .. } | AnnulusAnsatz::FixedProjection(_) => None,
             AnnulusAnsatz::MultiHoleHardConstraint(holes) => {
                 // Every trainable hole contributes its own entry, in `holes`' own order - this
                 // order is load-bearing: the CALLER indexes the owning model's `hole_scales:
@@ -354,11 +374,48 @@ impl pinn_core::problem::DirichletAnsatz for AnnulusAnsatz {
             }
         }
     }
+    fn traction_free_lift(&self) -> Option<pinn_core::problem::TractionFreeLift> {
+        let AnnulusAnsatz::BoundaryLift { hole, .. } = self else { return None };
+        Some(pinn_core::problem::TractionFreeLift {
+            center: hole.hole_center, radius: hole.hole_radius,
+            half_w: hole.half_w, half_h: hole.half_h, nu: hole.nu,
+        })
+    }
+    fn fixed_hole_projection(&self) -> Option<pinn_core::problem::FixedHoleProjection> {
+        match self {
+            AnnulusAnsatz::BoundaryLift { fixed, .. } => fixed.clone(),
+            AnnulusAnsatz::FixedProjection(mask) => Some(mask.clone()),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_trace_projection_preserves_independent_radial_strain() {
+        let fixed = pinn_core::problem::FixedCircle {
+            center: [0.03, 0.0], radius: 0.008, transition_width: 0.008,
+        };
+        let weight = |distance| fixed_trace_projection_weight(distance, fixed.transition_width);
+        assert_eq!(weight(0.0), 1.0);
+        assert_eq!(weight(fixed.transition_width), 0.0);
+        assert_eq!(weight(0.07), 0.0);
+        // Two fields with the same boundary value but different radial strains
+        // must retain those independent strains after zeroing displacement.
+        let projected = |distance: f64, strain: f64| {
+            let boundary_value = 2.0;
+            boundary_value + strain * distance - weight(distance) * boundary_value
+        };
+        assert_eq!(projected(0.0, 3.0), 0.0);
+        let h = 1e-10;
+        for strain in [0.5, 3.0] {
+            let slope = (projected(h, strain) - projected(0.0, strain)) / h;
+            assert!((slope - strain).abs() < 1e-4);
+        }
+    }
 
     const E: f64 = 71.7e9;
     const NU: f64 = 0.33;

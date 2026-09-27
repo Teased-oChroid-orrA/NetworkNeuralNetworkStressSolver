@@ -1456,6 +1456,68 @@ fn trainable_envelope_hole_phi_tensor<Bk: Backend<Device = BDevice>>(
     neg_u2.exp().mul_scalar(-1.0).add_scalar(1.0)
 }
 
+/// Lift a learned circular boundary displacement into a plane-stress traction-free
+/// field. At r=a, beta=1 and beta'=phi=phi'=0. For boundary trace g(theta),
+/// radial derivative h is set by sigma_rr=sigma_rtheta=0:
+/// h_r=-nu*(g_r+partial_theta g_theta)/a,
+/// h_theta=(g_theta-partial_theta g_r)/a.
+/// Cartesian derivatives below are the same relation after basis differentiation.
+fn traction_free_boundary_lift<Bk: Backend<Device = BDevice>>(
+    model: &ElasticityNet<Bk>, norm_locations: &[[f32; 2]],
+    hole: pinn_core::problem::TractionFreeLift, embedding: CoordinateEmbedding,
+    forward_mask: Option<&[bool]>, device: &BDevice,
+) -> (Tensor<Bk, 2>, Tensor<Bk, 2>) {
+    const ANGLE_STEP: f64 = 0.01;
+    let m = norm_locations.len();
+    let mut boundary = Vec::with_capacity(3 * m);
+    let mut shifted_plus = Vec::with_capacity(m);
+    let mut shifted_minus = Vec::with_capacity(m);
+    let mut cosines = Vec::with_capacity(m);
+    let mut sines = Vec::with_capacity(m);
+    let mut distances = Vec::with_capacity(m);
+    let mut decays = Vec::with_capacity(m);
+    for [xn, yn] in norm_locations {
+        let x = *xn as f64 * hole.half_w - hole.center[0];
+        let y = *yn as f64 * hole.half_h - hole.center[1];
+        let r = x.hypot(y);
+        assert!(r > 0.0, "boundary lift cannot evaluate a hole center");
+        let (s, c) = (y / r, x / r);
+        let theta = y.atan2(x);
+        let normalized = |angle: f64| {
+            [((hole.center[0] + hole.radius * angle.cos()) / hole.half_w) as f32,
+             ((hole.center[1] + hole.radius * angle.sin()) / hole.half_h) as f32]
+        };
+        boundary.push(normalized(theta));
+        shifted_plus.push(normalized(theta + ANGLE_STEP));
+        shifted_minus.push(normalized(theta - ANGLE_STEP));
+        cosines.push(c as f32);
+        sines.push(s as f32);
+        let distance = r - hole.radius;
+        distances.push(distance as f32);
+        decays.push((-(distance / hole.radius).powi(2)).exp() as f32);
+    }
+    boundary.extend(shifted_plus);
+    boundary.extend(shifted_minus);
+    let boundary_t = norm_pts_to_tensor::<Bk>(&boundary, device);
+    let trace = fwd_embedded_masked::<Bk>(model, boundary_t, embedding, device, forward_mask);
+    let column = |start: usize, col: usize| trace.clone().slice([start..start + m, col..col + 1]);
+    let gx = column(0, 0);
+    let gy = column(0, 1);
+    let dgx = (column(m, 0) - column(2 * m, 0)).div_scalar(2.0 * ANGLE_STEP);
+    let dgy = (column(m, 1) - column(2 * m, 1)).div_scalar(2.0 * ANGLE_STEP);
+    let scalar = |values: Vec<f32>| Tensor::<Bk, 2>::from_data(TensorData::new(values, vec![m, 1]), device);
+    let c = scalar(cosines);
+    let s = scalar(sines);
+    let d = scalar(distances);
+    let beta = scalar(decays);
+    let h_r = (s.clone() * dgx.clone() - c.clone() * dgy.clone())
+        .mul_scalar(hole.nu / hole.radius);
+    let h_t = (c.clone() * dgx + s.clone() * dgy).mul_scalar(-1.0 / hole.radius);
+    let hx = c.clone() * h_r.clone() - s.clone() * h_t.clone();
+    let hy = s * h_r + c * h_t;
+    ((gx + d.clone() * hx) * beta.clone(), (gy + d * hy) * beta)
+}
+
 pub(crate) fn stencil_forward_with_ansatz<Bk: Backend<Device = BDevice>>(
     model: &ElasticityNet<Bk>,
     ansatz: &dyn DirichletAnsatz,
@@ -1537,8 +1599,75 @@ pub(crate) fn stencil_forward_with_ansatz<Bk: Backend<Device = BDevice>>(
         dy_t = dy_t * phi_product;
     }
 
-    let u_col = raw_net.clone().slice([0..m, 0..1]) * dx_t + add_x_t;
-    let v_col = raw_net.clone().slice([0..m, 1..2]) * dy_t + add_y_t;
+    let lifted = ansatz.traction_free_lift().map(|hole| {
+        let mut locations = Vec::with_capacity(m);
+        for &(sx, sy) in &[(0.0f32, 0.0f32), (fd.hx, 0.0), (-fd.hx, 0.0), (0.0, fd.hy), (0.0, -fd.hy)] {
+            locations.extend(norm_pts.iter().map(|p| [p[0] + sx, p[1] + sy]));
+        }
+        traction_free_boundary_lift(model, &locations, hole, model_embedding.clone(), forward_mask, device)
+    });
+    let mut u_col = raw_net.clone().slice([0..m, 0..1]) * dx_t + add_x_t;
+    let mut v_col = raw_net.clone().slice([0..m, 1..2]) * dy_t + add_y_t;
+    if let Some((lift_x, lift_y)) = lifted {
+        u_col = u_col + lift_x;
+        v_col = v_col + lift_y;
+    }
+    if let Some(projection) = ansatz.fixed_hole_projection() {
+        // Project the complete pre-Fixed field onto zero displacement. Multiplying
+        // that field by a mask instead would set its boundary radial strain to
+        // field_value / transition_width, making support stress depend on an
+        // arbitrary transition width. Subtracting its angular boundary trace
+        // with a zero-slope weight preserves the field's learned radial strain.
+        let [exx, eyy, exy] = projection.background_strain;
+        for circle in &projection.circles {
+            let mut projected = Vec::with_capacity(m);
+            let mut weights = Vec::with_capacity(m);
+            let mut boundary_x = Vec::with_capacity(m);
+            let mut boundary_y = Vec::with_capacity(m);
+            let mut scales_x = Vec::with_capacity(m);
+            let mut scales_y = Vec::with_capacity(m);
+            let mut add_x = Vec::with_capacity(m);
+            let mut add_y = Vec::with_capacity(m);
+            for &(sx, sy) in &[(0.0f32, 0.0f32), (fd.hx, 0.0), (-fd.hx, 0.0), (0.0, fd.hy), (0.0, -fd.hy)] {
+                for p in norm_pts {
+                    let x = (p[0] + sx) as f64 * projection.half_w - circle.center[0];
+                    let y = (p[1] + sy) as f64 * projection.half_h - circle.center[1];
+                    let r = x.hypot(y);
+                    assert!(r > 0.0, "Fixed trace projection cannot evaluate a circle center");
+                    let bx = circle.center[0] + circle.radius * x / r;
+                    let by = circle.center[1] + circle.radius * y / r;
+                    let xn = (bx / projection.half_w) as f32;
+                    let yn = (by / projection.half_h) as f32;
+                    projected.push([xn, yn]);
+                    weights.push(crate::kirsch_hole_correction::fixed_trace_projection_weight(
+                        r - circle.radius, circle.transition_width) as f32);
+                    boundary_x.push(((exx * bx + exy * by) / u_ref) as f32);
+                    boundary_y.push(((exy * bx + eyy * by) / u_ref) as f32);
+                    let (dx, dy) = ansatz.eval(xn, yn, k);
+                    scales_x.push(dx);
+                    scales_y.push(dy);
+                    let (ax, ay) = ansatz.additive(xn, yn);
+                    add_x.push(ax);
+                    add_y.push(ay);
+                }
+            }
+            let trace = fwd_embedded_masked::<Bk>(model, norm_pts_to_tensor::<Bk>(&projected, device),
+                model_embedding.clone(), device, forward_mask);
+            let column = |col: usize| trace.clone().slice([0..m, col..col + 1]);
+            let tensor = |values: Vec<f32>| Tensor::<Bk, 2>::from_data(TensorData::new(values, vec![m, 1]), device);
+            let mut trace_x = column(0) * tensor(scales_x) + tensor(add_x) + tensor(boundary_x);
+            let mut trace_y = column(1) * tensor(scales_y) + tensor(add_y) + tensor(boundary_y);
+            if let Some(hole) = ansatz.traction_free_lift() {
+                let (lift_x, lift_y) = traction_free_boundary_lift(model, &projected, hole,
+                    model_embedding.clone(), forward_mask, device);
+                trace_x = trace_x + lift_x;
+                trace_y = trace_y + lift_y;
+            }
+            let weight = tensor(weights);
+            u_col = u_col - weight.clone() * trace_x;
+            v_col = v_col - weight * trace_y;
+        }
+    }
     let ansatz_out = if is_mdem {
         let s_xx = raw_net.clone().slice([0..m, 2..3]);
         let s_yy = raw_net.clone().slice([0..m, 3..4]);

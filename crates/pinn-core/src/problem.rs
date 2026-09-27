@@ -132,6 +132,42 @@ pub trait DirichletAnsatz: Send + Sync {
     /// keeps its envelope host-computed - every pre-existing implementor is unaffected, same
     /// precedent as `additive`/`saturation_scale_near` above.
     fn trainable_envelope_holes(&self) -> Option<Vec<TrainableEnvelopeHole>> { None }
+
+    /// Optional circular traction-free boundary lift. The solver evaluates the network's
+    /// boundary trace and its angular derivative, then supplies the radial derivative
+    /// required by plane-stress traction-free elasticity. Unlike a scalar envelope,
+    /// this leaves tangential boundary strain trainable.
+    fn traction_free_lift(&self) -> Option<TractionFreeLift> { None }
+
+    /// Optional compact-support exact Dirichlet projection for Fixed circles.
+    /// It subtracts the total field's boundary trace, including affine background,
+    /// without suppressing its independently learned radial derivative.
+    fn fixed_hole_projection(&self) -> Option<FixedHoleProjection> { None }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TractionFreeLift {
+    pub center: [f64; 2],
+    pub radius: f64,
+    pub half_w: f64,
+    pub half_h: f64,
+    pub nu: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FixedCircle {
+    pub center: [f64; 2],
+    pub radius: f64,
+    pub transition_width: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixedHoleProjection {
+    pub circles: Vec<FixedCircle>,
+    pub half_w: f64,
+    pub half_h: f64,
+    /// Background displacement is affine in global physical coordinates.
+    pub background_strain: [f64; 3], // exx, eyy, exy
 }
 
 /// One hole's worth of geometry needed to compute its `traction_free_envelope_scaled`-style

@@ -1,0 +1,47 @@
+# Capacity and quadrature-budget screen for the opt-in Free lift / Fixed projection.
+# Geometry, material, loading, boundary operators, and FD probe match the control.
+formulation = "Variational"
+
+[geometry]
+half_w = 0.10
+half_h = 0.05
+thickness = 0.005
+
+[[geometry.holes]]
+center = [-0.03, 0.0]
+radius = 0.01
+bc = "Free"
+
+[[geometry.holes]]
+center = [0.03, 0.0]
+radius = 0.008
+bc = "Fixed"
+
+[material]
+e = 71.7e9
+nu = 0.33
+density = 2810.0
+ultimate_strength_pa = 503e6
+
+[load]
+px = 6.9e7
+py = 0.0
+
+[network]
+hidden_dim = 64
+n_hidden = 8
+
+[architecture]
+hard_constraint_ansatz = true
+free_boundary_lifting = true
+hard_fixed_holes = true
+training_procedure = "SingleDomain"
+
+[training]
+max_steps = 3000
+n_interior = 4096
+n_boundary = 2048
+fd_h = 1e-3
+lr = 1e-3
+measure_aware_training = true
+amr_enabled = true

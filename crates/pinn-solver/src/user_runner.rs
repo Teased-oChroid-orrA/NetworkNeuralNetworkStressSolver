@@ -1119,6 +1119,13 @@ pub fn run_user_problem_training_with_diagnostics(
 pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
     use pinn_core::problem_spec::{CoordinateEmbeddingSelection, TrainingProcedure};
 
+    assert!(!spec.architecture.free_boundary_lifting
+        || spec.architecture.training_procedure == TrainingProcedure::SingleDomain,
+        "free boundary lifting requires SingleDomain training procedure");
+    assert!(!spec.architecture.hard_fixed_holes
+        || spec.architecture.training_procedure == TrainingProcedure::SingleDomain,
+        "exact Fixed-hole mask requires SingleDomain training procedure");
+
     // Issue #77 PH4-45: same architecture dispatch as `runner::run_training_user_problem`
     // (GUI), see that function's own comment - kept as two independent call sites (headless
     // has no `Sender<TrainingMsg>`/GUI vis grid to stream into), same precedent as every other

@@ -248,6 +248,18 @@ pub struct ArchitectureSpec {
     /// under `Joint` with it, or Stage B's annulus domain under `SequentialTwoStage`).
     #[serde(default)]
     pub hard_constraint_ansatz: bool,
+    /// Opt-in single-domain circular Free-boundary lift. Requires exactly one Free hole,
+    /// Variational formulation, and `hard_constraint_ansatz=true`. Existing specs retain
+    /// their original ansatz. The lift admits learned hoop strain while keeping Free-hole
+    /// normal and shear traction zero by construction.
+    #[serde(default)]
+    pub free_boundary_lifting: bool,
+    /// Apply exact zero-displacement trace projection at circular Fixed holes.
+    /// Compact support leaves other boundaries unchanged; zero projection-weight
+    /// slope at the support leaves radial strain trainable. Requires Variational
+    /// formulation. Defaults off for checkpoint and baseline compatibility.
+    #[serde(default)]
+    pub hard_fixed_holes: bool,
     /// Phase 1's near-hole stratified-sampling bias fraction (`UserSamplingStrategy::
     /// with_hole_bias`), quadrature-compensated via `hole_bias_quadrature_weights` (PH4-41
     /// finding 2's fix) so the energy integral stays correct under the resulting non-uniform
@@ -335,7 +347,10 @@ mod tests {
     #[test]
     fn shipped_plate_example_specs_parse() {
         let examples_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/problems");
-        for name in ["notched_plate.toml", "single_hole_plate.toml", "triple_hole_plate.toml", "biaxial_steel_plate.toml"] {
+        for name in ["notched_plate.toml", "notched_plate_boundary_lift_trial.toml",
+                     "notched_plate_boundary_lift_exact_fixed_trial.toml",
+                     "notched_no_hole_variational_companion.toml",
+                     "single_hole_plate.toml", "triple_hole_plate.toml", "biaxial_steel_plate.toml"] {
             let path = examples_dir.join(name);
             let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
             let spec: ProblemSpec = toml::from_str(&contents).unwrap_or_else(|e| panic!("failed to parse {path:?}: {e}"));
@@ -487,6 +502,8 @@ mod tests {
     fn architecture_spec_default_is_the_pre_existing_dispatch() {
         let a = ArchitectureSpec::default();
         assert!(!a.hard_constraint_ansatz);
+        assert!(!a.free_boundary_lifting);
+        assert!(!a.hard_fixed_holes);
         assert_eq!(a.hole_bias_fraction, 0.0);
         assert_eq!(a.coordinate_embedding, CoordinateEmbeddingSelection::Cartesian);
         assert_eq!(a.training_procedure, TrainingProcedure::Joint);
@@ -509,6 +526,8 @@ mod tests {
                 coordinate_embedding: CoordinateEmbeddingSelection::LogPolar,
                 training_procedure: TrainingProcedure::SequentialTwoStage { stage_a_steps: 500, stage_b_steps: 2500 },
                 trainable_saturation_scale: false,
+                free_boundary_lifting: false,
+                hard_fixed_holes: false,
             },
             ArchitectureSpec { hard_constraint_ansatz: true, trainable_saturation_scale: true, ..Default::default() },
         ] {

@@ -280,6 +280,38 @@ fn free_holes(spec: &ProblemSpec) -> Vec<&HoleSpec> {
     spec.geometry.holes.iter().filter(|h| h.bc == HoleBc::Free).collect()
 }
 
+fn exact_fixed_projection(spec: &ProblemSpec, affine_background: bool) -> pinn_core::problem::FixedHoleProjection {
+    use pinn_core::problem::{FixedCircle, FixedHoleProjection};
+    let geometry = &spec.geometry;
+    let mut circles = Vec::new();
+    let stencil_reach = spec.training.fd_h as f64 * geometry.half_w.max(geometry.half_h);
+    for hole in geometry.holes.iter().filter(|hole| hole.bc == HoleBc::Fixed) {
+        let mut clearance = (geometry.half_w - hole.center[0].abs() - hole.radius)
+            .min(geometry.half_h - hole.center[1].abs() - hole.radius);
+        for other in &geometry.holes {
+            if std::ptr::eq(hole, other) { continue; }
+            clearance = clearance.min(
+                (hole.center[0] - other.center[0]).hypot(hole.center[1] - other.center[1])
+                    - hole.radius - other.radius,
+            );
+        }
+        // The radius is a geometric compact-support scale, not an FD-resolution
+        // knob. The trace projection has zero slope at the support, so this
+        // width no longer sets boundary strain as the former multiplier did.
+        // Half-clearance keeps its correction off every other boundary.
+        let transition_width = (clearance * 0.5).min(hole.radius);
+        assert!(transition_width > 4.0 * stencil_reach,
+            "exact Fixed-hole projection needs boundary clearance resolved by the FD stencil");
+        circles.push(FixedCircle { center: hole.center, radius: hole.radius, transition_width });
+    }
+    assert!(!circles.is_empty(), "hard_fixed_holes requires at least one Fixed hole");
+    let background_strain = if affine_background {
+        let (exx, eyy, exy) = affine_strain(spec.load.px, spec.load.py, &spec.material);
+        [exx, eyy, exy]
+    } else { [0.0; 3] };
+    FixedHoleProjection { circles, half_w: geometry.half_w, half_h: geometry.half_h, background_strain }
+}
+
 /// Points sampled around each hole's circumference, per hole — a fixed, generous default;
 /// not user-configurable in v1 (see `ProblemSpec`'s scope note).
 const HOLE_RING_POINTS: usize = 64;
@@ -2072,6 +2104,20 @@ impl UserDefinedProblem {
     /// `multi_hole_reduces_to_single_hole_hard_constraint_when_n_equals_one`
     /// (`kirsch_hole_correction.rs`) for the byte-identical-output proof.
     pub fn new_with_hard_constraint_ansatz(spec: ProblemSpec, use_hard_constraint: bool, hole_bias_fraction: f64) -> Self {
+        if spec.architecture.free_boundary_lifting {
+            assert!(use_hard_constraint, "free boundary lifting requires hard_constraint_ansatz");
+            assert!(matches!(spec.formulation, pinn_core::problem_spec::FormulationSelection::Variational),
+                "free boundary lifting currently requires Variational formulation");
+            assert_eq!(free_holes(&spec).len(), 1,
+                "free boundary lifting currently supports exactly one circular Free hole");
+            assert!(!spec.architecture.trainable_saturation_scale,
+                "free boundary lifting cannot combine with trainable saturation scale");
+        }
+        assert!(!spec.architecture.hard_fixed_holes || !use_hard_constraint || spec.architecture.free_boundary_lifting,
+            "hard Fixed holes with a hard Free ansatz require free boundary lifting");
+        assert!(!spec.architecture.hard_fixed_holes
+            || matches!(spec.formulation, pinn_core::problem_spec::FormulationSelection::Variational),
+            "exact Fixed-hole projection currently requires Variational formulation");
         let mut problem = Self::new(spec.clone());
         if hole_bias_fraction > 0.0 {
             problem.sampling = problem.sampling.with_hole_bias(hole_bias_fraction);
@@ -2113,7 +2159,19 @@ impl UserDefinedProblem {
                     u_ref: scales.u_ref as f64, saturation_scale, trainable,
                 }
             }).collect();
-            problem.ansatz = crate::kirsch_hole_correction::AnnulusAnsatz::MultiHoleHardConstraint(sub_ansatzes);
+            let mut sub_ansatzes: Vec<_> = sub_ansatzes;
+            problem.ansatz = if spec.architecture.free_boundary_lifting {
+                crate::kirsch_hole_correction::AnnulusAnsatz::BoundaryLift {
+                    hole: sub_ansatzes.remove(0),
+                    fixed: spec.architecture.hard_fixed_holes.then(|| exact_fixed_projection(&spec, true)),
+                }
+            } else {
+                crate::kirsch_hole_correction::AnnulusAnsatz::MultiHoleHardConstraint(sub_ansatzes)
+            };
+        } else if spec.architecture.hard_fixed_holes {
+            problem.ansatz = crate::kirsch_hole_correction::AnnulusAnsatz::FixedProjection(
+                exact_fixed_projection(&spec, false),
+            );
         }
         problem
     }
@@ -2131,7 +2189,8 @@ impl UserDefinedProblem {
     pub(crate) fn hard_constraint_active(&self) -> bool {
         matches!(self.ansatz,
             crate::kirsch_hole_correction::AnnulusAnsatz::HardConstraint(_)
-                | crate::kirsch_hole_correction::AnnulusAnsatz::MultiHoleHardConstraint(_))
+                | crate::kirsch_hole_correction::AnnulusAnsatz::MultiHoleHardConstraint(_)
+                | crate::kirsch_hole_correction::AnnulusAnsatz::BoundaryLift { .. })
     }
 
     pub fn spec(&self) -> &ProblemSpec { &self.spec }
@@ -2316,6 +2375,9 @@ impl BoundaryValueProblem for UserDefinedProblem {
         let (mut free_occurrence, mut fixed_occurrence) = (0usize, 0usize);
         for (i, (hole, &name)) in self.spec.geometry.holes.iter().zip(self.hole_names.iter()).enumerate() {
             if hole.bc == HoleBc::Fixed || hole_free_active {
+                if hole.bc == HoleBc::Fixed && self.spec.architecture.hard_fixed_holes {
+                    continue;
+                }
                 let use_decomposed = decomposed && hole.bc == HoleBc::Free;
                 // Issue #77 Phase 1: under the hard-constraint ansatz the traction-free
                 // condition is already exact by construction (`kirsch_hole_correction`'s own
@@ -6904,6 +6966,30 @@ mod tests {
     }
 
     #[test]
+    fn persistent_adaptive_samples_keep_finite_difference_arms_outside_holes() {
+        let geometry = two_hole_geometry();
+        let collocation_geometry = geometry.inflated_for_collocation(
+            ring_anchor_margin_m(TEST_FD_H, &geometry));
+        let cfg = pinn_core::amr::derive_amr_config(
+            (-geometry.half_w, geometry.half_w, -geometry.half_h, geometry.half_h),
+            &pinn_core::amr::AmrDomain::lock_zones(&collocation_geometry),
+        );
+        let mut grid = pinn_core::amr::AdaptiveGrid::<UserGeometry>::new(&collocation_geometry, cfg);
+        let mut data = crate::problem::DomainStepData {
+            id: USER_DOMAIN, int_norm: uniform_int_norm(2048), extra_ring_norm: Vec::new(),
+            named: std::collections::HashMap::new(),
+        };
+        apply_persistent_adaptive_interior_sample(
+            &mut data, &geometry, TEST_FD_H, geometry.half_w, geometry.half_h, Some(&mut grid), 0,
+        );
+        let sampler = UserSamplingStrategy::new(geometry.clone(), TEST_FD_H);
+        let unsafe_count = data.int_norm.iter().filter(|&&[xn, yn]| {
+            !sampler.contains_for_collocation(xn as f64 * geometry.half_w, yn as f64 * geometry.half_h)
+        }).count();
+        assert_eq!(unsafe_count, 0, "persistent AMR produced {unsafe_count} FD-unsafe points");
+    }
+
+    #[test]
     fn adaptive_grid_probe_data_matches_grid_sampler_count() {
         let geometry = l5_geometry();
         let cfg = pinn_core::amr::derive_amr_config(
@@ -7628,6 +7714,91 @@ mod tests {
             "off-center hard-constraint hole must NOT register the redundant soft hole_free term");
     }
 
+    #[test]
+    fn boundary_lift_is_generic_for_one_free_hole_and_preserves_fixed_constraint() {
+        let mut spec = single_hole_like_spec(1);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        spec.geometry.holes[0].center = [-0.03, 0.0];
+        spec.geometry.holes.push(HoleSpec {
+            center: [0.03, 0.0], radius: 0.008, bc: HoleBc::Fixed,
+        });
+        spec.architecture.hard_constraint_ansatz = true;
+        spec.architecture.free_boundary_lifting = true;
+        let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec, true, 0.0);
+        assert!(problem.hard_constraint_active());
+        assert!(matches!(problem.ansatz, crate::kirsch_hole_correction::AnnulusAnsatz::BoundaryLift { .. }));
+        let names: Vec<_> = problem.loss_terms().iter().map(|term| term.name()).collect();
+        assert!(names.contains(&"physical_potential"));
+        assert!(names.contains(&"hole_fixed"));
+        assert!(!names.contains(&"hole_free"));
+    }
+
+    #[test]
+    fn exact_fixed_projection_zeroes_total_displacement_without_changing_free_circle() {
+        use crate::kirsch_hole_correction::AnnulusAnsatz;
+        let mut spec = single_hole_like_spec(1);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        spec.geometry.holes[0].center = [-0.03, 0.0];
+        spec.geometry.holes.push(HoleSpec {
+            center: [0.03, 0.0], radius: 0.008, bc: HoleBc::Fixed,
+        });
+        spec.architecture.hard_constraint_ansatz = true;
+        spec.architecture.free_boundary_lifting = true;
+        spec.architecture.hard_fixed_holes = true;
+        let device = crate::training_core::BDevice::default();
+        let model = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
+            .init(&device);
+        let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec.clone(), true, 0.0);
+        assert!(matches!(problem.ansatz, AnnulusAnsatz::BoundaryLift { fixed: Some(_), .. }));
+        assert!(!problem.loss_terms().iter().any(|term| term.name() == "hole_fixed"));
+        let (_, residuals) = probe_boundary_residuals_detailed(
+            &model, &spec, &device, &problem.ansatz, Some((spec.load.px, spec.load.py)),
+        );
+        assert!(residuals.fixed_hole_displacement_m[0].1.rms < 1e-9,
+            "exact Fixed projection must zero total, affine-completed displacement");
+        let projection = problem.ansatz.fixed_hole_projection().unwrap();
+        let fixed = &spec.geometry.holes[1];
+        let probe_x = fixed.center[0] + fixed.radius + ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+        let probe_weight = crate::kirsch_hole_correction::fixed_trace_projection_weight(
+            probe_x - fixed.center[0] - fixed.radius, projection.circles[0].transition_width);
+        assert!(probe_weight > 0.99 && probe_weight < 1.0,
+            "Fixed projection must subtract boundary value without suppressing radial strain");
+        let free = &spec.geometry.holes[0];
+        for i in 0..24 {
+            let theta = 2.0 * std::f64::consts::PI * i as f64 / 24.0;
+            let x = free.center[0] + free.radius * theta.cos();
+            let y = free.center[1] + free.radius * theta.sin();
+            let distance = (x - fixed.center[0]).hypot(y - fixed.center[1]) - fixed.radius;
+            assert_eq!(crate::kirsch_hole_correction::fixed_trace_projection_weight(
+                distance, projection.circles[0].transition_width), 0.0);
+        }
+    }
+
+    #[test]
+    fn exact_fixed_projection_supports_multiple_fixed_holes_without_a_free_hole() {
+        let mut spec = single_hole_like_spec(1);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        spec.geometry.holes = vec![
+            HoleSpec { center: [-0.03, 0.0], radius: 0.008, bc: HoleBc::Fixed },
+            HoleSpec { center: [0.03, 0.0], radius: 0.008, bc: HoleBc::Fixed },
+        ];
+        spec.architecture.hard_fixed_holes = true;
+        let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec.clone(), false, 0.0);
+        assert!(matches!(problem.ansatz, crate::kirsch_hole_correction::AnnulusAnsatz::FixedProjection(_)));
+        assert!(!problem.loss_terms().iter().any(|term| term.name().starts_with("hole_fixed")));
+        let device = crate::training_core::BDevice::default();
+        let model = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
+            .init(&device);
+        let (_, residuals) = probe_boundary_residuals_detailed(&model, &spec, &device, &problem.ansatz, None);
+        assert_eq!(residuals.fixed_hole_displacement_m.len(), 2);
+        assert!(residuals.fixed_hole_displacement_m.iter().all(|(_, r)| r.rms < 1e-9));
+    }
+
     /// A geometry with no `HoleBc::Free` hole at all (every hole `Fixed`, or no holes) must
     /// PANIC when the hard constraint is requested, not silently ignore it - a real
     /// misconfiguration, not a graceful fallback (matches this codebase's own "fail loudly"
@@ -8148,6 +8319,29 @@ mod tests {
                 HoleSpec { center: [0.03, 0.0], radius: 0.008, bc: HoleBc::Fixed },
             ],
         }
+    }
+
+    #[test]
+    fn mixed_hole_hard_ansatz_baseline_at_matched_probe_is_finite_and_suppresses_network() {
+        let spec = ProblemSpec {
+            geometry: two_hole_geometry(), material: MaterialProps::al7075_t6(),
+            load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(), training: Default::default(),
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
+        };
+        let problem = UserDefinedProblem::new_with_hard_constraint_ansatz(spec.clone(), true, 0.0);
+        let hole = &spec.geometry.holes[0];
+        let margin = ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+        let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+        let baseline = closed_form_only_kt_at_margin(
+            problem.ansatz(0), &spec.geometry, hole, margin, scales.u_ref as f64,
+            &spec.material, Some((spec.load.px, spec.load.py)), spec.load.px, 72,
+        );
+        let phi = crate::kirsch_hole_correction::traction_free_envelope(hole.radius + margin, 0.0, hole.radius);
+        assert!(baseline.is_finite() && (2.5..2.9).contains(&baseline), "baseline Kt={baseline}");
+        assert!(phi < 0.01, "network envelope at probe must be below 1%, got {phi}");
+        println!("mixed-hole pure ansatz Kt={baseline:.6}, network envelope={phi:.6}");
     }
 
     #[test]
@@ -9273,6 +9467,46 @@ mod tests {
         assert!(rms_rel_err < 0.1,
             "RMS reconstructed displacement at r={r:.6} should closely track the closed-form \
              Kirsch correction under the hard-constraint ansatz: rms_rel_err={rms_rel_err}");
+    }
+
+    #[test]
+    fn boundary_lift_keeps_free_traction_small_and_unfreezes_hoop_stress() {
+        use crate::kirsch_hole_correction::{AnnulusAnsatz, HoleTractionFreeAnsatz};
+        let device = crate::training_core::BDevice::default();
+        let model = crate::network::ElasticityNetConfig::new()
+            .with_input_dim(3).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
+            .init(&device);
+        let hole = HoleSpec { center: [-0.03, 0.01], radius: 0.01, bc: HoleBc::Free };
+        let geometry = UserGeometry { half_w: 0.1, half_h: 0.05, thickness: 0.005, holes: vec![hole.clone()] };
+        let material = MaterialProps::al7075_t6();
+        let px = 6.9e7;
+        let u_ref = 1e-4_f32;
+        let base = || HoleTractionFreeAnsatz {
+            hole_center: hole.center, hole_radius: hole.radius,
+            half_w: geometry.half_w, half_h: geometry.half_h,
+            px, py: 0.0, e: material.e as f64, nu: material.nu as f64,
+            u_ref: u_ref as f64, saturation_scale: 1.0, trainable: false,
+        };
+        let fd = crate::fd_stencil::FdConfig::new(1e-4, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+        let profile = |ansatz: &AnnulusAnsatz| probe_hole_boundary_profile_derived(
+            &model, &geometry, &hole, 24, &fd, u_ref, px, &material, 0.0,
+            &device, ansatz, Some((px, 0.0)),
+        );
+        let hard = profile(&AnnulusAnsatz::HardConstraint(base()));
+        let lifted = profile(&AnnulusAnsatz::BoundaryLift { hole: base(), fixed: None });
+        let mut peak_hoop_change = 0.0_f64;
+        for (a, b) in hard.iter().zip(&lifted) {
+            let theta = b.theta_deg.to_radians();
+            let (c, s) = (theta.cos(), theta.sin());
+            let normal = (b.sxx as f64 * c + b.sxy as f64 * s).hypot(
+                b.sxy as f64 * c + b.syy as f64 * s);
+            assert!(normal / px < 0.03, "boundary traction must remain small: {normal:e} Pa at {theta}");
+            let hoop_a = a.sxx as f64 * s * s - 2.0 * a.sxy as f64 * s * c + a.syy as f64 * c * c;
+            let hoop_b = b.sxx as f64 * s * s - 2.0 * b.sxy as f64 * s * c + b.syy as f64 * c * c;
+            peak_hoop_change = peak_hoop_change.max((hoop_b - hoop_a).abs());
+        }
+        assert!(peak_hoop_change / px > 0.01,
+            "lifted boundary trace must be able to change hoop stress");
     }
 
     #[test]

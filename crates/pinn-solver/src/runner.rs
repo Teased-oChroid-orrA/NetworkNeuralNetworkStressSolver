@@ -1153,6 +1153,13 @@ pub fn run_training_user_problem(
 ) {
     use pinn_core::problem_spec::{CoordinateEmbeddingSelection, TrainingProcedure};
 
+    assert!(!spec.architecture.free_boundary_lifting
+        || spec.architecture.training_procedure == TrainingProcedure::SingleDomain,
+        "free boundary lifting requires SingleDomain training procedure");
+    assert!(!spec.architecture.hard_fixed_holes
+        || spec.architecture.training_procedure == TrainingProcedure::SingleDomain,
+        "exact Fixed-hole mask requires SingleDomain training procedure");
+
     // Issue #77 PH4-45: routes to whichever of the three PH4-41..44-corrected architectures
     // `spec.architecture` selects - `ArchitectureSpec::default()` (every pre-#77 spec)
     // reproduces the exact pre-existing dispatch below byte-identically.

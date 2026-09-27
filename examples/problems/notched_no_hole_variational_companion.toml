@@ -1,0 +1,38 @@
+# No-hole L0/L4 companion for the mixed-hole validation plate. Geometry extent,
+# material, load, and formulation match the holed trial. L4 is an independent
+# solver-health prerequisite, so it uses the established no-hole convergence
+# budget instead of the shorter mixed-hole screening budget. Hole-specific
+# ansatz flags are omitted because no hole exists here.
+formulation = "Variational"
+
+[geometry]
+half_w = 0.10
+half_h = 0.05
+thickness = 0.005
+holes = []
+
+[material]
+e = 71.7e9
+nu = 0.33
+density = 2810.0
+ultimate_strength_pa = 503e6
+
+[load]
+px = 6.9e7
+py = 0.0
+
+[network]
+hidden_dim = 64
+n_hidden = 8
+
+[architecture]
+training_procedure = "SingleDomain"
+
+[training]
+max_steps = 3000
+n_interior = 4096
+n_boundary = 2048
+fd_h = 1e-3
+lr = 1e-3
+measure_aware_training = true
+amr_enabled = false
