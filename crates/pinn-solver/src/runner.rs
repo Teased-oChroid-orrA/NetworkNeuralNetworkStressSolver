@@ -1623,18 +1623,11 @@ fn run_user_problem_training_from(
     stop_rx: Receiver<ControlMsg>,
 ) {
     use crate::architecture_controller::{ArchitectureConfig, ArchitectureController};
-    use crate::problem::{
-        BoundaryValueProblem, DomainOptim, DomainStepCtx, MultiStepCtx,
-    };
-    use crate::training_core::{probe_interior_energy_residuals, residual_stats, step_physics_multi};
-    use crate::user_problem::{evaluate_user_vis_grid, UserDefinedProblem, USER_DOMAIN};
+    use crate::problem::{BoundaryValueProblem, DomainOptim};
+    use crate::training_core::step_physics_multi;
+    use crate::user_problem::{evaluate_user_vis_grid, UserDefinedProblem};
     use pinn_core::amr::{derive_amr_config, AdaptiveGrid, AmrDomain};
     use pinn_core::user_geometry::UserGeometry;
-
-    /// Steps before the first AMR sweep - a small, generic warmup (not derived from any
-    /// Kirsch-specific curriculum) so refinement isn't driven by a freshly-initialized
-    /// network's noisy residual signal.
-    const AMR_WARMUP_STEPS: usize = 200;
 
     // Issue #62 PH3-03: MANDATORY L0 gate, run before any neural optimization begins - see
     // `mandatory_l0_gate`'s own doc comment for why this GUI-driving entry point previously had
@@ -1778,7 +1771,6 @@ fn run_user_problem_training_from(
     // immediately overwrites `data.int_norm` afterward, same ordering as before this refactor -
     // AMR never touches boundary/named point sets regardless.
     let sampling = problem.sampling_strategy(0);
-    let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / half_w) as f32, (y / half_h) as f32] };
 
     // Generic, problem-agnostic AMR - see `pinn_core::amr::AmrDomain`'s doc comment. Nothing
     // here is gated on "does this geometry have a hole": `spec.geometry.lock_zones()` is
@@ -1821,223 +1813,20 @@ fn run_user_problem_training_from(
         }
         last_step = step;
 
-        // Issue #64/#66/#73: genuine per-step resample (interior + boundary + named), shared
-        // with `user_runner::run_headless_user_problem` via `resample_plate_step_data` - see
-        // this function's own doc comment above for why this was previously missing here and
-        // why AMR's own conditional block immediately below is the correct place to override
-        // `data.int_norm` when a sweep fires.
-        let mut data = crate::user_problem::resample_plate_step_data(
-            sampling, &placeholder_geom, &spec.load,
-            spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
+        // Issue #73/#75 close-out: the per-step sampling+AMR block used to be an independent
+        // copy of this same logic, maintained separately from `user_runner::run_headless_
+        // user_problem`'s own copy - the real, previously-undocumented divergence (this file's
+        // copy had real AMR, the headless copy had none at all) is why they're unified into
+        // ONE shared implementation now. See `resample_step_data_with_amr`'s own doc comment.
+        let outcome = crate::user_problem::resample_step_data_with_amr(
+            &spec, &problem, sampling, &placeholder_geom, half_w, half_h,
+            &model, &mut amr_grid, amr_interval, &config, &fd,
+            u_ref, ref_energy, ref_stress2, &device, step, step_offset,
         );
-
-        // Issue #63 sub-issue #67: `UserDefinedProblem::set_interior_weights`'s own documented
-        // contract is "None before the first sweep - plain uniform-random sampling is already
-        // an unbiased Monte-Carlo estimator, no compensation needed" - but that contract was
-        // written when `data.int_norm` stayed frozen at whichever sweep last set it (the
-        // pre-#73 behavior), so weights and points changed together and stayed matched between
-        // sweeps. Issue #73 made `data.int_norm` genuinely resample fresh every step (correct,
-        // fixing the #64-class staleness bug for interior points) - but nothing reset
-        // `current_interior_weights` back to `None` afterward, so a sweep's density-compensation
-        // weights (computed for THAT sweep's specific AMR point distribution) silently kept
-        // being applied to completely unrelated freshly-resampled points for up to
-        // `amr_interval` (1000) steps, reintroducing bias/noise into the interior energy
-        // estimate for most of a typical run. Reset every step by default; the AMR block below
-        // re-sets it to `Some(...)` only for the exact step a sweep fires, matching the
-        // documented contract exactly instead of only approximating it.
-        problem.set_interior_weights(None);
-
-        // Issue #77 PH4-41 fix (finding 2): `UserSamplingStrategy`'s hole-biased stratified
-        // sampling (`spec.architecture.hole_bias_fraction`, `0.0` = every pre-#77 spec,
-        // byte-identical) draws a deliberately non-uniform density -
-        // `PhysicalPotentialEnergyTerm`'s unweighted-mean energy integral is only a correct
-        // Monte-Carlo estimator under uniform density, so it must be told the real per-point
-        // weight. Set right after the reset above, on the SAME "last write wins" convention
-        // this loop already uses for AMR's own weights - if a sweep or persistent-adaptive
-        // block fires later this step, its own `set_interior_weights` call below correctly
-        // overwrites this one (compensating for its OWN, unrelated density change instead).
-        // Note: PH4-42's own real verification run used the simpler `run_user_problem_
-        // training_with_diagnostics` loop, which has no AMR sweep/persistent-adaptive logic at
-        // all - combining `hole_bias_fraction>0` with a REAL firing AMR sweep on this GUI path
-        // is therefore an untested extrapolation, not a proven configuration.
-        if spec.architecture.hole_bias_fraction > 0.0 {
-            let weights = crate::user_problem::hole_bias_quadrature_weights_including_fixed(
-                &data.int_norm, &spec.geometry, spec.architecture.hole_bias_fraction,
-                spec.architecture.hole_bias_include_fixed,
-            );
-            problem.set_interior_weights(Some(weights));
-        }
-
-        let mut amr_sweep_report = None;
-        // Issue #62 PH3-12: real on/off switch - see `TrainingSpec::amr_enabled`'s own doc
-        // comment for why this exists (the plan's mandated "fixed sampling vs AMR" controlled
-        // comparison was previously impossible - AMR fired unconditionally with no fixed-
-        // sampling control arm reachable at all).
-        if spec.training.amr_enabled && step >= AMR_WARMUP_STEPS && (step - AMR_WARMUP_STEPS) % amr_interval == 0 {
-            // A residual must be assigned to the leaf that produced its probe point. Hole
-            // training uses persistent fixed-budget quadrature, whose repeated samples cannot
-            // satisfy that one-residual-per-leaf contract, so probe once per active leaf here.
-            // Keep no-hole's established sweep path byte-for-byte unchanged.
-            let probe_data = (!spec.geometry.holes.is_empty()).then(|| {
-                crate::user_problem::adaptive_grid_probe_data(
-                    &data, half_w, half_h, &mut amr_grid, step,
-                )
-            });
-            let probe_data = probe_data.as_ref().unwrap_or(&data);
-            let probe_ctx = MultiStepCtx {
-                config: &config,
-                problem: &problem,
-                fd: &fd, hole_fd: &fd, per_domain_lr: None,
-                k: 1.0,
-                domains: vec![DomainStepCtx { data: probe_data, u_ref, ref_energy, ref_stress2 }],
-                dynamic_lam_h_cap: f64::MAX,
-                dynamic_lam_d_cap: f64::MAX,
-                dynamic_lam_penetration_cap: f64::MAX,
-                dynamic_lam_non_tension_cap: f64::MAX,
-                constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
-                n_fourier: spec.geometry.n_fourier(),
-                coordinate_embedding: spec.geometry.coordinate_embedding(),
-                domain_coordinate_embeddings: None,
-                probe_term_gradients: false,
-                phase2_active: true,
-                step,
-            };
-            if let Some(residuals) = probe_interior_energy_residuals(&probe_ctx, &[&model], &device).remove(&USER_DOMAIN) {
-                // `update_residuals` runs unconditionally (cheap EMA/trend bookkeeping, keeps
-                // the next interval's `should_adapt` check current) - only the actual
-                // adapt()+resample is gated (Phase 7's "smart activation": `should_adapt`
-                // defaults to always-true, zero behavior change, unless explicitly
-                // calibrated - see `AmrtConfig::residual_threshold`'s doc comment).
-                amr_grid.update_residuals(&residuals);
-                if amr_grid.should_adapt(&residuals) {
-                    // Phase 11 ("AMR Effectiveness") - real before/after residual + timing,
-                    // not just "the collocation count changed". `points_before`/`residual_*_
-                    // before` are captured from the SAME probe that fed `should_adapt` above
-                    // (no extra forward pass needed for the "before" half).
-                    let sweep_start = std::time::Instant::now();
-                    let points_before = probe_data.int_norm.len();
-                    let (rms_before, max_before) = residual_stats(&residuals);
-                    let domain_area = 4.0 * half_w * half_h;
-                    let hole_density_before = amr_grid.lock_zone_density();
-                    let domain_density_before = points_before as f64 / domain_area;
-
-                    amr_grid.adapt();
-                    // Issue #75: hole-bearing geometries get their interior points from the
-                    // NEW persistent-adaptive block below (runs every step, not just here) -
-                    // this legacy overwrite is specifically the no-hole path now, preserving
-                    // its pre-#75 sweep-only behavior byte-for-byte (issue #75's own "Preserve
-                    // baseline behavior" section: "amr_enabled=true with no holes: existing AMR
-                    // behavior may remain residual-driven"). Still runs `adapt()` above and
-                    // still updates `amr_grid`'s own topology either way - only the "which
-                    // block actually writes `data.int_norm`/weights" decision changes.
-                    //
-                    // Issue #62 PH3-04: when measure-aware training is on, resample WITH density
-                    // info (`sample_points_with_density`) instead of bare points, and hand the
-                    // resulting compensation weights to `problem` so the NEXT `loss_terms()`
-                    // call's `InteriorEnergyTerm` can debias against this sweep's now-nonuniform
-                    // point density - see `UserDefinedProblem::set_interior_weights`'s own doc
-                    // comment. Skipped entirely when the switch is off (the exact legacy
-                    // `sample_points()` call, zero added cost) - `problem.set_interior_weights`
-                    // is never called at all in that case, so `InteriorEnergyTerm`'s `weights`
-                    // stays `None` for the whole run, matching its pre-PH3-04 behavior exactly.
-                    let after_probe_data = if spec.geometry.holes.is_empty() {
-                        if spec.training.measure_aware_training {
-                            let density_samples = amr_grid.sample_points_with_density();
-                            data.int_norm = density_samples.iter().map(|s| norm_pt(s.point[0], s.point[1])).collect();
-                            problem.set_interior_weights(Some(pinn_core::amr::compensation_weights(&density_samples)));
-                        } else {
-                            data.int_norm = amr_grid.sample_points().iter().map(|&[x, y]| norm_pt(x, y)).collect();
-                        }
-                        // Byte-for-byte identical to this block's pre-#75 diagnostic value -
-                        // no-hole legacy path is untouched by issue #75.
-                        None
-                    } else {
-                        Some(crate::user_problem::adaptive_grid_probe_data(
-                            &data, half_w, half_h, &mut amr_grid, step,
-                        ))
-                    };
-                    let after_probe_data = after_probe_data.as_ref().unwrap_or(&data);
-                    let points_after = after_probe_data.int_norm.len();
-
-                    // "After" DOES need a fresh probe - the point set (and therefore the
-                    // residual signal at it) genuinely changed.
-                    let after_ctx = MultiStepCtx {
-                        config: &config, problem: &problem, fd: &fd, hole_fd: &fd, per_domain_lr: None, k: 1.0,
-                        domains: vec![DomainStepCtx { data: after_probe_data, u_ref, ref_energy, ref_stress2 }],
-                        dynamic_lam_h_cap: f64::MAX, dynamic_lam_d_cap: f64::MAX,
-                        dynamic_lam_penetration_cap: f64::MAX, dynamic_lam_non_tension_cap: f64::MAX,
-                        constitutive_consistency_weight: crate::training_core::LAM_CONSTITUTIVE_CONSISTENCY,
-                        n_fourier: spec.geometry.n_fourier(),
-                        coordinate_embedding: spec.geometry.coordinate_embedding(),
-                        domain_coordinate_embeddings: None,
-                        probe_term_gradients: false,
-                        phase2_active: true, step,
-                    };
-                    let after_residuals = probe_interior_energy_residuals(&after_ctx, &[&model], &device)
-                        .remove(&USER_DOMAIN).unwrap_or_default();
-                    let (rms_after, max_after) = residual_stats(&after_residuals);
-
-                    last_amr_sweep_step = Some(step);
-                    amr_sweep_report = Some(pinn_core::messages::AmrSweepReport {
-                        domain_label: "interior",
-                        step,
-                        points_before, points_after,
-                        residual_rms_before: rms_before, residual_max_before: max_before,
-                        residual_rms_after: rms_after, residual_max_after: max_after,
-                        sweep_duration_ms: sweep_start.elapsed().as_secs_f64() * 1000.0,
-                        hole_zone_density_before: hole_density_before,
-                        hole_zone_density_after: amr_grid.lock_zone_density(),
-                        domain_mean_density_before: domain_density_before,
-                        domain_mean_density_after: points_after as f64 / domain_area,
-                    });
-                }
-            }
-        }
-
-        // Issue #75: persistent, geometry-aware adaptive interior sampling for hole-bearing
-        // geometries - runs EVERY step (not gated on the sweep interval above), overwriting
-        // whatever `resample_plate_step_data` drew for `data.int_norm` moments ago. This is
-        // the actual fix the epic's own "Design principles" section describes: the sweep block
-        // above still tracks residuals and adapts `amr_grid`'s TOPOLOGY at the normal interval
-        // (unconditionally, regardless of hole presence - unchanged from before #75), but for
-        // a hole-bearing geometry the topology is no longer the only thing that matters -
-        // between sweeps, this block keeps drawing FRESH points from whatever the CURRENT
-        // topology is (quadtree jitter + a geometry-seeded annulus per hole, active from step
-        // 0 - never waiting on the network's own residual signal to discover a hole needs
-        // density), instead of `resample_plate_step_data`'s own plain uniform draw silently
-        // winning back every non-sweep step the way it did before this fix (PH4-14's own real
-        // A/B evidence for why enabling the OLD sweep-only AMR left Kt essentially unchanged).
-        // No-op (`InteriorSampleSource::Uniform`, `data.int_norm` untouched) whenever
-        // `amr_enabled=false` or the geometry has no holes - see `apply_persistent_adaptive_
-        // interior_sample`'s own doc comment for the exact preserved-baseline conditions.
-        let amr_grid_for_step = if spec.training.amr_enabled && !spec.geometry.holes.is_empty() {
-            Some(&mut amr_grid)
-        } else {
-            None
-        };
-        let (interior_source, persistent_weights) = crate::user_problem::apply_persistent_adaptive_interior_sample(
-            &mut data, &spec.geometry, spec.training.fd_h, half_w, half_h, amr_grid_for_step, step,
-        );
-        if interior_source == crate::user_problem::InteriorSampleSource::PersistentAdaptive {
-            problem.set_interior_weights(persistent_weights);
-            // Issue #75 workstream E (telemetry, minimal slice): print periodically, not every
-            // step - real signal, not log spam.
-            if step % 10 == 0 {
-                let near_hole = data.int_norm.iter().filter(|&&[xn, yn]| {
-                    let x = xn as f64 * half_w;
-                    let y = yn as f64 * half_h;
-                    spec.geometry.holes.iter().any(|h| {
-                        let dx = x - h.center[0];
-                        let dy = y - h.center[1];
-                        (dx * dx + dy * dy).sqrt() < 2.0 * h.radius
-                    })
-                }).count();
-                println!(
-                    "  [persistent-AMR step {step}] source=adaptive points={} near_hole(<2r)={near_hole} ({:.2}%)",
-                    data.int_norm.len(),
-                    100.0 * near_hole as f64 / data.int_norm.len().max(1) as f64,
-                );
-            }
+        let data = outcome.data;
+        let amr_sweep_report = outcome.amr_sweep_report;
+        if amr_sweep_report.is_some() {
+            last_amr_sweep_step = Some(step);
         }
 
         // Hoisted above `ctx`'s construction (previously computed just before its own use

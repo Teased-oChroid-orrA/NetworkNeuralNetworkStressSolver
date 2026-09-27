@@ -264,16 +264,31 @@ pub struct ArchitectureSpec {
     /// with_hole_bias`), quadrature-compensated via `hole_bias_quadrature_weights` (PH4-41
     /// finding 2's fix) so the energy integral stays correct under the resulting non-uniform
     /// density. `0.0` (default) reproduces the exact pre-existing uniform-density sampling.
+    ///
+    /// **No effect on `pinn_solver::runner`'s GUI-streaming/TUI training path
+    /// (`run_user_problem_training_from`) whenever `training.amr_enabled=true` (the default)
+    /// and the geometry has holes** - `apply_persistent_adaptive_interior_sample` (issue #75)
+    /// unconditionally overwrites both the sampled interior points and the interior weights
+    /// this fraction produces, every step, before either is used. Fully functional on the
+    /// `--headless`/`--problem-spec` CLI path, which never calls that override. See
+    /// `docs/findings/findings_multi-hole-kt-formulation-audit.md` for the byte-identical
+    /// control/treatment reproduction that found this; that path prints a one-time warning
+    /// when this combination is detected.
     #[serde(default)]
     pub hole_bias_fraction: f64,
     /// Extends `hole_bias_fraction`'s near-hole sampling bias from Free-only to every Fixed
     /// hole too, splitting the fraction evenly across every biased hole (Free and Fixed
-    /// together). `false` (default) is byte-identical to every pre-existing spec. Issue #78's
-    /// own earlier "fifth experiment" tried this once for the unrelated multi-Free-hole Kt
-    /// question and reverted it (no evidence there); this flag targets a different, still-open
-    /// question - whether near-Fixed-hole collocation density affects the Fixed hole's own
-    /// profile ANGULAR SHAPE, for the mixed Free+Fixed-hole boundary-lift/exact-projection
-    /// investigation (`docs/NUMERICAL_AND_TUI_RECONCILIATION_2026-09-23.md`).
+    /// together). `false` (default) is byte-identical to every pre-existing spec.
+    ///
+    /// **A controlled, deterministic re-test (see `docs/findings/findings_lbfgs-weight-lookup-
+    /// bug.md`'s own "CORRECTION" section) found NO real effect on the Fixed hole's angular-
+    /// shape mirror-asymmetry** - an earlier session's own claimed "68% improvement" for this
+    /// exact flag turned out to be measured on a confounded pair of runs (persistent-adaptive
+    /// AMR made the two configs byte-identical the whole time; see `hole_bias_fraction`'s own
+    /// doc comment above) and did not reproduce once that confound was removed. Kept because it
+    /// is harmless (default `false`, no regression risk) and remains genuinely functional
+    /// (changes real sampled points) whenever `training.amr_enabled=false` - just don't assume
+    /// setting it `true` improves anything without new evidence.
     #[serde(default)]
     pub hole_bias_include_fixed: bool,
     #[serde(default)]

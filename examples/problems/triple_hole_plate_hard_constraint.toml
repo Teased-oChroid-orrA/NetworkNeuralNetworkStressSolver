@@ -1,0 +1,64 @@
+# Same geometry/material/load/training as triple_hole_plate.toml, but with
+# hard_constraint_ansatz=true - the configuration that actually produced this project's
+# documented hole0/hole2 Kt=2.884/3.032 mirror-asymmetry result (see
+# docs/findings/findings_multi-hole-kt-ansatz-saturation-scale.md, "fourth follow-up" section).
+# That number came from a Rust test fixture, not this on-disk file (which has no [architecture]
+# section, so it trains the soft-penalty ansatz instead) - this file closes that gap so the
+# asymmetry can be reproduced and diagnosed (gradient-share/conflict instrumentation) via
+# `audit_trace` instead of only via a one-off test fixture.
+#
+# Run with: cargo run -p pinn-solver --release --features ndarray-backend --example audit_trace
+#   -- examples/problems/triple_hole_plate_hard_constraint.toml <output_dir>
+#
+# All lengths in meters [m], all stresses/moduli in pascals [Pa].
+
+[geometry]
+half_w = 0.15   # full width  = 0.30 m
+half_h = 0.06   # full height = 0.12 m
+thickness = 0.006
+
+[[geometry.holes]]
+center = [-0.06, 0.02]
+radius = 0.009
+bc = "Free"
+
+[[geometry.holes]]
+center = [0.0, -0.02]
+radius = 0.007
+bc = "Fixed"
+
+[[geometry.holes]]
+center = [0.06, 0.02]
+radius = 0.009
+bc = "Free"
+
+[material]
+e = 71.7e9               # Al 7075-T6
+nu = 0.33
+density = 2810.0
+ultimate_strength_pa = 503e6
+
+[load]
+px = 6.9e7
+py = 0.0
+
+[network]
+hidden_dim = 64
+n_hidden = 4
+
+[training]
+max_steps = 3000
+n_interior = 3072
+n_boundary = 768
+fd_h = 1e-3
+lr = 1e-3
+
+[architecture]
+hard_constraint_ansatz = true
+# Forces the plain UserDefinedProblem/MultiHoleHardConstraint path (matches the fixture that
+# produced the documented 2.884/3.032 result) instead of MultiAnnularDecompositionProblem's
+# kinematic-decomposition path, which `run_training_user_problem`'s own dispatch would otherwise
+# select for this N=2-Free-hole geometry (a different architecture giving very different,
+# already-separately-documented Kt numbers - see findings_multi-hole-kt-trainable-scale-
+# decomposition.md).
+training_procedure = "SingleDomain"

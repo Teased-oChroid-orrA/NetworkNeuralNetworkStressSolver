@@ -1342,22 +1342,41 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         .filter(|(_, h)| h.bc == pinn_core::user_geometry::HoleBc::Free)
         .map(|(i, _)| i).collect();
 
+    // Issue #73/#75 close-out: this headless path used to have NO AMR of any kind - a real,
+    // previously-undocumented divergence from the GUI/TUI/`audit_trace` path (see
+    // `docs/findings/findings_multi-hole-kt-formulation-audit.md`). `--headless`/
+    // `--problem-spec` is now the source of truth for per-step sampling+AMR
+    // (`crate::user_problem::resample_step_data_with_amr`, called in the loop below) - the
+    // GUI-streaming path (`runner::run_user_problem_training_from`) calls the exact same
+    // function instead of maintaining its own copy. Setup mirrors that file's own AMR-grid
+    // construction exactly.
+    let collocation_margin_m = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+    let collocation_geometry = spec.geometry.inflated_for_collocation(collocation_margin_m);
+    let amr_cfg = {
+        use pinn_core::amr::AmrDomain;
+        pinn_core::amr::derive_amr_config((-half_w, half_w, -half_h, half_h), &collocation_geometry.lock_zones())
+    };
+    let amr_interval = amr_cfg.interval_steps;
+    let mut amr_grid = pinn_core::amr::AdaptiveGrid::<pinn_core::user_geometry::UserGeometry>::new(&collocation_geometry, amr_cfg);
+
     let mut last_total = f32::NAN;
     for step in 0..spec.training.max_steps {
-        // Issue #73: shared with `runner::run_user_problem_training_from` - see
-        // `resample_plate_step_data`/`plate_multi_step_ctx`'s own doc comments (user_problem.rs)
-        // for why this must stay a real per-step call, not something cached across steps.
-        let data = resample_plate_step_data(
-            sampling, &placeholder_geom, &spec.load,
-            spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
+        // Issue #73/#75: the single shared implementation for interior/boundary/named resample
+        // PLUS AMR - see its own doc comment. Also handles the `hole_bias_fraction`/AMR
+        // override warning (now identical on every entry point, not headless-exempt).
+        let outcome = crate::user_problem::resample_step_data_with_amr(
+            &spec, &problem, sampling, &placeholder_geom, half_w, half_h,
+            &model, &mut amr_grid, amr_interval, &config, &fd,
+            u_ref, ref_energy, ref_stress2, &device, step, 0,
         );
-        // Issue #77 PH4-41 fix (finding 2) - same fix as `run_user_problem_training_with_
-        // diagnostics`, see that call site's own comment. `hole_bias_fraction()<=0.0` (every
-        // pre-#77 spec) makes this a no-op.
-        let weights = crate::user_problem::hole_bias_quadrature_weights_including_fixed(
-            &data.int_norm, &spec.geometry, problem.hole_bias_fraction(), problem.hole_bias_include_fixed(),
-        );
-        problem.set_interior_weights(Some(weights));
+        let data = outcome.data;
+        if let Some(report) = &outcome.amr_sweep_report {
+            println!(
+                "  [AMR sweep step {}] domain={} points {}->{} residual_rms {:.4e}->{:.4e} ({:.1}ms)",
+                report.step, report.domain_label, report.points_before, report.points_after,
+                report.residual_rms_before, report.residual_rms_after, report.sweep_duration_ms,
+            );
+        }
         let ctx = plate_multi_step_ctx(
             &config, &problem, &fd, &hole_fd, &data, u_ref, ref_energy, ref_stress2,
             spec.geometry.n_fourier(),

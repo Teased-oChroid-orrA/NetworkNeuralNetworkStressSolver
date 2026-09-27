@@ -1,0 +1,56 @@
+# No-AMR variant of the near-Fixed-hole collocation-density trial - amr_enabled=false so
+# hole_bias_fraction/hole_bias_include_fixed actually control the sampled points (persistent-
+# adaptive AMR, issue #75, overrides both whenever amr_enabled=true and holes are present -
+# see docs/findings/findings_multi-hole-kt-formulation-audit.md). Otherwise identical to its
+# amr_enabled=true sibling.
+# Treatment arm for the near-Fixed-hole collocation-density trial - identical to
+# notched_plate_fixed_hole_bias_control.toml except hole_bias_include_fixed=true, so the SAME
+# hole_bias_fraction budget is now split evenly between the Free and Fixed holes instead of
+# going entirely to the Free hole. Single-variable change from the control arm.
+formulation = "Variational"
+
+[geometry]
+half_w = 0.10
+half_h = 0.05
+thickness = 0.005
+
+[[geometry.holes]]
+center = [-0.03, 0.0]
+radius = 0.01
+bc = "Free"
+
+[[geometry.holes]]
+center = [0.03, 0.0]
+radius = 0.008
+bc = "Fixed"
+
+[material]
+e = 71.7e9
+nu = 0.33
+density = 2810.0
+ultimate_strength_pa = 503e6
+
+[load]
+px = 6.9e7
+py = 0.0
+
+[network]
+hidden_dim = 64
+n_hidden = 3
+
+[architecture]
+hard_constraint_ansatz = true
+free_boundary_lifting = true
+hard_fixed_holes = true
+training_procedure = "SingleDomain"
+hole_bias_fraction = 0.4
+hole_bias_include_fixed = true
+
+[training]
+max_steps = 1000
+n_interior = 2048
+n_boundary = 512
+fd_h = 1e-3
+lr = 1e-3
+measure_aware_training = true
+amr_enabled = false
