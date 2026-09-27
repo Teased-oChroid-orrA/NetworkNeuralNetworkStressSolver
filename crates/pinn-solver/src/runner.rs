@@ -4340,6 +4340,35 @@ mod tests {
         // ever call `.backward()` while this one is mid-graph.
         let (tx, rx) = crossbeam_channel::unbounded();
         let (tx_ctrl, stop_rx) = crossbeam_channel::unbounded();
+        // `cde1633`'s own real fix (a disconnected `stop_rx` now yields `StopImmediately`
+        // instead of falling through to `Continue`, closing a zombie-spin-loop risk) means the
+        // ORIGINAL `drop(tx_ctrl)` before the call disconnected `stop_rx` immediately - the
+        // step loop's very first `handle_control_messages` check then hit that branch and
+        // returned before `TrainingMsg::Done` was ever sent, failing this test's own
+        // `assert!(saw_done, ...)` deterministically (not the documented cross-thread flake
+        // this test's own comment above discusses - reproduces in complete isolation, single-
+        // threaded, every time).
+        //
+        // Simply keeping `tx_ctrl` alive across the whole call trades that bug for a real
+        // hang: after the step loop finishes and `Done` is sent, `run_user_problem_training_
+        // from` enters an intentional post-training checkpoint-serving loop (`loop { match
+        // stop_rx.recv() { Ok(Stop) | Err(_) => return, ... } }`) that blocks forever waiting
+        // for either a `Stop` message or disconnection - by design, so a live GUI session can
+        // keep saving checkpoints after training ends. A connected-but-silent channel makes
+        // that `.recv()` block indefinitely.
+        //
+        // The correct fix queues exactly one harmless message per step-loop iteration
+        // (`spec.training.max_steps` of them - `ControlMsg::ExportContactPressure` is a no-op
+        // `ControlAction::Continue` on this single-domain path, per `handle_control_messages`'s
+        // own match arm) BEFORE dropping `tx_ctrl`: every real step-loop check consumes one
+        // real message (so it never sees disconnection and never bails early), and once the
+        // queue is drained the sender is already gone, so the POST-Done serving loop's own
+        // `.recv()` sees `Err(Disconnected)` and returns immediately - the exact behavior this
+        // test needs from both loops at once, without a second thread (which would reintroduce
+        // the cross-thread autodiff race this test's own rewrite exists to avoid).
+        for _ in 0..spec.training.max_steps {
+            tx_ctrl.send(ControlMsg::ExportContactPressure).unwrap();
+        }
         drop(tx_ctrl);
         run_training_user_problem(spec, tx, stop_rx);
         let mut step_zero: Option<Box<TrainingUpdate>> = None;
