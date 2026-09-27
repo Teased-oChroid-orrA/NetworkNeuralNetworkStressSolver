@@ -1861,8 +1861,9 @@ fn run_user_problem_training_from(
         // all - combining `hole_bias_fraction>0` with a REAL firing AMR sweep on this GUI path
         // is therefore an untested extrapolation, not a proven configuration.
         if spec.architecture.hole_bias_fraction > 0.0 {
-            let weights = crate::user_problem::hole_bias_quadrature_weights(
+            let weights = crate::user_problem::hole_bias_quadrature_weights_including_fixed(
                 &data.int_norm, &spec.geometry, spec.architecture.hole_bias_fraction,
+                spec.architecture.hole_bias_include_fixed,
             );
             problem.set_interior_weights(Some(weights));
         }
@@ -4412,7 +4413,7 @@ mod tests {
         use crate::saw_brdr::SawBrdr;
         use crate::training_core::step_physics_multi;
         use crate::user_problem::{
-            hole_bias_quadrature_weights, plate_multi_step_ctx, probe_energy_balance_with_field,
+            hole_bias_quadrature_weights_including_fixed, plate_multi_step_ctx, probe_energy_balance_with_field,
             probe_energy_balance_with_field_at_points, resample_plate_step_data, UserDefinedProblem,
         };
         use burn::tensor::backend::Backend;
@@ -4452,7 +4453,9 @@ mod tests {
         let data = resample_plate_step_data(
             sampling, &placeholder, &spec.load, spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
         );
-        let weights = hole_bias_quadrature_weights(&data.int_norm, &spec.geometry, spec.architecture.hole_bias_fraction);
+        let weights = hole_bias_quadrature_weights_including_fixed(
+            &data.int_norm, &spec.geometry, spec.architecture.hole_bias_fraction, false,
+        );
         // Sanity check on `hole_bias_quadrature_weights`'s own contract (mean(w_i)==1.0) - if
         // this ever fails, the weighted/unweighted comparison below would be meaningless.
         let mean_w = weights.iter().sum::<f64>() / weights.len() as f64;

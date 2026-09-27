@@ -696,6 +696,17 @@ pub struct UserSamplingStrategy {
     /// zero Free holes makes this an unconditional no-op regardless of the fraction, same as
     /// `fraction=0.0` (nothing to bias toward).
     hole_bias_fraction: f64,
+    /// Issue #78's own "fifth experiment" (extending sampling bias to a Fixed hole too) was
+    /// tried once for the unrelated multi-Free-hole Kt question and reverted with no evidence
+    /// to justify it. `false` (every existing caller) keeps `hole_bias_fraction`'s bias strictly
+    /// Free-hole-only, byte-identical to before this field existed. `true` (opt-in, via
+    /// [`Self::with_hole_bias_including_fixed`]) extends the SAME near-hole-biased stratum
+    /// mechanism to every `HoleBc::Fixed` hole too, splitting the fraction evenly across every
+    /// biased hole (Free and Fixed together) - for the mixed Free+Fixed-hole investigation's own
+    /// still-open question of whether near-Fixed-hole collocation density affects the Fixed
+    /// hole's own profile ANGULAR SHAPE (not the Free-hole Kt question the earlier experiment
+    /// tested).
+    hole_bias_include_fixed: bool,
 }
 
 /// Outer radius of the near-hole-biased sampling stratum, as a multiple of hole radius — reuses
@@ -733,6 +744,7 @@ impl UserSamplingStrategy {
             interior_calls: std::sync::atomic::AtomicU64::new(0),
             boundary_calls: std::sync::atomic::AtomicU64::new(0),
             hole_bias_fraction: 0.0,
+            hole_bias_include_fixed: false,
         }
     }
 
@@ -745,10 +757,20 @@ impl UserSamplingStrategy {
         self
     }
 
+    /// See [`Self::hole_bias_include_fixed`]'s own doc comment. Builder-style, chained after
+    /// [`Self::with_hole_bias`] - `false` (every pre-existing call site) is byte-identical.
+    pub fn with_hole_bias_including_fixed(mut self, include_fixed: bool) -> Self {
+        self.hole_bias_include_fixed = include_fixed;
+        self
+    }
+
     /// See [`Self::hole_bias_fraction`]'s own doc comment — exposed so a caller can compute
-    /// matching quadrature weights via [`hole_bias_quadrature_weights`] without duplicating
-    /// this struct's own bias-fraction/geometry state.
+    /// matching quadrature weights via [`hole_bias_quadrature_weights_including_fixed`] without
+    /// duplicating this struct's own bias-fraction/geometry state.
     pub fn hole_bias_fraction(&self) -> f64 { self.hole_bias_fraction }
+
+    /// See [`Self::hole_bias_include_fixed`]'s own doc comment.
+    pub fn hole_bias_include_fixed(&self) -> bool { self.hole_bias_include_fixed }
 
     /// Like `UserGeometry::contains`, but excludes a `self.anchor_margin_m`-wide annulus just
     /// outside each hole too — deliberately DIFFERENT from `contains`'s general "is this a
@@ -795,28 +817,45 @@ impl UserSamplingStrategy {
 /// matches_unweighted_tensor_when_weights_are_uniform` already proves uniform weights of `1.0`
 /// reduce to the same result.
 ///
-/// Issue #78: generalized from one bias disk to N (one per `HoleBc::Free` hole, matching
+/// Issue #78: generalized from one bias disk to N (one per biased hole, matching
 /// `UserSamplingStrategy::sample_interior`'s own N-hole generalization) — a point is "in bias"
-/// if it falls within ANY Free hole's own `HOLE_BIAS_RADIUS_MULTIPLIER*radius` disk. Assumes
-/// (asserted, loudly) that no two Free holes' bias disks overlap — an untested edge case for
+/// if it falls within ANY biased hole's own `HOLE_BIAS_RADIUS_MULTIPLIER*radius` disk. Assumes
+/// (asserted, loudly) that no two biased holes' bias disks overlap — an untested edge case for
 /// very closely-spaced holes, flagged rather than silently producing wrong quadrature weights
 /// via double-counted area, per this codebase's "loud not silent" convention.
-pub(crate) fn hole_bias_quadrature_weights(
+///
+/// `include_fixed` matches the SAME flag `UserSamplingStrategy::with_hole_bias_including_fixed`
+/// controls on the sampling side, so a caller extending the bias to Fixed holes gets matching
+/// compensation weights - `false` (every pre-existing caller) is byte-identical to the
+/// original Free-hole-only behavior.
+pub(crate) fn hole_bias_quadrature_weights_including_fixed(
     points_norm: &[[f32; 2]],
     geometry: &UserGeometry,
     hole_bias_fraction: f64,
+    include_fixed: bool,
 ) -> Vec<f64> {
-    let free: Vec<&HoleSpec> = geometry.holes.iter().filter(|h| h.bc == HoleBc::Free).collect();
-    if free.is_empty() || hole_bias_fraction <= 0.0 {
+    hole_bias_quadrature_weights_impl(points_norm, geometry, hole_bias_fraction, include_fixed)
+}
+
+fn hole_bias_quadrature_weights_impl(
+    points_norm: &[[f32; 2]],
+    geometry: &UserGeometry,
+    hole_bias_fraction: f64,
+    include_fixed: bool,
+) -> Vec<f64> {
+    let biased: Vec<&HoleSpec> = geometry.holes.iter()
+        .filter(|h| h.bc == HoleBc::Free || (include_fixed && h.bc == HoleBc::Fixed))
+        .collect();
+    if biased.is_empty() || hole_bias_fraction <= 0.0 {
         return vec![1.0; points_norm.len()];
     }
-    for i in 0..free.len() {
-        for j in (i + 1)..free.len() {
-            let (dx, dy) = (free[i].center[0] - free[j].center[0], free[i].center[1] - free[j].center[1]);
+    for i in 0..biased.len() {
+        for j in (i + 1)..biased.len() {
+            let (dx, dy) = (biased[i].center[0] - biased[j].center[0], biased[i].center[1] - biased[j].center[1]);
             let sep = (dx * dx + dy * dy).sqrt();
-            let sum_bias_r = HOLE_BIAS_RADIUS_MULTIPLIER * (free[i].radius + free[j].radius);
+            let sum_bias_r = HOLE_BIAS_RADIUS_MULTIPLIER * (biased[i].radius + biased[j].radius);
             assert!(sep >= sum_bias_r,
-                "hole_bias_quadrature_weights: Free holes {i} and {j} have overlapping bias \
+                "hole_bias_quadrature_weights: biased holes {i} and {j} have overlapping bias \
                  disks (separation={sep}, sum of bias radii={sum_bias_r}) - not handled, see \
                  this function's own doc comment");
         }
@@ -824,24 +863,24 @@ pub(crate) fn hole_bias_quadrature_weights(
     let points: Vec<[f64; 2]> = points_norm.iter()
         .map(|p| [p[0] as f64 * geometry.half_w, p[1] as f64 * geometry.half_h])
         .collect();
-    let bias_r2: Vec<f64> = free.iter().map(|h| (HOLE_BIAS_RADIUS_MULTIPLIER * h.radius).powi(2)).collect();
-    // Which Free hole's own bias disk (if any) a point falls in - at most one, since the
+    let bias_r2: Vec<f64> = biased.iter().map(|h| (HOLE_BIAS_RADIUS_MULTIPLIER * h.radius).powi(2)).collect();
+    // Which biased hole's own bias disk (if any) a point falls in - at most one, since the
     // overlap assert above rules out two disks ever sharing a point. `sample_interior` draws
     // an EQUAL point count per hole (`hole_bias_fraction / bias_holes.len()`), regardless of
-    // that hole's own disk area - so for Free holes of DIFFERENT radii, the resulting local
-    // density genuinely differs per hole (a smaller disk with the same point count is denser).
-    // Pooling every biased point into one combined area/count (as this function once did)
-    // silently assumed uniform density across the whole union of disks, which is only
-    // correct when every Free hole shares the same radius - invisible in every existing test
-    // geometry (`two_hole_geometry`, `triple_hole_plate.toml`) because their Free holes happen
-    // to be equal-sized. Must be computed PER HOLE to match the sampler's real stratification.
+    // that hole's own disk area - so holes of DIFFERENT radii have genuinely different local
+    // density (a smaller disk with the same point count is denser). Pooling every biased point
+    // into one combined area/count (as this function once did) silently assumed uniform
+    // density across the whole union of disks, which is only correct when every biased hole
+    // shares the same radius - invisible in every existing test geometry (`two_hole_geometry`,
+    // `triple_hole_plate.toml`) because their biased holes happen to be equal-sized. Must be
+    // computed PER HOLE to match the sampler's real stratification.
     let hole_of_point: Vec<Option<usize>> = points.iter().map(|p| {
-        free.iter().zip(&bias_r2).position(|(hole, &r2)| {
+        biased.iter().zip(&bias_r2).position(|(hole, &r2)| {
             let (dx, dy) = (p[0] - hole.center[0], p[1] - hole.center[1]);
             dx * dx + dy * dy <= r2
         })
     }).collect();
-    let mut n_biased_per_hole = vec![0usize; free.len()];
+    let mut n_biased_per_hole = vec![0usize; biased.len()];
     for idx in hole_of_point.iter().flatten() {
         n_biased_per_hole[*idx] += 1;
     }
@@ -851,7 +890,7 @@ pub(crate) fn hole_bias_quadrature_weights(
     // in-r^2 draw (biased strata) and whole-plate-minus-those-disks draw (remainder) are meant
     // to cover, independent of how many points actually landed in each this particular call.
     let all_hole_area: f64 = geometry.holes.iter().map(|h| std::f64::consts::PI * h.radius * h.radius).sum();
-    let bias_area_per_hole: Vec<f64> = free.iter().zip(&bias_r2).map(|(h, &r2)| {
+    let bias_area_per_hole: Vec<f64> = biased.iter().zip(&bias_r2).map(|(h, &r2)| {
         (std::f64::consts::PI * r2 - std::f64::consts::PI * h.radius * h.radius).max(0.0)
     }).collect();
     let bias_area_total: f64 = bias_area_per_hole.iter().sum();
@@ -903,7 +942,9 @@ impl DomainSamplingStrategy for UserSamplingStrategy {
         // bespoke check) enforces the same FD-safety/plate-bounds/other-hole-exclusion
         // invariants every other draw in this function already relies on.
         let bias_holes: Vec<HoleSpec> = if self.hole_bias_fraction > 0.0 {
-            self.geometry.holes.iter().copied().filter(|h| h.bc == HoleBc::Free).collect()
+            self.geometry.holes.iter().copied()
+                .filter(|h| h.bc == HoleBc::Free || (self.hole_bias_include_fixed && h.bc == HoleBc::Fixed))
+                .collect()
         } else {
             Vec::new()
         };
@@ -2134,7 +2175,8 @@ impl UserDefinedProblem {
             "exact Fixed-hole projection currently requires Variational formulation");
         let mut problem = Self::new(spec.clone());
         if hole_bias_fraction > 0.0 {
-            problem.sampling = problem.sampling.with_hole_bias(hole_bias_fraction);
+            problem.sampling = problem.sampling.with_hole_bias(hole_bias_fraction)
+                .with_hole_bias_including_fixed(spec.architecture.hole_bias_include_fixed);
         }
         if use_hard_constraint {
             let holes = free_holes(&spec);
@@ -2213,6 +2255,9 @@ impl UserDefinedProblem {
     /// can compute matching quadrature weights (`hole_bias_quadrature_weights`) without
     /// reaching into this struct's own private `sampling` field.
     pub fn hole_bias_fraction(&self) -> f64 { self.sampling.hole_bias_fraction() }
+
+    /// See `UserSamplingStrategy::hole_bias_include_fixed`'s own doc comment.
+    pub fn hole_bias_include_fixed(&self) -> bool { self.sampling.hole_bias_include_fixed() }
 
     /// Issue #62 PH3-04: sets the per-interior-point AMR density-compensation weights the NEXT
     /// `loss_terms()` call's `InteriorEnergyTerm` will use (only when `spec.training.measure_
@@ -8186,7 +8231,7 @@ mod tests {
             let sampler = UserSamplingStrategy::new(geometry.clone(), 1e-3).with_hole_bias(fraction);
             let pts = sampler.sample_interior(&placeholder, n);
             let pts_norm: Vec<[f32; 2]> = pts.iter().map(|p| [(p[0] / a) as f32, (p[1] / b) as f32]).collect();
-            let weights = hole_bias_quadrature_weights(&pts_norm, &geometry, fraction);
+            let weights = hole_bias_quadrature_weights_including_fixed(&pts_norm, &geometry, fraction, false);
             let f = |p: &[f64; 2]| p[0] * p[0] + p[1] * p[1];
 
             let weighted_mean: f64 = pts.iter().zip(&weights).map(|(p, &w)| f(p) * w).sum::<f64>() / pts.len() as f64;
@@ -8239,7 +8284,7 @@ mod tests {
         let sampler = UserSamplingStrategy::new(geometry.clone(), 1e-3).with_hole_bias(fraction);
         let pts = sampler.sample_interior(&placeholder, n);
         let pts_norm: Vec<[f32; 2]> = pts.iter().map(|p| [(p[0] / a) as f32, (p[1] / b) as f32]).collect();
-        let weights = hole_bias_quadrature_weights(&pts_norm, &geometry, fraction);
+        let weights = hole_bias_quadrature_weights_including_fixed(&pts_norm, &geometry, fraction, false);
 
         let mean_w = weights.iter().sum::<f64>() / weights.len() as f64;
         assert!((mean_w - 1.0).abs() < 1e-6, "compensation weights must average to 1.0, got {mean_w}");

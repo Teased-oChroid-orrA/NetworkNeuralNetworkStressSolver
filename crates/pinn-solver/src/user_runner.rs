@@ -972,8 +972,8 @@ pub(crate) fn train_user_problem_for_benchmark(
         );
         // Issue #77 PH4-41 fix (finding 2) - see `run_user_problem_training_with_diagnostics`'s
         // identical comment for the full rationale.
-        let weights = crate::user_problem::hole_bias_quadrature_weights(
-            &data.int_norm, &spec.geometry, problem.hole_bias_fraction(),
+        let weights = crate::user_problem::hole_bias_quadrature_weights_including_fixed(
+            &data.int_norm, &spec.geometry, problem.hole_bias_fraction(), problem.hole_bias_include_fixed(),
         );
         problem.set_interior_weights(Some(weights));
         let ctx = plate_multi_step_ctx(
@@ -1086,8 +1086,8 @@ pub fn run_user_problem_training_with_diagnostics(
         // weights` return all-`1.0`, which `set_interior_weights(Some(...))` treats identically
         // to `None` (both feed `domain_integral_tensor`'s own uniform-mean path) - byte-
         // identical for every existing caller.
-        let weights = crate::user_problem::hole_bias_quadrature_weights(
-            &data.int_norm, &spec.geometry, problem.hole_bias_fraction(),
+        let weights = crate::user_problem::hole_bias_quadrature_weights_including_fixed(
+            &data.int_norm, &spec.geometry, problem.hole_bias_fraction(), problem.hole_bias_include_fixed(),
         );
         problem.set_interior_weights(Some(weights));
         let ctx = plate_multi_step_ctx(
@@ -1354,8 +1354,8 @@ pub fn run_headless_user_problem(spec: ProblemSpec) -> bool {
         // Issue #77 PH4-41 fix (finding 2) - same fix as `run_user_problem_training_with_
         // diagnostics`, see that call site's own comment. `hole_bias_fraction()<=0.0` (every
         // pre-#77 spec) makes this a no-op.
-        let weights = crate::user_problem::hole_bias_quadrature_weights(
-            &data.int_norm, &spec.geometry, problem.hole_bias_fraction(),
+        let weights = crate::user_problem::hole_bias_quadrature_weights_including_fixed(
+            &data.int_norm, &spec.geometry, problem.hole_bias_fraction(), problem.hole_bias_include_fixed(),
         );
         problem.set_interior_weights(Some(weights));
         let ctx = plate_multi_step_ctx(

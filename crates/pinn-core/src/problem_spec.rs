@@ -266,6 +266,16 @@ pub struct ArchitectureSpec {
     /// density. `0.0` (default) reproduces the exact pre-existing uniform-density sampling.
     #[serde(default)]
     pub hole_bias_fraction: f64,
+    /// Extends `hole_bias_fraction`'s near-hole sampling bias from Free-only to every Fixed
+    /// hole too, splitting the fraction evenly across every biased hole (Free and Fixed
+    /// together). `false` (default) is byte-identical to every pre-existing spec. Issue #78's
+    /// own earlier "fifth experiment" tried this once for the unrelated multi-Free-hole Kt
+    /// question and reverted it (no evidence there); this flag targets a different, still-open
+    /// question - whether near-Fixed-hole collocation density affects the Fixed hole's own
+    /// profile ANGULAR SHAPE, for the mixed Free+Fixed-hole boundary-lift/exact-projection
+    /// investigation (`docs/NUMERICAL_AND_TUI_RECONCILIATION_2026-09-23.md`).
+    #[serde(default)]
+    pub hole_bias_include_fixed: bool,
     #[serde(default)]
     pub coordinate_embedding: CoordinateEmbeddingSelection,
     #[serde(default = "default_training_procedure")]
@@ -505,6 +515,7 @@ mod tests {
         assert!(!a.free_boundary_lifting);
         assert!(!a.hard_fixed_holes);
         assert_eq!(a.hole_bias_fraction, 0.0);
+        assert!(!a.hole_bias_include_fixed);
         assert_eq!(a.coordinate_embedding, CoordinateEmbeddingSelection::Cartesian);
         assert_eq!(a.training_procedure, TrainingProcedure::Joint);
     }
@@ -528,6 +539,7 @@ mod tests {
                 trainable_saturation_scale: false,
                 free_boundary_lifting: false,
                 hard_fixed_holes: false,
+                hole_bias_include_fixed: false,
             },
             ArchitectureSpec { hard_constraint_ansatz: true, trainable_saturation_scale: true, ..Default::default() },
         ] {
