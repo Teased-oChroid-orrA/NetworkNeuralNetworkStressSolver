@@ -4,6 +4,68 @@
 
 Use installed `caveman` skill automatically for every user-facing response in this repository. Default to full mode for the whole session; no activation command required. Follow its auto-clarity and boundary rules. `stop caveman` or `normal mode` disables it immediately.
 
+### Continuation protocol
+
+When the user requests ongoing issue/bug work, continue through all evidence-backed fixes and
+verification gates in the same turn. Do not stop at a milestone, partial pass, or BLOCKED item
+while safe in-scope diagnostics and implementation remain. Preserve explicit process limits: at
+most one background `pinn-solver` run and two other background runs. If a turn boundary
+interrupts work, resume from the repository manifest and issue comments without repeating
+completed work. Never claim operational status until acceptance criteria pass; record blockers
+and continue alternate safe investigations.
+
+## Intent Layer
+
+> TL;DR: PINN structural-stress solver (Rust/`burn`/`egui`/`wgpu`). Start at Entry Points below;
+> everything after this section is the project's chronological engineering-history log (every
+> investigation finding, oldest first) — grep it by symbol/issue name rather than reading start
+> to end. No child `AGENTS.md` nodes exist yet; each crate's own internals aren't separately
+> documented beyond what's below and in the history log.
+
+### Subsystems
+
+| Crate | Owns | Depends on |
+|---|---|---|
+| `pinn-core` | Geometry (`UserGeometry`/`HoleSpec`/`GeometryConfig`), material props, `ProblemSpec`/`ArchitectureSpec`, sampling primitives, units. No ML deps. | — |
+| `pinn-solver` | Training loop, optimizer (SOAP-Muon), loss terms, all three problems' physics (`kirsch_problem.rs`, `pinlug_problem.rs`, `user_problem.rs`), decision-maker/L-BFGS, checkpointing. | `pinn-core` |
+| `pinn-gui` | `egui` panels (heatmap, training stats, params). | `pinn-core`, `pinn-solver` |
+| `pinn-app` | Binary: CLI/env parsing, `--headless`/`--tui`/GUI dispatch (`main.rs`). | all three |
+
+### Entry Points
+
+| Task | Start Here |
+|---|---|
+| Run Kirsch headless | `cargo run -p pinn-app --release -- --headless --problem kirsch` |
+| Run pin-lug headless | `cargo run -p pinn-app --release -- --headless --problem pinlug` |
+| Run a user-defined plate spec | `cargo run -p pinn-app --release -- --headless --problem-spec <path.toml>` (see `examples/problems/`) |
+| Terminal dashboard | add `--tui`/`-T` to any of the above, or alone for an interactive picker |
+| GUI-streaming plate training loop | `crates/pinn-solver/src/runner.rs::run_user_problem_training_from` |
+| Headless plate training loop | `crates/pinn-solver/src/user_runner.rs::run_headless_user_problem` |
+| New loss term / boundary condition | `crates/pinn-solver/src/user_problem.rs` (`LossTerm` impls) + `crates/pinn-core/src/problem.rs` (`LossTerm` trait) |
+| New ansatz (hard-constraint BC) | `crates/pinn-solver/src/kirsch_hole_correction.rs` (`AnnulusAnsatz`, `DirichletAnsatz` impls) |
+| Targeted test verification | `cargo test -p pinn-solver -p pinn-core --release -- --test-threads=1 <substring>` — see Pitfalls below before running a full suite |
+
+### Global Invariants
+
+- Internal storage is always SI (Pa, m); display layer converts to US customary (psi/ksi/in) via `pinn_core::units` only.
+- Every `LossTerm` must be normalized to O(1) before SAW-BRDR weighting (divide by `ref_energy`/`ref_stress2`) — an unnormalized term silently starves every other term's gradient.
+- `training_core::step_physics` (Kirsch, frozen/byte-proven) and `step_physics_multi` (N-domain, additive) are two separate functions by design — never collapse one into a thin wrapper around the other; each has its own regression oracle.
+- Converge-tier (L-BFGS) loss-weight lookup fails closed (`required_loss_weight`, panics on a missing key in both debug and release) — do not revert to a `.unwrap_or(&0.0)`-style silent default; that exact pattern silently zero-weighted a real loss term out of production training for as long as this codebase has had a decision-maker path (see history log, "Correction:" section).
+
+### Global Pitfalls
+
+- **`cargo test --release` on this workspace is slow to *compile* (5–13 min), not to run** — `[profile.release]` uses `lto = "thin"` + `codegen-units = 1` with no `incremental`, so every rebuild pays near-full-program codegen regardless of edit size. This is load-bearing for `burn`/`wgpu`/cubecl kernel-dispatch performance — a lighter profile (no LTO, more codegen units) was tried and made a GPU-kernel-heavy test go from ~1s to a multi-minute hang instead of faster. Don't fight this; batch multiple test-name filters into one `cargo test` invocation to amortize the compile cost instead.
+- **`cargo check --workspace` (no `--tests`) does not type-check `#[cfg(test)]` code.** A test-only import/call-site error will pass `cargo check` clean and only surface at `cargo test` (after paying the full release compile). Use `cargo check --workspace --tests` for a real pre-flight.
+- A disconnected `crossbeam_channel` control receiver (`stop_rx`) is treated as `ControlAction::StopImmediately` inside the training step loop (a deliberate, correct zombie-spin-loop fix) — a test that drops its control-sender *before* calling a training function to get prompt post-training cleanup will instead bail out of the step loop itself before `TrainingMsg::Done` is ever sent. See `runner::tests::gui_streaming_step_zero_matches_independent_shared_function_computation`'s own fix (queue one harmless `ControlMsg::ExportContactPressure` per expected step-loop iteration, then drop) for the pattern.
+- Near-hole sampling-bias weighting (`hole_bias_quadrature_weights_including_fixed`) must be computed **per hole**, not pooled across all biased holes — `sample_interior` draws an equal point count per hole regardless of that hole's own bias-disk area, so holes of different radii have genuinely different local density. Invisible in every test geometry that happens to use equal-radius holes.
+
+### Downlinks
+
+No child `AGENTS.md` nodes yet — every crate's internals are documented only in the Entry
+Points/Invariants/Pitfalls above and in the chronological history log below. Add a child node
+under `crates/<name>/AGENTS.md` if that crate's own internals grow past what a "Find It Fast"
+table in this root can reasonably cover.
+
 ## CodeGraph-First Engineering Workflow
 
 ### Purpose
