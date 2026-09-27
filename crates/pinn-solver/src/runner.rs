@@ -4362,6 +4362,113 @@ mod tests {
         );
     }
 
+    /// `docs/NUMERICAL_AND_TUI_RECONCILIATION_2026-09-23.md`'s own open question: a mixed-hole
+    /// run's post-update `probe_energy_balance_with_field` (a fresh, independently-seeded plain
+    /// interior resample) disagreed with that same step's own sampled training objective by
+    /// 0.009-0.012 J, with "quadrature mismatch between the two evaluators" as one of three
+    /// unranked candidate sources. This is the doc's own suggested cheapest, most decisive next
+    /// test: re-probe using the EXACT points/weights the training step itself used
+    /// (`probe_energy_balance_with_field_at_points`) instead of a reinitialized plain sampler,
+    /// on a single step (hole-bias weighting, not a full AMR sweep, is the cheapest way to get
+    /// a genuinely nonuniform `interior_weights` without a multi-hundred-step AMR warmup) - if
+    /// the weighted probe's internal energy differs meaningfully from the plain-resample probe's
+    /// own value, quadrature mismatch is a real, live contributor (not yet the WHOLE gap, since
+    /// this single-step test cannot itself separate out genuine model drift); if the two probes
+    /// agree closely, quadrature mismatch is NOT the dominant source and the doc's other two
+    /// candidates (model drift, quadrature bias) become the more likely explanation.
+    #[test]
+    fn energy_balance_probe_at_trained_points_differs_from_a_fresh_plain_resample_under_real_hole_bias_weighting() {
+        use crate::optim::{make_bias_optim, make_gate_optim, WeightOptim};
+        use crate::problem::{BoundaryValueProblem, DomainOptim};
+        use crate::saw_brdr::SawBrdr;
+        use crate::training_core::step_physics_multi;
+        use crate::user_problem::{
+            hole_bias_quadrature_weights, plate_multi_step_ctx, probe_energy_balance_with_field,
+            probe_energy_balance_with_field_at_points, resample_plate_step_data, UserDefinedProblem,
+        };
+        use burn::tensor::backend::Backend;
+
+        let mut spec = single_hole_like_spec(1);
+        spec.formulation = pinn_core::problem_spec::FormulationSelection::Variational;
+        spec.training.measure_aware_training = true;
+        spec.training.amr_enabled = false; // isolate hole-bias weighting alone, no AMR sweep noise
+        spec.architecture.hole_bias_fraction = 0.4; // real value this investigation's own trials used
+
+        let device = BDevice::default();
+        let half_w = spec.geometry.half_w;
+        let half_h = spec.geometry.half_h;
+        let problem = UserDefinedProblem::new(spec.clone());
+        let net_cfg = ElasticityNetConfig::new()
+            .with_input_dim(spec.geometry.net_input_dim())
+            .with_hidden_dim(spec.network.hidden_dim)
+            .with_n_hidden(spec.network.n_hidden)
+            .with_output_dim(5);
+        B::seed(&device, spec.network.model_init_seed);
+        let model = net_cfg.init(&device);
+        let mut optim = DomainOptim {
+            weight: WeightOptim::new(true), bias: make_bias_optim(),
+            gate: make_gate_optim(), hole_scale: make_gate_optim(),
+        };
+        let base_weights: Vec<f32> = problem.loss_terms().iter().map(|t| problem.base_weight(t.name())).collect();
+        let mut saw = SawBrdr::with_base(base_weights, 0.95);
+        let mut lr_sched = LrSchedule::new(spec.training.lr, 100, 500);
+        let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
+        let hole_fd = crate::user_problem::hole_fd_config_for_geometry(&fd, &spec.geometry);
+        let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+        let (u_ref, ref_energy, ref_stress2) = (scales.u_ref, scales.ref_energy, scales.ref_stress2);
+        let config = SolverConfig::default_kirsch();
+        let sampling = problem.sampling_strategy(0);
+        let placeholder = pinn_core::geometry::GeometryConfig::kirsch_plate_inches();
+
+        let data = resample_plate_step_data(
+            sampling, &placeholder, &spec.load, spec.training.n_interior, spec.training.n_boundary, half_w, half_h,
+        );
+        let weights = hole_bias_quadrature_weights(&data.int_norm, &spec.geometry, spec.architecture.hole_bias_fraction);
+        // Sanity check on `hole_bias_quadrature_weights`'s own contract (mean(w_i)==1.0) - if
+        // this ever fails, the weighted/unweighted comparison below would be meaningless.
+        let mean_w = weights.iter().sum::<f64>() / weights.len() as f64;
+        assert!((mean_w - 1.0).abs() < 1e-6, "hole-bias weights must average to 1.0, got {mean_w}");
+        let variance = weights.iter().map(|&w| (w - mean_w).powi(2)).sum::<f64>() / weights.len() as f64;
+        assert!(variance > 1e-6, "test setup sanity check: hole-bias weighting must be genuinely \
+            nonuniform for this comparison to mean anything, got variance={variance}");
+        problem.set_interior_weights(Some(weights.clone()));
+
+        let ctx = plate_multi_step_ctx(
+            &config, &problem, &fd, &hole_fd, &data,
+            u_ref, ref_energy, ref_stress2, spec.geometry.n_fourier(), spec.geometry.coordinate_embedding(), false, 0,
+        );
+        let (new_model, _out) = step_physics_multi(
+            vec![model], std::slice::from_mut(&mut optim), &ctx, &mut saw, &mut lr_sched, &device, 0, 1.0, 1.0,
+        );
+        let model_val: ElasticityNet<BInner> = new_model.into_iter().next().unwrap().valid();
+
+        let ansatz = problem.ansatz(0);
+        let plain_probe = probe_energy_balance_with_field(&model_val, &spec, &device, ansatz, None);
+        let weighted_probe = probe_energy_balance_with_field_at_points(
+            &model_val, &spec, &device, ansatz, None, &data.int_norm, Some(weights.as_slice()),
+        );
+
+        assert!(plain_probe.internal_energy.is_finite() && weighted_probe.internal_energy.is_finite());
+        let relative_diff = (weighted_probe.internal_energy - plain_probe.internal_energy).abs()
+            / plain_probe.internal_energy.abs().max(1e-30);
+        println!(
+            "energy-balance quadrature-mismatch probe: plain(fresh-resample)={:.6e} J, \
+             weighted(trained-points)={:.6e} J, relative_diff={:.4}%",
+            plain_probe.internal_energy, weighted_probe.internal_energy, relative_diff * 100.0,
+        );
+        // Real, decisive, single-variable evidence either way (see doc comment above): under
+        // real AMR-style hole-bias weighting, re-probing at the exact trained points/weights
+        // must move the internal-energy estimate measurably relative to a plain fresh resample
+        // - if it did NOT, `probe_energy_balance_with_field`'s own unweighted resample would
+        // already be indistinguishable from the weighted one, which would mean quadrature
+        // mismatch could never explain any part of the doc's own observed 0.009-0.012 J gap.
+        assert!(relative_diff > 1e-4,
+            "weighted and plain probes agreed to {relative_diff:.6} relative - if this holds, \
+             quadrature mismatch between the two evaluators is NOT a live contributor to the \
+             mixed-hole objective-vs-probe gap; the doc's other two candidates (model drift, \
+             quadrature bias) become the more likely explanation and should be investigated next");
+    }
+
     /// Issue #62 PH3-06: real, live evidence that `ad_fd_strain_diagnostic` actually fires
     /// during an actual training session (not just the isolated `differential_operator::` unit
     /// tests against a synthetic manufactured field) - a short, fast run (past the first

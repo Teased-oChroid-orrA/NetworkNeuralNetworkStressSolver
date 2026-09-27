@@ -2214,6 +2214,13 @@ impl UserDefinedProblem {
     pub fn set_interior_weights(&self, weights: Option<Vec<f64>>) {
         *self.current_interior_weights.lock().unwrap() = weights;
     }
+
+    /// Read-back of the weights `set_interior_weights` most recently stored - lets a caller
+    /// (e.g. a post-update diagnostic probe) reuse the EXACT weighting this step's own
+    /// `loss_terms()` forward pass used, instead of assuming `None`/re-deriving it.
+    pub fn interior_weights(&self) -> Option<Vec<f64>> {
+        self.current_interior_weights.lock().unwrap().clone()
+    }
 }
 
 impl BoundaryValueProblem for UserDefinedProblem {
@@ -4467,6 +4474,112 @@ pub fn probe_energy_balance_with_field(
             .collect();
         // Issue #61 P2-04: `∮ f ds ≈ Σ f_i * ds_i * thickness`, via the shared abstraction
         // (byte-identical formula to this call site's pre-P2-04 inline accumulation loop).
+        0.5 * crate::measure_integral::boundary_integral(&traction_dot_u, &ds_per_point, geometry.thickness)
+    };
+
+    let denom = external_work.abs().max(1e-30);
+    let energy_balance_error = (internal_energy - external_work).abs() / denom;
+
+    pinn_core::messages::EnergyBalance { internal_energy, external_work, energy_balance_error }
+}
+
+/// Same as [`probe_energy_balance_with_field`], but evaluates the internal-energy half at the
+/// EXACT interior points/weights a training step's own `loss_terms()` forward pass just used
+/// (`int_norm`/`interior_weights`, same order/length `UserDefinedProblem::interior_weights()`
+/// returns for that step), instead of drawing a fresh, independently-seeded plain sample.
+/// Isolates "quadrature mismatch between the two evaluators" from "real model drift between
+/// pre- and post-update" when comparing a post-update probe against the sampled training
+/// objective - see `docs/NUMERICAL_AND_TUI_RECONCILIATION_2026-09-23.md`'s own open question
+/// about the objective-vs-probe gap this exists to help disambiguate. `interior_weights` reuses
+/// `measure_integral::domain_integral_weighted_tensor` - the SAME function `PhysicalPotential
+/// EnergyTerm::compute()` calls under `measure_aware=true` - so a weighted probe's internal
+/// energy is computed by the identical formula training itself optimizes against, not a
+/// hand-rederived approximation of it. The external-work half still resamples the boundary
+/// fresh: AMR/hole-bias weighting only ever touches `data.int_norm` in this codebase (never
+/// boundary/named point sets), so there is no matching "training's own boundary sample" to
+/// reuse and no mismatch to isolate there.
+pub fn probe_energy_balance_with_field_at_points(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    spec: &ProblemSpec,
+    device: &crate::training_core::BDevice,
+    ansatz: &dyn DirichletAnsatz,
+    affine_strain_pair: Option<(f64, f64)>,
+    int_norm: &[[f32; 2]],
+    interior_weights: Option<&[f64]>,
+) -> pinn_core::messages::EnergyBalance {
+    use crate::energy::dem_energy_per_point;
+    use crate::differential_operator::production_strain as compute_strains;
+    use crate::fd_stencil::FdConfig;
+    use crate::training_core::{stencil_forward_with_ansatz, BInner};
+
+    let geometry = &spec.geometry;
+    let sampling = UserSamplingStrategy::new(geometry.clone(), spec.training.fd_h);
+    let placeholder = geometry.to_placeholder();
+    let fd = FdConfig::new(spec.training.fd_h, 2.0 * geometry.half_w, 2.0 * geometry.half_h);
+    let scales = crate::training_core::compute_reference_scales_for_plate(spec);
+    let (stress_ref, u_ref) = (scales.stress_ref, scales.u_ref);
+    let px_pa = stress_ref;
+    let norm_pt = |x: f64, y: f64| -> [f32; 2] { [(x / geometry.half_w) as f32, (y / geometry.half_h) as f32] };
+
+    let hole_radii: Vec<f64> = geometry.holes.iter().map(|h| h.radius).collect();
+    let area = crate::measure_integral::plate_domain_area(geometry.half_w, geometry.half_h, &hole_radii);
+    let internal_energy = if int_norm.is_empty() {
+        0.0
+    } else {
+        let n_int = int_norm.len();
+        let (scaled, _) = stencil_forward_with_ansatz::<BInner>(
+            model, ansatz, int_norm, &fd, 1.0, u_ref as f64, px_pa, true,
+            embedding_for_model(model, geometry), None, device,
+        );
+        let (mut exx, mut eyy, mut exy) = compute_strains::<BInner>(scaled, n_int, &fd);
+        if let Some((px, py)) = affine_strain_pair {
+            let (a_exx, a_eyy, a_exy) = affine_strain(px, py, &spec.material);
+            exx = exx.add_scalar(a_exx);
+            eyy = eyy.add_scalar(a_eyy);
+            exy = exy.add_scalar(a_exy);
+        }
+        let energy_density = dem_energy_per_point::<BInner>(exx, eyy, exy, &spec.material);
+        let energy_tensor = match interior_weights {
+            Some(weights) => crate::measure_integral::domain_integral_weighted_tensor::<BInner>(
+                area, geometry.thickness, energy_density, weights,
+            ),
+            None => crate::measure_integral::domain_integral_tensor::<BInner>(
+                area, geometry.thickness, energy_density,
+            ),
+        };
+        energy_tensor.into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0) as f64
+    };
+
+    let bnd_pts_phys = sampling.sample_boundary(&placeholder, &spec.load, spec.training.n_boundary);
+    let external_work = if bnd_pts_phys.is_empty() {
+        0.0
+    } else {
+        let n_bnd = bnd_pts_phys.len();
+        let per_edge = (n_bnd / 4).max(1);
+        let ds_x_normal = 2.0 * geometry.half_h / per_edge as f64;
+        let ds_y_normal = 2.0 * geometry.half_w / per_edge as f64;
+        let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
+        let (scaled, _) = stencil_forward_with_ansatz::<BInner>(
+            model, ansatz, &bnd_norm, &fd, 1.0, u_ref as f64, px_pa, true,
+            embedding_for_model(model, geometry), None, device,
+        );
+        let nx: Vec<f32> = bnd_pts_phys.iter().map(|p| p.nx as f32).collect();
+        let ny: Vec<f32> = bnd_pts_phys.iter().map(|p| p.ny as f32).collect();
+        let mut u_vals: Vec<f32> = scaled.clone().slice([0..n_bnd, 0..1]).reshape([n_bnd])
+            .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
+        let mut v_vals: Vec<f32> = scaled.slice([0..n_bnd, 1..2]).reshape([n_bnd])
+            .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
+        if let Some((px, py)) = affine_strain_pair {
+            let (a_exx, a_eyy, a_exy) = affine_strain(px, py, &spec.material);
+            for (i, point) in bnd_pts_phys.iter().enumerate() {
+                u_vals[i] += (a_exx * point.x + a_exy * point.y) as f32;
+                v_vals[i] += (a_exy * point.x + a_eyy * point.y) as f32;
+            }
+        }
+        let traction_dot_u = prescribed_traction_dot_displacement(&spec.load, &nx, &ny, &u_vals, &v_vals);
+        let ds_per_point: Vec<f64> = (0..n_bnd)
+            .map(|i| if nx[i].abs() > 0.5 { ds_x_normal } else { ds_y_normal })
+            .collect();
         0.5 * crate::measure_integral::boundary_integral(&traction_dot_u, &ds_per_point, geometry.thickness)
     };
 
