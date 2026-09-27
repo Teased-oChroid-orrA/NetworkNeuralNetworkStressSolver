@@ -4,6 +4,479 @@
 
 Use installed `caveman` skill automatically for every user-facing response in this repository. Default to full mode for the whole session; no activation command required. Follow its auto-clarity and boundary rules. `stop caveman` or `normal mode` disables it immediately.
 
+## CodeGraph-First Engineering Workflow
+
+### Purpose
+
+CodeGraph MCP is installed, initialized, and connected to this project.
+
+CodeGraph is a required architectural and code-relationship analysis tool for this project. It must be used whenever understanding relationships between code elements could affect the correctness, safety, completeness, or maintainability of a change.
+
+Claude must **not assume that an MCP being connected means it has actually been used**. For applicable tasks, CodeGraph must be explicitly consulted before making implementation decisions.
+
+The goal is not to use CodeGraph mechanically. The goal is to use it to understand the existing system before changing it.
+
+---
+
+### 1. Mandatory CodeGraph Usage
+
+Use CodeGraph before making decisions involving:
+
+* architecture
+* module boundaries
+* dependencies
+* call relationships
+* data flow
+* control flow
+* numerical computation flow
+* solver behavior
+* convergence behavior
+* state management
+* UI-to-backend interactions
+* refactoring
+* API changes
+* removing code
+* replacing implementations
+* consolidating duplicate functionality
+* determining whether an existing module can be reused
+* adding a new subsystem
+* modifying an existing engineering toolbox
+* modifying shared numerical/materials/precision infrastructure
+* changing behavior that may affect multiple tools
+
+CodeGraph should be treated as the **primary source for understanding code relationships**, while normal repository inspection remains necessary for understanding implementation details.
+
+---
+
+### 2. Required Workflow
+
+For any substantial coding task, follow this sequence:
+
+#### Phase 1 — Understand
+
+1. Inspect the current local Git state.
+2. Identify the relevant branch and working-tree state.
+3. Use CodeGraph to identify the relevant:
+
+   * callers
+   * callees
+   * types
+   * modules
+   * dependencies
+   * implementations
+   * data/control-flow relationships
+4. Inspect the actual source files involved.
+5. Identify existing functionality that may already solve part or all of the problem.
+
+Do not begin implementation merely because a file with a matching name has been found.
+
+---
+
+#### Phase 2 — Evaluate
+
+Determine:
+
+* What the existing architecture is actually doing.
+* Which existing abstractions should be reused.
+* Whether the requested functionality already exists in another form.
+* Whether apparently separate implementations are actually duplicates.
+* What code will be affected by the proposed change.
+* Whether the proposed change crosses module/API boundaries.
+* Whether there are hidden callers or dependencies.
+* Whether tests or other tools depend on the existing behavior.
+
+For numerical code, additionally determine:
+
+* Where inputs originate.
+* Where units/conversions are applied.
+* Where intermediate calculations occur.
+* Where numerical precision is handled.
+* Where convergence criteria are calculated.
+* Where solver state is updated.
+* Where results are consumed/displayed.
+* Whether multiple tools duplicate the same numerical logic.
+
+---
+
+### 3. Planning Requirements
+
+Before creating or substantially modifying an implementation plan, use CodeGraph to establish the relevant architecture.
+
+The plan must be based on the **actual repository relationships**, not assumptions based solely on:
+
+* filenames,
+* directory structure,
+* text search results,
+* documentation,
+* or the original task description.
+
+The plan should identify:
+
+* existing modules to reuse,
+* modules requiring modification,
+* affected callers,
+* affected dependents,
+* potential duplicate implementations,
+* likely regression areas,
+* and required validation.
+
+If CodeGraph reveals that the original plan is based on an incorrect architectural assumption, update the plan.
+
+Do not blindly follow an earlier plan simply because it already exists.
+
+---
+
+### 4. Trust but Validate
+
+Existing code, plans, previous AI-generated work, and developer assumptions are **inputs to evaluate, not automatically authoritative**.
+
+This applies equally to:
+
+* existing implementation,
+* previous Claude Code changes,
+* user-created changes,
+* generated code,
+* documentation,
+* architectural assumptions,
+* optimization proposals,
+* numerical approaches,
+* and previous plans.
+
+Use CodeGraph and repository evidence to determine whether those assumptions are correct.
+
+Do not preserve an existing implementation merely because it already exists.
+
+Do not replace an existing implementation merely because a new implementation appears cleaner.
+
+Make the decision based on evidence.
+
+---
+
+### 5. Existing Functionality Must Be Reused Where Appropriate
+
+Before creating a new implementation of functionality that may already exist:
+
+1. Query CodeGraph for related implementations and relationships.
+2. Inspect the existing implementation.
+3. Determine whether it can be reused directly.
+4. If not, determine whether it should be refactored into a reusable module.
+5. Update existing consumers as appropriate.
+6. Only create a parallel implementation when there is a documented technical reason.
+
+Avoid parallel implementations of the same engineering or numerical concept.
+
+Examples include:
+
+* materials calculations
+* pressure-vessel/Lamé equations
+* precision/display rules
+* unit conversion
+* numerical solvers
+* convergence detection
+* engineering-property calculations
+* geometry calculations
+* tolerance calculations
+* common validation
+* shared UI components
+
+Prefer one authoritative implementation with well-defined interfaces.
+
+---
+
+### 6. Duplicate-Code Detection
+
+Before adding substantial new code, use CodeGraph to determine whether equivalent or overlapping functionality already exists.
+
+After implementation, use CodeGraph again to look for:
+
+* obsolete implementations,
+* redundant call paths,
+* duplicate calculations,
+* unused abstractions,
+* bypassed shared modules,
+* and functionality that should now be consolidated.
+
+Remove obsolete code when it is safe to do so.
+
+Do not leave old implementations in place merely because they might theoretically be useful.
+
+Before removing code, verify that it is not required by:
+
+* callers,
+* tests,
+* configuration,
+* public APIs,
+* serialization,
+* generated code,
+* feature flags,
+* or planned functionality.
+
+---
+
+### 7. Local Repository Is the Source of Truth
+
+For code analysis and implementation, the **current local repository state takes precedence over GitHub's remote state**.
+
+This is especially important when:
+
+* local commits have not been pushed,
+* feature branches differ from remote branches,
+* the working tree contains changes,
+* or the user is experimenting locally.
+
+Do not assume GitHub contains the latest implementation.
+
+When reviewing a task involving Git history:
+
+1. Inspect local Git state.
+2. Identify local-only commits.
+3. Identify uncommitted changes.
+4. Compare against the relevant remote branch.
+5. Inspect GitHub separately for remote context.
+6. Clearly distinguish local code from remote code.
+
+Never overwrite or discard local work merely to synchronize with GitHub unless explicitly instructed.
+
+---
+
+### 8. CodeGraph Index Freshness
+
+Do not assume that CodeGraph automatically reflects every local modification.
+
+Before relying on CodeGraph for an important architectural decision, determine whether its index reflects the relevant current local repository state.
+
+If the index is stale:
+
+1. Refresh/reindex it when supported.
+2. Re-run the relevant CodeGraph queries.
+3. Verify important relationships against the actual source files.
+
+If CodeGraph cannot represent a recent change, use direct source inspection as the fallback.
+
+Never present stale CodeGraph information as current repository truth.
+
+---
+
+### 9. Debugging Requirements
+
+For non-trivial bugs, CodeGraph must be used to trace the relevant execution path before changing code.
+
+For example, for a numerical convergence problem, trace:
+
+```text
+UI / configuration
+        ↓
+solver construction
+        ↓
+initial conditions
+        ↓
+parameter normalization
+        ↓
+numerical state
+        ↓
+iteration/training loop
+        ↓
+loss/residual calculation
+        ↓
+gradient/update
+        ↓
+convergence criteria
+        ↓
+termination/result handling
+```
+
+The actual path will vary by implementation.
+
+Use CodeGraph to determine the real relationships rather than assuming this structure exists.
+
+Then inspect the actual implementations and validate the behavior experimentally.
+
+Do not "fix" convergence merely by:
+
+* loosening convergence criteria,
+* increasing iteration limits,
+* suppressing warnings,
+* masking numerical failures,
+* changing tolerances without justification,
+* or otherwise making failure less visible.
+
+First determine the underlying cause.
+
+---
+
+### 10. Numerical Engineering Requirements
+
+For numerical and engineering code, CodeGraph analysis must be combined with mathematical and numerical validation.
+
+Before modifying numerical behavior, determine:
+
+* the complete calculation path,
+* shared versus tool-specific calculations,
+* input/output relationships,
+* unit handling,
+* precision handling,
+* convergence behavior,
+* failure modes,
+* and downstream consumers.
+
+Do not infer mathematical correctness from code structure alone.
+
+Validate important numerical changes using appropriate:
+
+* analytical cases,
+* known solutions,
+* limiting cases,
+* dimensional checks,
+* independent calculations,
+* regression tests,
+* convergence studies,
+* or benchmarks.
+
+Where a change is intended to improve convergence or performance, measure it.
+
+---
+
+### 11. Engineering Toolbox Requirements
+
+For each engineering toolbox:
+
+1. Use CodeGraph to identify related existing modules.
+2. Search for existing calculations that can be reused.
+3. Identify shared infrastructure.
+4. Determine whether the functionality belongs in:
+
+   * the toolbox,
+   * a reusable numerical module,
+   * a reusable engineering module,
+   * or shared infrastructure.
+5. Implement only the minimum toolbox-specific logic necessary.
+6. Verify that shared functionality remains centralized.
+
+The toolbox should not independently reimplement calculations that belong in shared engineering modules.
+
+---
+
+### 12. Precision and Numerical Display
+
+Precision handling is a shared concern.
+
+Before adding or modifying precision/display behavior:
+
+1. Use CodeGraph to identify all existing precision-related implementations.
+2. Determine which components perform mathematical calculations.
+3. Determine which components perform display formatting.
+4. Keep mathematical precision separate from presentation precision.
+5. Preserve full precision for intermediate calculations.
+6. Apply display rounding only at the appropriate final-display boundary.
+7. Avoid duplicating precision policy inside individual toolboxes.
+
+Changes to the shared precision system must be evaluated for downstream effects.
+
+---
+
+### 13. Materials and Shared Engineering Libraries
+
+Before implementing a calculation requiring material properties:
+
+1. Use CodeGraph to locate existing materials functionality.
+2. Determine how existing tools consume it.
+3. Determine whether it is already sufficiently modular.
+4. If it is not appropriately modular, refactor it into a self-contained reusable module where justified.
+5. Update existing consumers to use the authoritative implementation.
+6. Do not create a second materials database or calculation path.
+
+The same principle applies to other shared engineering functionality.
+
+---
+
+### 14. Verification After Implementation
+
+After a substantial implementation, use CodeGraph again.
+
+Verify:
+
+* affected callers,
+* affected dependents,
+* newly introduced relationships,
+* obsolete relationships,
+* duplicate implementations,
+* unintended bypasses of shared modules,
+* and architectural consistency.
+
+Then run the appropriate tests and validation.
+
+CodeGraph verification does **not** replace testing.
+
+Testing does **not** replace CodeGraph analysis.
+
+Both provide different forms of evidence.
+
+---
+
+### 15. When CodeGraph Cannot Be Used
+
+If CodeGraph is:
+
+* disconnected,
+* unavailable,
+* stale,
+* unable to index the relevant code,
+* unable to answer the required relationship query,
+* or otherwise unusable,
+
+do not fabricate CodeGraph results.
+
+Instead:
+
+1. State internally/briefly that CodeGraph could not provide the required analysis.
+2. Fall back to direct repository inspection and other available tools.
+3. Continue only when sufficient evidence can be obtained another way.
+4. If the task depends critically on information CodeGraph should provide, flag that limitation before making a high-risk architectural change.
+
+Do not claim that CodeGraph was consulted when it was not.
+
+---
+
+### 16. Mandatory CodeGraph Checkpoint
+
+For every substantial task, before implementation, answer these questions:
+
+* Did I use CodeGraph?
+* Did I use it on the relevant local repository state?
+* Did I identify callers/dependents of the code I intend to change?
+* Did I check for existing implementations that should be reused?
+* Did I identify potentially affected components?
+* Did I inspect the actual source after the graph analysis?
+* Did I validate important CodeGraph findings against the source?
+
+If the answer to any applicable question is no, perform the missing analysis before proceeding.
+
+---
+
+### 17. Final Engineering Principle
+
+The preferred workflow is:
+
+**Understand → CodeGraph → Inspect → Validate → Plan → Implement → Test → CodeGraph Re-check → Clean Up → Final Validation**
+
+Do not use:
+
+**Guess → Search for a convenient file → Modify → Hope nothing else depends on it**
+
+CodeGraph is a required part of understanding the architecture, but it is **not an authority on correctness**.
+
+The authoritative result comes from combining:
+
+* CodeGraph relationships,
+* actual source code,
+* Git history,
+* tests,
+* numerical validation,
+* benchmarks where applicable,
+* and the stated requirements.
+
+Use all of these together to make engineering decisions.
+
 A physics-informed neural network (PINN) solver for structural boundary-value problems, built
 on `burn` (ML framework) + `egui`/`wgpu` (GUI). Ships two problems: **Kirsch** (a plate with a
 circular hole under remote tension; validation target K_t = 3.0 at the hole boundary) and
@@ -1464,3 +1937,81 @@ non-`main` branch triggers no workflow run at all, since `rust.yml`'s `on.push.b
 verified, rather than once per commit. This is a working-session convention, not a repository
 rule enforced anywhere in code - worth restating explicitly if a future session's own pattern
 drifts back toward pushing to `main` after every single commit.
+
+## Correction: `compute_loss_for_lbfgs_panics_on_lams_missing_a_real_term_key` was never actually
+## unrelated - every "1 pre-existing unrelated failure" line above is superseded
+
+Every regression-suite line above this point (546/563/565/566/568 passed, "same 1 pre-existing
+unrelated failure") was reporting this exact test failing, and every one of those sessions
+correctly noted it was unrelated to THEIR OWN change - that part was true. What none of them
+caught: `training_core::compute_loss_for_lbfgs`/`compute_loss_for_lbfgs_multi` looked up each
+active loss term's Converge-tier (L-BFGS) weight via `lams.get(name).unwrap_or(&0.0)`, guarded
+only by a `debug_assert!` that a matching key exists - and `debug_assert!` compiles to a no-op in
+`--release`, which every one of those "full regression suite" runs used. This test (`#[should_
+panic]`, relying on that same debug-only assert) was never testing a cosmetic gap - it was the
+one signal that a loss term whose name didn't match the hand-typed `HashMap` literal (e.g. a
+`LossTerm::name()` renamed without updating it) was being silently zero-weighted out of the
+optimized Converge-tier objective, in production, with zero warning, for as long as this
+codebase has had a decision-maker/L-BFGS path. Fixed (`required_loss_weight`, panics in both
+debug and release) in a session that also produced a real mixed Free/Fixed-hole convergence
+investigation - see that work's own section below. **Confirmed via a real full regression run
+after the fix landed: this test now passes.** Every "1 pre-existing unrelated failure" count
+above should be read as "and this failure was a real release-mode correctness gap the whole
+time," not as evidence the failure was harmless.
+
+**A second, genuinely still-open failure was found while confirming the fix above** -
+`runner::tests::gui_streaming_step_zero_matches_independent_shared_function_computation`,
+reproducible deterministically, single-threaded, in complete isolation (not the documented
+cross-thread `tracel-ai/burn#5573` flake this file describes elsewhere - that mechanism requires
+concurrent tests; this one fails alone in 7 seconds every time). Root cause: `handle_control_
+messages` (from the same session that fixed `required_loss_weight` above) now returns `ControlAction::
+StopImmediately` when `stop_rx` is disconnected - a deliberate, correct fix for a real zombie-
+spin-loop risk. But this test calls `drop(tx_ctrl)` before starting training to signal "no
+control needed," which disconnects that exact channel - the very first loop iteration hits the
+disconnected-channel branch and `return`s (before `TrainingMsg::Done` is ever sent), which the
+test's own `assert!(saw_done, ...)` then fails. Verified present at commit `681cdf1` (before any
+of this session's own changes) via an isolated worktree run - genuinely pre-existing, not
+introduced by this session. **Not yet fixed** - either the test's `drop(tx_ctrl)` pattern or the
+production disconnected-channel semantics needs to change; whichever fix lands should re-verify
+`run_training_pinlug_stop_message_ends_loop_before_max_steps`-style tests aren't relying on the
+opposite assumption.
+
+**`required_loss_weight`'s real-world impact - verified directly, not just via the unit tests
+above.** Running every `lbfgs`-named test together (`cargo test -p pinn-solver --release --lib
+lbfgs -- --test-threads=1`, ~18s, not a full-suite run) happened to include a real end-to-end
+DM-enabled pin-lug headless integration test: a genuine multi-thousand-step-capable training run
+that reached `Converge` tier repeatedly (`[DM@9] Align → Converge`, `[DM@19]`, `[DM@29]`, ...,
+cycling back to `Align` and returning to `Converge` many times over 79 real steps), completed in
+16s with a finite final loss (3.4111) and no panic, and wrote a real contact-pressure CSV. This
+is the direct, real-world confirmation the plan asked for: `compute_loss_for_lbfgs_multi`'s
+now-fail-closed `required_loss_weight` lookup does not break a real, live, repeatedly-Converge-
+cycling pin-lug run. Alongside it, `compute_loss_for_lbfgs_panics_on_lams_missing_a_real_term_key`
+now fails with a clear, actionable message ("L-BFGS: missing effective weight for active loss
+term 'hole_traction'") instead of silently zero-weighting the term out, and the normal happy-path
+Converge-tier computation tests (`compute_loss_for_lbfgs_still_applies_dynamic_hole_traction_cap_
+via_hashmap_lams`, `step_lbfgs_multi_reduces_loss_and_updates_both_domains_params`, etc.) all
+still pass unchanged. 11/11 in this targeted run, zero regressions.
+
+**Follow-up on the mixed Free/Fixed-hole objective-vs-probe gap (the doc's own cheapest, most
+decisive next test).** `user_problem::probe_energy_balance_with_field_at_points` (new, purely
+additive) re-evaluates the internal-energy half of a post-update energy-balance probe at the
+EXACT interior points/weights a training step's own `loss_terms()` forward pass just used
+(via the new `UserDefinedProblem::interior_weights()` getter), reusing `measure_integral::
+domain_integral_weighted_tensor` - the SAME function `PhysicalPotentialEnergyTerm::compute()`
+itself calls under `measure_aware=true` - instead of a fresh, independently-seeded plain
+resample. A single-step diagnostic test (`runner::tests::energy_balance_probe_at_trained_points_
+differs_from_a_fresh_plain_resample_under_real_hole_bias_weighting`, real hole-bias weighting,
+not a full AMR sweep - cheapest way to get genuinely nonuniform `interior_weights` without a
+multi-hundred-step warmup) found a real, measurable, nonzero effect: the weighted probe's
+internal energy differed from the plain-resample probe's by 0.9567% under one step of real
+nonuniform weighting (8.862e-2 J vs 8.947e-2 J). **Interpretation, honestly scoped**: this
+confirms quadrature mismatch between the two evaluators is a real, live, nonzero contributor to
+any objective-vs-probe gap - not a null hypothesis - but at ~1% relative on a single step, it is
+almost certainly NOT the dominant source of the doc's own observed 0.009-0.012 J gap (a ~10-13%
+relative effect on that trial's ~3.4 J internal-energy scale, accumulated over many steps of
+real training, not one isolated step). This single-step test cannot itself separate out genuine
+model drift, so it does not close the doc's own open question - it narrows it: quadrature
+mismatch is real but small: model drift and/or quadrature bias accumulated over the run are the
+more likely dominant contributors, and should be investigated next (e.g. probing at multiple
+points across a real multi-hundred-step trial, not just one step, to see whether the gap grows
+with training duration in a way pure quadrature noise would not).
