@@ -467,6 +467,23 @@ pub struct HoleAnalysis {
     pub stress_diagnostic: Option<HoleStressDiagnostic>,
 }
 
+/// Physical boundary checks kept separate because traction and displacement have different units.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundaryResidualStats {
+    pub rms: f64,
+    pub max: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhysicalBoundaryResiduals {
+    /// Derived-stress outer traction error, Pa.
+    pub outer_traction_pa: BoundaryResidualStats,
+    /// Derived-stress traction at the FD-safe ring, Pa. Index matches geometry hole order.
+    pub free_hole_traction_pa: Vec<(usize, BoundaryResidualStats)>,
+    /// Total-field displacement at the exact Fixed-hole boundary, m.
+    pub fixed_hole_displacement_m: Vec<(usize, BoundaryResidualStats)>,
+}
+
 /// Transport-side mirror of `pinn_solver::training_core::GradientShareReport` — a separate
 /// type (not the solver's own) so `pinn-core` never needs to depend on `pinn-solver`, same
 /// pattern `HoleBoundaryPoint`/`StressConcentration` already established for this exact reason
@@ -540,6 +557,8 @@ pub struct TrainingUpdate {
     /// genuine zero residual is also a valid value — check alongside `vis.is_some()`).
     pub bc_residual_rms: f64,
     pub bc_residual_max: f64,
+    /// Unit-separated physical checks. `None` off user-plate visualization cadence.
+    pub physical_boundary_residuals: Option<PhysicalBoundaryResiduals>,
     /// `enhancement.md` Phase 9 — see `ReactionForce`'s doc comment. Computed only on the same
     /// cadence `vis` is (`None` otherwise). `None` on Kirsch's own path too (deliberately not
     /// wired there — see `powershell_tool/CLAUDE.md`'s note on why BC residual was likewise

@@ -62,7 +62,18 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
                 lines.push(format!("Linear-elastic balance error |U-W_ext/2| / |W_ext/2| = {:.4e}", e.energy_balance_error));
             } else { lines.push("Physical energy not measured on this path / not available yet.".into()); }
             if let Some(f) = state.reaction_force { lines.push(format!("Net force [N]: ({:.4e}, {:.4e}); normalized imbalance {:.4e}", f.net_fx, f.net_fy, f.equilibrium_error)); }
-            if let Some((step, rms, max)) = state.boundary_residual { lines.push(format!("Boundary residual at step {step}: RMS {rms:.4e}; max {max:.4e} (solver units)")); }
+            if let Some(residuals) = &state.physical_boundary_residuals {
+                let outer = &residuals.outer_traction_pa;
+                lines.push(format!("Outer traction error: RMS {:.4e} Pa; max {:.4e} Pa", outer.rms, outer.max));
+                for (index, stats) in &residuals.free_hole_traction_pa {
+                    lines.push(format!("Free hole {index} traction at FD-safe offset: RMS {:.4e} Pa; max {:.4e} Pa", stats.rms, stats.max));
+                }
+                for (index, stats) in &residuals.fixed_hole_displacement_m {
+                    lines.push(format!("Fixed hole {index} displacement at boundary: RMS {:.4e} m; max {:.4e} m", stats.rms, stats.max));
+                }
+            } else if let Some((step, rms, max)) = state.boundary_residual {
+                lines.push(format!("Legacy boundary aggregate at step {step}: RMS {rms:.4e}; max {max:.4e} (not a mixed-hole accuracy gate)"));
+            }
             if let Some(kt) = state.kt_estimate { lines.push(format!("Kt estimate: {kt:.5}; reference acceptance not inferred")); }
             for h in &state.hole_analyses { lines.push(format!("Hole {}: Kt {:.5}; nominal {:.4e} Pa; {} / {}", h.hole_index, h.concentration.kt, h.concentration.nominal_stress, h.concentration.stress_projection, h.concentration.domain_classification)); }
             if let Some(e) = &state.convergence { lines.push(format!("Convergence evidence: {e:?}")); }

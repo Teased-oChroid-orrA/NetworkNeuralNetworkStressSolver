@@ -49,6 +49,7 @@ pub struct TuiState {
     pub energy_balance: Option<pinn_core::messages::EnergyBalance>,
     pub reaction_force: Option<pinn_core::messages::ReactionForce>,
     pub boundary_residual: Option<(usize, f64, f64)>,
+    pub physical_boundary_residuals: Option<pinn_core::messages::PhysicalBoundaryResiduals>,
     pub gradient_shares: Option<pinn_core::messages::GradientShareSummary>,
     pub convergence: Option<pinn_core::messages::ConvergenceEvidenceSummary>,
     pub sources: Vec<(&'static str, &'static str)>,
@@ -112,6 +113,9 @@ impl TuiState {
         if let Some(energy) = u.energy_balance { self.energy_balance = Some(energy); }
         if let Some(force) = u.reaction_force { self.reaction_force = Some(force); }
         if u.vis.is_some() { self.boundary_residual = Some((u.step, u.bc_residual_rms, u.bc_residual_max)); }
+        if let Some(residuals) = &u.physical_boundary_residuals {
+            self.physical_boundary_residuals = Some(residuals.clone());
+        }
         if let Some(shares) = &u.gradient_share_report { self.gradient_shares = Some(shares.clone()); }
         if let Some(evidence) = &u.convergence_evidence { self.convergence = Some(evidence.clone()); }
         if !u.stress_source_report.is_empty() { self.sources = u.stress_source_report.clone(); }
@@ -216,6 +220,7 @@ mod tests {
             grad_norm: Some(0.25),
             bc_residual_rms: 0.0,
             bc_residual_max: 0.0,
+            physical_boundary_residuals: None,
             reaction_force: None,
             energy_balance: None,
             network_snapshot: None,
@@ -268,6 +273,22 @@ mod tests {
         state.apply(&second);
         assert_eq!(state.total_loss_history, vec![1.5, 1.2], "history must append, not overwrite");
         assert_eq!(state.step, 20);
+    }
+
+    #[test]
+    fn apply_retains_unit_separated_boundary_residuals_between_visualization_ticks() {
+        let mut state = TuiState::new(100);
+        let mut update = base_update();
+        update.physical_boundary_residuals = Some(pinn_core::messages::PhysicalBoundaryResiduals {
+            outer_traction_pa: pinn_core::messages::BoundaryResidualStats { rms: 2.0e6, max: 3.0e6 },
+            free_hole_traction_pa: vec![(0, pinn_core::messages::BoundaryResidualStats { rms: 4.0e6, max: 5.0e6 })],
+            fixed_hole_displacement_m: vec![(1, pinn_core::messages::BoundaryResidualStats { rms: 1.0e-6, max: 2.0e-6 })],
+        });
+        state.apply(&update);
+        state.apply(&base_update());
+        let physical = state.physical_boundary_residuals.expect("latest physical boundary metrics persist");
+        assert_eq!(physical.free_hole_traction_pa[0].0, 0);
+        assert_eq!(physical.fixed_hole_displacement_m[0].1.rms, 1.0e-6);
     }
 
     #[test]

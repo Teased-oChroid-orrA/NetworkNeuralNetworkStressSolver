@@ -611,6 +611,7 @@ pub fn run_training(
                 // math, not reusing this one - a real, deferred follow-up, not a silent 0.0.
                 bc_residual_rms: 0.0,
                 bc_residual_max: 0.0,
+                physical_boundary_residuals: None,
                 // Same deferral as `bc_residual_rms`/`_max` immediately above - Kirsch's own
                 // path has no `probe_reaction_force`/`probe_energy_balance` equivalent built
                 // in this pass.
@@ -1133,13 +1134,10 @@ pub fn run_training_pinlug(
 /// enough (see `energy_loss`/`neumann_loss`'s role-based names, not Kirsch-specific ones) and
 /// this problem is single-domain like Kirsch, not two-domain like pin-lug.
 ///
-/// `neumann_loss = out.total_scalar - out.e_scalar` mirrors `run_training_pinlug`'s own
-/// exact convention (`let neumann_loss = out.total_scalar - energy_loss;`) for aggregating
-/// an arbitrary number of differently-named BC terms into one number, without needing this
-/// problem's own term names (`outer_traction`/`hole_free`/`hole_fixed`) to match any of
-/// `StepOutput`'s hardcoded per-name accessors. `out.e_scalar` DOES already match directly —
-/// this problem's energy term is named `"interior_energy"`, the same name `StepOutput::
-/// e_scalar` looks up for every problem.
+/// Legacy scalar channels remain compatibility fields. Variational energy reads the
+/// atomic `physical_potential` term from the named objective ledger; otherwise energy
+/// reads `interior_energy`. `neumann_loss` remains total minus that raw channel and is
+/// not a physical Neumann residual. Physical acceptance uses separate unit-safe probes.
 ///
 /// Deliberately no curriculum/decision-maker/AMR (matches `user_runner::
 /// run_headless_user_problem`'s same v1 scope cut) — plain constant/scheduled-LR AdamW via
@@ -1336,7 +1334,7 @@ fn run_training_annular_decomposition(
                 step, total_loss, energy_loss: total_loss, neumann_loss: 0.0, lr: lr as f32,
                 lam_energy: 1.0, lam_neumann: 0.0, n_colloc, kt_estimate, vis,
                 amr_sweep: None, hole_analyses: Vec::new(), grad_norm: None,
-                bc_residual_rms: 0.0, bc_residual_max: 0.0, reaction_force: None,
+                bc_residual_rms: 0.0, bc_residual_max: 0.0, physical_boundary_residuals: None, reaction_force: None,
                 energy_balance: None, network_snapshot: None, architecture_event: None,
                 gradient_share_report: None, gradient_conflict_report: None,
                 stress_source_report: stress_source_report.clone(),
@@ -1471,7 +1469,7 @@ fn run_training_annular_decomposition_sequential(
                 step: global_step, total_loss, energy_loss: total_loss, neumann_loss: 0.0,
                 lr: 0.0, lam_energy: 1.0, lam_neumann: 0.0, n_colloc: 0, kt_estimate, vis,
                 amr_sweep: None, hole_analyses: Vec::new(), grad_norm: None,
-                bc_residual_rms: 0.0, bc_residual_max: 0.0, reaction_force: None,
+                bc_residual_rms: 0.0, bc_residual_max: 0.0, physical_boundary_residuals: None, reaction_force: None,
                 energy_balance: None, network_snapshot: None, architecture_event: None,
                 gradient_share_report: None, gradient_conflict_report: None,
                 stress_source_report: stress_source_report.clone(),
@@ -1706,7 +1704,10 @@ fn run_user_problem_training_from(
     // Unlike a warm restart, a detected plateau here triggers a plain graceful stop (the same
     // path `ControlAction::StopAndFinish` already takes), not a restart - Kirsch's LR/Adam
     // reset + tightened `lam_h_cap` cascade is tuned specifically for its own K_t dynamics.
-    let mut plateau_tracker = spec.network.auto_stop_on_plateau.then(|| {
+    // Mixed units and untrained direct-stress columns make the legacy aggregate unsuitable
+    // for stopping a holed plate. Keep existing no-hole behavior until a validated physical
+    // multi-boundary stopping criterion is available.
+    let mut plateau_tracker = (spec.network.auto_stop_on_plateau && spec.geometry.holes.is_empty()).then(|| {
         ConvergenceTracker::for_metric(MetricDirection::SmallerIsBetter, 0.05, f64::INFINITY, 0.0)
     });
     let mut auto_stopped = false;
@@ -2072,7 +2073,7 @@ fn run_user_problem_training_from(
         // expensive field probe still only runs on the original every-10th-step/last-step
         // cadence.
         let mut architecture_event = None;
-        let (vis, hole_analyses, bc_residual_rms, bc_residual_max, reaction_force, energy_balance, network_snapshot, no_hole_benchmark, ad_fd_strain_diagnostic) = if send_vis {
+        let (vis, hole_analyses, bc_residual_rms, bc_residual_max, physical_boundary_residuals, reaction_force, energy_balance, network_snapshot, no_hole_benchmark, ad_fd_strain_diagnostic) = if send_vis {
             let model_val: ElasticityNet<BInner> = model.valid();
             // Issue #77 PH4-41/45: `ansatz` is this model's own real training-time ansatz -
             // `problem.ansatz(0)` (`Identity`, or the hard-constraint one when
@@ -2141,7 +2142,7 @@ fn run_user_problem_training_from(
                 .collect();
             // `enhancement.txt` items 4/C ("BC residual RMS/max") - same vis cadence as
             // above, a real side probe, not part of the per-step loss computation.
-            let (bc_rms, bc_max) = crate::user_problem::probe_boundary_residuals(&model_val, &spec, &device, ansatz, affine);
+            let ((bc_rms, bc_max), physical_boundary) = crate::user_problem::probe_boundary_residuals_detailed(&model_val, &spec, &device, ansatz, affine);
 
             // Issue #62 PH3-10: real per-tick convergence samples - `bc_rms` above and
             // `out.grad_norm` (already computed by `step_physics_multi`, this cadence's own
@@ -2171,7 +2172,7 @@ fn run_user_problem_training_from(
             let rf = crate::user_problem::probe_reaction_force(&model_val, &spec, &device, ansatz, affine);
             // `enhancement.md` Phase 10 ("Energy Validation") - same vis cadence/side-probe
             // precedent as `reaction_force` above.
-            let eb = crate::user_problem::probe_energy_balance(&model_val, &spec, &device);
+            let eb = crate::user_problem::probe_energy_balance_with_field(&model_val, &spec, &device, ansatz, affine);
             let ns = crate::network::network_snapshot(&model_val);
             // Issue #62 PH3-02 - same vis cadence as `rf`/`eb` above (a real forward pass +
             // boundary-residual probe, not free). `None` for a holed geometry - see
@@ -2237,9 +2238,9 @@ fn run_user_problem_training_from(
                 }
             }
 
-            (Some(vis), hole_analyses, bc_rms, bc_max, Some(rf), Some(eb), Some(ns), nhb, ad_fd_diag)
+            (Some(vis), hole_analyses, bc_rms, bc_max, Some(physical_boundary), Some(rf), Some(eb), Some(ns), nhb, ad_fd_diag)
         } else {
-            (None, Vec::new(), 0.0, 0.0, None, None, None, None, None)
+            (None, Vec::new(), 0.0, 0.0, None, None, None, None, None, None)
         };
 
         last_total_loss = out.total_scalar;
@@ -2249,7 +2250,13 @@ fn run_user_problem_training_from(
                 .collect());
         }
         let objective = out.objective_telemetry();
-        let energy_loss = out.e_scalar;
+        // Generic plate Variational has no `interior_energy` term: its one atomic
+        // energy objective is `physical_potential`. The legacy scalar accessor only
+        // looks up `interior_energy`, so it otherwise reports a false zero here.
+        let energy_loss = objective.as_ref()
+            .and_then(|ledger| ledger.terms.iter().find(|term| term.name == "physical_potential"))
+            .map(|term| term.normalized_raw as f32)
+            .unwrap_or(out.e_scalar);
         let neumann_loss = out.total_scalar - energy_loss;
         // `training_core::GradientShareReport` -> `pinn_core::messages::GradientShareSummary` -
         // a separate transport-side type so `pinn-core` never depends on `pinn-solver` (same
@@ -2345,7 +2352,9 @@ fn run_user_problem_training_from(
                     crate::verification_ladder::TrendDirection::Worsening => "Worsening",
                     crate::verification_ladder::TrendDirection::InsufficientData => "InsufficientData",
                 },
-                plausibly_converged: evidence.plausibly_converged,
+                // Legacy history mixes Pa and m on holed plates; never promote its trend
+                // to a convergence claim until unit-separated physical gates are assessed.
+                plausibly_converged: evidence.plausibly_converged && spec.geometry.holes.is_empty(),
             })
         } else {
             None
@@ -2367,6 +2376,7 @@ fn run_user_problem_training_from(
             grad_norm: out.grad_norm,
             bc_residual_rms,
             bc_residual_max,
+            physical_boundary_residuals,
             reaction_force,
             energy_balance,
             network_snapshot,
@@ -2426,12 +2436,14 @@ fn run_user_problem_training_from(
                 } else {
                     None
                 };
-                let energy_balance = crate::user_problem::probe_energy_balance(&model_val, &live_spec, &device);
+                let checkpoint_affine = (crate::user_problem::decomposition_applicable(&live_spec) || problem.hard_constraint_active())
+                    .then_some((live_spec.load.px, live_spec.load.py));
+                let energy_balance = crate::user_problem::probe_energy_balance_with_field(
+                    &model_val, &live_spec, &device, problem.ansatz(0), checkpoint_affine,
+                );
                 // Issue #78: same generalized ansatz/affine wiring as the training loop's own
                 // vis-cadence probe above - `problem` (this model's own real training-time
                 // problem) is still in scope in this post-training serving loop.
-                let checkpoint_affine = (crate::user_problem::decomposition_applicable(&live_spec) || problem.hard_constraint_active())
-                    .then_some((live_spec.load.px, live_spec.load.py));
                 let reaction_force = crate::user_problem::probe_reaction_force(&model_val, &live_spec, &device, problem.ansatz(0), checkpoint_affine);
                 // Reuses the SAME accumulated history `convergence_evidence` is built from on
                 // the final training-loop update (issue #62 PH3-10) - training has already
@@ -2442,7 +2454,7 @@ fn run_user_problem_training_from(
                     loss_trend: format!("{:?}", convergence_evidence.loss_trend),
                     grad_norm_trend: format!("{:?}", convergence_evidence.grad_norm_trend),
                     bc_residual_trend: format!("{:?}", convergence_evidence.bc_residual_trend),
-                    plausibly_converged: convergence_evidence.plausibly_converged,
+                    plausibly_converged: convergence_evidence.plausibly_converged && live_spec.geometry.holes.is_empty(),
                 };
                 let report = crate::provenance::build_plate_authoritative_report(
                     &live_spec,
@@ -2498,16 +2510,18 @@ pub fn serve_loaded_plate_checkpoint(
     let fd = FdConfig::new(spec.training.fd_h, 2.0 * half_w, 2.0 * half_h);
     let [nx_vis, ny_vis] = SolverConfig::default_kirsch().vis_grid;
 
-    // Issue #77 PH4-41/45: a loaded checkpoint carries no ansatz metadata (the checkpoint
-    // format only persists model weights) - `IdentityAnsatz` matches every checkpoint this
-    // codebase can currently produce, since the checkpoint-save path only ever ran a plain
-    // `UserDefinedProblem::new(spec)`. This is a real, disclosed gap, not a proven invariant:
-    // once a hard-constraint-ansatz run is checkpointed too, its reload would need the same
-    // architecture metadata `ProblemSpec.architecture` already carries - not yet wired here.
-    let ansatz = crate::pinlug_problem::IdentityAnsatz;
-    let affine = crate::user_problem::decomposition_applicable(&spec).then_some((spec.load.px, spec.load.py));
+    // Checkpoint metadata retains the training spec, including its ansatz selection. Rebuild
+    // that same field representation for every loaded probe; identity alone would silently
+    // misreport hard-constraint checkpoints even when the model weights loaded correctly.
+    use crate::problem::BoundaryValueProblem;
+    let problem = crate::user_problem::UserDefinedProblem::new_with_hard_constraint_ansatz(
+        spec.clone(), spec.architecture.hard_constraint_ansatz, spec.architecture.hole_bias_fraction,
+    );
+    let ansatz = problem.ansatz(0);
+    let affine = (crate::user_problem::decomposition_applicable(&spec) || problem.hard_constraint_active())
+        .then_some((spec.load.px, spec.load.py));
     let vis = crate::user_problem::evaluate_user_vis_grid(
-        &model, &spec.geometry, [nx_vis, ny_vis], u_ref, spec.load.px, &spec.material, &fd, &[], &device, &ansatz, affine,
+        &model, &spec.geometry, [nx_vis, ny_vis], u_ref, spec.load.px, &spec.material, &fd, &[], &device, ansatz, affine,
     );
     let nominal_stress = spec.load.px.abs().max(spec.load.py.abs());
     // Derived-stress-at-margin, not direct σ at the exact boundary - see
@@ -2517,7 +2531,7 @@ pub fn serve_loaded_plate_checkpoint(
         .map(|(hole_index, hole)| {
             let profile = crate::user_problem::probe_hole_boundary_profile_derived(
                 &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material, hole_margin, &device,
-                &ansatz, affine,
+                ansatz, affine,
             );
             let mut concentration = crate::user_problem::stress_concentration_from_profile(&profile, nominal_stress);
             // Issue #62 PH3-15 - same real angular/radial refinement check as the live
@@ -2526,26 +2540,25 @@ pub fn serve_loaded_plate_checkpoint(
             // are negligible.
             let kt_convergence = crate::user_problem::kt_convergence_check(
                 &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material,
-                hole_margin, nominal_stress, 0.05, &device, &ansatz, affine,
+                hole_margin, nominal_stress, 0.05, &device, ansatz, affine,
             );
             concentration.angular_refinement_relative_change = Some(kt_convergence.angular_relative_change);
             concentration.radial_offset_refinement_relative_change = Some(kt_convergence.radial_relative_change);
             concentration.refinement_converged = Some(kt_convergence.converged);
             let stress_diagnostic = crate::user_problem::probe_hole_stress_diagnostic(
                 &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px,
-                &spec.material, hole_margin, &device, &ansatz,
+                &spec.material, hole_margin, &device, ansatz,
             );
             pinn_core::messages::HoleAnalysis {
                 hole_index, profile, concentration, stress_diagnostic: Some(stress_diagnostic),
             }
         }).collect();
-    let (bc_residual_rms, bc_residual_max) = crate::user_problem::probe_boundary_residuals(&model, &spec, &device, &ansatz, affine);
-    let reaction_force = crate::user_problem::probe_reaction_force(&model, &spec, &device, &ansatz, affine);
-    let energy_balance = crate::user_problem::probe_energy_balance(&model, &spec, &device);
+    let ((bc_residual_rms, bc_residual_max), physical_boundary_residuals) = crate::user_problem::probe_boundary_residuals_detailed(&model, &spec, &device, ansatz, affine);
+    let reaction_force = crate::user_problem::probe_reaction_force(&model, &spec, &device, ansatz, affine);
+    let energy_balance = crate::user_problem::probe_energy_balance_with_field(&model, &spec, &device, ansatz, affine);
     let network_snapshot = crate::network::network_snapshot(&model);
-    // Transient - constructed only to enumerate `loss_terms()`, no network/training involved.
     let stress_source_report: Vec<(&'static str, &'static str)> =
-        crate::training_core::stress_source_report(&crate::user_problem::UserDefinedProblem::new(spec.clone()))
+        crate::training_core::stress_source_report(&problem)
             .into_iter()
             .map(|(name, source)| (name, match source {
                 crate::problem::StressSource::Direct => "Direct",
@@ -2554,7 +2567,7 @@ pub fn serve_loaded_plate_checkpoint(
             }))
             .collect();
     let boundary_operator_report: Vec<(&'static str, &'static str)> =
-        crate::training_core::boundary_operator_report(&crate::user_problem::UserDefinedProblem::new(spec.clone()))
+        crate::training_core::boundary_operator_report(&problem)
             .into_iter()
             .map(|(name, kind)| (name, match kind {
                 crate::problem::BoundaryOperatorKind::Dirichlet => "Dirichlet",
@@ -2566,7 +2579,7 @@ pub fn serve_loaded_plate_checkpoint(
             }))
             .collect();
     let derivative_order_report: Vec<(&'static str, &'static str)> =
-        crate::training_core::derivative_order_report(&crate::user_problem::UserDefinedProblem::new(spec.clone()))
+        crate::training_core::derivative_order_report(&problem)
             .into_iter()
             .map(|(name, order)| (name, match order {
                 crate::problem::DerivativeOrder::First => "First",
@@ -2574,7 +2587,7 @@ pub fn serve_loaded_plate_checkpoint(
             }))
             .collect();
     let formulation_kind_report: Vec<(&'static str, &'static str)> =
-        crate::training_core::formulation_kind_report(&crate::user_problem::UserDefinedProblem::new(spec.clone()))
+        crate::training_core::formulation_kind_report(&problem)
             .into_iter()
             .map(|(name, kind)| (name, match kind {
                 crate::problem::FormulationKind::Strong => "Strong",
@@ -2582,7 +2595,7 @@ pub fn serve_loaded_plate_checkpoint(
             }))
             .collect();
     let constraint_report: Vec<(&'static str, &'static str)> =
-        crate::training_core::constraint_report(&crate::user_problem::UserDefinedProblem::new(spec.clone()))
+        crate::training_core::constraint_report(&problem)
             .into_iter()
             .map(|(name, kind)| (name, match kind {
                 crate::problem::ConstraintKind::Unconstrained => "Unconstrained",
@@ -2601,6 +2614,7 @@ pub fn serve_loaded_plate_checkpoint(
         lam_energy: 0.0, lam_neumann: 0.0, n_colloc: 0, kt_estimate: None,
         vis: Some(vis), amr_sweep: None, hole_analyses,
         grad_norm: None, bc_residual_rms, bc_residual_max,
+        physical_boundary_residuals: Some(physical_boundary_residuals),
         reaction_force: Some(reaction_force), energy_balance: Some(energy_balance),
         network_snapshot: Some(network_snapshot),
         architecture_event: None, // loaded, not (re)trained this session - nothing happened
@@ -3108,6 +3122,59 @@ mod tests {
         assert!(saw_update, "expected at least one TrainingMsg::Update");
         assert!(saw_done, "expected TrainingMsg::Done");
 
+        tx_ctrl.send(ControlMsg::Stop).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn serve_loaded_plate_checkpoint_reconstructs_hard_constraint_field() {
+        use crate::problem::BoundaryValueProblem;
+
+        let mut spec = single_hole_like_spec(0);
+        spec.architecture.hard_constraint_ansatz = true;
+        let device = BDevice::default();
+        let model: ElasticityNet<BInner> = ElasticityNetConfig::new()
+            .with_input_dim(spec.geometry.net_input_dim()).with_hidden_dim(8).with_n_hidden(2).with_output_dim(5)
+            .init(&device);
+        let problem = crate::user_problem::UserDefinedProblem::new_with_hard_constraint_ansatz(
+            spec.clone(), true, spec.architecture.hole_bias_fraction,
+        );
+        let fd = FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+        let u_ref = crate::training_core::compute_reference_scales_for_plate(&spec).u_ref;
+        let margin = crate::user_problem::ring_anchor_margin_m(spec.training.fd_h, &spec.geometry);
+        let hole = &spec.geometry.holes[0];
+        let expected = crate::user_problem::probe_hole_boundary_profile_derived(
+            &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material,
+            margin, &device, problem.ansatz(0), Some((spec.load.px, spec.load.py)),
+        );
+        let identity = crate::user_problem::probe_hole_boundary_profile_derived(
+            &model, &spec.geometry, hole, 72, &fd, u_ref, spec.load.px, &spec.material,
+            margin, &device, &crate::pinlug_problem::IdentityAnsatz, None,
+        );
+        assert!(expected.iter().zip(&identity).any(|(a, b)| (a.ux - b.ux).abs() > 1e-9),
+            "fixture must distinguish reconstructed hard field from the old identity field");
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || serve_loaded_plate_checkpoint(spec, model, tx, rx_ctrl));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let update = loop {
+            assert!(std::time::Instant::now() < deadline, "loaded checkpoint did not send an update");
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(TrainingMsg::Update(update)) => break update,
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(e) => panic!("loaded checkpoint channel closed: {e}"),
+            }
+        };
+        let actual = &update.hole_analyses[0].profile;
+        assert_eq!(actual.len(), expected.len());
+        assert!(update.boundary_operator_report.iter().all(|(name, _)| *name != "hole_free"),
+            "loaded report must describe hard-constraint terms, not plain-problem terms");
+        for (got, want) in actual.iter().zip(&expected) {
+            assert_eq!(got.ux, want.ux);
+            assert_eq!(got.uy, want.uy);
+            assert_eq!(got.von_mises, want.von_mises);
+        }
         tx_ctrl.send(ControlMsg::Stop).unwrap();
         handle.join().unwrap();
     }

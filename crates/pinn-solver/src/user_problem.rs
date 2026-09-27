@@ -3595,10 +3595,21 @@ pub fn probe_boundary_residuals(
     ansatz: &dyn DirichletAnsatz,
     affine_strain_pair: Option<(f64, f64)>,
 ) -> (f64, f64) {
+    probe_boundary_residuals_detailed(model, spec, device, ansatz, affine_strain_pair).0
+}
+
+/// Legacy aggregate plus unit-separated checks of the physical total field.
+/// The aggregate remains available for compatibility, but must not certify mixed-hole runs.
+pub fn probe_boundary_residuals_detailed(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    spec: &ProblemSpec,
+    device: &crate::training_core::BDevice,
+    ansatz: &dyn DirichletAnsatz,
+    affine_strain_pair: Option<(f64, f64)>,
+) -> ((f64, f64), pinn_core::messages::PhysicalBoundaryResiduals) {
     use crate::energy::compute_stress;
     use crate::differential_operator::production_strain as compute_strains;
-    use crate::fd_stencil::{norm_pts_to_tensor, FdConfig};
-    use crate::network::fwd_embedded;
+    use crate::fd_stencil::FdConfig;
     use crate::training_core::{stencil_forward_with_ansatz, BInner};
     use burn::tensor::TensorData;
 
@@ -3621,6 +3632,11 @@ pub fn probe_boundary_residuals(
     };
 
     let mut residuals: Vec<f32> = Vec::new();
+    let mut physical = pinn_core::messages::PhysicalBoundaryResiduals {
+        outer_traction_pa: pinn_core::messages::BoundaryResidualStats { rms: 0.0, max: 0.0 },
+        free_hole_traction_pa: Vec::new(),
+        fixed_hole_displacement_m: Vec::new(),
+    };
 
     let bnd_pts_phys = sampling.sample_boundary(&placeholder, &spec.load, spec.training.n_boundary);
     if !bnd_pts_phys.is_empty() {
@@ -3644,7 +3660,10 @@ pub fn probe_boundary_residuals(
         let ex = tx_pred - tx_target;
         let ey = ty_pred - ty_target;
         let mag = (ex.clone() * ex + ey.clone() * ey).sqrt();
-        residuals.extend(mag.into_data().to_vec::<f32>().unwrap_or_default());
+        let outer: Vec<f32> = mag.into_data().to_vec::<f32>().unwrap_or_default();
+        let (rms, max) = crate::training_core::residual_stats(&outer);
+        physical.outer_traction_pa = pinn_core::messages::BoundaryResidualStats { rms, max };
+        residuals.extend(outer);
     }
 
     // `named_point_sets` returns one ring per hole in `geometry.holes.iter()` order (zip,
@@ -3654,7 +3673,7 @@ pub fn probe_boundary_residuals(
     // corrects FD-derived strain; a direct stress-column read has no strain step to correct),
     // but the `u`/`v` columns DO need the ansatz's own transform for the Fixed-hole branch
     // below, which is why `fwd_embedded` is still replaced with the ansatz-aware forward.
-    for (hole, set) in geometry.holes.iter().zip(sampling.named_point_sets(&[]).into_iter()) {
+    for (hole_index, (hole, set)) in geometry.holes.iter().zip(sampling.named_point_sets(&[]).into_iter()).enumerate() {
         let n_h = set.points.len();
         if n_h == 0 { continue; }
         let ring_norm: Vec<[f32; 2]> = set.points.iter().map(|p| norm_pt(p.x, p.y)).collect();
@@ -3665,31 +3684,26 @@ pub fn probe_boundary_residuals(
         // exact call site hit against a `tiny_model_raw()`-style narrower test model, on a
         // multi-hole geometry - the same model/geometry-embedding-mismatch class of bug
         // `embedding_for_model` itself exists to prevent everywhere else in this file).
-        let raw = fwd_embedded::<BInner>(model, norm_pts_to_tensor::<BInner>(&ring_norm, device), embedding_for_model(model, geometry), device);
-        let (dx_v, dy_v, add_x_v, add_y_v): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) = {
-            let mut dx_v = Vec::with_capacity(n_h);
-            let mut dy_v = Vec::with_capacity(n_h);
-            let mut add_x_v = Vec::with_capacity(n_h);
-            let mut add_y_v = Vec::with_capacity(n_h);
-            for p in &ring_norm {
-                let (dx, dy) = ansatz.eval(p[0], p[1], 1.0);
-                dx_v.push(dx);
-                dy_v.push(dy);
-                let (ax, ay) = ansatz.additive(p[0], p[1]);
-                add_x_v.push(ax);
-                add_y_v.push(ay);
-            }
-            (dx_v, dy_v, add_x_v, add_y_v)
-        };
-        let dx_t = Tensor::<BInner, 2>::from_data(TensorData::new(dx_v, vec![n_h, 1]), device);
-        let dy_t = Tensor::<BInner, 2>::from_data(TensorData::new(dy_v, vec![n_h, 1]), device);
-        let add_x_t = Tensor::<BInner, 2>::from_data(TensorData::new(add_x_v, vec![n_h, 1]), device);
-        let add_y_t = Tensor::<BInner, 2>::from_data(TensorData::new(add_y_v, vec![n_h, 1]), device);
-        let u_col = (raw.clone().slice([0..n_h, 0..1]) * dx_t + add_x_t).mul_scalar(u_ref as f64);
-        let v_col = (raw.clone().slice([0..n_h, 1..2]) * dy_t + add_y_t).mul_scalar(u_ref as f64);
-        let scaled = Tensor::cat(vec![u_col, v_col, raw.slice([0..n_h, 2..5]).mul_scalar(px_pa)], 1);
+        let (raw, _embedding) = stencil_forward_with_ansatz::<BInner>(
+            model, ansatz, &ring_norm, &fd, 1.0, u_ref as f64, px_pa, true,
+            embedding_for_model(model, geometry), None, device,
+        );
+        let scaled = raw.slice([0..n_h, 0..5]);
         match hole.bc {
             HoleBc::Free => {
+                let profile = probe_hole_boundary_profile_derived(
+                    model, geometry, hole, 72, &fd, u_ref, px_pa, &spec.material,
+                    ring_anchor_margin_m(spec.training.fd_h, geometry), device, ansatz, affine_strain_pair,
+                );
+                let derived_traction: Vec<f32> = profile.iter().map(|point| {
+                    let theta = point.theta_deg.to_radians();
+                    let (nx, ny) = (theta.cos(), theta.sin());
+                    let tx = point.sxx as f64 * nx + point.sxy as f64 * ny;
+                    let ty = point.sxy as f64 * nx + point.syy as f64 * ny;
+                    tx.hypot(ty) as f32
+                }).collect();
+                let (rms, max) = crate::training_core::residual_stats(&derived_traction);
+                physical.free_hole_traction_pa.push((hole_index, pinn_core::messages::BoundaryResidualStats { rms, max }));
                 let nx: Vec<f32> = set.points.iter().map(|p| p.nx as f32).collect();
                 let ny: Vec<f32> = set.points.iter().map(|p| p.ny as f32).collect();
                 let nx_t = Tensor::<BInner, 1>::from_data(TensorData::new(nx, vec![n_h]), device);
@@ -3703,15 +3717,25 @@ pub fn probe_boundary_residuals(
                 residuals.extend(mag.into_data().to_vec::<f32>().unwrap_or_default());
             }
             HoleBc::Fixed => {
-                let u = scaled.clone().slice([0..n_h, 0..1]).reshape([n_h]);
-                let v = scaled.slice([0..n_h, 1..2]).reshape([n_h]);
+                let mut u = scaled.clone().slice([0..n_h, 0..1]).reshape([n_h]);
+                let mut v = scaled.slice([0..n_h, 1..2]).reshape([n_h]);
+                if let Some((px, py)) = affine_strain_pair {
+                    let (exx, eyy, exy) = affine_strain(px, py, &spec.material);
+                    let us = set.points.iter().map(|p| (exx * p.x + exy * p.y) as f32).collect::<Vec<_>>();
+                    let vs = set.points.iter().map(|p| (exy * p.x + eyy * p.y) as f32).collect::<Vec<_>>();
+                    u = u + Tensor::<BInner, 1>::from_data(TensorData::new(us, vec![n_h]), device);
+                    v = v + Tensor::<BInner, 1>::from_data(TensorData::new(vs, vec![n_h]), device);
+                }
                 let mag = (u.clone() * u.clone() + v.clone() * v.clone()).sqrt();
-                residuals.extend(mag.into_data().to_vec::<f32>().unwrap_or_default());
+                let fixed: Vec<f32> = mag.into_data().to_vec::<f32>().unwrap_or_default();
+                let (rms, max) = crate::training_core::residual_stats(&fixed);
+                physical.fixed_hole_displacement_m.push((hole_index, pinn_core::messages::BoundaryResidualStats { rms, max }));
+                residuals.extend(fixed);
             }
         }
     }
 
-    crate::training_core::residual_stats(&residuals)
+    (crate::training_core::residual_stats(&residuals), physical)
 }
 
 /// Issue #61 EPIC P2-06's own "stencils avoid invalid points with recorded fallback/quality
@@ -4290,11 +4314,22 @@ pub fn probe_energy_balance(
     spec: &ProblemSpec,
     device: &crate::training_core::BDevice,
 ) -> pinn_core::messages::EnergyBalance {
+    probe_energy_balance_with_field(model, spec, device, &crate::pinlug_problem::IdentityAnsatz, None)
+}
+
+/// Probe the same ansatz-transformed, affine-completed physical field used by training.
+/// `probe_energy_balance` retains the historical identity-field API for older callers.
+pub fn probe_energy_balance_with_field(
+    model: &crate::network::ElasticityNet<crate::training_core::BInner>,
+    spec: &ProblemSpec,
+    device: &crate::training_core::BDevice,
+    ansatz: &dyn DirichletAnsatz,
+    affine_strain_pair: Option<(f64, f64)>,
+) -> pinn_core::messages::EnergyBalance {
     use crate::energy::dem_energy_per_point;
     use crate::differential_operator::production_strain as compute_strains;
-    use crate::fd_stencil::{assemble_stencil, norm_pts_to_tensor, FdConfig};
-    use crate::network::fwd_embedded;
-    use crate::training_core::BInner;
+    use crate::fd_stencil::FdConfig;
+    use crate::training_core::{stencil_forward_with_ansatz, BInner};
 
     let geometry = &spec.geometry;
     let sampling = UserSamplingStrategy::new(geometry.clone(), spec.training.fd_h);
@@ -4314,14 +4349,17 @@ pub fn probe_energy_balance(
     } else {
         let n_int = interior.len();
         let int_norm: Vec<[f32; 2]> = interior.iter().map(|&[x, y]| norm_pt(x, y)).collect();
-        let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&int_norm, device), &fd, device);
-        let raw = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device);
-        let m = 5 * n_int;
-        let scaled = Tensor::cat(vec![
-            raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
-            raw.slice([0..m, 2..5]).mul_scalar(px_pa),
-        ], 1);
-        let (exx, eyy, exy) = compute_strains::<BInner>(scaled, n_int, &fd);
+        let (scaled, _) = stencil_forward_with_ansatz::<BInner>(
+            model, ansatz, &int_norm, &fd, 1.0, u_ref as f64, px_pa, true,
+            embedding_for_model(model, geometry), None, device,
+        );
+        let (mut exx, mut eyy, mut exy) = compute_strains::<BInner>(scaled, n_int, &fd);
+        if let Some((px, py)) = affine_strain_pair {
+            let (a_exx, a_eyy, a_exy) = affine_strain(px, py, &spec.material);
+            exx = exx.add_scalar(a_exx);
+            eyy = eyy.add_scalar(a_eyy);
+            exy = exy.add_scalar(a_exy);
+        }
         let energy_density = dem_energy_per_point::<BInner>(exx, eyy, exy, &spec.material);
         let density_vals: Vec<f32> = energy_density.into_data().to_vec::<f32>().unwrap_or_default();
         // Issue #61 P2-04: `Integral_Omega(f) ≈ |Omega|*mean(f)`, via the shared abstraction
@@ -4339,19 +4377,23 @@ pub fn probe_energy_balance(
         let ds_x_normal = 2.0 * geometry.half_h / per_edge as f64;
         let ds_y_normal = 2.0 * geometry.half_w / per_edge as f64;
         let bnd_norm: Vec<[f32; 2]> = bnd_pts_phys.iter().map(|p| norm_pt(p.x, p.y)).collect();
-        let stencil = assemble_stencil::<BInner>(&norm_pts_to_tensor::<BInner>(&bnd_norm, device), &fd, device);
-        let raw = fwd_embedded::<BInner>(model, stencil, geometry.coordinate_embedding(), device);
-        let m = 5 * n_bnd;
-        let scaled = Tensor::cat(vec![
-            raw.clone().slice([0..m, 0..2]).mul_scalar(u_ref as f64),
-            raw.slice([0..m, 2..5]).mul_scalar(px_pa),
-        ], 1);
+        let (scaled, _) = stencil_forward_with_ansatz::<BInner>(
+            model, ansatz, &bnd_norm, &fd, 1.0, u_ref as f64, px_pa, true,
+            embedding_for_model(model, geometry), None, device,
+        );
         let nx: Vec<f32> = bnd_pts_phys.iter().map(|p| p.nx as f32).collect();
         let ny: Vec<f32> = bnd_pts_phys.iter().map(|p| p.ny as f32).collect();
-        let u_vals: Vec<f32> = scaled.clone().slice([0..n_bnd, 0..1]).reshape([n_bnd])
+        let mut u_vals: Vec<f32> = scaled.clone().slice([0..n_bnd, 0..1]).reshape([n_bnd])
             .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
-        let v_vals: Vec<f32> = scaled.slice([0..n_bnd, 1..2]).reshape([n_bnd])
+        let mut v_vals: Vec<f32> = scaled.slice([0..n_bnd, 1..2]).reshape([n_bnd])
             .into_data().to_vec::<f32>().unwrap_or_else(|_| vec![0.0; n_bnd]);
+        if let Some((px, py)) = affine_strain_pair {
+            let (a_exx, a_eyy, a_exy) = affine_strain(px, py, &spec.material);
+            for (i, point) in bnd_pts_phys.iter().enumerate() {
+                u_vals[i] += (a_exx * point.x + a_exy * point.y) as f32;
+                v_vals[i] += (a_exy * point.x + a_eyy * point.y) as f32;
+            }
+        }
         // Physical external work is the prescribed traction `tbar` dotted with the trial
         // displacement.  Using model-derived traction here would diagnose a different,
         // non-variational quantity and make `U-W_ext` unreconstructable from persisted data.
@@ -9781,6 +9823,49 @@ mod tests {
     }
 
     #[test]
+    fn mixed_hole_physical_boundary_residuals_keep_units_and_field_source_separate() {
+        let geometry = two_hole_geometry();
+        let model = tiny_model(&geometry);
+        let device = crate::training_core::BDevice::default();
+        let spec = ProblemSpec {
+            geometry, material: MaterialProps::al7075_t6(),
+            load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(), training: Default::default(),
+            formulation: pinn_core::problem_spec::default_formulation(),
+            architecture: Default::default(),
+        };
+        let (legacy, physical) = probe_boundary_residuals_detailed(
+            &model, &spec, &device, &IdentityAnsatz, Some((spec.load.px, spec.load.py)),
+        );
+        assert_eq!(physical.free_hole_traction_pa.len(), 1);
+        assert_eq!(physical.fixed_hole_displacement_m.len(), 1);
+        assert_eq!(physical.free_hole_traction_pa[0].0, 0);
+        assert_eq!(physical.fixed_hole_displacement_m[0].0, 1);
+        assert!(physical.outer_traction_pa.rms.is_finite());
+        assert!(physical.free_hole_traction_pa[0].1.rms.is_finite());
+        assert!(physical.fixed_hole_displacement_m[0].1.rms.is_finite());
+        let fd = crate::fd_stencil::FdConfig::new(spec.training.fd_h, 2.0 * spec.geometry.half_w, 2.0 * spec.geometry.half_h);
+        let scales = crate::training_core::compute_reference_scales_for_plate(&spec);
+        let profile = probe_hole_boundary_profile_derived(
+            &model, &spec.geometry, &spec.geometry.holes[0], 72, &fd, scales.u_ref,
+            scales.stress_ref, &spec.material, ring_anchor_margin_m(spec.training.fd_h, &spec.geometry),
+            &device, &IdentityAnsatz, Some((spec.load.px, spec.load.py)),
+        );
+        let expected_rms = (profile.iter().map(|point| {
+            let theta = point.theta_deg.to_radians();
+            let (nx, ny) = (theta.cos(), theta.sin());
+            let tx = point.sxx as f64 * nx + point.sxy as f64 * ny;
+            let ty = point.sxy as f64 * nx + point.syy as f64 * ny;
+            tx * tx + ty * ty
+        }).sum::<f64>() / profile.len() as f64).sqrt();
+        assert!((physical.free_hole_traction_pa[0].1.rms - expected_rms).abs() / expected_rms < 1e-5);
+        assert!(physical.outer_traction_pa.max >= physical.outer_traction_pa.rms);
+        assert!(physical.free_hole_traction_pa[0].1.max >= physical.free_hole_traction_pa[0].1.rms);
+        assert!(physical.fixed_hole_displacement_m[0].1.max >= physical.fixed_hole_displacement_m[0].1.rms);
+        assert!(legacy.0.is_finite(), "legacy value remains available but is not a physical mixed-unit gate");
+    }
+
+    #[test]
     fn probe_boundary_residuals_handles_a_geometry_with_no_holes() {
         let model = tiny_model_raw();
         let device = crate::training_core::BDevice::default();
@@ -11243,6 +11328,36 @@ mod tests {
             "internal_energy and external_work were suspiciously identical - suspect a copy-paste bug comparing a value against itself: {} vs {}",
             eb.internal_energy, eb.external_work
         );
+    }
+
+    #[test]
+    fn energy_balance_probe_includes_ansatz_and_affine_physical_field() {
+        struct SuppressNetwork;
+        impl DirichletAnsatz for SuppressNetwork {
+            fn eval(&self, _xn: f32, _yn: f32, _k: f32) -> (f32, f32) { (0.0, 0.0) }
+        }
+        let spec = ProblemSpec {
+            geometry: UserGeometry { half_w: 0.1, half_h: 0.1, thickness: 0.005, holes: vec![] },
+            material: MaterialProps::al7075_t6(),
+            load: pinn_core::loading::LoadConfig::uniaxial_x(6.9e7),
+            network: Default::default(), training: Default::default(),
+            formulation: pinn_core::problem_spec::FormulationSelection::Variational,
+            architecture: Default::default(),
+        };
+        let device = crate::training_core::BDevice::default();
+        let model = tiny_model_raw();
+        let zero = probe_energy_balance_with_field(&model, &spec, &device, &SuppressNetwork, None);
+        assert!(zero.internal_energy.abs() < 1e-12);
+        assert!(zero.external_work.abs() < 1e-12);
+
+        // Suppressed network plus physical affine field is the exact no-hole solution.
+        // The old raw-network probe returned zero for both energies in this case.
+        let affine = probe_energy_balance_with_field(
+            &model, &spec, &device, &SuppressNetwork, Some((spec.load.px, spec.load.py)),
+        );
+        assert!(affine.internal_energy > 0.0);
+        assert!(affine.external_work > 0.0);
+        assert!(affine.energy_balance_error < 1e-3, "{affine:?}");
     }
 
     #[test]
